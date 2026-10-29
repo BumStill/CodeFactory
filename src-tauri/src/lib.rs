@@ -44,6 +44,7 @@ mod errors;
 mod git_remote;
 mod http_util;
 mod knowledge;
+mod knowledge_watch;
 mod mcp;
 mod menu;
 mod clipboard_attachments;
@@ -1707,6 +1708,9 @@ pub fn run() {
             }
 
             let objective_pool = pool.clone();
+            // M191: knowledge libraries maintain themselves — the clone keeps a
+            // handle for the watcher/reconciler before the pool moves into state.
+            let knowledge_pool = pool.clone();
             app.manage(AppState {
                 db: Arc::new(RwLock::new(pool)),
                 settings: Arc::new(RwLock::new(settings)),
@@ -1726,6 +1730,8 @@ pub fn run() {
             app.manage(scheduler_handles);
             // CF-BG：启动后台任务对账 + 唤醒投递循环（重启后继续监视/补发唤醒）。
             crate::agent::background_tasks::start_runtime(app.handle().clone());
+            // M191: 启动知识库自动更新（崩溃修复 + 全库对账 + 文件监听 + 定时兜底）。
+            crate::knowledge_watch::start(knowledge_pool);
             let objective_store = agent::objective::ObjectiveStore::new(objective_pool.clone());
             let cancelled_sessions = tauri::async_runtime::block_on(
                 objective_store.consume_pending_chat_session_cancellations(),
@@ -2056,6 +2062,7 @@ pub fn run() {
             commands::knowledge::scan_knowledge_library,
             commands::knowledge::set_knowledge_library_enabled,
             commands::knowledge::delete_knowledge_library,
+            commands::knowledge::list_knowledge_library_failures,
             commands::models::list_models,
             commands::session::list_sessions,
             commands::background::list_session_background_activity,

@@ -30,6 +30,7 @@ describe("knowledge store", () => {
       scanSummaries: {},
       loading: false,
       scanning: {},
+      failures: {},
       error: null,
     });
   });
@@ -101,6 +102,29 @@ describe("knowledge store", () => {
       libraryId: "kb-1",
     });
     expect(useKnowledgeStore.getState().libraries).toEqual([]);
+  });
+
+  it("surfaces per-file index failures so the page can name the broken file", async () => {
+    const failure = {
+      path: "/Users/x/Knowledge/broken.docx",
+      kind: "docx",
+      error: "Invalid docx zip",
+      updated_at: "2026-10-29T09:00:00Z",
+    };
+    mocks.invoke.mockImplementation((cmd: string, args?: { libraryId?: string }) => {
+      if (cmd === "list_knowledge_libraries") return Promise.resolve([library]);
+      if (cmd === "list_knowledge_library_failures") {
+        return Promise.resolve(args?.libraryId === "kb-1" ? [failure] : []);
+      }
+      return Promise.resolve(undefined);
+    });
+
+    await useKnowledgeStore.getState().loadLibraries();
+
+    expect(mocks.invoke).toHaveBeenCalledWith("list_knowledge_library_failures", {
+      libraryId: "kb-1",
+    });
+    expect(useKnowledgeStore.getState().failures["kb-1"]).toEqual([failure]);
   });
 
   it("keeps existing libraries visible when loading fails", async () => {

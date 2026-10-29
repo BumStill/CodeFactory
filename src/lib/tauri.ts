@@ -892,6 +892,24 @@ export interface KnowledgeScanSummary {
   indexed_documents: number;
   failed_documents: number;
   chunks_indexed: number;
+  /** Documents that did not exist in the index before this pass. */
+  added_documents?: number;
+  /** Documents whose content changed and were re-chunked. */
+  updated_documents?: number;
+  /** Documents skipped because their bytes were already indexed. */
+  unchanged_documents?: number;
+  /** Index rows dropped because the source file is gone. */
+  removed_documents?: number;
+  /** This request merged into a pass that was already running. */
+  coalesced?: boolean;
+}
+
+/** A file that currently fails to index, shown in the knowledge page status. */
+export interface KnowledgeDocumentFailure {
+  path: string;
+  kind: string;
+  error: string;
+  updated_at: string;
 }
 
 export type TaskEventKind =

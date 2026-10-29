@@ -36,6 +36,7 @@ const knowledgeState = vi.hoisted(() => ({
   },
   loading: false,
   scanning: {} as Record<string, boolean>,
+  failures: {} as Record<string, { path: string; kind: string; error: string; updated_at: string }[]>,
   error: null as string | null,
   loadLibraries: mocks.loadLibraries,
   registerLibrary: mocks.registerLibrary,
@@ -123,6 +124,36 @@ describe("ResourcesPage", () => {
     await user.click(screen.getByRole("button", { name: "删除知识库 产品资料" }));
     expect(window.confirm).toHaveBeenCalled();
     expect(mocks.deleteLibrary).toHaveBeenCalledWith("kb-1");
+  });
+
+  it("shows the automatic update state and names the failing file in place", async () => {
+    // Auto-indexing is backend-driven: no button was pressed, yet the panel
+    // must show "正在更新" and the broken file with its reason (M191 R6).
+    const library = knowledgeState.libraries[0];
+    library.scan_status = "scanning";
+    knowledgeState.failures = {
+      "kb-1": [
+        {
+          path: "/Users/x/Knowledge/broken.docx",
+          kind: "docx",
+          error: "Invalid docx zip",
+          updated_at: "2026-10-29T09:00:00Z",
+        },
+      ],
+    };
+
+    try {
+      render(<ResourcesPage onBack={() => {}} />);
+
+      expect(await screen.findByText("正在更新")).toBeInTheDocument();
+      expect(screen.getByText(/最近更新：/)).toBeInTheDocument();
+      expect(screen.getByText("1 个文件无法建立索引")).toBeInTheDocument();
+      expect(screen.getByText("/Users/x/Knowledge/broken.docx")).toBeInTheDocument();
+      expect(screen.getByText("Invalid docx zip")).toBeInTheDocument();
+    } finally {
+      library.scan_status = "completed";
+      knowledgeState.failures = {};
+    }
   });
 
   it("adds a local folder and exposes the skills manager as a backend tab", async () => {
