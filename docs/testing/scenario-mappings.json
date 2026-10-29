@@ -9,6 +9,7 @@
     { "pattern": "scripts/verify-m198-permission-headless.mjs", "scenario_id": "UI-009" },
     { "pattern": "extension/manifest.json", "scenario_id": "RTE-002" },
     { "pattern": "scripts/verify-extension-bridge.mjs", "scenario_id": "RTE-002" },
-    { "pattern": "src-tauri/src/agent/thin_derive.rs", "scenario_id": "HLT-004" }
+    { "pattern": "src-tauri/src/agent/thin_derive.rs", "scenario_id": "HLT-004" },
+    { "pattern": "src-tauri/src/agent/background_tasks.rs", "scenario_id": "HLT-004" }
   ]
 }
