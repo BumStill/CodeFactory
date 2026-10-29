@@ -2062,7 +2062,9 @@ pub(crate) fn parse_windows_internet_settings(text: &str) -> SystemProxy {
 fn read_system_proxy() -> SystemProxy {
     #[cfg(target_os = "macos")]
     {
+        use crate::util::no_window::NoWindow;
         match std::process::Command::new("scutil")
+            .no_window()
             .arg("--proxy")
             .output()
         {
@@ -2081,14 +2083,13 @@ fn read_system_proxy() -> SystemProxy {
     }
     #[cfg(target_os = "windows")]
     {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        use crate::util::no_window::NoWindow;
         match std::process::Command::new("reg")
+            .no_window()
             .args([
                 "query",
                 r"HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings",
             ])
-            .creation_flags(CREATE_NO_WINDOW)
             .output()
         {
             Ok(output) if output.status.success() => {

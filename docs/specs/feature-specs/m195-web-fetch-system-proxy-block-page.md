@@ -63,6 +63,7 @@
 - macOS：`scutil --proxy`（系统当前生效配置，含 `ProxyAutoConfigURLString` 与 `ExceptionsList`），文本解析成结构体。
 - Windows：`reg query "HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings"`（`AutoConfigURL`、`ProxyEnable`、`ProxyServer`、`ProxyOverride`），文本解析成同一个结构体；不引入新的 FFI 依赖。
 - 两处都是「读取系统既有配置」，不写配置、不改 DNS、不做 WPAD 广播发现（`AutoConfigURL` 未设置时不猜 `wpad`）。
+- 两个探测进程都走 `crate::util::no_window::NoWindow`：Windows 上带 `CREATE_NO_WINDOW`，不会在 GUI 里闪控制台窗口（由 `tests/no_window_regression.rs` 的全仓扫描守住）。
 
 ### 代理不可用与认证
 - `Unsupported`：PAC 只给出 SOCKS（本构建未启用 `socks` feature）或代理 URL 形态无法交给 reqwest 时，`web_fetch` 直接返回原因，不静默直连。
