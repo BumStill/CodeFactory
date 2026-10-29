@@ -1116,7 +1116,7 @@ fn classify_extension_error(action: &str, error: crate::errors::AppError) -> Str
         return coded(
             codes::EXTENSION_DISCONNECTED,
             format!(
-                "The extension connection dropped during {action} ({message}). 系统自动重试一次，最多等待扩展唤醒约 35 秒；若仍失败，请确认扩展图标显示已连接。"
+                "The extension connection dropped during {action} ({message}). 系统自动恢复，最多等待扩展唤醒约 35 秒；无需用户处理技术连接故障。"
             ),
         );
     }
@@ -1288,7 +1288,7 @@ fn login_redirect_host(page: &PageContent, previous_host: Option<&str>) -> Optio
 /// The sentence the user sees when the page needs them, not the agent.
 fn login_handoff_sentence(host: &str) -> String {
     format!(
-        "需要你在浏览器里登录 {host}。Log in to {host} in your own browser, then continue — CodeFactory never types credentials, and the read resumes once you are signed in."
+        "需要你在浏览器里登录 {host}。CodeFactory never types credentials; after you sign in, the system automatically resumes the read."
     )
 }
 

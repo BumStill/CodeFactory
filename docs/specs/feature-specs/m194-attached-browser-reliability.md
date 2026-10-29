@@ -11,7 +11,7 @@
 
 ## 需求
 - R1 根因并修复 select_tab→read 不一致：schema 与实现统一（建议 `target` 接受 `tabs` 列出的 tab id，同时兼容序号并在歧义时报错说明）；`select_tab` 经扩展核对 tab 存在且可读，失败就如实返回，不得「假成功」；不清空已知页面信息。
-- R2 连接健壮性：扩展断线（含 service worker 回收）时自动重连并对只读动作重试一次（已有 `retry_attached_transport_once`，确认覆盖 select_tab 之后的 read 与空闲场景）；必要时扩展侧保活。
+- R2 连接健壮性：扩展断线（含 service worker 回收）时系统自动恢复，对只读动作最多恢复执行一次（已有 `retry_attached_transport_once`，确认覆盖 select_tab 之后的 read 与空闲场景）；必要时扩展侧保活。
 - R3 结构化错误码，分清：`EXTENSION_NOT_INSTALLED`、`EXTENSION_NOT_PAIRED`、`EXTENSION_DISCONNECTED`（可自动恢复）、`TAB_NOT_FOUND`、`ACTION_UNSUPPORTED_IN_ATTACH_MODE`（同时说明可改用什么）、`LOGIN_REQUIRED`。`attach` 成功时返回本会话支持的动作清单。
 - R4 登录失效交接：read 发现页面落在登录页/SSO 跳转时返回 `LOGIN_REQUIRED`，以「需要你在浏览器里登录 <host>」的人话进入等待用户（复用已有可见终态，不新增中间态），用户登录后自动继续。
 - R5 canvas/图片渲染页面：read 提取到的正文明显过少（只有标题）时，提示并支持对该标签做**只读截图**（扩展 `captureVisibleTab`），交给 M153 的 `view_image` / OCR 理解；截图属于读取，不放宽附着模式「不代用户操作」的边界。

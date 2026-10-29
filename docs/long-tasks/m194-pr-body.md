@@ -33,4 +33,4 @@ Windows 已配对扩展：tabs→select_tab(id/序号)→read；闲置后读取�
 
 README-Update: required
 README-Update-Reason: 说明只读截图及 Chrome 所需 host 权限，不改变导航/输入边界。
-Scenario-Test: RTE-002, RTE-003
+Scenario-Test: CXD-001, CXD-002, HLT-001, HLT-002, HLT-005, RTE-001, RTE-002, RTE-003, RTE-004

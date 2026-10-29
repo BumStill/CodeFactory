@@ -4,6 +4,14 @@
     {
       "pattern": "scripts/delivery-scenario-body.py",
       "scenario_id": "CXD-002"
+    },
+    {
+      "pattern": "extension/manifest.json",
+      "scenario_id": "RTE-002"
+    },
+    {
+      "pattern": "scripts/verify-extension-bridge.mjs",
+      "scenario_id": "RTE-002"
     }
   ]
 }
