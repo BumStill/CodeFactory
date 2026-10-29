@@ -1776,6 +1776,21 @@ pub fn decision_for_run_outcome_with_reason(
         return Ok(decision);
     }
 
+    if outcome.stop_reason == StopReason::Blocked && terminal_reason == Some("LOGIN_REQUIRED") {
+        return DecisionRouter::route(
+            objective,
+            RouteSignal::CoreInputRequired {
+                domain: RecoveryDomain::Browser,
+                request_key: format!("browser-login:{}:", objective.id),
+                missing_inputs: vec!["需要你在浏览器里完成登录；登录后系统自动继续".into()],
+                attempted_routes: vec!["browser_extension_read".into()],
+                resume_cursor: objective.resume_cursor.clone()
+                    .or_else(|| objective.root_turn_id.clone())
+                    .or_else(|| objective.task_id.clone()),
+            },
+        );
+    }
+
     if outcome.stop_reason == StopReason::Blocked
         && terminal_reason == Some("browser_pairing_required")
     {

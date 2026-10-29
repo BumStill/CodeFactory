@@ -1938,6 +1938,11 @@ pub fn run() {
                         );
                         loop {
                             if bridge.connected().await {
+                                if let Err(error) = tools::browser_session::resume_login_objectives(
+                                    &browser_pairing_pool,
+                                ).await {
+                                    tracing::warn!(%error, "browser login observation deferred; system will retry");
+                                }
                                 match commands::browser_sessions::resume_browser_pairing_objectives(
                                     &browser_pairing_pool,
                                 )

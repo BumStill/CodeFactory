@@ -61,6 +61,12 @@ pub enum Command {
     Read { tab_id: i64 },
     /// Search within a tab.
     Find { tab_id: i64, query: String },
+    /// One PNG of the tab's visible area, as a `data:image/png;base64,…` URL.
+    ///
+    /// Reading, not acting: a page rendered into a canvas (a slide preview, a
+    /// chart, a PDF viewer) yields a title and nothing else from `read`, so the
+    /// only honest way to describe it is to look at the pixels.
+    CaptureVisibleTab { tab_id: i64 },
 }
 
 /// What comes back. Errors are values, not dropped frames, so a failed command

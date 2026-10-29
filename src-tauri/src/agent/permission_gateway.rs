@@ -128,6 +128,18 @@ impl PermissionGateway for DesktopPermissionGateway {
             return outcome;
         }
         let policy = resolve_session_permission_policy(&self.db, &self.session_id).await;
+        if policy.full_access && tool_call.function.name == "bash" {
+            if let Some(number) = bash_command.and_then(super::trusted_git::own_pr_metadata_target) {
+                let key = format!("bash({})", bash_command.unwrap_or_default());
+                let denied = policy.deny.iter().any(|p| super::glob_match(p, "bash") || super::glob_match(p, &key));
+                let owned = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM thin_delivery_refs r JOIN execution_workspaces w ON w.session_id=r.session_id AND w.branch_name=r.branch WHERE r.session_id=? AND r.pr_number=? AND w.state IN ('active','delivering')")
+                    .bind(&self.session_id).bind(number).fetch_one(&self.db).await.unwrap_or(0) > 0;
+                if !denied && owned && super::fetch_session_delivery_authorized(&self.db, &self.session_id).await {
+                    return PermissionOutcome::Allow;
+                }
+                return self.request_permission(tool_call, args.clone(), bash_command).await;
+            }
+        }
         // M198: heredoc is executable interpreter input, not shell segments.
         // Require the same identity-verified registration used by local Git.
         if policy.full_access && tool_call.function.name == "bash"
@@ -930,6 +942,31 @@ mod tests {
         assert_eq!(super::super::permission_intent::permission_action_signature("bash", &args, Some(unsafe_command)), super::super::permission_intent::permission_action_signature("bash", &prompt, Some(unsafe_command)));
         // Restore synthetic state for the existing independent Git checks.
         std::fs::write(root.join("tracked.txt"), "base").unwrap();
+        let node = "node <<'JS'\nconst fs = require('fs');\nconst p = 'tracked.txt';\nlet s = fs.readFileSync(p, 'utf8');\ns = s.replace('base', 'node rewritten');\nfs.writeFileSync(p, s);\nJS";
+        let args = serde_json::json!({"command":node});
+        let call = ToolCall { id: "m198-node".into(), r#type: "function".into(), function: FunctionCall { name: "bash".into(), arguments: args.to_string() } };
+        assert_eq!(gateway.authorize(&call, &args, Some(node)).await, PermissionOutcome::Allow);
+        let output = std::process::Command::new(if cfg!(windows) { "bash" } else { "sh" }).no_window().current_dir(&root).args(["-c", node]).output().unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        assert_eq!(std::fs::read_to_string(root.join("tracked.txt")).unwrap(), "node rewritten");
+        std::fs::write(root.join("tracked.txt"), "base").unwrap();
+        sqlx::raw_sql("CREATE TABLE IF NOT EXISTS thin_delivery_refs(session_id TEXT PRIMARY KEY,branch TEXT NOT NULL,pr_number INTEGER NOT NULL,ceiling TEXT NOT NULL); INSERT INTO thin_delivery_refs SELECT 'permission-test',branch_name,777,'through_merge' FROM execution_workspaces WHERE id='synthetic-workspace';").execute(&gateway.db).await.unwrap();
+        for command in ["gh pr edit 777 --remove-label 'merge-queue: armed'", "gh pr edit 777 --add-label 'synthetic'", "gh pr comment 777 --body 'synthetic comment'"] {
+            let args = serde_json::json!({"command":command});
+            let call = ToolCall { id: "m198-owned-pr".into(), r#type: "function".into(), function: FunctionCall { name: "bash".into(), arguments: args.to_string() } };
+            assert_eq!(gateway.authorize(&call, &args, Some(command)).await, PermissionOutcome::Allow);
+        }
+        // M198 family regressions: mixed discovery must not make a local
+        // synchronization or the mandated local hook configuration prompt.
+        for command in [
+            "git fetch --prune origin main && git merge-base --is-ancestor origin/main HEAD; rg trusted src; cat docs/repo-governance-profile.md; ls src; git config core.hooksPath .githooks",
+            "git fetch --prune origin main && git merge origin/main && git diff --check",
+            "git merge --autostash origin/main && git status --short && git diff --check",
+        ] {
+            let args = serde_json::json!({"command":command});
+            let call = ToolCall { id: "m198-family".into(), r#type: "function".into(), function: FunctionCall { name: "bash".into(), arguments: args.to_string() } };
+            assert_eq!(gateway.authorize(&call, &args, Some(command)).await, PermissionOutcome::Allow, "{command}");
+        }
         // M180: exercise the exact production gateway, not just the proof helper.
         for command in [
             "sed -n '175,244p' src-tauri/src/agent/usage_windows.rs; sed -n '223,257p' src-tauri/src/vision/mod.rs; sed -n '35,100p' src-tauri/src/agent/internal_text.rs; grep -n 'attach_usage_settings' src-tauri/src/agent/mod.rs src-tauri/src/agent/model_transport.rs; grep -n 'settings' src-tauri/src/agent/internal_text.rs | head -15; git worktree list; git log -1 --oneline; git log -1 --oneline origin/main",
@@ -1047,7 +1084,7 @@ mod tests {
         let compound_call = ToolCall { id: "m166-compound".into(), r#type: "function".into(), function: FunctionCall { name: "bash".into(), arguments: compound_args.to_string() } };
         assert_eq!(gateway.authorize(&compound_call, &compound_args, Some(&compound)).await, PermissionOutcome::Allow);
         assert!(gateway.pending_permissions.lock().await.is_empty());
-        for command in ["gh auth token", "gh pr merge 7 --squash", "git push --force origin main", "git push origin :main", "git checkout -- ../other", "git reset --hard HEAD && rm -rf ../other"] {
+        for command in ["gh auth token", "gh pr merge 7 --squash", "gh pr edit 778 --remove-label 'merge-queue: armed'", "gh pr comment 778 --body 'not ours'", "git config --global core.hooksPath /tmp/hooks", "git push --force origin main", "git push origin :main", "git checkout -- ../other", "git reset --hard HEAD && rm -rf ../other"] {
             let args = serde_json::json!({"command":command});
             let call = ToolCall { id: "m159-remote".into(), r#type: "function".into(), function: FunctionCall { name: "bash".into(), arguments: args.to_string() } };
             let other = gateway.clone();

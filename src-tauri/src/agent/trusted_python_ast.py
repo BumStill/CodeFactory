@@ -8,7 +8,7 @@ import ast
 import pathlib
 import sys
 
-root = pathlib.Path(sys.argv[1]).resolve() if len(sys.argv) > 1 else None
+root = pathlib.Path(sys.argv[1]).resolve() if len(sys.argv) > 1 and sys.argv[1] else None
 STR, INT, BOOL, FILE, NONE = 'str', 'int', 'bool', 'file', 'none'
 values = {}
 functions = {}
@@ -114,8 +114,84 @@ def statements(body, env, in_function=False):
         else:
             raise ValueError('unsupported statement: ' + type(n).__name__)
 
+def node_statements(source):
+    # Parse a deliberately small JavaScript grammar without evaluating JS.
+    # Python's tokenizer is not used: JS quote escapes and statement delimiters
+    # are consumed explicitly, and template strings / computed calls fail shut.
+    import re
+    token = re.compile(r"\s*(?:(?P<string>'(?:[^'\\\n]|\\['\\])*'|\"(?:[^\"\\\n]|\\[\"\\])*\")|(?P<name>[A-Za-z_][A-Za-z_0-9]*)|(?P<symbol>[=().,;]))")
+    tokens = []
+    offset = 0
+    while source[offset:].strip():
+        match = token.match(source, offset)
+        if not match: raise ValueError('unsupported JS token')
+        tokens.append((match.lastgroup, match.group(match.lastgroup)))
+        offset = match.end()
+    index = 0
+    env = {}
+
+    def take(value=None):
+        nonlocal index
+        if index >= len(tokens): raise ValueError('incomplete JS')
+        kind, raw = tokens[index]
+        if value is not None and raw != value: raise ValueError('JS syntax')
+        index += 1
+        return kind, raw
+
+    def expression():
+        nonlocal index
+        kind, raw = take()
+        if kind == 'string':
+            result = (STR, ast.literal_eval(raw))
+        elif raw == 'require':
+            take('(')
+            kind, module = take()
+            if kind != 'string' or ast.literal_eval(module) not in ('fs', 'node:fs'): raise ValueError('JS capability')
+            take(')')
+            result = ('fs', None)
+        elif kind == 'name' and raw in env:
+            result = env[raw]
+        else: raise ValueError('JS unknown name')
+        while index < len(tokens) and tokens[index][1] == '.':
+            take('.')
+            _, method = take()
+            take('(')
+            args = []
+            if index < len(tokens) and tokens[index][1] != ')':
+                args.append(expression())
+                while index < len(tokens) and tokens[index][1] == ',':
+                    take(',')
+                    args.append(expression())
+            take(')')
+            if result[0] == 'fs' and method == 'readFileSync' and len(args) == 2 and args[1] == (STR, 'utf8'):
+                path(args[0][1])
+                result = (STR, None)
+            elif result[0] == 'fs' and method == 'writeFileSync' and len(args) == 2 and all(x[0] == STR for x in args):
+                path(args[0][1])
+                result = (NONE, None)
+            elif result[0] == STR and method in ('replace', 'replaceAll') and len(args) == 2 and all(x[0] == STR for x in args):
+                result = (STR, None)
+            else: raise ValueError('JS external or unknown operation')
+        return result
+
+    while index < len(tokens):
+        declaration = tokens[index][1] in ('const', 'let', 'var')
+        if declaration: take()
+        if index + 1 < len(tokens) and tokens[index][0] == 'name' and tokens[index + 1][1] == '=':
+            _, name = take()
+            take('=')
+            env[name] = expression()
+        elif declaration: raise ValueError('JS declaration')
+        else: expression()
+        take(';')
+
+
 try:
-    tree = ast.parse(sys.stdin.read())
+    source = sys.stdin.read()
+    if len(sys.argv) > 2 and sys.argv[2] == 'node':
+        node_statements(source)
+        sys.exit(0)
+    tree = ast.parse(source)
     statements(tree.body, values)
     # Even uncalled functions must not contain unchecked effects.
     for name, fn in list(functions.items()):

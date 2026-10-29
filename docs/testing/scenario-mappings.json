@@ -1,14 +1,14 @@
 {
   "schema_version": 1,
   "mappings": [
-    {
-      "pattern": "scripts/delivery-scenario-body.py",
-      "scenario_id": "CXD-002"
-    },
+    { "pattern": "scripts/delivery-scenario-body.py", "scenario_id": "CXD-002" },
     { "pattern": "src-tauri/src/agent/trusted_python_ast.py", "scenario_id": "UI-009" },
     { "pattern": "src-tauri/src/agent/permission_intent.rs", "scenario_id": "UI-009" },
     { "pattern": "src/acceptance/m198-permission.tsx", "scenario_id": "UI-009" },
     { "pattern": "scripts/verify-m198-python-ast.mjs", "scenario_id": "UI-009" },
-    { "pattern": "scripts/verify-m198-permission-headless.mjs", "scenario_id": "UI-009" }
+    { "pattern": "scripts/verify-m198-permission-headless.mjs", "scenario_id": "UI-009" },
+    { "pattern": "extension/manifest.json", "scenario_id": "RTE-002" },
+    { "pattern": "scripts/verify-extension-bridge.mjs", "scenario_id": "RTE-002" },
+    { "pattern": "src-tauri/src/agent/thin_derive.rs", "scenario_id": "HLT-004" }
   ]
 }
