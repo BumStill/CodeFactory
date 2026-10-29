@@ -12,6 +12,10 @@
     {
       "pattern": "scripts/verify-extension-bridge.mjs",
       "scenario_id": "RTE-002"
+    },
+    {
+      "pattern": "src-tauri/src/agent/thin_derive.rs",
+      "scenario_id": "HLT-004"
     }
   ]
 }
