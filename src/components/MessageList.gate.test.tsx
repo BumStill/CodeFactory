@@ -235,7 +235,7 @@ describe("MessageList completion-review isolation", () => {
     expect(container.querySelector(".justify-end")).toBeNull();
   });
 
-  it("rehydrates a persisted tool-amplification notice with warning semantics", () => {
+  it("never renders a legacy tool-amplification notice as a visible warning", () => {
     const { container } = render(
       <MessageList
         messages={[
@@ -250,9 +250,9 @@ describe("MessageList completion-review isolation", () => {
         cwd={null}
       />,
     );
-    const warning = screen.getByText(/工具调用较多/);
-    expect(warning.className).toContain("text-status-warning");
-    expect(container.querySelector(".justify-end")).toBeNull();
+    // M193：收敛只在工具结果通道里说明卡住的证据，不再有可见警告。
+    expect(screen.queryByText(/工具调用较多/)).toBeNull();
+    expect(container.querySelector(".text-status-warning")).toBeNull();
   });
 
   it("renders a verification-incomplete warning as an amber notice, with the reply left visible", () => {

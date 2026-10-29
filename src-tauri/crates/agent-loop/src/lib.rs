@@ -29,6 +29,7 @@ pub mod policy;
 pub mod protocol;
 pub mod run;
 pub mod services;
+pub mod stuck_detector;
 pub mod tool;
 pub mod transport;
 pub mod types;

@@ -204,7 +204,7 @@ where
         replay_rejected_draft: true,
         tool_heartbeat_interval: None,
         long_tool_wait_threshold: std::time::Duration::from_secs(60),
-        tool_amplification_threshold: None,
+        stuck_no_progress_limit: None,
         session_id: String::new(),
         endpoint_name: String::new(),
         model_id: config.model.clone(),

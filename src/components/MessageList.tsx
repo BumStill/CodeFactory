@@ -957,7 +957,10 @@ function isModelRouteSwitchNotice(detail: string): boolean {
   return detail.includes("已自动切换到") && detail.includes("任务继续执行");
 }
 
-function isToolAmplificationNotice(detail: string): boolean {
+// M193：收敛不再按固定工具调用次数触发，提示也只走工具结果通道。这条历史
+// 通知既不该再产生，也不该作为可见警告出现——旧会话里已落库的行同样按「不
+// 渲染」处理（用户不需要为系统内部的收敛动作做任何决定）。
+function isLegacyToolAmplificationNotice(detail: string): boolean {
   return detail.includes("本回合工具调用较多") && detail.includes("收敛剩余步骤");
 }
 
@@ -1180,14 +1183,9 @@ const MessageRow = memo(function MessageRow({
         </div>
       );
     }
-    if (isToolAmplificationNotice(msg.content)) {
-      return (
-        <div className="flex justify-center">
-          <div className="max-w-[85%] rounded border border-status-warning/30 bg-status-warning-soft/55 px-2.5 py-1 text-caption leading-snug text-status-warning break-words whitespace-pre-wrap">
-            {msg.content}
-          </div>
-        </div>
-      );
+    if (isLegacyToolAmplificationNotice(msg.content)) {
+      // M193：固定次数收敛提示已取消，历史行也不再渲染为警告。
+      return null;
     }
     return (
       <div className="flex justify-center">

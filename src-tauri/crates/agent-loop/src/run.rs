@@ -302,9 +302,12 @@ pub struct RunConfig {
     pub tool_heartbeat_interval: Option<std::time::Duration>,
     /// When a pending tool becomes a user-visible long wait.
     pub long_tool_wait_threshold: std::time::Duration,
-    /// One-shot root-turn convergence signal after this many received tool
-    /// calls. `None` disables the signal.
-    pub tool_amplification_threshold: Option<usize>,
+    /// M193：卡住检测的「无新证据」上限——连续这么多次工具调用都没有产生新
+    /// 结果时才给出收敛提示。`None` 关闭检测。
+    ///
+    /// 这里**不再是固定次数阈值**：调用次数本身不构成提示理由，正常的 40+
+    /// 步长任务不会再被打断；只有可观察的循环特征才算卡住。
+    pub stuck_no_progress_limit: Option<usize>,
     // Usage-attribution identity + working dir (all constant for the run).
     pub session_id: String,
     pub endpoint_name: String,
@@ -904,7 +907,7 @@ pub async fn run_agent_loop(
         replay_rejected_draft,
         tool_heartbeat_interval,
         long_tool_wait_threshold,
-        tool_amplification_threshold,
+        stuck_no_progress_limit,
         session_id,
         endpoint_name,
         model_id,
@@ -994,12 +997,12 @@ pub async fn run_agent_loop(
     let mut require_tool_next = command_repair.is_some();
     let mut model_round_index = 0_usize;
     let mut stalled_chat_segments = 0_u32;
-    let mut root_tool_call_count = match root_turn_id.as_deref() {
-        Some(root_turn_id) => persistence.root_turn_tool_call_count(root_turn_id).await?,
-        None => 0,
+    // M193：收敛提示只由「卡住的证据」触发（见 `stuck_detector`），不再按固定
+    // 工具调用次数触发。
+    let mut stuck_detector = match stuck_no_progress_limit {
+        Some(limit) if limit > 0 => Some(crate::stuck_detector::StuckDetector::new(limit)),
+        _ => None,
     };
-    let mut amplification_signal_emitted = false;
-    let mut amplification_prompt_pending = false;
     // Run-level totals + the last model reply, carried into `RunOutcome`
     // (keystone slice 4.8c). The desktop discards them; the sidecar builds its
     // terminal `finished` payload from them.
@@ -1828,30 +1831,6 @@ pub async fn run_agent_loop(
             let completion_evidence_before_tool_batch = completion_gate.evidence();
 
             for (tool_index, tc) in tool_calls.iter().enumerate() {
-                root_tool_call_count = root_tool_call_count.saturating_add(1);
-                if !amplification_signal_emitted
-                    && tool_amplification_threshold
-                        .filter(|threshold| *threshold > 0)
-                        .is_some_and(|threshold| root_tool_call_count >= threshold)
-                {
-                    let threshold = tool_amplification_threshold.unwrap_or(root_tool_call_count);
-                    let notice = "本回合工具调用较多，系统已要求复用已有证据并收敛剩余步骤。";
-                    let marker = format!(
-                        "tool_amplification:{}:{threshold}",
-                        root_turn_id.as_deref().unwrap_or("anonymous")
-                    );
-                    let newly_persisted = persistence
-                        .persist_gate_message_once(&marker, notice, "turn_notice")
-                        .await?;
-                    amplification_signal_emitted = true;
-                    if anonymous || newly_persisted {
-                        amplification_prompt_pending = true;
-                        events.emit(crate::types::StreamEvent::CompletionGateAction {
-                            kind: "warning".into(),
-                            detail: notice.into(),
-                        });
-                    }
-                }
                 if let Some(remaining) =
                     cancelled_tool_suffix(cancel.as_ref(), &tool_calls, tool_index)
                 {
@@ -2787,11 +2766,62 @@ pub async fn run_agent_loop(
             messages.push(crate::types::ChatMessage {
                 role: "assistant".into(),
                 content: crate::types::MessageContent::Text(text),
-                tool_calls: Some(tool_calls),
+                tool_calls: Some(tool_calls.clone()),
                 tool_call_id: None,
                 name: None,
                 reasoning_content: reasoning,
             });
+            // M193：只看本批次真实的卡住证据，并且提示走工具结果通道——不落库、
+            // 不产生可见警告、不额外插入 user 消息。收敛提示只在证据说明模型在
+            // 原地打转时出现，正常的长任务（每步都有新证据）不会被提示。
+            if let Some(detector) = stuck_detector.as_mut() {
+                if !completion_gate.evidence().completed {
+                    let convergence_scope = match turn_capability {
+                        TurnCapability::ReviewOnly => "只保留尚未完成且能改变结论的最少只读检查",
+                        TurnCapability::Implement => {
+                            "只执行尚未完成且能改变结果的最少实施或验证步骤"
+                        }
+                        TurnCapability::Deliver => "只执行尚未完成且能改变交付结果的最少步骤",
+                    };
+                    let mut stuck_hint: Option<String> = None;
+                    let mut cursor = 0_usize;
+                    for message in result_messages.iter() {
+                        if message.role != "tool" {
+                            continue;
+                        }
+                        let matched = message
+                            .tool_call_id
+                            .as_deref()
+                            .and_then(|id| tool_calls.iter().position(|call| call.id == id))
+                            .unwrap_or(cursor);
+                        cursor = matched.saturating_add(1);
+                        let Some(call) = tool_calls.get(matched) else {
+                            continue;
+                        };
+                        let observation = match &message.content {
+                            crate::types::MessageContent::Text(text) => text.as_str(),
+                            _ => "",
+                        };
+                        let signature =
+                            format!("{}({})", call.function.name, call.function.arguments);
+                        if let Some(signal) = detector.observe(&signature, observation, false) {
+                            stuck_hint = Some(signal.hint(convergence_scope));
+                        }
+                    }
+                    if let Some(hint) = stuck_hint {
+                        if let Some(last) = result_messages
+                            .iter_mut()
+                            .rev()
+                            .find(|message| message.role == "tool")
+                        {
+                            if let crate::types::MessageContent::Text(text) = &mut last.content {
+                                text.push_str("\n\n");
+                                text.push_str(&hint);
+                            }
+                        }
+                    }
+                }
+            }
             messages.extend(result_messages);
             if let Some(repair) = command_repair.as_ref() {
                 require_tool_next = true;
@@ -2987,29 +3017,6 @@ pub async fn run_agent_loop(
                 });
             }
             let evidence = completion_gate.evidence();
-            if amplification_prompt_pending {
-                amplification_prompt_pending = false;
-                if !evidence.completed && !finalization_pending && !structural_denial_seen {
-                    let threshold = tool_amplification_threshold.unwrap_or(root_tool_call_count);
-                    let convergence_scope = match turn_capability {
-                        TurnCapability::ReviewOnly => "只保留尚未完成且能改变结论的最少只读检查",
-                        TurnCapability::Implement => {
-                            "只执行尚未完成且能改变结果的最少实施或验证步骤"
-                        }
-                        TurnCapability::Deliver => "只执行尚未完成且能改变交付结果的最少步骤",
-                    };
-                    messages.push(crate::types::ChatMessage {
-                        role: "user".into(),
-                        content: crate::types::MessageContent::Text(format!(
-                            "本回合已累计 {threshold} 次工具调用。请在下一轮主动收敛：复用已有证据，停止重复探测，{convergence_scope}；若存在外部阻断，请直接说明，不要轮询等待。"
-                        )),
-                        tool_calls: None,
-                        tool_call_id: None,
-                        name: None,
-                        reasoning_content: None,
-                    });
-                }
-            }
             if crate::policy::completion_ready_applies(finalization)
                 && evidence.completed
                 && evidence.last_successful_verification_sequence != last_completion_nudge_sequence
@@ -4191,6 +4198,44 @@ mod tests {
         }
     }
 
+    /// 每次调用都返回不同内容的工具后端：用来表达「每一步都产生新证据」的正常长任务。
+    struct PerCallTools;
+
+    #[async_trait::async_trait]
+    impl ToolBackend for PerCallTools {
+        async fn list_schemas(&self) -> Vec<ToolDefinition> {
+            vec![tool_definition()]
+        }
+
+        async fn execute(
+            &self,
+            call: &ToolCall,
+            args: &serde_json::Value,
+            _ctx: &ToolCtx,
+        ) -> Result<ToolInvocationResult, ToolError> {
+            let body = args
+                .get("path")
+                .and_then(serde_json::Value::as_str)
+                .map(|path| format!("contents of {path}"))
+                .unwrap_or_else(|| format!("result for {}", call.function.name));
+            let (command, kind) = CountingTools::default().classify(call, args);
+            Ok(ToolInvocationResult {
+                content: body,
+                is_error: false,
+                status: crate::tool::ToolExecutionStatus::Done,
+                command,
+                kind,
+                return_code: Some(0),
+                stdout: String::new(),
+                stderr: String::new(),
+                error: None,
+                metadata: None,
+                next_working_directory: None,
+                duration_ms: 1,
+            })
+        }
+    }
+
     #[derive(Default)]
     struct CountingFactChecker {
         calls: std::sync::atomic::AtomicUsize,
@@ -4423,7 +4468,7 @@ mod tests {
             replay_rejected_draft: false,
             tool_heartbeat_interval: None,
             long_tool_wait_threshold: std::time::Duration::from_secs(60),
-            tool_amplification_threshold: None,
+            stuck_no_progress_limit: None,
             session_id: "session".into(),
             endpoint_name: "test".into(),
             model_id: "model".into(),
@@ -5662,7 +5707,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fortieth_tool_call_emits_one_visible_signal_and_one_convergence_prompt() {
+    async fn long_task_with_fresh_evidence_gets_no_convergence_signal() {
         let tool_calls = (0..41)
             .map(|index| {
                 call(
@@ -5680,16 +5725,16 @@ mod tests {
         let events = Arc::new(CollectingEventSink::new());
         let mut cfg = config();
         cfg.turn_capability = TurnCapability::ReviewOnly;
-        cfg.tool_amplification_threshold = Some(40);
+        cfg.stuck_no_progress_limit = Some(40);
+        let mut svc = services(transport.clone(), persistence.clone(), events.clone());
+        // 每一步读到的文件都不同——这才是「正常的长任务」：有 41 步，但每步都有新证据。
+        svc.tools = Arc::new(PerCallTools);
 
-        run_agent_loop(
-            inputs(),
-            cfg,
-            services(transport.clone(), persistence.clone(), events.clone()),
-        )
+        run_agent_loop(inputs(), cfg, svc)
         .await
         .expect("loop runs");
 
+        // 调用次数本身不再是理由：41 步各有新证据的正常任务不得收到任何收敛提示。
         let warnings: Vec<_> = events
             .events()
             .into_iter()
@@ -5699,47 +5744,118 @@ mod tests {
                 }
                 _ => None,
             })
-            .filter(|detail| detail.contains("工具调用较多"))
+            .filter(|detail| detail.contains("工具调用较多") || detail.contains("卡住信号"))
             .collect();
-        assert_eq!(warnings.len(), 1, "one visible signal per root turn");
+        assert!(
+            warnings.is_empty(),
+            "no visible warning for a productive task: {warnings:?}"
+        );
         assert_eq!(
             persistence
                 .notices
                 .lock()
                 .expect("notices")
                 .iter()
-                .filter(|(_, content)| content.contains("工具调用较多"))
+                .filter(|(_, content)| {
+                    content.contains("工具调用较多") || content.contains("卡住信号")
+                })
                 .count(),
-            1,
-            "one persisted signal per root turn"
+            0,
+            "no persisted convergence notice for a productive task"
         );
-        let requests = transport.requests();
-        let convergence_prompts: Vec<_> = requests
+        let injected: Vec<_> = transport
+            .requests()
             .iter()
             .flat_map(|request| request.iter())
-            .filter_map(|message| {
-                if message.role != "user" {
-                    return None;
+            .filter_map(|message| match &message.content {
+                MessageContent::Text(text)
+                    if text.contains("本回合已累计") || text.contains("卡住信号") =>
+                {
+                    Some(text.clone())
                 }
-                match &message.content {
-                    MessageContent::Text(text) if text.contains("本回合已累计 40 次工具调用") => {
-                        Some(text)
-                    }
-                    _ => None,
-                }
+                _ => None,
             })
             .collect();
-        assert_eq!(
-            convergence_prompts.len(),
-            1,
-            "one convergence prompt per root turn"
+        assert!(
+            injected.is_empty(),
+            "the prompt must carry no convergence notice: {injected:?}"
         );
-        assert!(convergence_prompts[0].contains("最少只读检查"));
-        assert!(!convergence_prompts[0].contains("实施"));
     }
 
     #[tokio::test]
-    async fn resumed_root_turn_counts_prior_tool_calls_before_emitting_one_signal() {
+    async fn repeated_identical_tool_calls_get_a_hidden_stuck_hint() {
+        // M193：证据说明在原地打转时，提示只挂在工具结果通道上；界面没有警告，
+        // 也没有额外插入 user 消息，也没有落库通知。
+        let tool_calls = (0..4)
+            .map(|index| {
+                call(
+                    &format!("tool-{index}"),
+                    "read_file",
+                    serde_json::json!({"path": "same-doc.md"}),
+                )
+            })
+            .collect();
+        let transport = Arc::new(ScriptedTransport::new(vec![
+            response("检查文件", tool_calls, 0),
+            response("已完成", vec![], 1),
+        ]));
+        let persistence = Arc::new(RecordingPersistence::default());
+        let events = Arc::new(CollectingEventSink::new());
+        let mut cfg = config();
+        cfg.turn_capability = TurnCapability::ReviewOnly;
+        cfg.stuck_no_progress_limit = Some(40);
+
+        run_agent_loop(
+            inputs(),
+            cfg,
+            services(transport.clone(), persistence.clone(), events.clone()),
+        )
+        .await
+        .expect("loop runs");
+
+        let requests = transport.requests();
+        let second = requests.last().expect("second request");
+        let tool_bodies: Vec<String> = second
+            .iter()
+            .filter(|message| message.role == "tool")
+            .filter_map(|message| match &message.content {
+                MessageContent::Text(text) => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            tool_bodies.iter().any(|body| body.contains("【卡住信号】")),
+            "the hint must ride the tool-result channel: {tool_bodies:?}"
+        );
+        assert!(
+            !second
+                .iter()
+                .any(|message| message.role == "user"
+                    && matches!(&message.content, MessageContent::Text(text)
+                        if text.contains("卡住信号"))),
+            "the hint must not be injected as a user message"
+        );
+        assert!(
+            !events.events().iter().any(|event| matches!(
+                event,
+                StreamEvent::CompletionGateAction { kind, detail }
+                    if kind == "warning" && detail.contains("卡住信号")
+            )),
+            "the hint must not surface as a visible warning"
+        );
+        assert!(
+            !persistence
+                .notices
+                .lock()
+                .expect("notices")
+                .iter()
+                .any(|(_, body)| body.contains("卡住信号")),
+            "the hint must not be persisted as a turn notice"
+        );
+    }
+
+    #[tokio::test]
+    async fn resumed_tool_call_counts_never_produce_a_convergence_notice() {
         let persistence = Arc::new(RecordingPersistence::default());
         persistence.tool_call_count.store(30, Ordering::SeqCst);
         let first_transport = Arc::new(ScriptedTransport::new(vec![
@@ -5759,7 +5875,7 @@ mod tests {
             response("完成", vec![], 1),
         ]));
         let mut cfg = config();
-        cfg.tool_amplification_threshold = Some(40);
+        cfg.stuck_no_progress_limit = Some(40);
 
         run_agent_loop(
             inputs(),
@@ -5803,10 +5919,12 @@ mod tests {
                 .lock()
                 .expect("notices")
                 .iter()
-                .filter(|(_, content)| content.contains("工具调用较多"))
+                .filter(|(_, content)| {
+                    content.contains("工具调用较多") || content.contains("卡住信号")
+                })
                 .count(),
-            1,
-            "restart/resume must preserve one warning per root turn"
+            0,
+            "prior/resumed tool-call counts must never produce a convergence notice"
         );
     }
 
@@ -7045,7 +7163,7 @@ mod tests {
             replay_rejected_draft: false,
             tool_heartbeat_interval: Some(std::time::Duration::from_secs(30)),
             long_tool_wait_threshold: std::time::Duration::from_secs(60),
-            tool_amplification_threshold: Some(40),
+            stuck_no_progress_limit: Some(40),
             session_id: session_id.clone(),
             endpoint_name: endpoint_name.clone(),
             model_id: model_id.clone(),
@@ -7075,7 +7193,7 @@ mod tests {
             replay_rejected_draft: true,
             tool_heartbeat_interval: None,
             long_tool_wait_threshold: std::time::Duration::from_secs(60),
-            tool_amplification_threshold: None,
+            stuck_no_progress_limit: None,
             session_id,
             endpoint_name,
             model_id,
