@@ -996,8 +996,47 @@ mod tests {
                 assert!(!super::super::trusted_git::registered_rewrite(&[root.clone()], &root, &command), "negative family must stay fenced: {command}");
             }
         }
-        for command in ["git merge HEAD; python3 ../outside.py", "git merge HEAD; pnpm --dir ../outside run check", "git merge HEAD; python3 -c 'print(1)'", "git fetch --upload-pack=evil origin; git merge HEAD", "git fetch 'ext::evil'; git merge HEAD", "git merge HEAD; git push origin other", "git merge HEAD; git branch -D someone-else"] {
+        // M207 explicitly replaces the M204 runner whitelist: these ordinary
+        // non-Git segments must match their standalone trusted decision.
+        for command in ["python3 ../outside.py", "pnpm --dir ../outside run check", "python3 -c 'print(1)'"] {
+            let args = serde_json::json!({"command":command});
+            assert!(matches!(super::super::decide_permission_for_call(&super::super::permission_policy_for_mode("trusted"), "bash", &args, Some(command), false, Some(&root)), super::super::PermissionDecision::Allow));
+            assert!(super::super::trusted_git::registered_rewrite(&[root.clone()], &root, &format!("git merge HEAD; {command}")));
+        }
+        for command in ["git fetch --upload-pack=evil origin; git merge HEAD", "git fetch 'ext::evil'; git merge HEAD", "git merge HEAD; git push origin other", "git merge HEAD; git branch -D someone-else"] {
             assert!(!super::super::trusted_git::registered_rewrite(&[root.clone()], &root, command), "must remain unproved: {command}");
+        }
+        assert_eq!(sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM permission_intents").fetch_one(&gateway.db).await.unwrap(), intents_before);
+        // M207: compare the actual gateway outcomes, not a hand-written allow
+        // oracle. Deterministic random combinations cover operators and quotes.
+        let mut pool = vec![
+            "git show HEAD".to_string(), "git rev-parse HEAD".into(),
+            "git branch --list".into(), "git stash list".into(),
+            "git config core.hooksPath .githooks".into(),
+            "python3.11 tools/governance/run_scenario_harness_gate.py --stage local".into(),
+            format!("grep -n -E 'synthetic' '{}'", outside.display()),
+            "tail -12".into(), "git merge HEAD".into(),
+        ];
+        for base in m198_family.as_array().unwrap().iter().filter(|case| case["allow"] == true).map(|case| case["command"].as_str().unwrap()).chain(std::iter::once(m204_original)) {
+            pool.extend(super::super::trusted_git::command_segments(base).unwrap());
+        }
+        for command in &pool {
+            let args = serde_json::json!({"command":command});
+            let call = ToolCall { id: "m207-single".into(), r#type: "function".into(), function: FunctionCall { name: "bash".into(), arguments: args.to_string() } };
+            assert_eq!(gateway.authorize(&call, &args, Some(command)).await, PermissionOutcome::Allow, "standalone: {command}");
+        }
+        let mut seed = 207_u64;
+        for _ in 0..200 {
+            let mut selected = Vec::new();
+            for _ in 0..3 {
+                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                selected.push(pool[(seed >> 32) as usize % pool.len()].clone());
+            }
+            let separator = ["; ", " && ", " || "][seed as usize % 3];
+            let command = selected.join(separator);
+            let args = serde_json::json!({"command":command});
+            let call = ToolCall { id: "m207-composed".into(), r#type: "function".into(), function: FunctionCall { name: "bash".into(), arguments: args.to_string() } };
+            assert_eq!(gateway.authorize(&call, &args, Some(&command)).await, PermissionOutcome::Allow, "composition: {command}");
         }
         assert_eq!(sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM permission_intents").fetch_one(&gateway.db).await.unwrap(), intents_before);
         // M204-R3: a real unmerged index makes write-tree fail. This is a
