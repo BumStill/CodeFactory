@@ -315,6 +315,46 @@ pub(crate) async fn resume_running_without_executor(
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn m200_restart_model_wait_is_not_orphaned_and_wakes_once() {
+        let db = crate::storage::db::connect("sqlite::memory:").await.unwrap();
+        sqlx::raw_sql("INSERT INTO sessions(id,title,cwd,model_id,created_at,updated_at,delivery_mode) VALUES ('m200','synthetic','/synthetic','model',1,1,'thin');
+            INSERT INTO chat_turn_state(root_turn_id,session_id,phase,status,started_at,updated_at) VALUES ('m200-root','m200','working','active',1,1);
+            INSERT INTO chat_run_controls(run_instance_id,session_id,root_turn_id,status,created_process_instance,created_at,updated_at) VALUES ('m200-run','m200','m200-root','active','synthetic-prior-process',1,1);")
+            .execute(&db).await.unwrap();
+        crate::agent::thin_state::save(&db, "m200", &crate::agent::thin_state::ThinState::running()).await.unwrap();
+        capture_restart_interruptions(&db).await.unwrap();
+        assert!(claim_restart(&db, "m200", "m200-root").await.unwrap().is_some());
+        let due = chrono::Utc::now().timestamp_millis() + 120_000;
+        let error = crate::agent::failover::ModelUnavailable { resume_at_ms: Some(due), notice: "合成模型等待，系统自动重试/自愈".into() }.encode();
+        crate::agent::thin_state::settle_error(&db, "m200", "m200-root", &error).await.unwrap();
+        // The startup/heartbeat reader must not retire this root while its wake owns it.
+        crate::agent::thin_derive::reconcile_orphan_turns(&db).await.unwrap();
+        let reason: Option<String> = sqlx::query_scalar("SELECT terminal_reason FROM chat_turn_state WHERE root_turn_id='m200-root'").fetch_one(&db).await.unwrap();
+        assert!(reason.is_none(), "a model wait is not an orphan: {reason:?}");
+        let state = crate::agent::thin_state::load(&db, "m200").await.unwrap().unwrap();
+        assert_eq!(state.state, crate::agent::thin_state::SessionState::WaitingWake);
+        let wakes = crate::agent::background_tasks::list_wakeups(&db, "m200").await.unwrap();
+        assert_eq!(wakes.len(), 1);
+        assert_eq!(wakes[0].status, "pending");
+        struct Sink(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+        impl crate::agent::background_tasks::WakeSink for Sink {
+            fn enqueue(&self, session: String, text: String) -> crate::agent::background_tasks::WakeFuture {
+                assert_eq!(session, "m200");
+                assert!(text.contains("系统自动重试/自愈"));
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Box::pin(async { true })
+            }
+        }
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let sink = Sink(calls.clone());
+        let at = (due + 999) / 1000;
+        assert_eq!(crate::agent::background_tasks::drain_due_wakeups_at(&db, &sink, at - 1).await, 0);
+        assert_eq!(crate::agent::background_tasks::drain_due_wakeups_at(&db, &sink, at).await, 1);
+        assert_eq!(crate::agent::background_tasks::drain_due_wakeups_at(&db, &sink, at + 1).await, 0);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
     async fn fixture() -> SqlitePool {
         let db = SqlitePool::connect("sqlite::memory:").await.unwrap();
         sqlx::raw_sql("CREATE TABLE sessions (id TEXT PRIMARY KEY, delivery_mode TEXT);")

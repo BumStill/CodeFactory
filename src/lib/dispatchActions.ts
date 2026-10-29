@@ -60,7 +60,24 @@ export interface DispatchDeliveryReceipt {
 
 export interface DispatchSendResult {
   session_id: string;
+  status?: "started" | "queued_waiting_model";
+  next_at?: number | null;
   delivery: DispatchDeliveryReceipt;
+}
+
+export interface DurableDispatchReceipt {
+  session_id: string;
+  root_turn_id: string;
+  status: "started" | "queued_waiting_model";
+  next_at: number | null;
+  turn_exists: boolean;
+}
+
+export function receiptResult(receipt: DurableDispatchReceipt): DispatchSendResult {
+  return { session_id: receipt.session_id, status: receipt.status, next_at: receipt.next_at,
+    delivery: receipt.status === "queued_waiting_model"
+      ? { status: "queued", ahead: "model_availability", note: "已持久化，系统自动重试/自愈：模型可用后继续" }
+      : { status: "delivered", into: "new_turn" } };
 }
 
 export interface DispatchStatusResult {
@@ -204,7 +221,7 @@ async function waitForSteerApplied(
  * 空闲会话下两种都是"立即开始新的一轮"。
  */
 export async function dispatchSend(
-  input: { sessionId: string; message: string; mode: DispatchSendMode; deliveryAuthorized?: boolean; releaseUrgency?: "default" | "immediate" | "hold" },
+  input: { sessionId: string; message: string; mode: DispatchSendMode; rootTurnId?: string; deliveryAuthorized?: boolean; releaseUrgency?: "default" | "immediate" | "hold" },
   options: { timeoutMs?: number; steerAppliedTimeoutMs?: number } = {},
 ): Promise<DispatchSendResult> {
   const session = requireSession(input.sessionId);
@@ -302,11 +319,21 @@ export async function dispatchSend(
 
   // 空闲（或只剩一个已经结算的旧回合残留）：现在就开新的一轮。
   const sinceMs = Date.now();
-  await withDeadline(
-    useChatStore.getState().sendMessage(input.message, session.id),
-    timeoutMs,
-    `session ${session.id} did not start a new turn in time`,
-  );
+  // Exact root identity distinguishes a durable acceptance from an optimistic bubble.
+  const rootTurnId = input.rootTurnId ?? crypto.randomUUID();
+  let sendError: unknown;
+  try {
+    await withDeadline(
+      useChatStore.getState().sendMessage(input.message, session.id, rootTurnId),
+      timeoutMs,
+      `session ${session.id} did not start a new turn in time`,
+    );
+  } catch (error) { sendError = error; }
+  const durable = await withDeadline(invoke<DurableDispatchReceipt | null>("dispatch_delivery_receipt", {
+    sessionId: session.id, rootTurnId, message: input.message,
+  }), timeoutMs, `session ${session.id}'s durable receipt could not be checked`);
+  if (durable) return receiptResult(durable);
+  if (sendError) throw sendError;
   const receipt = classifyDelivery({
     before,
     after: runtimeOf(session.id),

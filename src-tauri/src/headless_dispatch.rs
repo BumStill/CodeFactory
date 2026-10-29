@@ -71,6 +71,8 @@ pub enum DispatchReleaseUrgency { Immediate, Default, Hold }
 pub enum Request {
     /// CF-HDE-R1: create a session in a named project and send the first message.
     CreateAndSend {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        client_request_id: Option<String>,
         project: String,
         message: String,
         #[serde(default)]
@@ -273,12 +275,14 @@ fn require_send_mode(mode: &str) -> Result<(), ErrorBody> {
 pub fn validate_request(request: &Request) -> Result<(), ErrorBody> {
     match request {
         Request::CreateAndSend {
+            client_request_id,
             project,
             message,
             model,
             permission_mode,
             ..
         } => {
+            if let Some(key) = client_request_id { require_non_empty("client_request_id", key)?; }
             require_non_empty("project", project)?;
             require_non_empty("message", message)?;
             if let Some(model) = model {
