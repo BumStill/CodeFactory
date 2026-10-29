@@ -346,6 +346,34 @@ try {
     fail("a paired connection should not produce refusals");
   }
 
+  const capture = await bridge.state.call({ cmd: "capture_visible_tab", tab_id: target.tab_id });
+  if (!capture.ok || !capture.data.data_url.startsWith("data:image/png;base64,")) {
+    throw new Error(`capture failed: ${capture.error}`);
+  }
+  const png = Buffer.from(capture.data.data_url.split(",")[1], "base64");
+  if (!png.subarray(0, 8).equals(Buffer.from([137,80,78,71,13,10,26,10]))) {
+    throw new Error("capture returned invalid PNG");
+  }
+  log(`read-only screenshot: ${png.length} PNG bytes`);
+  const missing = await bridge.state.call({ cmd: "read", tab_id: 2147483647 });
+  if (missing.ok || !missing.error) throw new Error("missing tab reported false success");
+  log("missing tab refused, live channel remains readable");
+  log("idle 36 seconds, then read the same selected tab");
+  await new Promise((resolve) => setTimeout(resolve, 36000));
+  const idleRead = await bridge.state.call({ cmd: "read", tab_id: target.tab_id });
+  if (!idleRead.ok || !idleRead.data.markdown.includes("Revenue grew by 12%")) {
+    throw new Error(`idle read failed: ${idleRead.error}`);
+  }
+  const oldSocket = bridge.state.socket;
+  oldSocket.destroy();
+  await waitFor(() => bridge.state.socket && bridge.state.socket !== oldSocket,
+    "extension reconnect after transport drop", 40000);
+  const reconnected = await bridge.state.call({ cmd: "read", tab_id: target.tab_id });
+  if (!reconnected.ok || !reconnected.data.markdown.includes("Europe")) {
+    throw new Error(`reconnected read failed: ${reconnected.error}`);
+  }
+  log("idle and real extension reconnect verified");
+
   if (process.exitCode) throw new Error("assertions failed");
   console.log("\n✓ extension bridge verified end to end in a real browser");
 } catch (error) {
