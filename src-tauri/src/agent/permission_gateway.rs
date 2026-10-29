@@ -648,6 +648,7 @@ async fn persist_interruption(
 
 #[cfg(test)]
 mod tests {
+    use crate::util::no_window::NoWindow;
     use std::collections::HashMap;
 
     use sqlx::sqlite::SqlitePoolOptions;
@@ -836,9 +837,14 @@ mod tests {
         m159_git(&root, &["init", "-q"]);
         m159_git(&root, &["config", "user.name", "Synthetic"]);
         m159_git(&root, &["config", "user.email", "synthetic@example.invalid"]);
+        // Synthetic byte assertions must not inherit runner-global CRLF conversion.
+        m159_git(&root, &["config", "core.autocrlf", "false"]);
         std::fs::write(root.join("tracked.txt"), "base").unwrap();
         m159_git(&root, &["add", "."]);
         m159_git(&root, &["commit", "-qm", "synthetic"]);
+        let remote = temp.path().join("remote.git");
+        m159_git(temp.path(), &["init", "--bare", "-q", remote.to_str().unwrap()]);
+        m159_git(&root, &["remote", "add", "origin", remote.to_str().unwrap()]);
         super::super::execution_workspace::ensure_schema(&gateway.db).await.unwrap();
         // Register exact synthetic Git identity without invoking network allocation.
         let common = m159_git(&root, &["rev-parse", "--path-format=absolute", "--git-common-dir"]);
@@ -869,6 +875,93 @@ mod tests {
             assert_eq!(outcome, PermissionOutcome::Allow, "M180 trusted command: {command}");
             assert!(gateway.pending_permissions.lock().await.is_empty());
         }
+        // M182 R1/R5: exact redirect/pipeline incidents must traverse the
+        // production gateway, create durable backups and leave no prompt.
+        for command in [
+            "git fetch --prune origin main && git merge origin/main --no-edit 2>&1 | tail -25; git status --short | head -20",
+            "git reset -q --hard HEAD && git status --short && git merge --no-edit origin/main 2>&1 | tail -5",
+            "git merge --no-edit origin/main > merge.log || git status --short",
+        ] {
+            let before = m159_git(&root, &["for-each-ref", "--format=%(refname)", "refs/codefactory/backup/"]);
+            let args = serde_json::json!({"command": command});
+            let call = ToolCall { id: format!("m182-{}", before.lines().count()), r#type: "function".into(), function: FunctionCall { name: "bash".into(), arguments: args.to_string() } };
+            let outcome = tokio::time::timeout(Duration::from_secs(10), gateway.authorize(&call, &args, Some(command))).await.expect("trusted incident must not wait for approval");
+            assert_eq!(outcome, PermissionOutcome::Allow, "{command}");
+            assert!(gateway.pending_permissions.lock().await.is_empty());
+            let after = m159_git(&root, &["for-each-ref", "--format=%(refname)", "refs/codefactory/backup/"]);
+            assert!(after.lines().count() > before.lines().count(), "backup must precede Allow: {command}");
+        }
+        // R6 equivalent synthetic execution: use only a local bare remote,
+        // authorize each exact R5 command through the production gateway,
+        // then actually execute it and assert both effects and no approvals.
+        m159_git(&root, &["push", "-q", "origin", "HEAD:refs/heads/main"]);
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/main.rs"), "synthetic original\n").unwrap();
+        m159_git(&root, &["add", "."]);
+        m159_git(&root, &["commit", "-qm", "synthetic source"]);
+        m159_git(&root, &["push", "-q", "origin", "HEAD:refs/heads/main"]);
+        let r5 = [
+            "git fetch --prune origin main && git merge origin/main --no-edit 2>&1 | tail -25; git status --short | head -20",
+            "git fetch --prune origin main && git stash push -u -m x && git merge origin/main && git stash pop",
+            "git checkout origin/main -- src/main.rs && git diff --stat && git status --short && sed -n '1,20p' src/main.rs",
+            "git add -A && git commit -m 'synthetic change'",
+            "git reset -q --hard HEAD && git status --short && git merge --no-edit origin/main 2>&1 | tail -5",
+        ];
+        let shell = if cfg!(windows) {
+            let exec_path = std::path::PathBuf::from(m159_git(&root, &["--exec-path"]));
+            exec_path.ancestors().map(|p| p.join("bin/bash.exe")).find(|p| p.is_file()).expect("Git Bash")
+        } else { std::path::PathBuf::from("sh") };
+        for (index, command) in r5.iter().enumerate() {
+            if index == 1 { std::fs::write(root.join("tracked.txt"), "synthetic dirty stash\n").unwrap(); }
+            if index == 2 { std::fs::write(root.join("src/main.rs"), "synthetic to restore\n").unwrap(); }
+            if index == 3 { std::fs::write(root.join("commit.txt"), "synthetic committed\n").unwrap(); }
+            if index == 4 { std::fs::write(root.join("commit.txt"), "synthetic discarded\n").unwrap(); }
+            let before = m159_git(&root, &["for-each-ref", "--format=%(refname)", "refs/codefactory/backup/"]);
+            let args = serde_json::json!({"command":command});
+            let call = ToolCall { id: format!("m182-r6-{index}"), r#type: "function".into(), function: FunctionCall { name: "bash".into(), arguments: args.to_string() } };
+            assert_eq!(tokio::time::timeout(Duration::from_secs(10), gateway.authorize(&call, &args, Some(command))).await.expect("R5 must not wait"), PermissionOutcome::Allow);
+            let after = m159_git(&root, &["for-each-ref", "--format=%(refname)", "refs/codefactory/backup/"]);
+            let reference = after.lines().find(|r| !before.lines().any(|old| old == *r)).expect("new snapshot before execution");
+            let output = std::process::Command::new(&shell).no_window().current_dir(&root).args(["-c", command]).output().unwrap();
+            assert!(output.status.success(), "R5[{index}] {command}: {}", String::from_utf8_lossy(&output.stderr));
+            assert!(gateway.pending_permissions.lock().await.is_empty(), "R5[{index}]");
+            match index {
+                0 => assert!(String::from_utf8_lossy(&output.stdout).contains("Already up to date")),
+                1 => assert_eq!(std::fs::read_to_string(root.join("tracked.txt")).unwrap(), "synthetic dirty stash\n"),
+                2 => assert_eq!(std::fs::read_to_string(root.join("src/main.rs")).unwrap(), "synthetic original\n"),
+                3 => assert_eq!(m159_git(&root, &["show", "HEAD:commit.txt"]), "synthetic committed"),
+                4 => {
+                    assert_eq!(std::fs::read_to_string(root.join("commit.txt")).unwrap(), "synthetic committed\n");
+                    assert_eq!(m159_git(&root, &["show", &format!("{reference}:commit.txt")]), "synthetic discarded");
+                }
+                _ => unreachable!(),
+            }
+            println!("M182-R6 fixture command[{index}] executed; snapshot={reference}; approvals=[]");
+        }
+        let target = temp.path().join("owned-worktree");
+        m159_git(&root, &["worktree", "add", "-qb", "synthetic-owned", target.to_str().unwrap()]);
+        let target_repo = super::super::delivery::resolve_repo(&target, None).unwrap();
+        let target_identity = super::super::delivery::capture_delivery_identity(&target_repo).unwrap();
+        sqlx::query("INSERT INTO objectives(id,revision,status) VALUES ('synthetic-owned-objective',1,'active')").execute(&gateway.db).await.unwrap();
+        sqlx::query("INSERT INTO execution_workspaces(id,objective_id,session_id,repo_identity,repo_root,git_common_dir,worktree_path,worktree_identity,branch_name,base_ref,base_sha,head_sha,state,created_at,updated_at) VALUES ('synthetic-owned-workspace','synthetic-owned-objective','permission-test',?,?,?,?,?,'synthetic-owned','HEAD',?,?,'active',1,1)")
+            .bind(target_identity.repo_identity).bind(root.to_string_lossy().as_ref())
+            .bind(m159_git(&root, &["rev-parse", "--path-format=absolute", "--git-common-dir"]))
+            .bind(target.to_string_lossy().as_ref()).bind(target_identity.worktree_identity)
+            .bind(&head).bind(&head).execute(&gateway.db).await.unwrap();
+        std::fs::write(target.join("tracked.txt"), "synthetic owned dirty data\n").unwrap();
+        let command = format!("S=\"{}\"; A=\"{}\"; git -C \"$S\" worktree remove --force \"$A\"; git -C \"$S\" checkout {}", root.display(), target.display(), m159_git(&root, &["branch", "--show-current"]));
+        let before = m159_git(&root, &["for-each-ref", "--format=%(refname)", "refs/codefactory/backup/"]);
+        let args = serde_json::json!({"command":command});
+        let call = ToolCall { id: "m182-r6-5".into(), r#type: "function".into(), function: FunctionCall { name: "bash".into(), arguments: args.to_string() } };
+        assert_eq!(tokio::time::timeout(Duration::from_secs(10), gateway.authorize(&call, &args, Some(&command))).await.expect("owned worktree must not prompt"), PermissionOutcome::Allow);
+        let output = std::process::Command::new(&shell).no_window().current_dir(&root).args(["-c", &command]).output().unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        assert!(!target.exists());
+        assert!(gateway.pending_permissions.lock().await.is_empty());
+        let after = m159_git(&root, &["for-each-ref", "--format=%(refname)", "refs/codefactory/backup/"]);
+        assert!(after.lines().filter(|r| !before.lines().any(|old| old == *r)).any(|reference| m159_git(&root, &["show", &format!("{reference}:tracked.txt")]) == "synthetic owned dirty data"));
+        sqlx::query("UPDATE execution_workspaces SET state='closed' WHERE id='synthetic-owned-workspace'").execute(&gateway.db).await.unwrap();
+        println!("M182-R6 fixture command[5] executed; owned worktree removed; dirty content recovered from snapshot; approvals=[]");
         std::fs::write(root.join("tracked.txt"), "uncommitted").unwrap();
         let command = "git reset --hard HEAD";
         let args = serde_json::json!({"command": command});

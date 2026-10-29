@@ -95,7 +95,7 @@ fn m177_previously_blocked_read_only_commands_do_not_ask() {
     assert!(!trusted_git::sensitive(script), "quoted script data must not ask");
     assert!(!trusted_git::sensitive("cat src/main.rs"));
     assert!(!trusted_git::sensitive("cat tracked.txt && git status --short"));
-    assert!(!trusted_git::sensitive("git add -A && git commit -m \"m177 sync\""));
+    assert!(trusted_git::sensitive("git add -A && git commit -m \"m177 sync\""), "M182 requires snapshots for local index/history writes");
     // M159 still requires a snapshot before a local rewrite is allowed; M177
     // only removes the *approval prompt* for workspace-local compositions.
     assert!(trusted_git::sensitive(INCIDENT));
