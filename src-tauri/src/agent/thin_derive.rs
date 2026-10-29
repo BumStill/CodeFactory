@@ -36,7 +36,13 @@ fn has_internal_wording(text: &str) -> bool {
 /// M158/R2：系统自己盯着的等待。外部对象之外，后台任务 / 定时唤醒这类系统
 /// 占位等待同样不属于用户的决定——它只能由系统心跳跟进或结束，不能问用户。
 fn is_system_followed(what: &str) -> bool {
-    super::thin::is_external_object(what) || what.contains("后台任务") || what.contains("定时唤醒")
+    // M197：执行者缺失/回合中断这类由系统自己恢复的占位等待（「系统自动重试/自愈：…」）
+    // 也必须算系统自己推进；否则重启对账会把「不确定的 running 投影」误判成要用户决定。
+    super::thin::is_external_object(what)
+        || what.contains("后台任务")
+        || what.contains("定时唤醒")
+        || what.contains("系统自动重试")
+        || what.contains("系统周期")
 }
 
 /// 从一段会话事实里认最后一个 PR 号：`/pull/<n>` 链接，或「PR #<n>」叙述。
