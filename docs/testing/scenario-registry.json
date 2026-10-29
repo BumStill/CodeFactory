@@ -98,6 +98,17 @@
   ],
   "scenarios": [
     {
+      "id": "KB-001",
+      "name": "知识库索引自动跟随本地文件变化",
+      "category": "capability_usage",
+      "priority": "P1",
+      "source_kind": "product_contract",
+      "change_patterns": ["src-tauri/src/knowledge.rs", "src-tauri/src/knowledge_watch.rs", "src-tauri/src/commands/knowledge.rs", "src/stores/knowledge.ts", "src/lib/tauri.ts", "src/pages/Resources/ResourcesPage.tsx", "src/pages/Resources/ResourcesPage.test.tsx"],
+      "automated_by": ["rust:background_index_builds_on_registration_and_follows_edits", "rust:deleted_file_leaves_no_documents_or_chunks", "rust:renamed_file_moves_its_index_entry", "rust:rescan_of_unchanged_folder_does_no_extraction", "rust:touched_but_identical_file_is_not_reindexed", "rust:startup_reconcile_indexes_files_added_while_app_was_closed", "rust:interrupted_scan_state_is_repaired_on_restart", "rust:aborted_scan_releases_the_library_and_leaves_no_partial_rows", "rust:library_failures_report_paths_and_reasons", "rust:filesystem_change_reports_the_library_id", "rust:debounce_collapses_a_save_burst_into_one_scan", "path:src/pages/Resources/ResourcesPage.test.tsx"],
+      "required_evidence": ["L0", "L1"],
+      "gates": ["pull_request"]
+    },
+    {
       "id": "HLT-001",
       "name": "一次授权后跨进程自动完成",
       "category": "long_task_continuity",
