@@ -458,10 +458,22 @@ fn first_line(text: &str) -> String {
     text.lines().next().unwrap_or("agent loop error").chars().take(160).collect()
 }
 
+/// M197/R4：等待标签必须同时写明「在等什么」和「预计何时回来」；两者都不能是空的。
+fn waiting_wake_label(state: &ThinState) -> String {
+    let what = state.waiting_for.clone()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "外部事项".to_string());
+    let when = state.wake_source.clone()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "系统会在下一次检查时自动继续".to_string());
+    format!("等唤醒：{what}（{when}）")
+}
+
 pub(crate) async fn project_turn(db: &SqlitePool, root_turn_id: &str, state: &ThinState) -> sqlx::Result<()> {
     let (phase, kind, label) = match state.state {
         SessionState::Running => ("working", "thin_running", "运行中".to_string()),
-        SessionState::WaitingWake => ("waiting", "thin_waiting_wake", format!("等唤醒：{}", state.waiting_for.clone().unwrap_or_default())),
+        // M197/R4：「等待中」必须写明在等什么、预计何时回来，不允许空原因。
+        SessionState::WaitingWake => ("waiting", "thin_waiting_wake", waiting_wake_label(state)),
         SessionState::WaitingUser => ("waiting", "thin_waiting_user", state.question.clone().unwrap_or_else(|| "需要你决定下一步".into())),
         SessionState::Ended => ("finalizing", "thin_ended", state.reason.clone().unwrap_or_else(|| "已结束".into())),
     };
@@ -728,5 +740,36 @@ mod settle_tests {
         assert!(third.reason.unwrap().contains("bash exited 1"));
         let model = settle_error(&db, "s-1", "root-1", "no endpoints are available: no_model_available").await.unwrap();
         assert_eq!(model.state, SessionState::WaitingWake);
+    }
+}
+
+#[cfg(test)]
+mod m197_tests {
+    use super::*;
+
+    /// R4：等待标签不允许只有「等唤醒：」这种空原因。
+    #[test]
+    fn m197_waiting_label_names_the_wait_and_the_wake_time() {
+        let labelled = ThinState {
+            state: SessionState::WaitingWake,
+            waiting_for: Some("PR #900 合并/CI".into()),
+            wake_source: Some("系统 PR 监视（≥180s）".into()),
+            ..ThinState::running()
+        };
+        let label = waiting_wake_label(&labelled);
+        assert!(label.contains("PR #900"), "{label}");
+        assert!(label.contains("≥180s"), "{label}");
+        assert!(!label.trim_end().ends_with('：'), "{label}");
+
+        let empty = ThinState {
+            state: SessionState::WaitingWake,
+            waiting_for: Some("   ".into()),
+            wake_source: None,
+            ..ThinState::running()
+        };
+        let label = waiting_wake_label(&empty);
+        assert!(label.contains("外部事项"), "{label}");
+        assert!(label.contains("下一次检查"), "{label}");
+        assert_ne!(label.trim(), "等唤醒：", "empty wait reason must not be projected");
     }
 }
