@@ -1229,6 +1229,7 @@ pub fn wakeup_text(wakeup: &WakeupSchedule, occurrence: i64, late: bool) -> Stri
 /// `next_at` 做比较并交换，因此并发/重启都不会重复投递同一次到点。
 /// M205：恢复预算耗尽不是无限等待的许可。拒绝、终态与取消在同一事务提交。
 async fn reject_exhausted_wakes(pool: &SqlitePool, session: &str, wakes: &[WakeupSchedule], now: i64) -> sqlx::Result<bool> {
+    if super::thin_derive::unanswered_user(pool, session).await? { return Ok(false); }
     let budget: Option<(i64, Option<String>, Option<String>)> = sqlx::query_as(
         "SELECT attempts,settled_reason,last_error FROM workspace_recovery_budget WHERE session_id=?")
         .bind(session).fetch_optional(pool).await?;

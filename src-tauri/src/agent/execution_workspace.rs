@@ -4180,6 +4180,7 @@ async fn repair_session_split_under_repo_lock(
 
 pub(crate) async fn settle_missing_terminal_workspace(pool: &SqlitePool, session: &str) -> Result<bool> {
     super::workspace_recovery_budget::ensure(pool).await?;
+    if super::thin_derive::unanswered_user(pool, session).await? { return Ok(false); }
     let has: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='thin_external_observations'").fetch_one(pool).await?;
     if has == 0 { return Ok(false); }
     let reason: Option<String> = sqlx::query_scalar("SELECT completed_reason FROM thin_external_observations WHERE session_id=? AND (completed_reason LIKE '%已合并%' OR completed_reason LIKE '%已关闭但未合并%')")

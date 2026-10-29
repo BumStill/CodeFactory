@@ -126,6 +126,31 @@ fn process_start_token(_pid: u32) -> Option<String> {
     None
 }
 
+/// Wall-clock process birth, used only to prove prior-process activity.
+/// Failure to obtain OS evidence must fail closed (never label a turn orphaned).
+pub(crate) fn current_process_started_at_ms() -> Option<i64> {
+    let token = current_process_start_token()?;
+    #[cfg(target_os = "macos")]
+    {
+        let (seconds, micros) = token.split_once(':')?;
+        Some(seconds.parse::<i64>().ok()?.checked_mul(1000)? + micros.parse::<i64>().ok()? / 1000)
+    }
+    #[cfg(windows)]
+    {
+        Some((token.parse::<u64>().ok()? / 10_000).checked_sub(11_644_473_600_000)? as i64)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let stat = std::fs::read_to_string("/proc/stat").ok()?;
+        let boot = stat.lines().find_map(|line| line.strip_prefix("btime "))?.parse::<i64>().ok()?;
+        let ticks = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+        if ticks <= 0 { return None; }
+        Some(boot * 1000 + token.parse::<i64>().ok()? * 1000 / ticks as i64)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+    { let _ = token; None }
+}
+
 pub(crate) fn current_process_start_token() -> Option<String> {
     process_start_token(std::process::id())
 }

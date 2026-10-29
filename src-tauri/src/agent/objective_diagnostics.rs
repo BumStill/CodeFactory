@@ -204,8 +204,8 @@ pub async fn collect(
     platform: &str,
     shell: &str,
 ) -> anyhow::Result<SessionDiagnostics> {
-    let derived = super::thin_derive::derive_state(db, session_id).await?;
     let cached = super::thin_state::load(db, session_id).await?;
+    let derived = super::thin_derive::derive_state(db, session_id).await?;
     let delivery_mode: Option<String> =
         sqlx::query_scalar("SELECT delivery_mode FROM sessions WHERE id=?")
             .bind(session_id)
@@ -441,10 +441,10 @@ pub async fn reset_session_state(db: &SqlitePool, session_id: &str) -> anyhow::R
 
     // 事实重算；仍被判成 running 说明缓存自持，这里直接落一个诚实的终态。
     let mut state = super::thin_derive::derive_state(db, session_id).await?;
-    if state.state == SessionState::Running
+    if !super::thin_derive::unanswered_user(db, session_id).await? && (state.state == SessionState::Running
         || (state.state == SessionState::WaitingWake
             && (state.wake_source.as_deref() == Some("系统周期恢复扫描")
-                || state.waiting_for.as_deref() == Some("系统自动重试/自愈：接续中断回合"))) {
+                || state.waiting_for.as_deref() == Some("系统自动重试/自愈：接续中断回合")))) {
         super::background_tasks::cancel_session_wakeups(db, session_id).await;
         state = ThinState::ended("已手动重置会话状态：残留运行状态已清理", "本会话记录");
         super::thin_state::save(db, session_id, &state).await?;
@@ -593,12 +593,12 @@ mod tests {
         let report = collect(&db, "diag", "1.0.0", "windows", "powershell").await.unwrap();
         assert_eq!(report.schema, "codefactory.session_diagnostics.v1");
         assert_eq!(report.thin_session_state.as_ref().unwrap().state, "running");
-        assert_eq!(report.derived_state.state, "ended");
+        assert_eq!(report.derived_state.state, "waiting_wake");
         assert!(!report.cache_matches_facts);
         assert_eq!(report.messages.count, 1);
         let json = serde_json::to_string(&report).unwrap();
         assert!(!json.contains("帮我改一下这个函数"), "诊断不得携带消息正文");
-        assert!(json.contains("已随进程退出"), "诊断要说明为什么被判成结束");
+        assert!(json.contains("系统自动重试"), "M206：未回应用户任务必须保留自动恢复归属");
         assert_eq!(report.evidence.orphan_run_controls, 1);
         assert_eq!(report.run_controls.len(), 1);
         assert!(!report.run_controls[0].live_in_this_process);
@@ -623,7 +623,7 @@ mod tests {
         assert!(outcome.reset, "无活执行者时必须允许重置：{:?}", outcome.reason);
         assert_eq!(outcome.settled_cancel_intents, 1);
         assert_eq!(outcome.retired_run_controls, 1);
-        assert_eq!(outcome.resulting_state, "ended");
+        assert_eq!(outcome.resulting_state, "waiting_wake");
         assert_eq!(outcome.messages_before, 1);
         assert_eq!(outcome.messages_after, 1, "R9：重置绝不删除消息");
         let intents: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM chat_session_cancel_intents WHERE session_id='stuck'")
@@ -637,14 +637,10 @@ mod tests {
             .unwrap();
         assert_eq!(status, "completed");
         // 重置后下一条消息不会再被残留状态挡住。
-        assert_eq!(super::super::thin_derive::derive_state(&db, "stuck").await.unwrap().state, SessionState::Ended);
+        assert_eq!(super::super::thin_derive::derive_state(&db, "stuck").await.unwrap().state, SessionState::WaitingWake);
         let settled = super::super::thin_state::load(&db, "stuck").await.unwrap().unwrap();
-        assert_eq!(settled.state, SessionState::Ended);
-        let reason = settled.reason.unwrap_or_default();
-        assert!(
-            reason.contains("没有活着的执行者") || reason.contains("已手动重置"),
-            "重置后必须给出可解释的终态，实际：{reason}"
-        );
+        assert_eq!(settled.state, SessionState::WaitingWake);
+        assert!(settled.wake_source.is_some(), "M206：未回应任务必须绑定持久恢复来源");
     }
 
     /// R3：活着的回合不允许被重置。
