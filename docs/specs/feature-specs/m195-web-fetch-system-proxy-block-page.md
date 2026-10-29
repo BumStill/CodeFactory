@@ -49,11 +49,15 @@
 - `boa_engine` / `rquickjs`（完整 JS 引擎跑 PAC）：PAC 是任意 JS，最通用；但等于给进程再塞一个 JS 运行时（数 MB + 编译时间 + 新的安全面），而 `web_fetch` 只需要一个只读的选路结果。**不选**。
 - `proxycfg` / `system-proxy` / `proxy-pac` 一类 crate：多数只做「读系统代理」，PAC 求值要么缺失、要么长期无人维护，且对 `NO_PROXY`/例外列表的语义与 reqwest 不一致。**不选**，改为自己读同样的两处系统配置。
 - `pac-v1`（PAC 解析器）：只解析脚本结构，不提供求值环境；仍需自写求值器。**不选**。
-- 结论：**reqwest 保持环境变量语义（含 `NO_PROXY`），系统代理自己读，PAC 用一个只覆盖真实脚本子集的求值器**（`web_fetch_net::pac`）。
+- 结论：**reqwest 保持环境变量语义（含 `NO_PROXY`），系统代理自己读，PAC 用一个只覆盖真实脚本子集的求值器**（`web_fetch.rs` 内的 `pac_eval` 模块）。
 
 ### PAC 求值器覆盖范围
 支持：`if / else / return / {} / ;`、`|| && !`、`== != < > <= >=`、字符串/数字/布尔字面量、`shExpMatch`、`dnsDomainIs`、`isPlainHostName`、`localHostOrDomainIs`、`isInNet`（字面 IP 与系统解析）、`dnsResolve`、`isResolvable`、`host.toLowerCase()` / `.toUpperCase()` / `.indexOf()` / `.substring()` / `.substr()`。
 不支持（遇到即 `Err`，走「PAC 不可用」回落并记录原因）：时间/日期类函数（`weekdayRange`、`dateRange`、`timeRange`）、`myIpAddress`、数组/循环/自定义函数。
+
+### 代码落位
+
+选路 / PAC 求值 / 拦截页识别都在 `src-tauri/src/tools/web_fetch.rs` 的私有模块 `net_policy`、`pac_eval`、`block_page` 内：`docs/testing/scenario-registry.json` 的 CAP-001 已登记该文件，而注册表属场景门禁信任根，普通 PR 不得自改（门禁会 fail closed），因此不新增独立文件。
 
 ### 平台读取方式
 - macOS：`scutil --proxy`（系统当前生效配置，含 `ProxyAutoConfigURLString` 与 `ExceptionsList`），文本解析成结构体。
