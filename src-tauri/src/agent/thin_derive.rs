@@ -80,18 +80,49 @@ fn last_pr_number(text: &str) -> Option<i64> {
     number
 }
 
-/// 最近会话事实里认领的 PR 号；认不出就是没有（不猜）。
+/// M206: PR identity never comes from transcript text. Only an explicit
+/// delivery receipt or a head-branch lookup may establish ownership.
 async fn discovered_pr(db: &SqlitePool, session: &str) -> sqlx::Result<Option<i64>> {
-    if !has_table(db, "messages").await? {
-        return Ok(None);
+    if !has_table(db, "execution_workspaces").await? { return Ok(None); }
+    let workspace: Option<(String, String)> = sqlx::query_as("SELECT repo_root,branch_name FROM execution_workspaces WHERE session_id=? AND state<>'closed' ORDER BY updated_at DESC LIMIT 1")
+        .bind(session).fetch_optional(db).await?;
+    let Some((cwd, branch)) = workspace else { return Ok(None); };
+    let output = tokio::task::spawn_blocking(move || observe_command(&cwd, &["pr", "list", "--head", &branch, "--state", "all", "--json", "number,headRefName", "--limit", "20"]).map(|output| (output, branch))).await.ok().flatten();
+    let Some((output, branch)) = output else { return Ok(None); };
+    let rows: serde_json::Value = serde_json::from_str(&output).unwrap_or_default();
+    let found: Vec<i64> = rows.as_array().into_iter().flatten().filter(|row| row["headRefName"].as_str() == Some(branch.as_str())).filter_map(|row| row["number"].as_i64()).collect();
+    Ok((found.len() == 1).then(|| found[0]))
+}
+
+/// Quarantine only the legacy synthetic `pr-N` association marker. The
+/// original rows remain in an append-only archive; transcript history is untouched.
+async fn clear_text_pr_association(db: &SqlitePool, session: &str) -> sqlx::Result<()> {
+    if !has_table(db, "thin_delivery_refs").await? { return Ok(()); }
+    let legacy: Option<i64> = sqlx::query_scalar("SELECT pr_number FROM thin_delivery_refs WHERE session_id=? AND branch='pr-' || pr_number")
+        .bind(session).fetch_optional(db).await?;
+    let Some(number) = legacy else { return Ok(()); };
+    // A matching real workspace branch is explicit ownership, not text inference.
+    if has_table(db, "execution_workspaces").await? {
+        let owned: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM execution_workspaces WHERE session_id=? AND branch_name=?")
+            .bind(session).bind(format!("pr-{number}")).fetch_one(db).await?;
+        if owned > 0 { return Ok(()); }
     }
-    let rows: Vec<(String,)> = sqlx::query_as(
-        "SELECT content FROM messages WHERE session_id=? AND (content LIKE '%/pull/%' OR content LIKE '%PR #%') ORDER BY created_at DESC LIMIT 20",
-    )
-    .bind(session)
-    .fetch_all(db)
-    .await?;
-    Ok(rows.iter().find_map(|(content,)| last_pr_number(content)))
+    ensure_external(db).await?;
+    let has_wakes = has_table(db, "wakeup_schedules").await?;
+    let mut tx = crate::storage::db::begin_write(db).await?;
+    sqlx::query("CREATE TABLE IF NOT EXISTS thin_invalid_pr_history(session_id TEXT,pr_number INTEGER,ref_json TEXT,observation_json TEXT,archived_at INTEGER,PRIMARY KEY(session_id,pr_number))").execute(&mut *tx).await?;
+    sqlx::query("INSERT OR IGNORE INTO thin_invalid_pr_history SELECT ref.session_id,ref.pr_number,json_object('branch',ref.branch,'ceiling',ref.ceiling),json_object('completed_reason',observation.completed_reason,'observed_at',observation.observed_at,'closeout_queued',observation.closeout_queued,'ceiling',observation.ceiling,'merged_at',observation.merged_at,'next_check_at',observation.next_check_at),? FROM thin_delivery_refs ref LEFT JOIN thin_external_observations observation ON observation.session_id=ref.session_id AND observation.pr_number=ref.pr_number WHERE ref.session_id=? AND ref.branch='pr-' || ref.pr_number")
+        .bind(chrono::Utc::now().timestamp_millis()).bind(session).execute(&mut *tx).await?;
+    sqlx::query("DELETE FROM thin_external_observations WHERE session_id=? AND pr_number=?").bind(session).bind(number).execute(&mut *tx).await?;
+    sqlx::query("DELETE FROM thin_delivery_refs WHERE session_id=? AND branch='pr-' || pr_number").bind(session).execute(&mut *tx).await?;
+    if has_wakes {
+        for prefix in ["thin-repair", "thin-closeout"] {
+            sqlx::query("UPDATE wakeup_schedules SET status='cancelled' WHERE session_id=? AND id=? AND status='pending'")
+                .bind(session).bind(format!("{prefix}-{session}-{number}")).execute(&mut *tx).await?;
+        }
+    }
+    tx.commit().await?;
+    Ok(())
 }
 
 /// M158/R1+R2：授权交付会话开出 PR 后，系统**自己**登记 PR 监视。
@@ -99,6 +130,7 @@ async fn discovered_pr(db: &SqlitePool, session: &str) -> sqlx::Result<Option<i6
 /// （ceiling: merged）并建立观测行，让既有心跳（≥180 秒、遵守 GitHub 配额
 /// 策略）立刻接管。这件事绝不再升级成「请选择继续监视或结束任务」。
 pub(crate) async fn ensure_pr_monitor(db: &SqlitePool, session: &str) -> sqlx::Result<Option<i64>> {
+    clear_text_pr_association(db, session).await?;
     if !has_table(db, "thin_delivery_refs").await? {
         return Ok(None);
     }
@@ -128,11 +160,13 @@ pub(crate) async fn ensure_pr_monitor(db: &SqlitePool, session: &str) -> sqlx::R
         Some(found) => found,
         None => match discovered_pr(db, session).await? {
             Some(number) => {
+                let branch: String = sqlx::query_scalar("SELECT branch_name FROM execution_workspaces WHERE session_id=? AND state<>'closed' ORDER BY updated_at DESC LIMIT 1")
+                    .bind(session).fetch_one(db).await?;
                 sqlx::query(
                     "INSERT INTO thin_delivery_refs (session_id,branch,pr_number,ceiling) VALUES (?,?,?,'ThroughMerge') ON CONFLICT(session_id) DO NOTHING",
                 )
                 .bind(session)
-                .bind(format!("pr-{number}"))
+                .bind(branch)
                 .bind(number)
                 .execute(db)
                 .await?;
@@ -292,6 +326,10 @@ pub struct WakeReconcileReport {
 /// 有源等待 / 人话提问 / 已结束；最后跑一次失效守卫 sweep。
 /// 全程只读本地持久事实（GH 观测由既有 ≥180s 心跳与配额策略负责），幂等。
 pub async fn reconcile_waiting_wake_sources(db: &SqlitePool) -> sqlx::Result<WakeReconcileReport> {
+    if has_table(db, "thin_delivery_refs").await? {
+        let legacy: Vec<String> = sqlx::query_scalar("SELECT session_id FROM thin_delivery_refs WHERE branch='pr-' || pr_number").fetch_all(db).await?;
+        for session in legacy { clear_text_pr_association(db, &session).await?; }
+    }
     reconcile_orphan_turns(db).await?;
     super::thin_state::ensure(db).await?;
     let sessions: Vec<String> = sqlx::query_scalar("SELECT state.session_id FROM thin_session_state state JOIN sessions session ON session.id=state.session_id WHERE state.state='waiting_wake' AND session.delivery_mode='thin'")
@@ -647,6 +685,18 @@ async fn live_background_count(db: &SqlitePool, session: &str) -> sqlx::Result<i
     }).count() as i64)
 }
 
+/// M206: conservative transcript guard shared by every terminal writer.
+/// System-wake roots are durably tagged at admission, never identified by prose.
+pub(crate) async fn unanswered_user(db: &SqlitePool, session: &str) -> sqlx::Result<bool> {
+    if !has_table(db, "messages").await? || !has_column(db, "messages", "role").await? {
+        return Ok(false);
+    }
+    sqlx::query("CREATE TABLE IF NOT EXISTS thin_system_wake_roots(root_turn_id TEXT PRIMARY KEY)").execute(db).await?;
+    let pending: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages user WHERE user.session_id=? AND user.role='user' AND NOT EXISTS (SELECT 1 FROM thin_system_wake_roots wake WHERE wake.root_turn_id=user.id) AND NOT EXISTS (SELECT 1 FROM messages answer WHERE answer.session_id=user.session_id AND answer.role='assistant' AND answer.created_at>=user.created_at)")
+        .bind(session).fetch_one(db).await?;
+    Ok(pending > 0)
+}
+
 /// Atomically retire abandoned turns before deriving any session projection.
 /// Snapshot exact roots so concurrent admission cannot sweep a newly created turn.
 pub(crate) async fn reconcile_orphan_turns(db: &SqlitePool) -> sqlx::Result<u64> {
@@ -658,6 +708,13 @@ pub(crate) async fn reconcile_orphan_turns(db: &SqlitePool) -> sqlx::Result<u64>
     let has_interruptions = has_table(db, "thin_restart_interruptions").await?;
     let has_wakes = has_table(db, "wakeup_schedules").await?;
     for (root, session, revision) in rows {
+        let Some(birth) = crate::storage::db::current_process_started_at_ms() else { continue; };
+        let activity: i64 = sqlx::query_scalar("SELECT MAX(updated_at) FROM chat_turn_state WHERE session_id=?")
+            .bind(&session).fetch_one(db).await?;
+        let message_activity: Option<i64> = if has_table(db, "messages").await? {
+            sqlx::query_scalar("SELECT MAX(created_at) FROM messages WHERE session_id=?").bind(&session).fetch_one(db).await?
+        } else { None };
+        if activity.max(message_activity.unwrap_or(0)) >= birth || unanswered_user(db, &session).await? { continue; }
         // M200/R1: a durable wake owns the interrupted root after the restart
         // claim has been consumed. A cached waiting state alone is not evidence.
         if has_wakes {
@@ -749,6 +806,7 @@ pub async fn derive_state(db: &SqlitePool, session: &str) -> sqlx::Result<ThinSt
 }
 
 async fn derive_candidate(db: &SqlitePool, session: &str) -> sqlx::Result<ThinState> {
+    clear_text_pr_association(db, session).await?;
     super::workspace_recovery_budget::ensure(db).await?;
     let settled: Option<String> = sqlx::query_scalar("SELECT settled_reason FROM workspace_recovery_budget WHERE session_id=?")
         .bind(session).fetch_optional(db).await?.flatten();
@@ -784,6 +842,13 @@ async fn derive_candidate(db: &SqlitePool, session: &str) -> sqlx::Result<ThinSt
     if has_active_work(db, session).await? {
         tracing::warn!(session, "active work protects session from terminal projection");
         return Ok(ThinState::running());
+    }
+    if unanswered_user(db, session).await? {
+        let user_at: Option<i64> = sqlx::query_scalar("SELECT MAX(created_at) FROM messages WHERE session_id=? AND role='user'").bind(session).fetch_one(db).await?;
+        if let Some(wait) = super::thin_state::load(db, session).await?.filter(|state| state.state == SessionState::WaitingUser && state.updated_at >= user_at.unwrap_or(0) && state.question.is_some()) {
+            return Ok(wait);
+        }
+        return Ok(executor_missing_state());
     }
     if let Some(reason) = settled { return Ok(ThinState::ended(&reason, "本会话记录")); }
     match crate::session_executor_alive(session) {
@@ -1094,6 +1159,88 @@ pub async fn refresh(db: &SqlitePool, session: &str) -> sqlx::Result<ThinState> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn m206_output_numbers_never_claim_pr() {
+        let db = fixture().await;
+        sqlx::query("INSERT INTO messages(id,session_id,role,content,created_at) VALUES ('noise','derive','tool','source M188 line 188- PR #188 https://example.invalid/pull/188',100)")
+            .execute(&db).await.unwrap();
+        assert_eq!(ensure_pr_monitor(&db, "derive").await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn m206_new_user_outranks_old_merge_and_settlement() {
+        let db = fixture().await;
+        ensure_external(&db).await.unwrap();
+        sqlx::query("INSERT INTO thin_delivery_refs VALUES ('derive','synthetic',917,'ThroughMerge')").execute(&db).await.unwrap();
+        sqlx::query("INSERT INTO thin_external_observations(session_id,pr_number,ceiling,completed_reason,closeout_queued) VALUES ('derive',917,'ThroughMerge','PR #917 已合并',1)").execute(&db).await.unwrap();
+        sqlx::query("INSERT INTO messages(id,session_id,role,content,created_at) VALUES ('old-answer','derive','assistant','§8 收尾完成',100),('new-task','derive','user','synthetic next task',200)").execute(&db).await.unwrap();
+        super::super::thin_state::save(&db, "derive", &ThinState::running()).await.unwrap();
+        merged_settlement::settle_merged_sessions(&db).await.unwrap();
+        assert_ne!(super::super::thin_state::load(&db,"derive").await.unwrap().unwrap().state, SessionState::Ended);
+        assert_ne!(refresh(&db,"derive").await.unwrap().state, SessionState::Ended);
+        super::super::thin_state::save(&db,"derive", &ThinState::ended("old terminal", "fixture")).await.unwrap();
+        assert_ne!(super::super::thin_state::load(&db,"derive").await.unwrap().unwrap().state, SessionState::Ended);
+    }
+
+    #[tokio::test]
+    async fn m206_quarantines_only_text_inferred_observation_and_preserves_history() {
+        let db = fixture().await;
+        ensure_external(&db).await.unwrap();
+        sqlx::query("INSERT INTO thin_delivery_refs VALUES ('derive','pr-188',188,'ThroughMerge')").execute(&db).await.unwrap();
+        sqlx::query("INSERT INTO thin_external_observations(session_id,pr_number,ceiling,completed_reason) VALUES ('derive',188,'ThroughMerge','PR #188 已关闭但未合并')").execute(&db).await.unwrap();
+        sqlx::query("INSERT INTO messages(id,session_id,role,content,created_at) VALUES ('noise','derive','tool','PR #188 source M188',100)").execute(&db).await.unwrap();
+        assert_eq!(ensure_pr_monitor(&db,"derive").await.unwrap(), None);
+        assert_eq!(ensure_pr_monitor(&db,"derive").await.unwrap(), None);
+        let counts: (i64,i64,i64,i64) = sqlx::query_as("SELECT (SELECT COUNT(*) FROM thin_delivery_refs),(SELECT COUNT(*) FROM thin_external_observations),(SELECT COUNT(*) FROM thin_invalid_pr_history),(SELECT COUNT(*) FROM messages WHERE id='noise')").fetch_one(&db).await.unwrap();
+        assert_eq!(counts,(0,0,1,1));
+    }
+
+    #[tokio::test]
+    async fn m206_terminal_writer_family_preserves_unanswered_user() {
+        for route in ["refresh", "save", "settle_final", "settle_error", "closeout", "missing_workspace", "orphan", "reset"] {
+            let db = fixture().await;
+            sqlx::query("INSERT INTO messages(id,session_id,role,content,created_at) VALUES ('pending-user','derive','user','synthetic pending work',100)").execute(&db).await.unwrap();
+            sqlx::query("INSERT INTO chat_turn_state(root_turn_id,session_id,phase,status,started_at,updated_at) VALUES ('pending-user','derive','working','active',100,100)").execute(&db).await.unwrap();
+            super::super::thin_state::save(&db,"derive",&ThinState::running()).await.unwrap();
+            match route {
+                "refresh" => { refresh(&db,"derive").await.unwrap(); }
+                "save" => { super::super::thin_state::save(&db,"derive",&ThinState::ended("stale terminal","fixture")).await.unwrap(); }
+                "settle_final" => { super::super::thin_state::settle_final(&db,"derive","pending-user",None).await.unwrap(); }
+                "settle_error" => {
+                    for _ in 0..3 { super::super::thin_state::settle_error(&db,"derive","pending-user","synthetic technical failure").await.unwrap(); }
+                }
+                "closeout" => { merged_settlement::settle_ended_and_cancel(&db,"derive","old PR merged","fixture").await.unwrap(); }
+                "missing_workspace" => { assert!(!super::super::execution_workspace::settle_missing_terminal_workspace(&db,"derive").await.unwrap()); }
+                "orphan" => { assert_eq!(reconcile_orphan_turns(&db).await.unwrap(),0); }
+                "reset" => { super::super::objective_diagnostics::reset_session_state(&db,"derive").await.unwrap(); }
+                _ => unreachable!(),
+            }
+            assert_ne!(super::super::thin_state::load(&db,"derive").await.unwrap().unwrap().state,SessionState::Ended,"route {route}");
+            let reason: Option<String> = sqlx::query_scalar("SELECT terminal_reason FROM chat_turn_state WHERE root_turn_id='pending-user'").fetch_one(&db).await.unwrap();
+            assert_eq!(reason,None,"route {route}");
+        }
+    }
+
+    #[tokio::test]
+    async fn m206_same_process_answered_activity_also_blocks_orphan_label() {
+        let db = fixture().await;
+        let at = chrono::Utc::now().timestamp_millis();
+        sqlx::query("INSERT INTO messages(id,session_id,role,content,created_at) VALUES ('old-user','derive','user','synthetic',1),('current-answer','derive','assistant','synthetic response',?)").bind(at).execute(&db).await.unwrap();
+        sqlx::query("INSERT INTO chat_turn_state(root_turn_id,session_id,phase,status,started_at,updated_at) VALUES ('old-user','derive','working','active',1,1)").execute(&db).await.unwrap();
+        assert_eq!(reconcile_orphan_turns(&db).await.unwrap(),0);
+    }
+
+    #[tokio::test]
+    async fn m206_same_process_unanswered_turn_never_orphaned() {
+        let db = fixture().await;
+        let at = chrono::Utc::now().timestamp_millis();
+        sqlx::query("INSERT INTO messages(id,session_id,role,content,created_at) VALUES ('fresh-user','derive','user','synthetic new task',?)").bind(at).execute(&db).await.unwrap();
+        sqlx::query("INSERT INTO chat_turn_state(root_turn_id,session_id,phase,status,started_at,updated_at) VALUES ('fresh-user','derive','working','active',?,?)").bind(at).bind(at).execute(&db).await.unwrap();
+        assert_eq!(reconcile_orphan_turns(&db).await.unwrap(), 0);
+        let reason: Option<String> = sqlx::query_scalar("SELECT terminal_reason FROM chat_turn_state WHERE root_turn_id='fresh-user'").fetch_one(&db).await.unwrap();
+        assert_eq!(reason, None);
+    }
 
     #[tokio::test]
     async fn m202_all_waiting_fixtures_require_queryable_source() {
@@ -2342,6 +2489,8 @@ mod tests {
             .await.unwrap();
         sqlx::query("INSERT INTO messages(id,session_id,role,content,created_at) VALUES ('created','derive','assistant','已开 PR：https://github.com/BumStill/CodeFactory/pull/846',100)")
             .execute(&db).await.unwrap();
+        sqlx::query("INSERT INTO tool_calls(id,message_id,tool_name,arguments,result,status,created_at) VALUES ('m158-delivery','created','deliver_changes','{}',?,'done',101)")
+            .bind(serde_json::json!({"pr_number":846,"branch":"synthetic-delivered","effective_ceiling":"ThroughMerge"}).to_string()).execute(&db).await.unwrap();
         let state = refresh(&db, "derive").await.unwrap();
         assert_eq!(state.state, SessionState::WaitingWake, "开完 PR 不得停在 waiting_user：{state:?}");
         assert!(state.question.is_none(), "不得把内部决策变成给用户的问题：{:?}", state.question);
@@ -2370,6 +2519,8 @@ mod tests {
         super::super::thin_state::save(&db, "derive", &limbo).await.unwrap();
         sqlx::query("INSERT INTO messages(id,session_id,role,content,created_at) VALUES ('created','derive','assistant','PR #846 已开，等 CI',100)")
             .execute(&db).await.unwrap();
+        sqlx::query("INSERT INTO tool_calls(id,message_id,tool_name,arguments,result,status,created_at) VALUES ('m158-delivery','created','deliver_changes','{}',?,'done',101)")
+            .bind(serde_json::json!({"pr_number":846,"branch":"synthetic-delivered","effective_ceiling":"ThroughMerge"}).to_string()).execute(&db).await.unwrap();
         let state = refresh(&db, "derive").await.unwrap();
         assert_eq!(state.state, SessionState::WaitingWake, "{state:?}");
         assert!(state.question.is_none(), "内部问题必须消失：{:?}", state.question);
@@ -2444,6 +2595,10 @@ pub(crate) mod merged_settlement {
         session_id: &str,
         state: &thin_state::ThinState,
     ) -> Result<()> {
+        if state.state == thin_state::SessionState::Ended && super::unanswered_user(db, session_id).await? {
+            thin_state::save(db, session_id, &thin_state::ThinState::running()).await?;
+            return Ok(());
+        }
         if state.state == thin_state::SessionState::Ended
             && (super::has_active_work(db, session_id).await?
                 || super::live_background_count(db, session_id).await? > 0) {
@@ -2556,6 +2711,10 @@ pub(crate) mod merged_settlement {
             // A live executor owns its own settlement; never race it.
             if crate::session_executor_alive(&session) != Some(false)
                 || super::live_background_count(pool, &session).await? > 0 {
+                summary.skipped += 1;
+                continue;
+            }
+            if super::unanswered_user(pool, &session).await? {
                 summary.skipped += 1;
                 continue;
             }

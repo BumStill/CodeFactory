@@ -178,6 +178,13 @@ pub async fn ensure(db: &SqlitePool) -> sqlx::Result<()> {
 
 pub async fn save(db: &SqlitePool, session_id: &str, state: &ThinState) -> sqlx::Result<()> {
     ensure(db).await?;
+    let guarded;
+    let state = if state.state == SessionState::Ended
+        && super::thin_derive::unanswered_user(db, session_id).await?
+        && !state.reason.as_deref().is_some_and(|reason| reason.starts_with("cancelled")) {
+        guarded = ThinState::running();
+        &guarded
+    } else { state };
     sqlx::query(
         "INSERT INTO thin_session_state
          (session_id, state, waiting_for, wake_source, question, reason,
@@ -470,6 +477,12 @@ fn waiting_wake_label(state: &ThinState) -> String {
 }
 
 pub(crate) async fn project_turn(db: &SqlitePool, root_turn_id: &str, state: &ThinState) -> sqlx::Result<()> {
+    if state.state == SessionState::Ended && !state.reason.as_deref().is_some_and(|reason| reason.starts_with("cancelled")) {
+        let session: Option<String> = sqlx::query_scalar("SELECT session_id FROM chat_turn_state WHERE root_turn_id=?").bind(root_turn_id).fetch_optional(db).await?;
+        if let Some(session) = session {
+            if super::thin_derive::unanswered_user(db, &session).await? { return Ok(()); }
+        }
+    }
     let (phase, kind, label) = match state.state {
         SessionState::Running => ("working", "thin_running", "运行中".to_string()),
         // M197/R4：「等待中」必须写明在等什么、预计何时回来，不允许空原因。

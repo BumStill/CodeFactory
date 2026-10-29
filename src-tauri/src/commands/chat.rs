@@ -2952,7 +2952,13 @@ async fn admit_persisted_chat_turn_with_origin(
         );
     }
     crate::agent::workspace_recovery_budget::ensure(pool).await?;
+    // Persist wake identity before the transaction so terminal guards never
+    // mistake a system continuation for a fresh human request.
+    sqlx::query("CREATE TABLE IF NOT EXISTS thin_system_wake_roots(root_turn_id TEXT PRIMARY KEY)").execute(pool).await?;
     let mut tx = crate::storage::db::begin_write(pool).await?;
+    if matches!(origin, crate::agent::objective::TurnOrigin::SystemWake) {
+        sqlx::query("INSERT OR IGNORE INTO thin_system_wake_roots(root_turn_id) VALUES (?)").bind(&root_turn_id).execute(&mut *tx).await?;
+    }
     // A new user intent supersedes a previous workspace-recovery conclusion.
     if matches!(origin, crate::agent::objective::TurnOrigin::User) {
         sqlx::query("DELETE FROM workspace_recovery_budget WHERE session_id=?")
@@ -3349,9 +3355,9 @@ async fn admit_persisted_chat_turn_with_origin(
     let has_thin_state: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='thin_session_state'",
     ).fetch_one(&mut *tx).await?;
-    if fresh_user_message && control_status != "cancel_requested" && has_thin_state == 1 {
-        sqlx::query("DELETE FROM thin_session_state WHERE session_id=? AND state='ended' AND reason LIKE 'cancelled%'")
-            .bind(session_id).execute(&mut *tx).await?;
+    if fresh_user_message && matches!(origin, crate::agent::objective::TurnOrigin::User) && control_status != "cancel_requested" && has_thin_state == 1 {
+        sqlx::query("UPDATE thin_session_state SET state='running',reason=NULL,waiting_for=NULL,wake_source=NULL,question=NULL,updated_at=? WHERE session_id=?")
+            .bind(now).bind(session_id).execute(&mut *tx).await?;
     }
     tx.commit().await?;
     Ok(ChatAdmissionReceipt {
@@ -6274,6 +6280,21 @@ mod tests {
         assert_eq!(history, 2, "the new turn must carry the earlier user message");
         pool.close().await;
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// M206: a fresh human admission reopens any ended projection atomically.
+    #[tokio::test]
+    async fn m206_ended_session_admission_reopens_and_records_exact_started_root() {
+        let pool = crate::storage::db::connect("sqlite::memory:").await.unwrap();
+        sqlx::query("INSERT INTO sessions(id,title,cwd,model_id,created_at,updated_at,delivery_mode) VALUES ('m206-admit','synthetic','/synthetic','model',1,1,'thin')").execute(&pool).await.unwrap();
+        crate::agent::thin_state::save(&pool,"m206-admit", &crate::agent::thin_state::ThinState::ended("PR #917 已合并", "synthetic")).await.unwrap();
+        let receipt = admit_persisted_chat_turn(&pool,&crate::ChatRunControl::pending(),"m206-admit",Some("m206-new-root"),"synthetic next task").await.unwrap();
+        assert_eq!(receipt.root_turn_id,"m206-new-root");
+        assert!(!receipt.already_settled);
+        assert_eq!(crate::agent::thin_state::load(&pool,"m206-admit").await.unwrap().unwrap().state,crate::agent::thin_state::SessionState::Running);
+        let durable = crate::agent::dispatch::load_delivery_receipt(&pool,"m206-admit","m206-new-root","synthetic next task").await.unwrap().unwrap();
+        assert_eq!(durable.status,"started");
+        assert!(durable.turn_exists);
     }
 
     /// M129 R3: two open candidates is a bookkeeping ambiguity, not a refusal.
