@@ -174,6 +174,35 @@ async fn materialize_session_and_first_message(
     Ok(session)
 }
 
+fn dispatch_identity(client_request_id: &str) -> (String, String) {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(format!("codefactory-dispatch:{client_request_id}").as_bytes());
+    let hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+    let seed = &hex[..32];
+    (format!("{}-{}-4{}-8{}-{}", &seed[..8], &seed[8..12], &seed[13..16], &seed[17..20], &seed[20..32]),
+     format!("{}-{}-4{}-8{}-{}", &hex[32..40], &hex[40..44], &hex[45..48], &hex[49..52], &hex[52..64]))
+}
+
+/// M200/R3: a dispatch idempotency key names ONE durable session and first
+/// message. Deterministic IDs make a repeated request reuse the same rows,
+/// and the exact-content check in `materialize_session_and_first_message`
+/// refuses a key reused for different work instead of silently deduplicating.
+#[tauri::command]
+pub async fn materialize_dispatch_session(
+    client_request_id: String,
+    cwd: Option<String>,
+    model_id: String,
+    first_message: String,
+    state: State<'_, AppState>,
+) -> Result<(Session, String), AppError> {
+    if client_request_id.trim().is_empty() {
+        return Err(AppError::Other("client_request_id must not be empty".into()));
+    }
+    let (draft_id, first_message_id) = dispatch_identity(&client_request_id);
+    let session = materialize_draft_session(draft_id, cwd, model_id, first_message_id.clone(), first_message, state).await?;
+    Ok((session, first_message_id))
+}
+
 /// Turn a frontend draft into a real session on its first message.
 ///
 /// A draft has exactly ONE dimension the user controls: does it have a project
@@ -2304,4 +2333,35 @@ pub async fn reset_session_state(
     crate::agent::objective_diagnostics::reset_session_state(&db, session_id.trim())
         .await
         .map_err(|error| AppError::Other(format!("会话状态重置失败：{error}")))
+}
+
+#[cfg(test)]
+mod m200_tests {
+    use super::*;
+
+    #[test]
+    fn m200_dispatch_identity_is_stable_valid_uuid_and_key_scoped() {
+        let (session, message) = dispatch_identity("synthetic-key");
+        assert_eq!((session.clone(), message.clone()), dispatch_identity("synthetic-key"));
+        assert_ne!(session, dispatch_identity("other-key").0);
+        assert!(Uuid::parse_str(&session).is_ok() && Uuid::parse_str(&message).is_ok());
+        assert_ne!(session, message);
+    }
+
+    #[tokio::test]
+    async fn m200_repeated_key_reuses_one_session_and_one_message_and_rejects_reuse_for_other_work() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new().max_connections(1)
+            .connect("sqlite::memory:").await.unwrap();
+        sqlx::raw_sql("CREATE TABLE sessions (id TEXT PRIMARY KEY, title TEXT NOT NULL, title_source TEXT NOT NULL DEFAULT 'legacy', cwd TEXT NOT NULL, endpoint_id TEXT, model_id TEXT NOT NULL, model_policy TEXT NOT NULL DEFAULT 'fixed', created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, total_input_tokens INTEGER NOT NULL DEFAULT 0, total_output_tokens INTEGER NOT NULL DEFAULT 0, parent_session_id TEXT, kind TEXT NOT NULL DEFAULT 'project', delivery_mode TEXT NOT NULL DEFAULT 'legacy', reasoning_effort TEXT);
+            CREATE TABLE messages (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, role TEXT NOT NULL, content TEXT NOT NULL, created_at INTEGER NOT NULL);")
+            .execute(&pool).await.unwrap();
+        let (session, message) = dispatch_identity("synthetic-key");
+        let first = materialize_session_and_first_message(&pool, &session, "project", "/synthetic", "model", "model", "fixed", &message, "synthetic task", 1).await.unwrap();
+        let again = materialize_session_and_first_message(&pool, &session, "project", "/synthetic", "model", "model", "fixed", &message, "synthetic task", 2).await.unwrap();
+        assert_eq!(first.id, again.id);
+        let counts: (i64, i64) = sqlx::query_as("SELECT (SELECT COUNT(*) FROM sessions), (SELECT COUNT(*) FROM messages)").fetch_one(&pool).await.unwrap();
+        assert_eq!(counts, (1, 1), "a retry must not duplicate the session or its first message");
+        let mismatch = materialize_session_and_first_message(&pool, &session, "project", "/synthetic", "model", "model", "fixed", &message, "different task", 3).await;
+        assert!(mismatch.is_err(), "one key must not silently deduplicate unrelated work");
+    }
 }
