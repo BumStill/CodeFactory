@@ -10,7 +10,7 @@
 ## Spec Amendment（尚未裁决，不冒称全部验收完成）
 1. R6“所有失败路径回收租约”与 R2 重连、R4 登录后自动继续及仓库已有会话保留回归存在冲突：建议只回收失败创建/显式关闭/任务结束/TTL，临时读取错误保留租约。当前实现延续既有行为，等待编排方审查。
 2. Chrome 是否安装扩展无法从“准备好的扩展目录”得知：当前无握手证据时返回 EXTENSION_NOT_PAIRED，而非虚构 EXTENSION_NOT_INSTALLED。建议允许未知安装状态；没有修改原始规格含义。
-3. captureVisibleTab 需要 `<all_urls>` 权限（真 Chrome 实测原 http/https 匹配失败）；仅捕获已活动 HTTP(S) 标签，拒绝后台/内部页，截图前后核对标签。README 已披露权限。
+3. 截图权限修订：原 `<all_urls>` 方案违反既有 host 范围安全测试，已撤回；改为 HTTP(S) host + 用户主动调用扩展后临时授予的 `activeTab`。此前真 Chrome 截图通过仅证明旧权限版本，不能作为当前权限版本的截图成功证据；当前真实权限/截图链路待复验。
 
 ## Harnesses / AI Collaboration
 - Spec：原文位于 docs/specs/feature-specs/m194-attached-browser-reliability.md；只实现 R1–R6。
