@@ -2119,3 +2119,121 @@ mod tests {
         );
     }
 }
+
+// --- M200/R2: durable acceptance receipt for a dispatched turn ------------
+//
+// The dispatch bridge used to answer "已开始" as soon as the request was
+// accepted, so a turn that never actually queued anything (row not persisted,
+// wake not scheduled) still looked delivered to the caller. The receipt below
+// is only produced from persisted state: an exact user row in the target
+// session, plus whatever the wake/turn tables really hold.
+
+/// M200/R2: only an exact persisted user row is an acceptance receipt.
+#[derive(Debug, serde::Serialize)]
+pub struct DurableDispatchReceipt {
+    pub session_id: String,
+    pub root_turn_id: String,
+    pub status: &'static str,
+    pub next_at: Option<i64>,
+    pub turn_exists: bool,
+}
+
+pub(crate) async fn load_delivery_receipt(
+    db: &sqlx::SqlitePool,
+    session: &str,
+    root: &str,
+    message: &str,
+) -> Result<Option<DurableDispatchReceipt>, crate::errors::AppError> {
+    let persisted: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM messages WHERE id=? AND session_id=? AND role='user' AND content=?",
+    )
+    .bind(root)
+    .bind(session)
+    .bind(message)
+    .fetch_one(db)
+    .await?;
+    if persisted == 0 {
+        return Ok(None);
+    }
+    super::background_tasks::ensure_wake_schema(db).await?;
+    let next_at: Option<i64> = sqlx::query_scalar(
+        "SELECT next_at FROM wakeup_schedules WHERE id=? AND session_id=? AND root_turn_id=? AND status='pending'",
+    )
+    .bind(format!("model-availability-{session}"))
+    .bind(session)
+    .bind(root)
+    .fetch_optional(db)
+    .await?;
+    let turn_exists: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM chat_turn_state WHERE root_turn_id=? AND session_id=?")
+            .bind(root)
+            .bind(session)
+            .fetch_one(db)
+            .await?;
+    Ok(Some(DurableDispatchReceipt {
+        session_id: session.into(),
+        root_turn_id: root.into(),
+        status: if next_at.is_some() {
+            "queued_waiting_model"
+        } else {
+            "started"
+        },
+        next_at,
+        turn_exists: turn_exists > 0,
+    }))
+}
+
+#[tauri::command]
+pub async fn dispatch_delivery_receipt(
+    state: tauri::State<'_, crate::AppState>,
+    session_id: String,
+    root_turn_id: String,
+    message: String,
+) -> Result<Option<DurableDispatchReceipt>, crate::errors::AppError> {
+    let db = state.db.read().await.clone();
+    load_delivery_receipt(&db, &session_id, &root_turn_id, &message).await
+}
+
+#[cfg(test)]
+mod m200_receipt_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn m200_receipt_requires_the_exact_persisted_row_and_reports_a_pending_model_wake() {
+        let db = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        super::super::background_tasks::ensure_wake_schema(&db)
+            .await
+            .unwrap();
+        sqlx::raw_sql(
+            "CREATE TABLE messages (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, role TEXT NOT NULL, content TEXT NOT NULL);
+            CREATE TABLE chat_turn_state (root_turn_id TEXT PRIMARY KEY, session_id TEXT NOT NULL);
+            INSERT INTO messages VALUES ('root-1','synthetic','user','synthetic task');
+            INSERT INTO chat_turn_state VALUES ('root-1','synthetic');
+            INSERT INTO wakeup_schedules (id,session_id,root_turn_id,prompt,source,next_at,status,created_at)
+              VALUES ('model-availability-synthetic','synthetic','root-1','retry','model_availability',2000000000,'pending',1);",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        let receipt = load_delivery_receipt(&db, "synthetic", "root-1", "synthetic task")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (receipt.status, receipt.next_at, receipt.turn_exists),
+            ("queued_waiting_model", Some(2000000000), true)
+        );
+        assert!(load_delivery_receipt(&db, "synthetic", "root-1", "different task")
+            .await
+            .unwrap()
+            .is_none());
+        assert!(load_delivery_receipt(&db, "other", "root-1", "synthetic task")
+            .await
+            .unwrap()
+            .is_none());
+    }
+}

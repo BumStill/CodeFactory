@@ -74,6 +74,7 @@ export interface DispatchApproval {
  */
 export interface DispatchHandlers {
   createAndSend: (input: {
+    clientRequestId?: string;
     project: string;
     message: string;
     model?: string;
@@ -181,6 +182,7 @@ export async function applyDispatchRequest(
     switch (event.operation) {
       case "create_and_send":
         result = await handlers.createAndSend({
+          ...(body.client_request_id === undefined ? {} : { clientRequestId: requiredString(body.client_request_id, "client_request_id") }),
           project: requiredString(body.project, "project"),
           message: requiredString(body.message, "message"),
           model: optionalString(body.model, "model"),
