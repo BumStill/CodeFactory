@@ -40,7 +40,7 @@ not live。真机验收由编排方发版后完成：安装新版本，启动核
 
 Spec Amendment: 无。
 
-Scenario-Test: HLT-004, RTE-005
+Scenario-Test: HLT-001, HLT-004, RTE-005
 README-Update: reviewed
 README-Update-Reason: 内部持久收尾状态修复，无新增公共能力、安装、隐私或平台承诺。
 
