@@ -988,6 +988,7 @@ async fn assert_one_visible_interrupt_notice(
 }
 
 async fn verify_liveness_after_restart(pool: &SqlitePool) -> anyhow::Result<()> {
+    super::thin_restart::capture_restart_interruptions(pool).await?;
     // M188: a pre-restart running oracle needs a real current-process owner;
     // durable rows seeded by the exited worker are not execution evidence.
     for session in [LIVENESS_MIDTURN_SESSION, LIVENESS_STREAMING_SESSION] {
