@@ -11,6 +11,8 @@ import { invoke } from "../lib/tauri";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { ImagePreview } from "./ImagePreview";
 import { ComposerControlBar } from "./ComposerControlBar";
+import { MessageFileArtifactCard } from "./MessageFileArtifactCard";
+import { attachmentLink, attachmentType, formatAttachmentSize } from "./attachmentPresentation";
 
 interface SkillSlashCommand {
   name: string;
@@ -30,8 +32,7 @@ interface AttachmentChip {
 }
 
 const IMAGE_EXTS = ["png", "jpg", "jpeg", "gif", "webp"];
-const DOC_EXTS = ["pptx", "docx", "pdf", "xlsx"];
-const ACCEPT_ATTR = [...IMAGE_EXTS, ...DOC_EXTS].map((e) => `.${e}`).join(",");
+const ACCEPT_ATTR = "*/*";
 const MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024;
 
 function extOf(name: string): string {
@@ -47,9 +48,7 @@ function attachmentImageSrc(path: string): string {
 }
 
 function attachmentImageMarkdown(name: string, path: string): string {
-  const url = path.startsWith("file://") ? path : `file://${path}`;
-  const destination = /\s/.test(url) ? `<${url}>` : url;
-  return `![${name}](${destination})`;
+  return attachmentLink(name, path, true);
 }
 
 interface Props {
@@ -122,7 +121,8 @@ export const MessageInput = forwardRef<MessageInputHandle, Props>(function Messa
   const [value, setValue] = useState("");
   const ref = useRef<HTMLTextAreaElement>(null);
   const [attachments, setAttachments] = useState<AttachmentChip[]>([]);
-  const [uploading, setUploading] = useState(false);
+  const [pendingUploads, setPendingUploads] = useState(0);
+  const uploading = pendingUploads > 0;
   const [dragOver, setDragOver] = useState(false);
   const [attachError, setAttachError] = useState<string | null>(null);
   const [guidanceState, setGuidanceState] = useState<
@@ -152,8 +152,12 @@ export const MessageInput = forwardRef<MessageInputHandle, Props>(function Messa
   // is appended at SEND time, not now, so chips can be removed without
   // hunting through the textarea content.
   const saveAttachmentFile = async (file: File): Promise<void> => {
-    setUploading(true);
-    setAttachError(null);
+    if (file.size > MAX_ATTACHMENT_BYTES) {
+      setAttachError((prev) => [prev, `${file.name} 超过 25MB 上限，已跳过`].filter(Boolean).join("\n"));
+      return;
+    }
+    const filename = file.name || `粘贴图片-${Date.now()}-${crypto.randomUUID().slice(0, 8)}.${file.type.split("/")[1]?.replace("jpeg", "jpg") || "png"}`;
+    setPendingUploads((n) => n + 1);
     try {
       const buf = await file.arrayBuffer();
       // Browser-safe base64 of binary data.
@@ -166,42 +170,59 @@ export const MessageInput = forwardRef<MessageInputHandle, Props>(function Messa
       const b64 = btoa(binary);
       const saved = await invoke<AttachmentChip & { size_bytes: number }>(
         "save_session_attachment",
-        { cwd: cwd ?? null, sessionId: sessionId ?? null, filename: file.name || "pasted.png", dataBase64: b64 },
+        { cwd: cwd ?? null, sessionId: sessionId ?? null, filename, dataBase64: b64 },
       );
       // Display the original filename (the on-disk name is a uuid); the
       // original name's extension is what tells images from documents.
       setAttachments((prev) => [
         ...prev,
-        { id: crypto.randomUUID(), path: saved.path, name: file.name || saved.name, sizeBytes: saved.size_bytes },
+        { id: crypto.randomUUID(), path: saved.path, name: filename, sizeBytes: saved.size_bytes },
       ]);
     } catch (e) {
-      setAttachError(String(e));
+      setAttachError((prev) => [prev, `${filename} 保存失败：${String(e)}`].filter(Boolean).join("\n"));
     } finally {
-      setUploading(false);
+      setPendingUploads((n) => n - 1);
     }
   };
 
-  const onPaste = (e: ClipboardEvent<HTMLTextAreaElement>) => {
-    const items = e.clipboardData?.items;
-    if (!items) return;
-    for (const item of Array.from(items)) {
-      if (item.kind === "file" && item.type.startsWith("image/")) {
-        e.preventDefault();
-        const file = item.getAsFile();
-        if (file) void saveAttachmentFile(file);
-        return;
+  const pasteNativeAttachments = async () => {
+    setPendingUploads((n) => n + 1);
+    try {
+      const saved = await invoke<{ path: string; name: string; size_bytes: number; error?: string }[]>(
+        "paste_session_attachments", { cwd: cwd ?? null, sessionId: sessionId ?? null },
+      );
+      for (const item of saved ?? []) {
+        if (item.error) setAttachError((prev) => [prev, item.error].filter(Boolean).join("\n"));
+        else setAttachments((prev) => [...prev, { id: crypto.randomUUID(), path: item.path, name: item.name, sizeBytes: item.size_bytes }]);
       }
+    } catch (e) {
+      setAttachError((prev) => [prev, `剪贴板附件读取失败：${String(e)}`].filter(Boolean).join("\n"));
+    } finally {
+      setPendingUploads((n) => n - 1);
     }
   };
 
   const enqueueFiles = (files: File[]) => {
-    for (const f of files) {
-      // Cap per-file to avoid choking the IPC bridge on huge drops.
-      if (f.size > MAX_ATTACHMENT_BYTES) {
-        setAttachError(`${f.name} 超过 25MB 上限，已跳过`);
-        continue;
+    for (const file of files) void saveAttachmentFile(file);
+  };
+
+  const onPaste = (e: ClipboardEvent<HTMLTextAreaElement>) => {
+    const data = e.clipboardData;
+    if (!data) return;
+    const files = Array.from(data.files ?? []);
+    if (!files.length) {
+      for (const item of Array.from(data.items ?? [])) {
+        if (item.kind !== "file") continue;
+        const file = item.getAsFile();
+        if (file) files.push(file);
       }
-      void saveAttachmentFile(f);
+    }
+    // Do not preventDefault: browser inserts the text portion of mixed content.
+    if (files.length) enqueueFiles(files);
+    else {
+      const text = data.getData?.("text/plain") ?? "";
+      const hasTextItem = Array.from(data.items ?? []).some((item) => item.kind === "string" && item.type === "text/plain");
+      if ((!text && !hasTextItem) || /^(file:\/\/|\/|[A-Za-z]:[\\/])/.test(text.trim())) void pasteNativeAttachments();
     }
   };
 
@@ -241,6 +262,7 @@ export const MessageInput = forwardRef<MessageInputHandle, Props>(function Messa
   const commandCandidate = parseSlashCommand(value.trim());
 
   const submit = async ({ forceQueue = false }: { forceQueue?: boolean } = {}) => {
+    if (uploading) return;
     // 真实 DOM 值优先:粘贴、无障碍写值、菜单栏剪贴板发送都不经过 React 的
     // onChange,state 可能落后于用户眼前看到的内容。
     const text = readComposerText(ref.current, value);
@@ -290,7 +312,7 @@ export const MessageInput = forwardRef<MessageInputHandle, Props>(function Messa
       const docs = attachments.filter((a) => !isImageAttachment(a.name));
       for (const a of images) blocks.push(attachmentImageMarkdown(a.name, a.path));
       if (docs.length > 0) {
-        const lines = docs.map((a) => `- ${a.name} — 本地路径: ${a.path}`).join("\n");
+        const lines = docs.map((a) => `- ${attachmentLink(a.name, a.path)} (${formatAttachmentSize(a.sizeBytes)}) — 本地路径: ${a.path}`).join("\n");
         blocks.push(
           `已上传以下文件（.pptx 用 read_pptx 读结构后：edit_pptx 原地增强内容、format_pptx 统一美化排版；.xlsx 用 read_xlsx 读成表格、edit_xlsx 把结果写回单元格（如逐行总结到某列）；要总结/演讲稿就读取后在聊天框回答或 write_docx 生成。.docx/.pdf 用 read_file 提取文本）：\n${lines}`,
         );
@@ -451,17 +473,17 @@ export const MessageInput = forwardRef<MessageInputHandle, Props>(function Messa
               <figure
                 key={a.id}
                 className="group relative overflow-hidden rounded-xl border border-border bg-surface-3 p-1 shadow-sm"
-                title={a.path}
+                title={a.name}
               >
                 <ImagePreview
                   src={attachmentImageSrc(a.path)}
                   alt={a.name}
                   thumbnailClassName="block h-20 w-28 rounded-lg bg-surface-2 object-cover transition-opacity hover:opacity-90"
-                  title={a.path}
+                  title={`${a.name} · ${formatAttachmentSize(a.sizeBytes)}`}
                 />
                 <figcaption className="mt-1 flex max-w-28 items-center gap-1 text-caption text-gray-400">
-                  <span className="truncate">{a.name}</span>
-                  <span className="shrink-0 text-gray-600">{(a.sizeBytes / 1024).toFixed(0)}KB</span>
+                  <span className="truncate" title={a.name}>{a.name}</span>
+                  <span className="shrink-0 text-gray-600">{attachmentType(a.name)} · {formatAttachmentSize(a.sizeBytes)}</span>
                 </figcaption>
                 <button
                   type="button"
@@ -476,14 +498,10 @@ export const MessageInput = forwardRef<MessageInputHandle, Props>(function Messa
             ) : (
               <span
                 key={a.id}
-                className="inline-flex min-h-8 items-center gap-1.5 rounded-full border border-border bg-surface-3 px-2.5 text-note text-gray-300"
+                className="inline-flex min-h-8 min-w-0 max-w-full items-center gap-1.5 rounded-full border border-border bg-surface-3 px-2.5 text-note text-gray-300"
                 title={a.path}
               >
-                <Paperclip size={14} className="text-accent" />
-                <span className="max-w-[160px] truncate">{a.name}</span>
-                <span className="text-caption text-gray-600">
-                  {(a.sizeBytes / 1024).toFixed(0)}KB
-                </span>
+                <MessageFileArtifactCard path={a.path} name={a.name} sizeBytes={a.sizeBytes} cwd={cwd} sessionId={sessionId} compact />
                 <button
                   type="button"
                   onClick={() => removeAttachment(a.id)}
@@ -502,7 +520,10 @@ export const MessageInput = forwardRef<MessageInputHandle, Props>(function Messa
             </span>
           )}
           {attachError && (
-            <span className="text-note text-status-danger">{attachError}</span>
+            <span role="alert" className="inline-flex items-center gap-1 whitespace-pre-line text-note text-status-danger">
+              {attachError}
+              <button type="button" aria-label="移除附件错误" onClick={() => setAttachError(null)} className="rounded p-2 hover:bg-status-danger-soft"><X size={14} /></button>
+            </span>
           )}
         </div>
       )}

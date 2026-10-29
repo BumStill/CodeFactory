@@ -21,6 +21,9 @@ export function ImagePreview({
   title,
 }: ImagePreviewProps) {
   const [open, setOpen] = useState(false);
+  const [failed, setFailed] = useState(false);
+  useEffect(() => { setFailed(false); }, [src]);
+  const imageError = () => { setFailed(true); onError?.(); };
 
   useEffect(() => {
     if (!open) return;
@@ -30,6 +33,8 @@ export function ImagePreview({
     document.addEventListener("keydown", onKeyDown);
     return () => document.removeEventListener("keydown", onKeyDown);
   }, [open]);
+
+  if (failed) return <span role="status" className="inline-block max-w-full rounded border border-border p-2 text-caption text-gray-500" title={alt}>图片无法预览，文件可能已被删除或格式不受支持：{alt}</span>;
 
   return (
     <>
@@ -45,7 +50,7 @@ export function ImagePreview({
           alt={alt}
           className={thumbnailClassName}
           loading="lazy"
-          onError={onError}
+          onError={imageError}
         />
         {caption && <span className="mt-1 block text-caption text-gray-500">{caption}</span>}
       </button>
@@ -77,9 +82,10 @@ export function ImagePreview({
             <img
               src={src}
               alt={alt}
+              onError={imageError}
               className="max-h-[85vh] max-w-[92vw] rounded-xl border border-white/20 bg-surface-2 object-contain shadow-2xl"
             />
-            <figcaption className="max-w-[92vw] truncate rounded-full bg-black/50 px-3 py-1 text-label text-white/80">
+            <figcaption title={caption ?? alt} className="max-w-[92vw] truncate rounded-full bg-black/50 px-3 py-1 text-label text-white/80">
               {caption ?? alt}
             </figcaption>
           </figure>

@@ -3,7 +3,9 @@
 // legacy card's extension rules but routes every open through the controlled
 // native link command, so a missing file surfaces a toast instead of nothing.
 import { Copy, ExternalLink, FileText, Eye } from "lucide-react";
-import { useContext } from "react";
+import { useContext, useEffect, useState } from "react";
+import { invoke } from "../lib/tauri";
+import { formatAttachmentSize } from "./attachmentPresentation";
 import { FileLinkScope, openFileLinkVisible, resolveLocalPath } from "./MessageFileLinks";
 
 export { isDocumentPath } from "./FileArtifactCard";
@@ -19,18 +21,33 @@ function extension(path: string): string {
 
 interface Props {
   path: string;
+  name?: string;
+  sizeBytes?: number;
   cwd?: string | null;
   sessionId?: string | null;
   onPreview?: (path: string) => void;
   compact?: boolean;
 }
 
-export function MessageFileArtifactCard({ path, cwd, sessionId, onPreview, compact = false }: Props) {
+export function MessageFileArtifactCard({ path, name: originalName, sizeBytes, cwd, sessionId, onPreview, compact = false }: Props) {
   const scope = useContext(FileLinkScope);
   cwd = cwd ?? scope.cwd;
   sessionId = sessionId ?? scope.sessionId;
   const resolved = resolveLocalPath(cwd, path);
-  const name = basename(path);
+  const name = originalName ?? basename(path);
+  const [metadata, setMetadata] = useState<{ size_bytes: number } | null>(null);
+  const [missing, setMissing] = useState(false);
+  useEffect(() => {
+    let active = true;
+    setMetadata(null); setMissing(false);
+    if (typeof window !== "undefined" && "__TAURI_INTERNALS__" in window) {
+      void invoke<{ size_bytes: number } | null>("attachment_metadata", { path: resolved })
+        .then((data) => { if (active) setMetadata(data); })
+        .catch(() => { if (active) setMissing(true); });
+    }
+    return () => { active = false; };
+  }, [resolved]);
+  const displaySize = metadata?.size_bytes ?? sizeBytes;
   const handleOpen = () => {
     openFileLinkVisible(path, cwd, sessionId);
   };
@@ -40,10 +57,12 @@ export function MessageFileArtifactCard({ path, cwd, sessionId, onPreview, compa
   return (
     <span className={`my-2 inline-flex max-w-full items-center gap-2 rounded-lg border border-border bg-surface-1 align-middle ${compact ? "px-2 py-1" : "px-2.5 py-2"}`}>
       <FileText size={compact ? 12 : 14} className="shrink-0 text-status-info" aria-hidden="true" />
-      <span className="min-w-0">
+      <span className="min-w-0 flex-1">
         <span className="flex items-center gap-1.5 text-label font-medium text-gray-200">
-          <span className="truncate" title={resolved}>{name}</span>
-          <span className="shrink-0 rounded bg-surface-3 px-1 text-caption text-gray-500">{extension(path)}</span>
+          <span className="truncate" title={name}>{name}</span>
+          <span className="shrink-0 rounded bg-surface-3 px-1 text-caption text-gray-500">{extension(name)}</span>
+          {displaySize !== undefined && <span className="shrink-0 text-caption text-gray-500">{formatAttachmentSize(displaySize)}</span>}
+          {missing && <span role="status" className="text-caption text-status-danger">文件已删除或无法访问</span>}
         </span>
         {!compact && <span className="block max-w-[32ch] truncate font-mono text-caption text-gray-500" title={resolved}>{path}</span>}
       </span>

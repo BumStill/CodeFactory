@@ -246,8 +246,8 @@
       "category": "content_rendering",
       "priority": "P1",
       "source_kind": "product_contract",
-      "change_patterns": ["src/components/*Image*.tsx", "src/components/*Attachment*.tsx"],
-      "automated_by": ["pnpm:test:image-preview:headless"],
+      "change_patterns": ["src/components/*Image*.tsx", "src/components/*Attachment*.tsx", "src/components/attachmentPresentation.ts", "src-tauri/src/clipboard_attachments.rs", "src/acceptance/paste-attachments.tsx", "scripts/verify-paste-attachments-headless.mjs", "paste-attachments-acceptance.html"],
+      "automated_by": ["pnpm:test:image-preview:headless", "path:src/components/MessageInput.paste.test.tsx", "path:src/components/MessageAttachmentMatrix.test.tsx", "rust:m190_clipboard_limits_and_file_list"],
       "required_evidence": ["L0", "L3"],
       "gates": ["pull_request", "manual_canary"]
     },
