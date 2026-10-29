@@ -651,7 +651,15 @@ pub(crate) async fn reconcile_orphan_turns(db: &SqlitePool) -> sqlx::Result<u64>
     let mut retired = 0;
     let mut orphaned = Vec::new();
     let has_interruptions = has_table(db, "thin_restart_interruptions").await?;
+    let has_wakes = has_table(db, "wakeup_schedules").await?;
     for (root, session, revision) in rows {
+        // M200/R1: a durable wake owns the interrupted root after the restart
+        // claim has been consumed. A cached waiting state alone is not evidence.
+        if has_wakes {
+            let pending: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM wakeup_schedules WHERE session_id=? AND root_turn_id=? AND status='pending'")
+                .bind(&session).bind(&root).fetch_one(db).await?;
+            if pending > 0 { continue; }
+        }
         if has_interruptions {
             let interrupted: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM thin_restart_interruptions WHERE root_turn_id=?")
                 .bind(&root).fetch_one(db).await?;
