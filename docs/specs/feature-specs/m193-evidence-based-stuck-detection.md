@@ -20,7 +20,7 @@ OpenHands 的 `StuckDetector` 早已说明该用「循环证据」而不是「�
 
 | Req | 需求 | 实现位置 |
 | --- | --- | --- |
-| R1 | 卡住判据基于证据：同一调用同一结果重复、同一调用连续错误、A/B 交替循环、长时间无新证据（阈值默认 12，可配置，配置表示「连续多少次调用没有新证据」而不是固定调用次数） | `src-tauri/crates/agent-loop/src/stuck_detector.rs`；`RunConfig::stuck_no_progress_limit` |
+| R1 | 卡住判据基于证据：同一调用同一结果重复、同一调用连续错误、A/B 交替循环、长时间无新证据（阈值默认 12，可配置，配置表示「连续多少次调用没有新证据」而不是固定调用次数） | `src-tauri/crates/agent-loop/src/stuck_detector.rs`；`RunConfig::tool_amplification_threshold` |
 | R2 | 正常长任务不得被警示：40+ 步且每步都有新证据时不产生任何提示 | `run::tests::long_task_with_fresh_evidence_gets_no_convergence_signal`、`resumed_tool_call_counts_never_produce_a_convergence_notice`、`stuck_detector::tests::long_task_with_fresh_evidence_never_trips` |
 | R3 | 警示不上屏：不落库 `turn_notice`、不发 `CompletionGateAction{kind:"warning"}`、不作为 `user` 消息插入；提示只追加在工具结果通道（`【卡住信号】` 前缀），内容为「已观察到的卡住事实 + 最少收敛动作（按 TurnCapability：只读检查/实施验证/交付）」 | `run.rs` 批次末尾的观察钩子；`StuckSignal::hint` |
 | R4 | 回归不被削弱：既有卡死场景仍然触发（重复读同一文件、反复失败的原样重试、A/B 循环） | `stuck_detector` 9 个单元测试 + `repeated_identical_tool_calls_get_a_hidden_stuck_hint` |

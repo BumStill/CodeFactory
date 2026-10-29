@@ -307,7 +307,12 @@ pub struct RunConfig {
     ///
     /// 这里**不再是固定次数阈值**：调用次数本身不构成提示理由，正常的 40+
     /// 步长任务不会再被打断；只有可观察的循环特征才算卡住。
-    pub stuck_no_progress_limit: Option<usize>,
+    ///
+    /// 字段名沿用旧标识符 `tool_amplification_threshold`：`RunConfig` 用结构体
+    /// 字面量构造，改名会波及 `agent-headless`、`delivery_scenario_repair` 等
+    /// 未被 `scenario-registry.json` 的 `change_patterns` 覆盖的产品文件，而该
+    /// 注册表属于逐字节 trust root，普通 PR 不得自改。语义以本节注释为准。
+    pub tool_amplification_threshold: Option<usize>,
     // Usage-attribution identity + working dir (all constant for the run).
     pub session_id: String,
     pub endpoint_name: String,
@@ -907,7 +912,7 @@ pub async fn run_agent_loop(
         replay_rejected_draft,
         tool_heartbeat_interval,
         long_tool_wait_threshold,
-        stuck_no_progress_limit,
+        tool_amplification_threshold,
         session_id,
         endpoint_name,
         model_id,
@@ -999,7 +1004,7 @@ pub async fn run_agent_loop(
     let mut stalled_chat_segments = 0_u32;
     // M193：收敛提示只由「卡住的证据」触发（见 `stuck_detector`），不再按固定
     // 工具调用次数触发。
-    let mut stuck_detector = match stuck_no_progress_limit {
+    let mut stuck_detector = match tool_amplification_threshold {
         Some(limit) if limit > 0 => Some(crate::stuck_detector::StuckDetector::new(limit)),
         _ => None,
     };
@@ -4468,7 +4473,7 @@ mod tests {
             replay_rejected_draft: false,
             tool_heartbeat_interval: None,
             long_tool_wait_threshold: std::time::Duration::from_secs(60),
-            stuck_no_progress_limit: None,
+            tool_amplification_threshold: None,
             session_id: "session".into(),
             endpoint_name: "test".into(),
             model_id: "model".into(),
@@ -5725,7 +5730,7 @@ mod tests {
         let events = Arc::new(CollectingEventSink::new());
         let mut cfg = config();
         cfg.turn_capability = TurnCapability::ReviewOnly;
-        cfg.stuck_no_progress_limit = Some(40);
+        cfg.tool_amplification_threshold = Some(40);
         let mut svc = services(transport.clone(), persistence.clone(), events.clone());
         // 每一步读到的文件都不同——这才是「正常的长任务」：有 41 步，但每步都有新证据。
         svc.tools = Arc::new(PerCallTools);
@@ -5803,7 +5808,7 @@ mod tests {
         let events = Arc::new(CollectingEventSink::new());
         let mut cfg = config();
         cfg.turn_capability = TurnCapability::ReviewOnly;
-        cfg.stuck_no_progress_limit = Some(40);
+        cfg.tool_amplification_threshold = Some(40);
 
         run_agent_loop(
             inputs(),
@@ -5875,7 +5880,7 @@ mod tests {
             response("完成", vec![], 1),
         ]));
         let mut cfg = config();
-        cfg.stuck_no_progress_limit = Some(40);
+        cfg.tool_amplification_threshold = Some(40);
 
         run_agent_loop(
             inputs(),
@@ -7163,7 +7168,7 @@ mod tests {
             replay_rejected_draft: false,
             tool_heartbeat_interval: Some(std::time::Duration::from_secs(30)),
             long_tool_wait_threshold: std::time::Duration::from_secs(60),
-            stuck_no_progress_limit: Some(40),
+            tool_amplification_threshold: Some(40),
             session_id: session_id.clone(),
             endpoint_name: endpoint_name.clone(),
             model_id: model_id.clone(),
@@ -7193,7 +7198,7 @@ mod tests {
             replay_rejected_draft: true,
             tool_heartbeat_interval: None,
             long_tool_wait_threshold: std::time::Duration::from_secs(60),
-            stuck_no_progress_limit: None,
+            tool_amplification_threshold: None,
             session_id,
             endpoint_name,
             model_id,

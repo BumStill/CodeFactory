@@ -3429,7 +3429,7 @@ mod tests {
             replay_rejected_draft: false,
             tool_heartbeat_interval: None,
             long_tool_wait_threshold: std::time::Duration::from_secs(60),
-            stuck_no_progress_limit: None,
+            tool_amplification_threshold: None,
             session_id: "session-context-loop".into(),
             endpoint_name: "test".into(),
             model_id: "model".into(),
