@@ -411,8 +411,8 @@
       "category": "capability_usage",
       "priority": "P1",
       "source_kind": "incident_shape",
-      "change_patterns": ["src-tauri/src/tools/web_fetch.rs", "src-tauri/src/tools/fixtures/web-fetch*.html"],
-      "automated_by": ["rust:m131c_tag_prefixes_do_not_consume_unrelated_elements", "rust:literal_local_hosts_are_rejected_without_any_dns_lookup", "rust:ordinary_domains_are_not_ruled_out_by_address_guessing"],
+      "change_patterns": ["src-tauri/src/tools/web_fetch.rs", "src-tauri/src/tools/web_fetch_net.rs", "src-tauri/src/tools/web_fetch_pac.rs", "src-tauri/src/tools/web_fetch_block.rs", "src-tauri/src/tools/fixtures/web-fetch*.html"],
+      "automated_by": ["rust:m131c_tag_prefixes_do_not_consume_unrelated_elements", "rust:literal_local_hosts_are_rejected_without_any_dns_lookup", "rust:ordinary_domains_are_not_ruled_out_by_address_guessing", "rust:m195_pac_routes_public_hosts_through_the_proxy", "rust:m195_environment_beats_the_system_pac", "rust:m195_gateway_interstitial_is_reported_as_a_network_policy_block", "rust:m195_redirect_to_a_gateway_host_is_reported_as_a_block"],
       "required_evidence": ["L0", "L1"],
       "gates": ["pull_request"]
     },

@@ -99,7 +99,7 @@ pub(crate) async fn execute_with(args: Value, fetch: FetchContext) -> Result<Too
     let start = args.start.unwrap_or(0);
     let client = match fetch.client {
         Some(client) => client,
-        None => default_client()?,
+        None => client_for_route(&url).await?,
     };
 
     let response = match client
@@ -131,23 +131,6 @@ pub(crate) async fn execute_with(args: Value, fetch: FetchContext) -> Result<Too
         .unwrap_or("")
         .to_string();
 
-    if matches!(status.as_u16(), 401 | 403) {
-        return Ok(ToolOutput::err(format!(
-            "web_fetch got HTTP {code} for {final_url} — this page needs a sign-in or refuses non-browser clients.\n\
-             Use the `browser_session` tool instead: action=\"attach\" (the user's own session) or \"open\" with \
-             url=\"{final_url}\", then action=\"read\". web_fetch sends no cookies and no credentials.\n\
-             Do not retry web_fetch on this URL.",
-            code = status.as_u16()
-        )));
-    }
-    if !status.is_success() {
-        return Ok(ToolOutput::err(format!(
-            "web_fetch got HTTP {} {}\nFinal URL: {final_url}",
-            status.as_u16(),
-            status.canonical_reason().unwrap_or("").trim()
-        )));
-    }
-
     let (bytes, truncated) = read_capped(response).await?;
     let (title, body, js_only) = match classify(&content_type, &bytes) {
         Kind::Pdf => (None, crate::knowledge::pdf_text_from_bytes(&bytes), false),
@@ -174,6 +157,43 @@ pub(crate) async fn execute_with(args: Value, fetch: FetchContext) -> Result<Too
         }
     };
     let body = tidy(&body);
+
+    // M195 R2 — a filtered corporate network answers with the gateway's own
+    // page, usually `200 OK`. Reporting that as content would tell the model
+    // the site says "blocked by your network's security policy".
+    if let Some(block) = crate::tools::web_fetch_block::detect(
+        &url,
+        &final_url,
+        status.as_u16(),
+        title.as_deref(),
+        &body,
+    ) {
+        return Ok(ToolOutput::err(crate::tools::web_fetch_block::message(&block)));
+    }
+
+    if status.as_u16() == 407 {
+        return Ok(ToolOutput::err(format!(
+            "web_fetch got HTTP 407 Proxy Authentication Required for {url} — this machine's proxy requires \
+             authentication (NTLM/Kerberos), which web_fetch does not implement.\n\
+             Ask the user to open the page themselves; do not retry web_fetch on this URL."
+        )));
+    }
+    if matches!(status.as_u16(), 401 | 403) {
+        return Ok(ToolOutput::err(format!(
+            "web_fetch got HTTP {code} for {final_url} — this page needs a sign-in or refuses non-browser clients.\n\
+             Use the `browser_session` tool instead: action=\"attach\" (the user's own session) or \"open\" with \
+             url=\"{final_url}\", then action=\"read\". web_fetch sends no cookies and no credentials.\n\
+             Do not retry web_fetch on this URL.",
+            code = status.as_u16()
+        )));
+    }
+    if !status.is_success() {
+        return Ok(ToolOutput::err(format!(
+            "web_fetch got HTTP {} {}\nFinal URL: {final_url}",
+            status.as_u16(),
+            status.canonical_reason().unwrap_or("").trim()
+        )));
+    }
 
     if js_only || body.trim().is_empty() {
         return Ok(ToolOutput::err(format!(
@@ -245,6 +265,59 @@ fn default_client() -> Result<reqwest::Client> {
         .map_err(|error| {
             AppError::Other(format!("web_fetch could not build an HTTP client: {error}"))
         })
+}
+
+/// M195 — build the client for the route this machine's own configuration
+/// dictates: environment variables first, then the system proxy (fixed, or a
+/// PAC script evaluated per URL), then a direct connection. A proxy this build
+/// cannot use is reported; it is never worked around.
+async fn client_for_route(url: &Url) -> Result<reqwest::Client> {
+    use crate::tools::web_fetch_net::{select_route, Route};
+    let route = select_route(url).await;
+    let builder = || {
+        reqwest::Client::builder()
+            .timeout(REQUEST_TIMEOUT)
+            .redirect(reqwest::redirect::Policy::limited(MAX_REDIRECTS))
+            .user_agent(USER_AGENT)
+    };
+    let built = match route {
+        Route::Environment => builder().build(),
+        Route::Direct { note } => {
+            if let Some(note) = note {
+                tracing::debug!(
+                    target: "codefactory::web_fetch",
+                    "M195: fetching {url} directly ({note})"
+                );
+            }
+            builder().no_proxy().build()
+        }
+        Route::Proxy {
+            url: proxy_url,
+            source,
+        } => {
+            let proxy = reqwest::Proxy::all(&proxy_url).map_err(|error| {
+                AppError::Other(format!(
+                    "web_fetch could not use the proxy `{proxy_url}` from {}: {error}",
+                    source.label()
+                ))
+            })?;
+            tracing::debug!(
+                target: "codefactory::web_fetch",
+                "M195: {url} goes through {proxy_url} from {}",
+                source.label()
+            );
+            builder().proxy(proxy).build()
+        }
+        Route::Unsupported { reason } => {
+            return Err(AppError::Other(format!(
+                "web_fetch cannot honour this machine's proxy configuration: {reason}\n\
+                 It will not fall back to a direct connection, because that would bypass the network policy."
+            )))
+        }
+    };
+    built.map_err(|error| {
+        AppError::Other(format!("web_fetch could not build an HTTP client: {error}"))
+    })
 }
 
 async fn read_capped(mut response: reqwest::Response) -> Result<(Vec<u8>, bool)> {
@@ -887,6 +960,9 @@ mod tests {
             // and fail every case with 502 instead of reaching this server.
             .no_proxy()
             .resolve("fixture.test", addr)
+            // M195: a gateway interstitial is served from a different host than
+            // the one that was requested, so the fixture must answer for both.
+            .resolve("gw.fixture.test", addr)
             .build()
             .expect("test client");
         (addr, client)
@@ -1384,6 +1460,135 @@ and why a single HTTP GET beats launching a browser for a page that is already s
         assert!(
             out.content.contains("\n  \"b\": 1"),
             "not pretty printed: {}",
+            out.content
+        );
+    }
+
+    // --------------------------------------- M195: gateway block pages (R2/R3)
+
+    /// A Chinese corporate gateway interstitial, served with `200 OK` — exactly
+    /// what the user's Windows session received from the company network.
+    const BLOCK_PAGE: &str = r#"<!doctype html>
+<html><head><title>安全风险提示</title></head>
+<body>
+  <h1>安全风险提示</h1>
+  <p>根据公司网络安全策略，您访问的网站存在安全风险，已被拦截。</p>
+  <p>如需继续访问，请联系 IT 服务台。</p>
+</body></html>"#;
+
+    #[tokio::test]
+    async fn m195_gateway_interstitial_is_reported_as_a_network_policy_block() {
+        let response = http_response(
+            "200 OK",
+            &[("Content-Type", "text/html; charset=utf-8")],
+            BLOCK_PAGE.as_bytes(),
+        );
+        let (_addr, client) = fixture(vec![("/blocked", response)]).await;
+        let out = fetch(&client, "http://fixture.test/blocked", json!({})).await;
+
+        assert!(
+            out.is_error,
+            "a gateway page must not be handed back as article content: {}",
+            out.content
+        );
+        assert!(
+            out.content.starts_with("BLOCKED_BY_NETWORK_POLICY"),
+            "{}",
+            out.content
+        );
+        assert!(
+            out.content.contains("http://fixture.test/blocked"),
+            "the requested URL must survive: {}",
+            out.content
+        );
+        assert!(
+            out.content.contains("Gateway host: fixture.test"),
+            "{}",
+            out.content
+        );
+        assert!(
+            !out.content.contains("如需继续访问"),
+            "the gateway's own text must not leak into the model's content: {}",
+            out.content
+        );
+    }
+
+    #[tokio::test]
+    async fn m195_redirect_to_a_gateway_host_is_reported_as_a_block() {
+        const GATEWAY: &str = r#"<html><head><title>Access Denied</title></head>
+<body>The website you are trying to access has been blocked by your organization's security policy.</body></html>"#;
+        let (_addr, client) = fixture(vec![
+            (
+                "/start",
+                http_response(
+                    "302 Found",
+                    &[("Location", "http://gw.fixture.test/block?url=metr.org")],
+                    b"",
+                ),
+            ),
+            (
+                "/block",
+                http_response(
+                    "200 OK",
+                    &[("Content-Type", "text/html; charset=utf-8")],
+                    GATEWAY.as_bytes(),
+                ),
+            ),
+        ])
+        .await;
+        let out = fetch(&client, "http://fixture.test/start", json!({})).await;
+
+        assert!(out.is_error, "{}", out.content);
+        assert!(
+            out.content.starts_with("BLOCKED_BY_NETWORK_POLICY"),
+            "{}",
+            out.content
+        );
+        assert!(
+            out.content.contains("Gateway host: gw.fixture.test"),
+            "{}",
+            out.content
+        );
+        assert!(
+            out.content.contains("http://fixture.test/start"),
+            "the requested URL must be preserved, not the gateway one: {}",
+            out.content
+        );
+    }
+
+    #[tokio::test]
+    async fn m195_proxy_authentication_requirement_is_explained() {
+        let response = http_response(
+            "407 Proxy Authentication Required",
+            &[("Content-Type", "text/html; charset=utf-8")],
+            b"<html><head><title>407</title></head><body>Proxy Authentication Required</body></html>",
+        );
+        let (_addr, client) = fixture(vec![("/any", response)]).await;
+        let out = fetch(&client, "http://fixture.test/any", json!({})).await;
+
+        assert!(out.is_error, "{}", out.content);
+        assert!(out.content.contains("407"), "{}", out.content);
+        assert!(
+            out.content.contains("NTLM"),
+            "the proxy-authentication limit must be stated: {}",
+            out.content
+        );
+    }
+
+    #[tokio::test]
+    async fn m195_ordinary_article_still_reads_as_content() {
+        let response = http_response(
+            "200 OK",
+            &[("Content-Type", "text/html; charset=utf-8")],
+            ARTICLE.as_bytes(),
+        );
+        let (_addr, client) = fixture(vec![("/post", response)]).await;
+        let out = fetch(&client, "http://fixture.test/post", json!({})).await;
+
+        assert!(!out.is_error, "unexpected error: {}", out.content);
+        assert!(
+            out.content.contains("Shipping notes"),
+            "the article must still be readable: {}",
             out.content
         );
     }
