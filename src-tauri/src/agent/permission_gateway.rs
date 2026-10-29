@@ -648,6 +648,7 @@ async fn persist_interruption(
 
 #[cfg(test)]
 mod tests {
+    use crate::util::no_window::NoWindow;
     use std::collections::HashMap;
 
     use sqlx::sqlite::SqlitePoolOptions;
@@ -919,7 +920,7 @@ mod tests {
             assert_eq!(tokio::time::timeout(Duration::from_secs(10), gateway.authorize(&call, &args, Some(command))).await.expect("R5 must not wait"), PermissionOutcome::Allow);
             let after = m159_git(&root, &["for-each-ref", "--format=%(refname)", "refs/codefactory/backup/"]);
             let reference = after.lines().find(|r| !before.lines().any(|old| old == *r)).expect("new snapshot before execution");
-            let output = std::process::Command::new(&shell).current_dir(&root).args(["-c", command]).output().unwrap();
+            let output = std::process::Command::new(&shell).no_window().current_dir(&root).args(["-c", command]).output().unwrap();
             assert!(output.status.success(), "R5[{index}] {command}: {}", String::from_utf8_lossy(&output.stderr));
             assert!(gateway.pending_permissions.lock().await.is_empty(), "R5[{index}]");
             match index {
@@ -951,7 +952,7 @@ mod tests {
         let args = serde_json::json!({"command":command});
         let call = ToolCall { id: "m182-r6-5".into(), r#type: "function".into(), function: FunctionCall { name: "bash".into(), arguments: args.to_string() } };
         assert_eq!(tokio::time::timeout(Duration::from_secs(10), gateway.authorize(&call, &args, Some(&command))).await.expect("owned worktree must not prompt"), PermissionOutcome::Allow);
-        let output = std::process::Command::new(&shell).current_dir(&root).args(["-c", &command]).output().unwrap();
+        let output = std::process::Command::new(&shell).no_window().current_dir(&root).args(["-c", &command]).output().unwrap();
         assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
         assert!(!target.exists());
         assert!(gateway.pending_permissions.lock().await.is_empty());
