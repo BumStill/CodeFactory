@@ -988,6 +988,18 @@ async fn assert_one_visible_interrupt_notice(
 }
 
 async fn verify_liveness_after_restart(pool: &SqlitePool) -> anyhow::Result<()> {
+    super::thin_restart::capture_restart_interruptions(pool).await?;
+    // M188: a pre-restart running oracle needs a real current-process owner;
+    // durable rows seeded by the exited worker are not execution evidence.
+    for session in [LIVENESS_MIDTURN_SESSION, LIVENESS_STREAMING_SESSION] {
+        let control = crate::ChatRunControl::pending();
+        crate::register_session_executor(session, &control);
+        let state = super::thin_derive::refresh(pool, session).await?;
+        crate::unregister_session_executor(session, &control);
+        if state.state != super::thin_state::SessionState::Running {
+            bail!("M187: active turn/tool became {:?} before recovery: {session}", state.state);
+        }
+    }
     let now = Utc::now().timestamp_millis();
     let startup = super::thin_restart::running_interrupted_by_restart(pool, now, |_| false).await?;
     for session in [LIVENESS_MIDTURN_SESSION, LIVENESS_STREAMING_SESSION] {
@@ -1304,6 +1316,18 @@ pub(crate) async fn run_parent() -> anyhow::Result<serde_json::Value> {
         ] {
             pids.push(run_phase(&root, phase).await?);
         }
+        // M187/R4: the PR hard gate must run the real AgentLoop/provider/tool
+        // path too, not only fixtures representing an interrupted turn.
+        let executable = std::env::current_exe()?;
+        let live = Command::new(executable).no_window()
+            .arg("--thin-executor-liveness-smoke")
+            .arg(root.join("live-executor.json"))
+            .output()?;
+        anyhow::ensure!(live.status.success(), "M187 live executor smoke failed: {}", String::from_utf8_lossy(&live.stderr));
+        let receipt: serde_json::Value = serde_json::from_slice(&std::fs::read(root.join("live-executor.json"))?)?;
+        anyhow::ensure!(receipt["ok"] == true && receipt["tool_wait_exercised"] == true
+            && receipt["answers"] == 1 && receipt["bash_results"] == 1,
+            "M187 live executor receipt failed: {receipt}");
         pids.sort_unstable();
         pids.dedup();
         if pids.len() != 14 {

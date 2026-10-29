@@ -1744,6 +1744,9 @@ pub fn run() {
                     "startup: persisted chat cancellations settled before recovery admission"
                 );
             }
+            tauri::async_runtime::block_on(
+                agent::thin_restart::capture_restart_interruptions(&objective_pool),
+            )?;
             let stale_chat_runs = tauri::async_runtime::block_on(
                 objective_store.reconcile_stale_chat_run_controls(&process_instance),
             )?;
@@ -1753,6 +1756,10 @@ pub fn run() {
                     "startup: retired prior-process chat transports before objective recovery"
                 );
             }
+            // M188: retire orphan transports and settle merged sessions before
+            // admitting restart recovery, which could otherwise revive old PRs.
+            tauri::async_runtime::block_on(agent::thin_derive::reconcile_orphan_turns(&objective_pool))?;
+            tauri::async_runtime::block_on(agent::thin_derive::settle_merged_sessions(&objective_pool))?;
             // 阶段 2 P0/R2: thin sessions are heartbeat-only, so a row left
             // `running` by a prior process (install restart) has no executor
             // and no other owner. Resume it now instead of leaving it running

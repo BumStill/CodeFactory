@@ -17,6 +17,82 @@ use tauri::Manager;
 /// 心跳判定「执行者已死」的宽限期：`running` 超过这么久还没有活执行者就续跑。
 pub(crate) const RUNNING_WITHOUT_EXECUTOR_GRACE_MS: i64 = 10 * 60 * 1_000;
 
+/// M189：在启动清理旧 transport 之前冻结真实中断身份。
+/// 只采集旧进程仍 active 的回合，不能把 completed 控制记录反推为中断。
+pub(crate) async fn capture_restart_interruptions(db: &SqlitePool) -> sqlx::Result<()> {
+    sqlx::query("CREATE TABLE IF NOT EXISTS thin_restart_interruptions(root_turn_id TEXT PRIMARY KEY, session_id TEXT NOT NULL, process_instance TEXT NOT NULL)")
+        .execute(db).await?;
+    sqlx::query("INSERT OR IGNORE INTO thin_restart_interruptions(root_turn_id,session_id,process_instance)
+        SELECT turn.root_turn_id,turn.session_id,control.created_process_instance
+        FROM chat_turn_state turn JOIN chat_run_controls control ON control.root_turn_id=turn.root_turn_id
+        WHERE control.status='active' AND control.created_process_instance<>?
+          AND turn.completed_at IS NULL AND turn.terminal_reason IS NULL")
+        .bind(crate::agent::objective::current_process_instance()).execute(db).await?;
+    Ok(())
+}
+
+/// M189：恢复资格必须来自未结束的旧进程回合，而非过期的 running 投影。
+async fn filter_restart_candidates(
+    db: &SqlitePool,
+    rows: Vec<String>,
+) -> sqlx::Result<Vec<String>> {
+    let full_schema: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='chat_run_controls'")
+        .fetch_one(db).await?;
+    if full_schema == 0 { return Ok(rows); }
+    sqlx::query("CREATE TABLE IF NOT EXISTS thin_restart_interruptions(root_turn_id TEXT PRIMARY KEY, session_id TEXT NOT NULL, process_instance TEXT NOT NULL)").execute(db).await?;
+    let mut eligible = Vec::new();
+    for session in rows {
+        let open: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM chat_turn_state turn
+             JOIN chat_run_controls control ON control.root_turn_id=turn.root_turn_id
+             WHERE turn.session_id=? AND turn.completed_at IS NULL AND turn.terminal_reason IS NULL
+               AND ((control.status='active' AND control.created_process_instance<>?)
+                 OR EXISTS (SELECT 1 FROM thin_restart_interruptions interrupted
+                   WHERE interrupted.root_turn_id=turn.root_turn_id))
+               AND NOT EXISTS (SELECT 1 FROM messages answer WHERE answer.session_id=turn.session_id
+                 AND answer.role='assistant' AND answer.created_at>=turn.started_at
+                 AND TRIM(answer.content)<>''
+                 AND (answer.tool_calls IS NULL OR answer.tool_calls='' OR answer.tool_calls='[]')
+                 AND NOT EXISTS (SELECT 1 FROM tool_calls invocation WHERE invocation.message_id=answer.id)
+                 AND (answer.completion_state IS NULL OR answer.completion_state='' OR answer.completion_state='final'))")
+            .bind(&session).bind(crate::agent::objective::current_process_instance())
+            .fetch_one(db).await?;
+        if open > 0 { eligible.push(session); }
+    }
+    Ok(eligible)
+}
+
+/// M189：按工具调用身份（无工具时按根回合）原子认领，跨进程也最多一次。
+/// 先落 claim 再调用模型；崩溃后的不确定结果不能靠换时间戳无限重放。
+pub(crate) async fn claim_restart(
+    db: &SqlitePool,
+    session: &str,
+    root: &str,
+) -> sqlx::Result<Option<String>> {
+    sqlx::query("CREATE TABLE IF NOT EXISTS thin_restart_claims (claim_key TEXT PRIMARY KEY, session_id TEXT NOT NULL, root_turn_id TEXT NOT NULL, claimed_at INTEGER NOT NULL)")
+        .execute(db).await?;
+    if filter_restart_candidates(db, vec![session.to_string()]).await?.is_empty() {
+        return Ok(None);
+    }
+    sqlx::query("CREATE UNIQUE INDEX IF NOT EXISTS thin_restart_claim_root ON thin_restart_claims(root_turn_id)").execute(db).await?;
+    let tool: Option<String> = sqlx::query_scalar(
+        "SELECT tool.id FROM tool_calls tool JOIN messages message ON message.id=tool.message_id
+         JOIN chat_turn_state turn ON turn.root_turn_id=? AND turn.session_id=message.session_id
+         WHERE message.session_id=? AND tool.created_at>=turn.started_at
+           AND tool.status IN ('pending','approved') AND (tool.result IS NULL OR TRIM(tool.result)='')
+         ORDER BY tool.created_at DESC,tool.id DESC LIMIT 1")
+        .bind(root).bind(session).fetch_optional(db).await?;
+    let key = tool.map_or_else(|| format!("turn:{root}"), |id| format!("tool:{id}"));
+    let written = sqlx::query("INSERT OR IGNORE INTO thin_restart_claims(claim_key,session_id,root_turn_id,claimed_at) VALUES (?,?,?,?)")
+        .bind(&key).bind(session).bind(root).bind(chrono::Utc::now().timestamp_millis())
+        .execute(db).await?.rows_affected();
+    if written == 1 {
+        sqlx::query("DELETE FROM thin_restart_interruptions WHERE root_turn_id=?")
+            .bind(root).execute(db).await?;
+    }
+    Ok((written == 1).then_some(key))
+}
+
 /// 纯查询 + 可注入的「活执行者」判定，合成 fixture 可直接驱动。
 pub(crate) async fn running_without_executor(
     db: &SqlitePool,
@@ -54,7 +130,7 @@ pub(crate) async fn running_without_executor(
             .bind(now_ms.saturating_sub(grace_ms))
             .bind(now_ms.saturating_sub(grace_ms))
             .bind(now_ms.saturating_sub(grace_ms)).fetch_all(db).await?;
-        return Ok(rows.into_iter().filter(|session| !has_live_executor(session)).collect());
+        return filter_restart_candidates(db, rows.into_iter().filter(|session| !has_live_executor(session)).collect()).await;
     }
     crate::agent::thin_state::ensure(db).await?;
     let rows: Vec<String> = sqlx::query_scalar(
@@ -66,10 +142,10 @@ pub(crate) async fn running_without_executor(
     .bind(now_ms.saturating_sub(grace_ms))
     .fetch_all(db)
     .await?;
-    Ok(rows
+    filter_restart_candidates(db, rows
         .into_iter()
         .filter(|session| !has_live_executor(session))
-        .collect())
+        .collect()).await
 }
 
 /// 阶段 2 P0/R2：启动扫描。进程刚起来时执行者注册表天然为空，所以任何
@@ -113,10 +189,10 @@ pub(crate) async fn running_interrupted_by_restart(
         .fetch_all(db)
         .await?
     };
-    Ok(rows
+    filter_restart_candidates(db, rows
         .into_iter()
         .filter(|session| !has_live_executor(session))
-        .collect())
+        .collect()).await
 }
 
 /// 阶段 2 P0/R2：中断现场标记。`pending`/`approved` 且没有结果的工具调用在重启后
@@ -270,6 +346,77 @@ mod tests {
             .execute(db)
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn m189_final_answer_survives_three_recovery_sweeps() {
+        let db = crate::storage::db::connect("sqlite::memory:").await.unwrap();
+        sqlx::raw_sql("INSERT INTO sessions(id,title,cwd,model_id,created_at,updated_at,delivery_mode) VALUES ('m189-final','synthetic','/synthetic','model',1,1,'thin');
+            INSERT INTO chat_turn_state(root_turn_id,session_id,phase,status,started_at,updated_at) VALUES ('m189-root','m189-final','running','running',1,1);
+            INSERT INTO chat_run_controls(run_instance_id,session_id,root_turn_id,status,created_process_instance,created_at,updated_at,settled_at) VALUES ('m189-run','m189-final','m189-root','completed','old-process',1,1,2);
+            INSERT INTO messages(id,session_id,role,content,completion_state,created_at) VALUES ('m189-answer','m189-final','assistant','synthetic finished','final',2);")
+            .execute(&db).await.unwrap();
+        crate::agent::thin_state::save(&db, "m189-final", &crate::agent::thin_state::ThinState::running()).await.unwrap();
+        sqlx::query("UPDATE thin_session_state SET updated_at=1 WHERE session_id='m189-final'").execute(&db).await.unwrap();
+        for tick in 1..=3 {
+            let now = tick * 10_000_000;
+            assert!(running_without_executor(&db, now, 0, |_| false).await.unwrap().is_empty(), "completed turn must never dispatch another model run");
+            assert!(running_interrupted_by_restart(&db, now, |_| false).await.unwrap().is_empty(), "restart must not reopen a final answer");
+        }
+        crate::agent::thin_derive::refresh(&db, "m189-final").await.unwrap();
+        assert_eq!(crate::agent::thin_state::load(&db, "m189-final").await.unwrap().unwrap().state, crate::agent::thin_state::SessionState::Ended);
+        let notices: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages WHERE session_id='m189-final' AND role='system'").fetch_one(&db).await.unwrap();
+        assert_eq!(notices, 0);
+    }
+
+    #[test]
+    fn m189_restart_claim_survives_real_process_restart() {
+        const ENV: &str = "CODEFACTORY_M189_SYNTHETIC_DB";
+        if let Some(url) = std::env::var_os(ENV) {
+            tokio::runtime::Runtime::new().unwrap().block_on(async {
+                let db = crate::storage::db::connect(url.to_str().unwrap()).await.unwrap();
+                capture_restart_interruptions(&db).await.unwrap();
+                crate::agent::objective::ObjectiveStore::new(db.clone())
+                    .reconcile_stale_chat_run_controls(&crate::agent::objective::current_process_instance()).await.unwrap();
+                crate::agent::thin_derive::reconcile_orphan_turns(&db).await.unwrap();
+                let claim = claim_restart(&db, "m189-restart", "m189-root").await.unwrap();
+                if std::env::var("CODEFACTORY_M189_EXPECT_CLAIM").unwrap() == "yes" {
+                    assert_eq!(claim.as_deref(), Some("tool:m189-tool"));
+                    crate::commands::chat::persist_resume_interrupt_notice(&db, "m189-restart", claim.as_deref().unwrap()).await.unwrap();
+                    mark_interrupted_tool_calls(&db, "m189-restart").await.unwrap();
+                } else { assert!(claim.is_none()); }
+                for _ in 0..3 {
+                    assert!(claim_restart(&db, "m189-restart", "m189-root").await.unwrap().is_none());
+                }
+                let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM thin_restart_claims").fetch_one(&db).await.unwrap();
+                assert_eq!(count, 1);
+                let notices: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages WHERE role='system'").fetch_one(&db).await.unwrap();
+                assert_eq!(notices, 1);
+            });
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let url = format!("sqlite:{}?mode=rwc", dir.path().join("synthetic.db").display());
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let db = crate::storage::db::connect(&url).await.unwrap();
+            sqlx::raw_sql("INSERT INTO sessions(id,title,cwd,model_id,created_at,updated_at,delivery_mode) VALUES ('m189-restart','synthetic','/synthetic','model',1,1,'thin');
+                INSERT INTO chat_turn_state(root_turn_id,session_id,phase,status,started_at,updated_at) VALUES ('m189-root','m189-restart','running','running',1,1);
+                INSERT INTO messages(id,session_id,role,content,tool_calls,created_at) VALUES ('m189-call','m189-restart','assistant','','[]',2);
+                INSERT INTO tool_calls(id,message_id,tool_name,arguments,status,created_at) VALUES ('m189-tool','m189-call','background_task_list','{}','pending',2);")
+                .execute(&db).await.unwrap();
+            sqlx::query("INSERT INTO chat_run_controls(run_instance_id,session_id,root_turn_id,status,created_process_instance,created_at,updated_at) VALUES ('m189-run','m189-restart','m189-root','active',?,1,1)")
+                .bind(crate::agent::objective::current_process_instance()).execute(&db).await.unwrap();
+            crate::agent::thin_state::save(&db, "m189-restart", &crate::agent::thin_state::ThinState::running()).await.unwrap();
+            assert!(claim_restart(&db, "m189-restart", "m189-root").await.unwrap().is_none(), "same process is not a restart");
+            db.close().await;
+        });
+        for expected in ["yes", "no", "no"] {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "agent::thin_restart::tests::m189_restart_claim_survives_real_process_restart", "--nocapture"])
+                .env(ENV, &url).env("CODEFACTORY_M189_EXPECT_CLAIM", expected)
+                .current_dir(dir.path()).output().unwrap();
+            assert!(output.status.success(), "{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+        }
     }
 
     #[tokio::test]
