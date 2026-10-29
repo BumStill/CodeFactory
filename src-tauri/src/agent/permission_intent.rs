@@ -2145,7 +2145,10 @@ pub(crate) fn permission_action_signature(
     args: &Value,
     bash_command: Option<&str>,
 ) -> String {
-    let canonical = canonical_json(args);
+    // M198: server-owned prompt diagnostics are not executable arguments.
+    let mut action_args = args.clone();
+    if let Some(object) = action_args.as_object_mut() { object.remove("_permission"); }
+    let canonical = canonical_json(&action_args);
     let mut digest = Sha256::new();
     for part in [tool_name, canonical.as_str(), bash_command.unwrap_or("")] {
         let bytes = part.as_bytes();

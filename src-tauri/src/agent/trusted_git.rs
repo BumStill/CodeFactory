@@ -17,8 +17,45 @@ use crate::util::no_window::NoWindow;
 /// then judge the segment's own subcommand. Anything we cannot parse safely
 /// stays sensitive (fail closed).
 pub(super) fn sensitive(command: &str) -> bool {
+    if command.contains("<<") {
+        return !python_heredoc_proved(None, command);
+    }
     let Some(segments) = executable_segments(command) else { return true };
     segments.iter().any(|words| segment_is_sensitive(words))
+}
+
+/// M198: recognize one complete, expansion-disabled Python stdin program.
+/// No shell suffix, custom executable, wrapper, substitution or redirection is
+/// accepted. The validator parses AST only; it never evaluates model code.
+pub(super) fn python_heredoc_proved(root: Option<&Path>, command: &str) -> bool {
+    if command.len() > 256 * 1024 { return false; }
+    let Some((header, rest)) = command.split_once('\n') else { return false; };
+    let header = header.trim().strip_prefix("cd \"$(pwd)\"; ").unwrap_or(header.trim());
+    let Some((runner, delimiter)) = header.split_once(" <<") else { return false; };
+    let node = ["node", "node -"].contains(&runner);
+    if !node && !["python3 -", "python -"].contains(&runner) { return false; }
+    let Some(delimiter) = delimiter.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')) else { return false; };
+    if delimiter.is_empty() || !delimiter.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') { return false; }
+    let mut body = String::new();
+    let mut lines = rest.lines();
+    let mut closed = false;
+    while let Some(line) = lines.next() {
+        if line == delimiter {
+            closed = true;
+            if lines.any(|l| !l.trim().is_empty()) { return false; }
+            break;
+        }
+        body.push_str(line);
+        body.push('\n');
+    }
+    if !closed { return false; }
+    let mut cmd = Command::new(if cfg!(windows) { "python" } else { "python3" });
+    cmd.args(["-I", "-c", include_str!("trusted_python_ast.py")]);
+    if let Some(root) = root { cmd.arg(root); } else { cmd.arg(""); }
+    if node { cmd.arg("node"); }
+    let Ok(mut child) = cmd.no_window().stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null()).spawn() else { return false; };
+    let written = child.stdin.take().is_some_and(|mut input| input.write_all(body.as_bytes()).is_ok());
+    written && child.wait().is_ok_and(|s| s.success())
 }
 
 /// Git subcommands that move the working tree, the index or a local branch.
@@ -698,7 +735,12 @@ fn bounded_args(root: &Path, args: &[&str]) -> bool {
 fn local_denylist(root: &Path, args: &[&str]) -> bool {
     let Some((verb, rest)) = args.split_first() else { return false };
     // These verbs affect remote authority, command execution or configuration.
-    if ["push", "config", "filter-branch", "filter-repo", "submodule", "send-email", "credential"].contains(verb) { return false; }
+    // M198: repository-mandated workspace-local hook setup is not a remote
+    // credential/protection rewrite. Exact shape only; --global stays fenced.
+    if *verb == "config" {
+        return matches!(rest, ["core.hooksPath", ".githooks"] | ["--local", "core.hooksPath", ".githooks"]);
+    }
+    if ["push", "filter-branch", "filter-repo", "submodule", "send-email", "credential"].contains(verb) { return false; }
     if rest.iter().any(|w| {
         let option = w.split('=').next().unwrap_or(w);
         ["--interactive", "--patch", "--edit", "--exec", "--editor", "--upload-pack", "--receive-pack", "--ext-diff", "--textconv", "--output", "--output-directory", "--git-dir", "--work-tree", "--unsafe-paths", "--pathspec-from-file", "--recurse-submodules", "--separate-git-dir", "--reference", "--alternate-refs-command"].contains(&option)
@@ -726,12 +768,30 @@ fn readonly_filter(root: &Path, argv: &[&str]) -> bool {
     if !bounded_args(root, rest) { return false; }
     if rest.iter().any(|w| !w.starts_with('-') && !safe_path(root, w)) { return false; }
     match *verb {
+        "ls" | "rg" | "find" => !rest.iter().any(|w| matches!(*w, "--pre" | "--pre-glob" | "-exec" | "-execdir" | "-delete" | "-fprint" | "-fprintf") || w.starts_with("--pre=")),
         "head" | "tail" | "wc" | "uniq" | "cat" => rest.iter().all(|w| !w.starts_with('-') || w.chars().skip(1).all(|c| c.is_ascii_digit() || "nclwqbsvET".contains(c))),
         "sort" => rest.iter().all(|w| !w.starts_with('-') || ["-n", "-r", "-u", "-f", "--numeric-sort", "--reverse", "--unique"].contains(w)),
         "grep" => rest.iter().all(|w| !w.starts_with('-') || ["-n", "-i", "-v", "-E", "-F", "-c", "-h", "--"].contains(w)),
         "sed" => matches!(rest, ["-n", range, paths @ ..] if range.strip_suffix('p').is_some_and(|r| !r.is_empty() && r.split(',').all(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()))) && paths.iter().all(|p| safe_path(root, p))),
         _ => false,
     }
+}
+
+/// Exact single PR metadata mutation. Compound commands, repository overrides,
+/// edits of another resource and implicit current-PR selection are not grants.
+pub(super) fn own_pr_metadata_target(command: &str) -> Option<i64> {
+    let segments = segments(command)?;
+    if segments.len() != 1 || segments[0].words.iter().any(|w| w.redirect) { return None; }
+    let words: Vec<_> = segments[0].words.iter().map(|w| w.text.as_str()).collect();
+    let ["gh", "pr", action, number, rest @ ..] = words.as_slice() else { return None; };
+    let number = number.parse::<i64>().ok().filter(|n| *n > 0)?;
+    let mut pairs = rest.chunks_exact(2);
+    let allowed = pairs.by_ref().all(|pair| !pair[1].is_empty() && match *action {
+        "edit" => ["--add-label", "--remove-label"].contains(&pair[0]),
+        "comment" => pair[0] == "--body",
+        _ => false,
+    });
+    (allowed && !rest.is_empty() && pairs.remainder().is_empty()).then_some(number)
 }
 
 fn workspace_at(roots: &[std::path::PathBuf], cwd: &Path, path: &str) -> Option<std::path::PathBuf> {
@@ -803,7 +863,8 @@ fn prove(roots: &[std::path::PathBuf], cwd: &Path, command: &str) -> Option<Vec<
                     || p.chars().all(|c| c.is_ascii_digit())
                     || (p.len() > 1 && p.starts_with('-') && p[1..].chars().all(|c| c.is_ascii_digit()))
             }),
-            ["diff", rest @ ..] => rest.iter().all(|p| ["--stat", "--name-only", "--cached", "--staged"].contains(p)),
+            ["diff", rest @ ..] => rest.iter().all(|p| ["--stat", "--name-only", "--cached", "--staged", "--check"].contains(p)),
+            ["merge-base", "--is-ancestor", left, right] => revision(left) && revision(right),
             _ => false,
         };
         if args.first() == Some(&"worktree") {
@@ -833,7 +894,7 @@ fn prove(roots: &[std::path::PathBuf], cwd: &Path, command: &str) -> Option<Vec<
         if input_pipe { return None; }
         // M182: option ordering is not authority. Confined non-interactive
         // local verbs use the shared denylist and the same durable snapshot.
-        if args.first().is_some_and(|verb| ["fetch", "stash", "merge", "rebase", "switch", "checkout", "restore", "clean", "add", "commit", "reset", "cherry-pick", "revert", "am", "apply"].contains(verb)) {
+        if args.first().is_some_and(|verb| ["fetch", "stash", "merge", "rebase", "switch", "checkout", "restore", "clean", "add", "commit", "reset", "cherry-pick", "revert", "am", "apply", "config"].contains(verb)) {
             touched.entry(root).or_default();
             continue;
         }
