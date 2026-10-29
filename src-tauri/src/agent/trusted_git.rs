@@ -3,6 +3,11 @@
 use std::{path::{Component, Path}, process::{Command, Stdio}, io::Write};
 use crate::util::no_window::NoWindow;
 
+// The very same policy source used by standalone shell calls; also available
+// to the standalone integration harnesses that include this proof module.
+#[path = "../tools/shell_policy.rs"]
+mod standalone_shell_policy;
+
 /// M172-R1: ask for the M159 proof/snapshot only when an **executable segment**
 /// runs a Git action that can discard local work.
 ///
@@ -214,6 +219,14 @@ fn git_segment_is_sensitive(args: &[String]) -> bool {
     if lower == "worktree" && args.get(index + 1).is_some_and(|a| a == "list") {
         return false;
     }
+    if lower == "branch" {
+        return !codefactory_agent_core::command_segment_is_read_only_probe(
+            &std::iter::once("git").chain(args[index..].iter().map(String::as_str)).collect::<Vec<_>>().join(" "),
+        );
+    }
+    if lower == "fetch" {
+        return !fetch_args(&args[index + 1..].iter().map(String::as_str).collect::<Vec<_>>());
+    }
     if DESTRUCTIVE_GIT_SUBCOMMANDS.contains(&lower.as_str()) {
         return true;
     }
@@ -388,7 +401,13 @@ fn legacy_rewrite(root: &Path, command: &str) -> bool {
 /// subshells or inherited variables. Quotes retain literal vs expansion meaning.
 #[derive(Default)]
 struct Word { text: String, expanded: bool, redirect: bool }
-struct Segment { words: Vec<Word>, separator: char }
+struct Segment { words: Vec<Word>, separator: char, raw: String }
+
+/// Lossless segment text for the permission gateway: quoted script data is
+/// never reconstructed or reinterpreted as shell operators.
+pub(super) fn command_segments(command: &str) -> Option<Vec<String>> {
+    Some(segments(command)?.into_iter().map(|segment| segment.raw).collect())
+}
 fn segments(command: &str) -> Option<Vec<Segment>> {
     let mut chars = command.chars().peekable();
     let mut result = Vec::new();
@@ -397,6 +416,7 @@ fn segments(command: &str) -> Option<Vec<Segment>> {
     let mut started = false;
     let mut quote = None;
     let mut variables = std::collections::HashMap::<String, String>::new();
+    let mut raw_start = 0;
     while let Some(c) = chars.next() {
         if matches!(c, '\n' | '\r' | '`') { return None; }
         if c == '\\' {
@@ -438,7 +458,10 @@ fn segments(command: &str) -> Option<Vec<Segment>> {
             };
             if words.is_empty() { return None; }
             record_assignment(&words, &mut variables)?;
-            result.push(Segment { words: std::mem::take(&mut words), separator });
+            let end = command.len() - chars.clone().map(char::len_utf8).sum::<usize>();
+            let delimiter_len = if matches!(separator, '&' | 'o') { 2 } else { 1 };
+            result.push(Segment { words: std::mem::take(&mut words), separator, raw: command[raw_start..end - delimiter_len].trim().into() });
+            raw_start = end;
             continue;
         }
         if quote.is_none() && c == '>' {
@@ -466,7 +489,7 @@ fn segments(command: &str) -> Option<Vec<Segment>> {
     if started { words.push(word); }
     if words.is_empty() { return None; }
     record_assignment(&words, &mut variables)?;
-    result.push(Segment { words, separator: ';' });
+    result.push(Segment { words, separator: ';', raw: command[raw_start..].trim().into() });
     Some(result)
 }
 fn record_assignment(words: &[Word], variables: &mut std::collections::HashMap<String, String>) -> Option<()> {
@@ -763,32 +786,6 @@ fn local_denylist(root: &Path, args: &[&str]) -> bool {
     !message && bounded_args(root, &checked)
 }
 
-/// Workspace task runners already allowed independently in trusted mode.
-/// Validate parsed argv, not reconstructed shell text: arguments stay data.
-fn workspace_runner(root: &Path, argv: &[&str]) -> bool {
-    let Some((program, args)) = argv.split_first() else { return false; };
-    let name = program.rsplit(['/', '\\']).next().unwrap_or(program).trim_end_matches(".exe");
-    if ["python", "python3", "node"].contains(&name) {
-        let Some((script, rest)) = args.split_first() else { return false; };
-        return !script.starts_with('-') && safe_path(root, script)
-            && root.join(script).is_file() && bounded_args(root, rest);
-    }
-    if name == "pnpm" {
-        let (task, rest) = match args {
-            ["run", task, rest @ ..] => (*task, rest),
-            [task, rest @ ..] => (*task, rest),
-            _ => return false,
-        };
-        if !bounded_args(root, rest) { return false; }
-        let manifest = root.join("package.json");
-        if !safe_path(root, "package.json") { return false; }
-        return std::fs::read(manifest).ok()
-            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
-            .is_some_and(|json| json["scripts"][task].is_string());
-    }
-    false
-}
-
 /// Fetch reads a remote, unlike push. Ref specs and URLs are not local paths.
 /// Keep executable transport overrides and external remote helpers fenced.
 fn fetch_args(rest: &[&str]) -> bool {
@@ -800,20 +797,6 @@ fn fetch_args(rest: &[&str]) -> bool {
                 && !word.chars().any(|c| c.is_control() || c.is_whitespace())
         }
     })
-}
-
-fn readonly_filter(root: &Path, argv: &[&str]) -> bool {
-    let Some((verb, rest)) = argv.split_first() else { return false };
-    if !bounded_args(root, rest) { return false; }
-    if rest.iter().any(|w| !w.starts_with('-') && !safe_path(root, w)) { return false; }
-    match *verb {
-        "ls" | "rg" | "find" => !rest.iter().any(|w| matches!(*w, "--pre" | "--pre-glob" | "-exec" | "-execdir" | "-delete" | "-fprint" | "-fprintf") || w.starts_with("--pre=")),
-        "head" | "tail" | "wc" | "uniq" | "cat" => rest.iter().all(|w| !w.starts_with('-') || w.chars().skip(1).all(|c| c.is_ascii_digit() || "nclwqbsvET".contains(c))),
-        "sort" => rest.iter().all(|w| !w.starts_with('-') || ["-n", "-r", "-u", "-f", "--numeric-sort", "--reverse", "--unique"].contains(w)),
-        "grep" => rest.iter().all(|w| !w.starts_with('-') || ["-n", "-i", "-v", "-E", "-F", "-c", "-h", "--"].contains(w)),
-        "sed" => matches!(rest, ["-n", range, paths @ ..] if range.strip_suffix('p').is_some_and(|r| !r.is_empty() && r.split(',').all(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()))) && paths.iter().all(|p| safe_path(root, p))),
-        _ => false,
-    }
 }
 
 /// Exact single PR metadata mutation. Compound commands, repository overrides,
@@ -879,10 +862,15 @@ fn prove(roots: &[std::path::PathBuf], cwd: &Path, command: &str) -> Option<Vec<
             if removed.contains(&cwd) { return None; }
             continue;
         }
-        if readonly_filter(&cwd, &argv) { continue; }
-        if !piped && !removed.contains(&cwd) && workspace_runner(&cwd, &argv) {
-            touched.entry(cwd.clone()).or_default();
-            continue;
+        // M207: non-Git commands use the same shell safety decision as a
+        // standalone trusted call. Do not impose a second path/runner whitelist.
+        if argv.first() != Some(&"git") && argv.first() != Some(&"rm") {
+            let standalone = segment.raw.as_str();
+            if matches!(standalone_shell_policy::classify_command(standalone), standalone_shell_policy::ShellCommandPolicy::Allow { .. })
+                && !codefactory_agent_loop::policy::is_delivery_command(standalone)
+                && !sensitive(standalone)
+            { continue; }
+            return None;
         }
         let (root, args) = match argv.as_slice() {
             ["git", "-C", path, rest @ ..] => (workspace_at(&roots, &cwd, path)?, rest),
@@ -896,20 +884,23 @@ fn prove(roots: &[std::path::PathBuf], cwd: &Path, command: &str) -> Option<Vec<
         };
         if removed.contains(&root) { return None; }
         has_git = true;
-        let readonly = match args {
-            ["status", rest @ ..] => rest.iter().all(|p| {
-                ["--porcelain", "--short", "-s", "-sb", "--branch", "--porcelain=v1", "--untracked-files=no"]
-                    .contains(p)
-            }),
-            ["log", rest @ ..] => rest.iter().all(|p| {
-                ["-1", "--oneline", "--no-decorate", "--graph", "--all", "--stat", "-n"].contains(p)
-                    || p.chars().all(|c| c.is_ascii_digit())
-                    || (p.len() > 1 && p.starts_with('-') && p[1..].chars().all(|c| c.is_ascii_digit()))
-            }),
-            ["diff", rest @ ..] => rest.iter().all(|p| ["--stat", "--name-only", "--cached", "--staged", "--check"].contains(p)),
-            ["merge-base", "--is-ancestor", left, right] => revision(left) && revision(right),
-            _ => false,
-        };
+        // Queries do not need path confinement or a snapshot. Reject execution
+        // and output overrides before using the shared Git query classifier.
+        let readonly = (codefactory_agent_core::command_segment_is_read_only_probe(&segment.raw)
+            || matches!(args, ["stash", "list", ..] | ["stash", "show", ..] | ["worktree", "list", ..])
+            || matches!(args, ["config", "core.hooksPath"] | ["config", "--get", "core.hooksPath"] | ["config", "--local", "--get", "core.hooksPath"]))
+            && args.first() != Some(&"fetch")
+            && !args.iter().any(|word| {
+                let option = word.split('=').next().unwrap_or(word);
+                ["--ext-diff", "--textconv", "--output", "--output-directory", "--upload-pack", "--receive-pack"].contains(&option)
+            });
+        if readonly { continue; }
+        if args.first() == Some(&"reset") && args.iter().any(|word| *word == "--hard") {
+            let revisions: Vec<_> = args[1..].iter().filter(|word| !word.starts_with('-')).copied().collect();
+            if revisions.len() > 1 { return None; }
+            let revision = revisions.first().copied().unwrap_or("HEAD");
+            if !legacy_rewrite(&root, &format!("git reset --hard {revision}")) { return None; }
+        }
         if args.first() == Some(&"worktree") {
             match args {
                 ["worktree", "remove", flags @ ..] | ["worktree", "add", flags @ ..] => {
@@ -985,9 +976,9 @@ pub(super) fn backup_registered(roots: &[std::path::PathBuf], cwd: &Path, comman
     let targets = prove(roots, cwd, command)?;
     let mut refs = Vec::new();
     for (root, paths) in targets { refs.push(snapshot(&root, &paths)?); }
-    // Even read-only proven compositions retain an auditable snapshot.
-    if refs.is_empty() { refs.push(snapshot(cwd, &[])?); }
-    Some(refs.join(","))
+    // An empty target set means the command contains only proved queries.
+    // Do not turn an unrelated conflicted index into a read-only approval.
+    Some(if refs.is_empty() { "read-only".into() } else { refs.join(",") })
 }
 
 /// Snapshot via a private index; never stash away or rewrite the live index.
