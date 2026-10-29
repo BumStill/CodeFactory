@@ -36,7 +36,13 @@ fn has_internal_wording(text: &str) -> bool {
 /// M158/R2：系统自己盯着的等待。外部对象之外，后台任务 / 定时唤醒这类系统
 /// 占位等待同样不属于用户的决定——它只能由系统心跳跟进或结束，不能问用户。
 fn is_system_followed(what: &str) -> bool {
-    super::thin::is_external_object(what) || what.contains("后台任务") || what.contains("定时唤醒")
+    // M197：执行者缺失/回合中断这类由系统自己恢复的占位等待（「系统自动重试/自愈：…」）
+    // 也必须算系统自己推进；否则重启对账会把「不确定的 running 投影」误判成要用户决定。
+    super::thin::is_external_object(what)
+        || what.contains("后台任务")
+        || what.contains("定时唤醒")
+        || what.contains("系统自动重试")
+        || what.contains("系统周期")
 }
 
 /// 从一段会话事实里认最后一个 PR 号：`/pull/<n>` 链接，或「PR #<n>」叙述。
@@ -267,6 +273,21 @@ fn observe_command(cwd: &str, args: &[&str]) -> Option<String> {
 /// M174: reconcile every persisted waiting session once per process startup.
 /// Reuse the bounded, durable observer; no parallel unbudgeted GitHub poller.
 pub(crate) async fn reconcile_waiting_on_startup(db: &SqlitePool) -> sqlx::Result<usize> {
+    Ok(reconcile_waiting_wake_sources(db).await?.scanned)
+}
+
+/// M197/R3：`waiting_wake` 的周期对账报告（启动一次 + 之后每 180 秒）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WakeReconcileReport {
+    pub scanned: usize,
+    pub swept: usize,
+    pub still_waiting: usize,
+}
+
+/// M197/R1+R3：对账全部 `waiting_wake` 会话，把「无源等待」当场变成
+/// 有源等待 / 人话提问 / 已结束；最后跑一次失效守卫 sweep。
+/// 全程只读本地持久事实（GH 观测由既有 ≥180s 心跳与配额策略负责），幂等。
+pub async fn reconcile_waiting_wake_sources(db: &SqlitePool) -> sqlx::Result<WakeReconcileReport> {
     reconcile_orphan_turns(db).await?;
     super::thin_state::ensure(db).await?;
     let sessions: Vec<String> = sqlx::query_scalar("SELECT state.session_id FROM thin_session_state state JOIN sessions session ON session.id=state.session_id WHERE state.state='waiting_wake' AND session.delivery_mode='thin'")
@@ -277,15 +298,23 @@ pub(crate) async fn reconcile_waiting_on_startup(db: &SqlitePool) -> sqlx::Resul
         repair_waiting_wake_source(db, session).await?;
         refresh(db, session).await?;
     }
-    Ok(sessions.len())
+    let swept = super::thin_state::sweep(db, chrono::Utc::now().timestamp_millis()).await?;
+    let still_waiting: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM thin_session_state WHERE state='waiting_wake'",
+    ).fetch_one(db).await.unwrap_or(0);
+    Ok(WakeReconcileReport { scanned: sessions.len(), swept, still_waiting: still_waiting.max(0) as usize })
 }
 
 /// M183/R3：等待投影不是唤醒源。持久补建只发生在没有执行者和真实来源时。
+///
+/// M197/R1：这是「`waiting_wake` 必须有具体唤醒源」的唯一落地点，也是 fail-closed
+/// 的：没有源时不允许继续停在 `waiting_wake`。系统自己能推进的（PR/CI/后台任务/
+/// 定时唤醒）立即补一个真实来源并写明来源（系统自动重试/自愈）；补不出来且自愈
+/// 次数用尽的，转成对用户的人话提问；已经无事可做的直接结束。
 async fn repair_waiting_wake_source(db: &SqlitePool, session: &str) -> sqlx::Result<()> {
     if crate::session_executor_alive(session) != Some(false) { return Ok(()); }
-    if super::thin_state::load(db, session).await?.is_none_or(|state| state.state != SessionState::WaitingWake) {
-        return Ok(());
-    }
+    let Some(state) = super::thin_state::load(db, session).await? else { return Ok(()) };
+    if state.state != SessionState::WaitingWake { return Ok(()); }
     if super::background_tasks::wake_source_cover(db, session).await.is_covered() { return Ok(()); }
     // 未决 PR 由已有持久监视登记负责；已完成的 PR 则必须有真实收尾唤醒。
     if has_table(db, "thin_external_observations").await? {
@@ -293,17 +322,79 @@ async fn repair_waiting_wake_source(db: &SqlitePool, session: &str) -> sqlx::Res
             .bind(session).fetch_one(db).await?;
         if monitor > 0 { return Ok(()); }
     }
+    let what = state.waiting_for.clone().unwrap_or_default().trim().to_string();
+    // R1：没有等待对象 = 没有待办，不能停在「等唤醒」。
+    if what.is_empty() {
+        let ended = ThinState::ended("没有待办事项，任务已结束", "本会话记录");
+        super::thin_state::save(db, session, &ended).await?;
+        audit_wait_guard(db, session, "ended_no_wait", "", 0).await;
+        tracing::warn!(session, "waiting_wake without a wait target ended");
+        return Ok(());
+    }
     let completed = completed_external(db, session).await?;
     if completed.is_some() && derive_state(db, session).await?.state == SessionState::Ended { return Ok(()); }
-    let reason = completed.unwrap_or_else(|| "存量 waiting_wake 缺少真实唤醒源".into());
-    let prefix = if reason.contains("已合并") { "thin-closeout-source" } else { "thin-source-repair" };
+    if let Some(reason) = completed {
+        // R2：外部事项已完成 → 明确的收尾唤醒（幂等，重复补建不叠加）。
+        arm_durable_wake(db, session, "thin-closeout-source", &format!("{reason}。系统自动重试/自愈：核对持久事实并继续原任务；若 PR 已合并，执行任务模板 §8 收尾后给出最终回答，不重复交付。")).await?;
+        audit_wait_guard(db, session, "closeout_wake", &what, 0).await;
+        tracing::warn!(session, "waiting_wake source missing; durable automatic repair queued");
+        return Ok(());
+    }
+    let fired = self_continue_fires(db, session).await?;
+    if is_system_followed(&what) && fired < MAX_SELF_CONTINUE {
+        // R1/R5：系统自己能推进 —— 补真实来源（系统自动重试/自愈），不是问用户。
+        arm_durable_wake(db, session, "thin-source-repair", &format!("存量等待仍无推进：{what}。系统自动重试/自愈：核对持久事实并继续原任务；确实无事可做时给出最终回答。")).await?;
+        audit_wait_guard(db, session, "self_continue", &what, fired).await;
+        tracing::warn!(session, attempts = fired, "waiting_wake source missing; durable automatic repair queued");
+        return Ok(());
+    }
+    // R1：需要人，或来源彻底消失且自愈次数用尽 —— 必须让人看到人话原因。
+    let question = if is_system_followed(&what) {
+        format!("我原本在等「{what}」，但这件事已经没有东西会在之后把它推进了；系统自动重试 {fired} 次后仍然停在这里。请你决定：要我换个做法继续，还是就此结束？")
+    } else {
+        format!("我停在「{what}」上，需要你一句话才能继续：是继续做，还是先结束？")
+    };
+    super::thin_state::ask_user(db, session, &question).await?;
+    audit_wait_guard(db, session, "asked_user", &what, fired).await;
+    tracing::warn!(session, attempts = fired, "waiting_wake source gone; asked the user");
+    Ok(())
+}
+
+/// R5：同一会话最多自动补两次来源；再多就不是「系统自愈」而是空转。
+const MAX_SELF_CONTINUE: i64 = 2;
+
+async fn arm_durable_wake(db: &SqlitePool, session: &str, prefix: &str, prompt: &str) -> sqlx::Result<()> {
     let at = chrono::Utc::now().timestamp();
     sqlx::query("INSERT INTO wakeup_schedules(id,session_id,prompt,source,next_at,status,created_at) VALUES (?,?,?,'agent_decided',?,'pending',?) ON CONFLICT(id) DO UPDATE SET prompt=excluded.prompt,next_at=excluded.next_at,status='pending' WHERE wakeup_schedules.status<>'pending'")
         .bind(format!("{prefix}-{session}")).bind(session)
-        .bind(format!("{reason}。系统自动重试/自愈：核对持久事实并继续原任务；若 PR 已合并，执行任务模板 §8 收尾后给出最终回答，不重复交付。"))
+        .bind(prompt)
         .bind(at).bind(at).execute(db).await?;
-    tracing::warn!(session, "waiting_wake source missing; durable automatic repair queued");
     Ok(())
+}
+
+async fn self_continue_fires(db: &SqlitePool, session: &str) -> sqlx::Result<i64> {
+    if !has_table(db, "wakeup_schedules").await? { return Ok(0); }
+    let fired: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(SUM(fire_count),0) FROM wakeup_schedules WHERE session_id=? AND id LIKE 'thin-source-repair-%'",
+    ).bind(session).fetch_one(db).await?;
+    Ok(fired.max(0))
+}
+
+async fn audit_wait_guard(db: &SqlitePool, session: &str, action: &str, waiting_for: &str, fired: i64) {
+    if !has_table(db, "session_audit_events").await.unwrap_or(false) { return; }
+    let detail = serde_json::json!({ "action": action, "waiting_for": waiting_for, "self_continue_fires": fired }).to_string();
+    if let Err(error) = sqlx::query(
+        "INSERT INTO session_audit_events (id, session_id, kind, actor, detail_json, created_at)
+         VALUES (?, ?, 'thin_wait_guard', 'system', ?, CAST(strftime('%s','now') AS INTEGER) * 1000)",
+    )
+    .bind(uuid::Uuid::new_v4().to_string())
+    .bind(session)
+    .bind(&detail)
+    .execute(db)
+    .await
+    {
+        tracing::warn!(session, %error, "thin wait guard audit not recorded");
+    }
 }
 
 /// 心跳先刷新事实，再由持久唤醒入口投递一次 §8 收尾。
@@ -859,12 +950,151 @@ pub async fn refresh(db: &SqlitePool, session: &str) -> sqlx::Result<ThinState> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    // ── M197：`waiting_wake` 必须有具体唤醒源 ──────────────────────────────────
+    async fn m197_wait(session: &str, db: &SqlitePool, what: &str) {
+        super::super::thin_state::save(db, session, &ThinState {
+            state: SessionState::WaitingWake,
+            waiting_for: Some(what.to_string()),
+            wake_source: Some(format!("已登记的唤醒源：{what}")),
+            ..ThinState::running()
+        }).await.unwrap();
+    }
+
+    async fn m197_fired_repair(db: &SqlitePool, session: &str, fire_count: i64) {
+        super::super::background_tasks::ensure_wake_schema(db).await.unwrap();
+        sqlx::query("INSERT INTO wakeup_schedules(id,session_id,prompt,source,next_at,status,fire_count,created_at) VALUES (?,?,'repair','agent_decided',1,'done',?,1) ON CONFLICT(id) DO UPDATE SET status='done',fire_count=excluded.fire_count")
+            .bind(format!("thin-source-repair-{session}")).bind(session).bind(fire_count)
+            .execute(db).await.unwrap();
+    }
+
+    /// R1/R5：唤醒已经触发完、又没挂新唤醒的会话，不会永远停在 `waiting_wake`：
+    /// 系统自己能推进的立即补一个真实来源（系统自动重试/自愈），不是问用户。
+    #[tokio::test]
+    async fn m197_wake_without_source_is_never_left_waiting() {
+        let db = fixture().await;
+        m197_wait("derive", &db, "PR #77 合并/CI").await;
+        m197_fired_repair(&db, "derive", 1).await;
+        let report = reconcile_waiting_wake_sources(&db).await.unwrap();
+        assert_eq!(report.scanned, 1, "{report:?}");
+        let state = super::super::thin_state::load(&db, "derive").await.unwrap().unwrap();
+        assert_eq!(state.state, SessionState::WaitingWake, "{state:?}");
+        let cover = super::super::background_tasks::wake_source_cover(&db, "derive").await;
+        assert!(cover.is_covered(), "no real wake source after reconcile: {cover:?}");
+        assert!(state.question.is_none(), "system-followable wait must not ask the user: {state:?}");
+        let prompt: String = sqlx::query_scalar(
+            "SELECT prompt FROM wakeup_schedules WHERE session_id='derive' AND status='pending'",
+        ).fetch_one(&db).await.unwrap();
+        assert!(prompt.contains("系统自动重试"), "{prompt}");
+    }
+
+    /// R1/R5：自愈有界。同一会话自动补过两次仍然没有推进对象时，必须变成人话提问，
+    /// 不允许无限补来源、也不允许继续停在 `waiting_wake`。
+    #[tokio::test]
+    async fn m197_self_continue_is_bounded_then_asks_user() {
+        let db = fixture().await;
+        m197_wait("derive", &db, "PR #77 合并/CI").await;
+        m197_fired_repair(&db, "derive", MAX_SELF_CONTINUE).await;
+        reconcile_waiting_wake_sources(&db).await.unwrap();
+        let state = super::super::thin_state::load(&db, "derive").await.unwrap().unwrap();
+        assert_eq!(state.state, SessionState::WaitingUser, "{state:?}");
+        let question = state.question.expect("escalation must carry a question");
+        assert!(question.contains("PR #77"), "{question}");
+        for internal in ["唤醒源", "外部事项", "waiting_wake", "waiting_user"] {
+            assert!(!question.contains(internal), "internal wording in {question}");
+        }
+        let pending: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM wakeup_schedules WHERE session_id='derive' AND status='pending'",
+        ).fetch_one(&db).await.unwrap();
+        assert_eq!(pending, 0, "bounded self-continue must not keep arming");
+    }
+
+    /// R2：PR 已合并 → 立刻挂出收尾唤醒，而不是没有源的等待。
+    #[tokio::test]
+    async fn m197_merged_pr_gets_closeout_wake() {
+        let db = fixture().await;
+        sqlx::query("INSERT INTO thin_delivery_refs VALUES ('derive','synthetic',73,'ThroughMerge')")
+            .execute(&db).await.unwrap();
+        ensure_external(&db).await.unwrap();
+        sqlx::query("INSERT INTO thin_external_observations(session_id,pr_number,ceiling,observed_at,completed_reason,closeout_queued) VALUES ('derive',73,'ThroughMerge',1,'PR #73 已合并',0)")
+            .execute(&db).await.unwrap();
+        m197_wait("derive", &db, "PR #73 合并/CI").await;
+        reconcile_waiting_wake_sources(&db).await.unwrap();
+        let cover = super::super::background_tasks::wake_source_cover(&db, "derive").await;
+        assert!(cover.is_covered(), "{cover:?}");
+        let prompt: String = sqlx::query_scalar(
+            "SELECT prompt FROM wakeup_schedules WHERE session_id='derive' AND status='pending' ORDER BY created_at DESC LIMIT 1",
+        ).fetch_one(&db).await.unwrap();
+        assert!(prompt.contains("已合并"), "{prompt}");
+        assert!(prompt.contains("§8 收尾"), "{prompt}");
+    }
+
+    /// R2：活着的外部观测本身就是唤醒源；收尾入队之后再算账。
+    #[tokio::test]
+    async fn m197_active_observation_counts_as_wake_source() {
+        let db = fixture().await;
+        ensure_external(&db).await.unwrap();
+        sqlx::query("INSERT INTO thin_external_observations(session_id,pr_number,ceiling,observed_at,closeout_queued) VALUES ('derive',73,'ThroughMerge',0,0)")
+            .execute(&db).await.unwrap();
+        let live = super::super::background_tasks::wake_source_cover(&db, "derive").await;
+        assert_eq!(live.external_observations, 1, "{live:?}");
+        assert!(live.is_covered(), "{live:?}");
+        sqlx::query("INSERT INTO thin_delivery_refs VALUES ('derive','synthetic',73,'ThroughMerge')")
+            .execute(&db).await.unwrap();
+        sqlx::query("UPDATE thin_external_observations SET completed_reason='PR #73 已合并', closeout_queued=1 WHERE session_id='derive'")
+            .execute(&db).await.unwrap();
+        let done = super::super::background_tasks::wake_source_cover(&db, "derive").await;
+        assert_eq!(done.external_observations, 0, "{done:?}");
+    }
+
+    /// R3/R5：重启对账把存量脏状态一次修完，而且幂等。
+    #[tokio::test]
+    async fn m197_stock_dirty_states_repaired_and_idempotent() {
+        let db = fixture().await;
+        for (id, title) in [("a", "a"), ("b", "b")] {
+            sqlx::query("INSERT INTO sessions(id,title,cwd,model_id,created_at,updated_at,delivery_mode) VALUES (?,'synthetic','/synthetic','model',1,1,'thin')")
+                .bind(id).bind(title).execute(&db).await.unwrap();
+        }
+        // a：系统能推进（PR 已合并的收尾事实缺失）→ 补来源
+        m197_wait("a", &db, "PR #91 合并/CI").await;
+        sqlx::query("INSERT INTO thin_delivery_refs VALUES ('a','synthetic',91,'ThroughMerge')")
+            .execute(&db).await.unwrap();
+        ensure_external(&db).await.unwrap();
+        sqlx::query("INSERT INTO thin_external_observations(session_id,pr_number,ceiling,observed_at,completed_reason,closeout_queued) VALUES ('a',91,'ThroughMerge',1,'PR #91 已合并',0)")
+            .execute(&db).await.unwrap();
+        // b：等的是一个人的决定 → 必须变成人话提问
+        m197_wait("b", &db, "是否继续这次重构").await;
+
+        let first = reconcile_waiting_wake_sources(&db).await.unwrap();
+        assert_eq!(first.scanned, 2, "{first:?}");
+        let mut uncovered = Vec::new();
+        for session in ["a", "b"] {
+            let state = super::super::thin_state::load(&db, session).await.unwrap().unwrap();
+            let covered = super::super::background_tasks::wake_source_cover(&db, session).await.is_covered();
+            if state.state == SessionState::WaitingWake && !covered { uncovered.push(session); }
+        }
+        assert!(uncovered.is_empty(), "uncovered waiting_wake survived reconcile: {uncovered:?}");
+
+        let b = super::super::thin_state::load(&db, "b").await.unwrap().unwrap();
+        assert_eq!(b.state, SessionState::WaitingUser, "{b:?}");
+        assert!(!b.question.unwrap_or_default().contains("唤醒源"));
+
+        let pending_first: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM wakeup_schedules WHERE status='pending'")
+            .fetch_one(&db).await.unwrap();
+        let second = reconcile_waiting_wake_sources(&db).await.unwrap();
+        let pending_second: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM wakeup_schedules WHERE status='pending'")
+            .fetch_one(&db).await.unwrap();
+        assert_eq!(pending_first, pending_second, "reconcile must be idempotent");
+        assert_eq!(second.still_waiting, second.scanned, "no silent uncovered leftover: {second:?}");
+    }
+
     #[tokio::test]
     async fn m183_startup_repairs_waiting_wake_without_a_source() {
         let db = fixture().await;
+        // M197/R1 之后，「系统自己盯着」的等待才允许自动补来源；要人决定的等待转人话提问
+        // （见 m197_self_continue_is_bounded_then_asks_user）。这里仍验证补来源路径。
         super::super::thin_state::save(&db, "derive", &ThinState {
             state: SessionState::WaitingWake,
-            waiting_for: Some("synthetic unfinished closeout".into()),
+            waiting_for: Some("等待后台任务完成".into()),
             wake_source: Some("持久收尾投递器：系统自动重试/自愈".into()),
             ..ThinState::running()
         }).await.unwrap();
