@@ -25,6 +25,6 @@ Spec：原文规格+矩阵；Payload：大小/多项/读取错误；Compatibilit
 
 macOS 原生兜底已用独立命名 NSPasteboard 实测多文件 URL、空剪贴板、合成有效 PNG 位图→PNG base64 输出断言；不读取或修改生产 general pasteboard，不需要 Swift 开发工具。
 
-Scenario-Test: UI-001, UI-007, UI-008
+Scenario-Test: CAP-001, CXD-001, CXD-002, DAT-001, HLT-001, HLT-002, HLT-003, HLT-004, HLT-005, RTE-001, RTE-002, RTE-003, RTE-004, RTE-005, SKL-002, SKL-003, UI-001, UI-002, UI-003, UI-004, UI-005, UI-006, UI-007, UI-008, UI-009, UI-010, UI-011, UI-012, UI-013, UI-014, UI-015, VIS-001
 README-Update: reviewed
 README-Update-Reason: 补齐已承诺的粘贴附件与预览行为，不改变安装、隐私或平台公开承诺。
