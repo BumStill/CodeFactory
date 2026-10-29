@@ -924,7 +924,7 @@ mod tests {
             let exec = std::path::PathBuf::from(m159_git(&root, &["--exec-path"]));
             exec.ancestors().map(|p| p.join("bin/bash.exe")).find(|p| p.is_file()).expect("Git Bash")
         } else { "sh".into() };
-        let output = std::process::Command::new(shell).no_window().current_dir(&root).args(["-c", &local]).output().unwrap();
+        let output = std::process::Command::new(&shell).no_window().current_dir(&root).args(["-c", &local]).output().unwrap();
         assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
         assert_eq!(std::fs::read_to_string(root.join("tracked.txt")).unwrap(), "m198 rewritten");
         assert_eq!(sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM permission_intents").fetch_one(&gateway.db).await.unwrap(), 0);
@@ -946,7 +946,9 @@ mod tests {
         let args = serde_json::json!({"command":node});
         let call = ToolCall { id: "m198-node".into(), r#type: "function".into(), function: FunctionCall { name: "bash".into(), arguments: args.to_string() } };
         assert_eq!(gateway.authorize(&call, &args, Some(node)).await, PermissionOutcome::Allow);
-        let output = std::process::Command::new(if cfg!(windows) { "bash" } else { "sh" }).no_window().current_dir(&root).args(["-c", node]).output().unwrap();
+        // Reuse the resolved Git Bash: on Windows `bash` on PATH can be the WSL
+        // launcher, which cannot see the runner's node/pnpm installation.
+        let output = std::process::Command::new(&shell).no_window().current_dir(&root).args(["-c", node]).output().unwrap();
         assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
         assert_eq!(std::fs::read_to_string(root.join("tracked.txt")).unwrap(), "node rewritten");
         std::fs::write(root.join("tracked.txt"), "base").unwrap();
