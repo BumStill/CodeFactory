@@ -17,6 +17,10 @@ async fn ensure_external(db: &SqlitePool) -> sqlx::Result<()> {
         sqlx::query("ALTER TABLE thin_external_observations ADD COLUMN merged_at INTEGER")
             .execute(db).await?;
     }
+    if !has_column(db, "thin_external_observations", "next_check_at").await? {
+        sqlx::query("ALTER TABLE thin_external_observations ADD COLUMN next_check_at INTEGER NOT NULL DEFAULT 0")
+            .execute(db).await?;
+    }
     Ok(())
 }
 
@@ -373,7 +377,8 @@ async fn arm_durable_wake(db: &SqlitePool, session: &str, prefix: &str, prompt: 
 }
 
 async fn self_continue_fires(db: &SqlitePool, session: &str) -> sqlx::Result<i64> {
-    if !has_table(db, "wakeup_schedules").await? { return Ok(0); }
+    if !has_table(db, "wakeup_schedules").await?
+        || !has_column(db, "wakeup_schedules", "fire_count").await? { return Ok(0); }
     let fired: i64 = sqlx::query_scalar(
         "SELECT COALESCE(SUM(fire_count),0) FROM wakeup_schedules WHERE session_id=? AND id LIKE 'thin-source-repair-%'",
     ).bind(session).fetch_one(db).await?;
@@ -437,8 +442,8 @@ pub(crate) async fn heartbeat_external(db: &SqlitePool, session: &str) -> sqlx::
     sqlx::query("INSERT INTO thin_external_observations(session_id,pr_number,ceiling) VALUES (?,?,?) ON CONFLICT(session_id) DO UPDATE SET pr_number=excluded.pr_number,ceiling=excluded.ceiling,observed_at=0,completed_reason=NULL,closeout_queued=0 WHERE pr_number<>excluded.pr_number OR ceiling<>excluded.ceiling")
         .bind(session).bind(number).bind(&ceiling).execute(db).await?;
     let at = chrono::Utc::now().timestamp_millis();
-    let claimed = sqlx::query("UPDATE thin_external_observations SET observed_at=? WHERE session_id=? AND (completed_reason IS NULL OR completed_reason NOT LIKE '%已合并%') AND observed_at<=?")
-        .bind(at).bind(session).bind(at - 180_000).execute(db).await?.rows_affected() == 1;
+    let claimed = sqlx::query("UPDATE thin_external_observations SET observed_at=?,next_check_at=? WHERE session_id=? AND (completed_reason IS NULL OR completed_reason NOT LIKE '%已合并%') AND observed_at<=?")
+        .bind(at).bind(at + 180_000).bind(session).bind(at - 180_000).execute(db).await?.rows_affected() == 1;
     if claimed {
         let observe_ceiling = ceiling.clone();
         let observed = tokio::task::spawn_blocking(move || {
@@ -694,6 +699,56 @@ pub(crate) async fn reconcile_running_liveness(db: &SqlitePool) -> sqlx::Result<
 }
 
 pub async fn derive_state(db: &SqlitePool, session: &str) -> sqlx::Result<ThinState> {
+    let mut state = derive_candidate(db, session).await?;
+    if state.state != SessionState::WaitingWake { return Ok(state); }
+    let previous = super::thin_state::load(db, session).await?;
+    if let Some(old) = previous.as_ref().filter(|old| old.state == state.state) {
+        state.updated_at = old.updated_at;
+    }
+    // M202/R1: one boundary for every WaitingWake branch. No prose-only source
+    // may escape. Persist the exact row reference with the projection atomically.
+    super::background_tasks::ensure_schema(db).await?;
+    super::thin_state::ensure(db).await?;
+    ensure_pr_monitor(db, session).await?;
+    let has_monitor = has_table(db, "thin_external_observations").await?;
+    let repair_fires = self_continue_fires(db, session).await?;
+    let mut tx = crate::storage::db::begin_write(db).await?;
+    let wake: Option<String> = sqlx::query_scalar("SELECT id FROM wakeup_schedules WHERE session_id=? AND status='pending' ORDER BY next_at,id LIMIT 1")
+        .bind(session).fetch_optional(&mut *tx).await?;
+    let monitor: Option<i64> = if has_monitor {
+        sqlx::query_scalar("SELECT pr_number FROM thin_external_observations WHERE session_id=? AND (completed_reason IS NULL OR completed_reason NOT LIKE '%已合并%')")
+            .bind(session).fetch_optional(&mut *tx).await?
+    } else { None };
+    let task: Option<String> = sqlx::query_scalar("SELECT id FROM background_tasks WHERE session_id=? AND (status='running' OR wake_state='pending') LIMIT 1")
+        .bind(session).fetch_optional(&mut *tx).await?;
+    state.wake_source = Some(if let Some(id) = wake {
+        format!("pending wakeup：{id}")
+    } else if let Some(number) = monitor {
+        sqlx::query("UPDATE thin_external_observations SET next_check_at=MAX(next_check_at,observed_at+180000) WHERE session_id=?")
+            .bind(session).execute(&mut *tx).await?;
+        format!("系统 PR 监视订阅：{session}/PR#{number}")
+    } else if let Some(id) = task {
+        format!("后台任务：{id}")
+    } else {
+        if repair_fires >= MAX_SELF_CONTINUE {
+            tx.rollback().await?;
+            super::thin_state::ask_user(db, session, &format!("我原本在等「{}」，系统自动重试 {repair_fires} 次后仍未推进。请决定换个做法继续还是结束？", state.waiting_for.as_deref().unwrap_or("原任务"))).await?;
+            return Ok(super::thin_state::load(db, session).await?.unwrap());
+        }
+        let id = format!("thin-source-repair-{session}");
+        let now = chrono::Utc::now().timestamp();
+        sqlx::query("INSERT INTO wakeup_schedules(id,session_id,prompt,source,next_at,status,created_at) VALUES (?,?,?,'agent_decided',?,'pending',?) ON CONFLICT(id) DO UPDATE SET status='pending',next_at=excluded.next_at,prompt=excluded.prompt")
+            .bind(&id).bind(session).bind(format!("系统自动重试/自愈：{}；核对事实并接续原任务。", state.waiting_for.as_deref().unwrap_or("接续中断回合")))
+            .bind(now + 60).bind(now).execute(&mut *tx).await?;
+        format!("pending wakeup：{id}")
+    });
+    sqlx::query("INSERT INTO thin_session_state(session_id,state,waiting_for,wake_source,reason,updated_at) VALUES (?,'waiting_wake',?,?,?,?) ON CONFLICT(session_id) DO UPDATE SET state='waiting_wake',waiting_for=excluded.waiting_for,wake_source=excluded.wake_source,reason=excluded.reason,updated_at=excluded.updated_at")
+        .bind(session).bind(&state.waiting_for).bind(&state.wake_source).bind(&state.reason).bind(state.updated_at).execute(&mut *tx).await?;
+    tx.commit().await?;
+    Ok(state)
+}
+
+async fn derive_candidate(db: &SqlitePool, session: &str) -> sqlx::Result<ThinState> {
     super::workspace_recovery_budget::ensure(db).await?;
     let settled: Option<String> = sqlx::query_scalar("SELECT settled_reason FROM workspace_recovery_budget WHERE session_id=?")
         .bind(session).fetch_optional(db).await?.flatten();
@@ -892,6 +947,10 @@ pub async fn derive_state(db: &SqlitePool, session: &str) -> sqlx::Result<ThinSt
             return Ok(executor_missing_state());
         }
     } else if let Some((_, reason)) = &terminal {
+        if completed.as_deref().is_some_and(|value| !is_external_failure(value))
+            && unfinished_delivery(db, session).await?.is_none() {
+            return Ok(ThinState::ended(reason, "本会话记录"));
+        }
         let previous = super::thin_state::load(db, session).await?;
         // A final answer may deliberately settle to waiting_wake. A stop never does.
         // M158/R3：历史上写进库里的「没有活着的唤醒源」问题（waiting_user +
@@ -921,6 +980,11 @@ pub async fn derive_state(db: &SqlitePool, session: &str) -> sqlx::Result<ThinSt
                 return Ok(ThinState { state: SessionState::WaitingUser, question: Some(what), ..ThinState::running() });
             }
         }
+    }
+    if due_wakes > 0 && pending_background == 0
+        && terminal.as_ref().is_some_and(|(_, reason)| reason == "最终回答已完成")
+        && latest_user.is_none_or(|time| time <= cutoff) {
+        return Ok(ThinState::ended("最终回答已完成", "本会话记录"));
     }
     if pending_background + due_wakes > 0 {
         return Ok(ThinState {
@@ -1014,7 +1078,7 @@ pub async fn refresh(db: &SqlitePool, session: &str) -> sqlx::Result<ThinState> 
     // M199: ensure_terminal_wake already committed this projection with its wake.
     // Do not write a stale waiting projection a second time after another writer cancels it.
     if state.state == SessionState::WaitingWake
-        && state.wake_source.as_deref().is_some_and(|source| source.starts_with("pending wakeup：")) {
+        && state.wake_source.as_deref().is_some_and(|source| source.starts_with("pending wakeup：") || source.starts_with("系统 PR 监视订阅：") || source.starts_with("后台任务：")) {
         return Ok(state);
     }
     super::thin_state::ensure(db).await?;
@@ -1030,6 +1094,72 @@ pub async fn refresh(db: &SqlitePool, session: &str) -> sqlx::Result<ThinState> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn m202_all_waiting_fixtures_require_queryable_source() {
+        for kind in ["pr", "interrupted", "system_wait"] {
+            let db = fixture().await;
+            match kind {
+                "pr" => {
+                    sqlx::query("INSERT INTO thin_delivery_refs VALUES ('derive','synthetic',202,'ThroughMerge')")
+                        .execute(&db).await.unwrap();
+                }
+                "interrupted" => {
+                    sqlx::query("INSERT INTO messages(id,session_id,role,content,created_at) VALUES ('m202-user','derive','user','synthetic task',100)")
+                        .execute(&db).await.unwrap();
+                }
+                _ => m197_wait("derive", &db, "系统自动重试/自愈：继续任务").await,
+            }
+            let state = derive_state(&db, "derive").await.unwrap();
+            if state.state == SessionState::WaitingWake {
+                let cover = super::super::background_tasks::wake_source_cover(&db, "derive").await;
+                assert!(cover.is_covered(), "{kind}: waiting without durable fact: {state:?}");
+                assert!(state.wake_source.as_deref().is_some_and(|source| source.contains("：")), "{state:?}");
+            }
+        }
+    }
+    #[tokio::test]
+    async fn m202_pending_failure_subscription_survives_restart() {
+        use super::super::background_tasks::{WakeSink, WakeFuture, drain_due_wakeups_at};
+        let dir = tempfile::tempdir().unwrap();
+        let url = format!("sqlite://{}?mode=rwc", dir.path().join("m202.sqlite").display());
+        let db = crate::storage::db::connect(&url).await.unwrap();
+        sqlx::query("INSERT INTO sessions(id,title,cwd,model_id,created_at,updated_at,delivery_mode) VALUES ('derive','synthetic','/synthetic','model',1,1,'thin')").execute(&db).await.unwrap();
+        sqlx::query("INSERT INTO thin_delivery_refs VALUES ('derive','synthetic',202,'ThroughMerge')").execute(&db).await.unwrap();
+        let state = refresh(&db, "derive").await.unwrap();
+        assert_eq!(state.state, SessionState::WaitingWake);
+        let subscription: (i64,i64,i64) = sqlx::query_as("SELECT pr_number,observed_at,next_check_at FROM thin_external_observations WHERE session_id='derive'").fetch_one(&db).await.unwrap();
+        assert_eq!(subscription.0, 202);
+        db.close().await;
+        let db = crate::storage::db::connect(&url).await.unwrap();
+        let reopened: (i64,i64,i64) = sqlx::query_as("SELECT pr_number,observed_at,next_check_at FROM thin_external_observations WHERE session_id='derive'").fetch_one(&db).await.unwrap();
+        assert_eq!(subscription, reopened);
+        let at = chrono::Utc::now().timestamp_millis();
+        // Synthetic GitHub responses enter the same reducer as the bounded observer.
+        let pending = serde_json::json!({"state":"OPEN", "statusCheckRollup":[{"name":"check-rust","status":"IN_PROGRESS"}]});
+        assert!(failure_reason(&pending, 202).is_none());
+        apply_observation(&db, "derive", 202, "ThroughMerge", None, None).await.unwrap();
+        let failed = serde_json::json!({"state":"OPEN", "statusCheckRollup":[{"name":"check-rust","status":"COMPLETED","conclusion":"FAILURE"}]});
+        let reason = failure_reason(&failed, 202).unwrap();
+        apply_observation(&db, "derive", 202, "ThroughMerge", Some(&reason), None).await.unwrap();
+        // Reserve the current interval, so this offline test never invokes real gh.
+        sqlx::query("UPDATE thin_external_observations SET observed_at=?,next_check_at=? WHERE session_id='derive'").bind(at).bind(at+180000).execute(&db).await.unwrap();
+        heartbeat_external(&db, "derive").await.unwrap();
+        let due: i64 = sqlx::query_scalar("SELECT next_at FROM wakeup_schedules WHERE session_id='derive' AND status='pending'").fetch_one(&db).await.unwrap();
+        assert!(due * 1000 - at <= 300000);
+        struct Sink;
+        impl WakeSink for Sink {
+            fn enqueue(&self, session: String, text: String) -> WakeFuture {
+                assert_eq!(session, "derive");
+                assert!(text.contains("check-rust") && text.contains("同一分支"), "{text}");
+                Box::pin(async { true })
+            }
+        }
+        assert_eq!(drain_due_wakeups_at(&db, &Sink, due).await, 1);
+        assert_eq!(drain_due_wakeups_at(&db, &Sink, due).await, 0);
+        db.close().await;
+    }
+
     async fn m199_merged_fixture(db: &SqlitePool, cwd: &str, fires: i64) {
         sqlx::query("UPDATE sessions SET cwd=? WHERE id='derive'").bind(cwd).execute(db).await.unwrap();
         sqlx::query("INSERT INTO thin_delivery_refs VALUES ('derive','synthetic',908,'ThroughMerge')").execute(db).await.unwrap();
@@ -1728,7 +1858,8 @@ mod tests {
         let unwatched = refresh(&db, "derive").await.unwrap();
         assert_eq!(unwatched.state, SessionState::WaitingWake, "{unwatched:?}");
         assert!(unwatched.question.is_none(), "外部等待不得变成用户问题：{:?}", unwatched.question);
-        assert!(unwatched.wake_source.unwrap_or_default().contains("系统自动监视"));
+        assert!(unwatched.wake_source.unwrap_or_default().starts_with("pending wakeup："));
+        assert!(super::super::background_tasks::wake_source_cover(&db, "derive").await.is_covered());
         super::super::thin_state::save(&db, "derive", &waiting).await.unwrap();
         super::super::background_tasks::wake_source_cover(&db, "derive").await;
         sqlx::query("INSERT INTO wakeup_schedules(id,session_id,prompt,source,next_at,status,created_at) VALUES ('monitor','derive','synthetic','agent_decided',9223372036854775807,'pending',1)")
@@ -1954,7 +2085,7 @@ mod tests {
         );
         assert_eq!(
             derived.wake_source.as_deref(),
-            Some("系统 PR 监视（心跳，间隔不少于 180 秒）")
+            Some("系统 PR 监视订阅：derive/PR#305")
         );
 
         // 边界：closeout 已入队（PR 真正收口）后，同一个终态事实照旧结束会话。

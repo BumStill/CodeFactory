@@ -1275,6 +1275,16 @@ pub async fn drain_due_wakeups_at(pool: &SqlitePool, sink: &dyn WakeSink, now: i
                 return 0;
             }
             let _ = super::workspace_recovery_budget::clear(pool, &session).await;
+            for wake in &wakes {
+                let cycle = wake.every_sec.or(wake.after_sec).unwrap_or(60).max(1) as i64;
+                if now.saturating_sub(wake.next_at) > cycle.saturating_mul(2) {
+                    let detail = serde_json::json!({"wakeup_id":wake.id,"next_at":wake.next_at,"recovered_at":now,"delay_seconds":now.saturating_sub(wake.next_at)}).to_string();
+                    if let Err(error) = sqlx::query("INSERT OR IGNORE INTO session_audit_events(id,session_id,kind,actor,detail_json,created_at) VALUES (?,?,'wakeup_overdue_recovered','system',?,?)")
+                        .bind(format!("wake-overdue-{}-{}", wake.id, wake.next_at)).bind(&session).bind(detail).bind(now.saturating_mul(1000)).execute(pool).await {
+                        tracing::warn!(%error, session, "overdue wake audit deferred; system automatic recovery");
+                    }
+                }
+            }
             // 至少一次：成功入队才推进；崩溃前未推进仍可重试，不丢失原因。
             let mut advanced = false;
             for wake in wakes {
@@ -1361,7 +1371,7 @@ pub async fn wake_source_cover(pool: &SqlitePool, session_id: &str) -> WakeSourc
     };
     let external_observations: i64 = if ensure_external_table(pool).await.is_ok() {
         sqlx::query_scalar(
-            "SELECT COUNT(*) FROM thin_external_observations WHERE session_id = ? AND completed_reason IS NULL",
+            "SELECT COUNT(*) FROM thin_external_observations WHERE session_id = ? AND (completed_reason IS NULL OR (completed_reason NOT LIKE '%已合并%' AND completed_reason NOT LIKE '%已关闭但未合并%'))",
         )
         .bind(session_id)
         .fetch_one(pool)
@@ -2329,6 +2339,22 @@ mod tests {
         assert_eq!(get(&reopened, "bg-m168").await.unwrap().unwrap().wake_state, "enqueued");
         assert_eq!(drain_pending_wakes(&reopened, sink(&Arc::new(Recorder::default()))).await, 0);
         reopened.close().await;
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn m202_overdue_wake_is_audited_and_delivered() {
+        let dir = scratch_dir("m202-overdue");
+        let pool = file_pool(&dir).await;
+        sqlx::query("CREATE TABLE IF NOT EXISTS session_audit_events(id TEXT PRIMARY KEY,session_id TEXT,kind TEXT,actor TEXT,detail_json TEXT,created_at INTEGER)").execute(&pool).await.unwrap();
+        schedule_wakeup_at(&pool, wakeup_request("s1", "synthetic overdue", Some(180)), 1000).await.unwrap();
+        let recorder = Arc::new(Recorder::default());
+        assert_eq!(drain_due_wakeups_at(&pool, sink(&recorder), 1600).await, 1);
+        assert_eq!(recorder.take().len(), 1);
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM session_audit_events WHERE session_id='s1' AND kind='wakeup_overdue_recovered'").fetch_one(&pool).await.unwrap();
+        assert_eq!(count, 1, "overdue recovery must be durable audit evidence");
+        assert_eq!(drain_due_wakeups_at(&pool, sink(&recorder), 1600).await, 0);
+        pool.close().await;
         std::fs::remove_dir_all(dir).unwrap();
     }
 
