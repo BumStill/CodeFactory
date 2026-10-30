@@ -1523,6 +1523,21 @@ async fn ensure_schema(pool: &SqlitePool) -> crate::errors::Result<()> {
     )
     .execute(pool)
     .await?;
+    // M210/R3：`PROVIDER_FATAL` 要留下服务方状态码与脱敏摘要。只加列，旧库照常可读。
+    ensure_column(pool, "model_route_attempts", "provider_status", "INTEGER").await?;
+    ensure_column(pool, "model_route_attempts", "failure_summary", "TEXT").await?;
+    // M210/R1：模型可用性等待是一等持久事实（有自己的恢复时间与重试计数）。
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS model_availability_waits (
+            session_id   TEXT PRIMARY KEY,
+            reason       TEXT NOT NULL,
+            resume_at_ms INTEGER,
+            attempts     INTEGER NOT NULL DEFAULT 0,
+            updated_at   INTEGER NOT NULL
+        )",
+    )
+    .execute(pool)
+    .await?;
 
     // task_runs.acceptance_criteria_json: JSON Vec<String> set by the
     // decompose commands at task creation time. The autonomous subagent

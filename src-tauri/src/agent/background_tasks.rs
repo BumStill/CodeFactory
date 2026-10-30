@@ -1010,23 +1010,47 @@ async fn ensure_wakeup_schema(pool: &SqlitePool) -> sqlx::Result<()> {
 }
 
 /// 系统模型等待不受用户工具的 60 秒/6 小时输入范围约束；绝对恢复时间直接落盘。
-/// 固定 session ID 去重，避免同一等待的重复结算产生多个续跑回合。
+///
+/// M210/R5：同一次等待续期时沿用仍在 pending 的那一行（避免同一等待出现两个唤醒）；
+/// 唤醒已经触发过、模型仍不可用时，重挂**新 id** 的唤醒，让会话保持
+/// `waiting_wake` 而不是被孤儿清理或升级成提问。
 pub(crate) async fn persist_model_wakeup(
     pool: &SqlitePool, session: &str, root: &str, at_ms: i64, notice: &str,
-) -> sqlx::Result<()> {
+) -> sqlx::Result<String> {
     ensure_wakeup_schema(pool).await?;
+    let base = format!("model-availability-{session}");
+    let pending: Option<String> = sqlx::query_scalar(
+        "SELECT id FROM wakeup_schedules
+          WHERE session_id=? AND status='pending' AND id LIKE 'model-availability-%'
+          ORDER BY next_at ASC, created_at ASC LIMIT 1",
+    )
+    .bind(session)
+    .fetch_optional(pool)
+    .await?;
+    let id = match pending {
+        Some(id) => id,
+        None => {
+            let seen: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM wakeup_schedules WHERE session_id=? AND id LIKE 'model-availability-%'",
+            )
+            .bind(session)
+            .fetch_one(pool)
+            .await?;
+            if seen == 0 { base } else { format!("{base}-re{seen}") }
+        }
+    };
     sqlx::query(
         "INSERT INTO wakeup_schedules(id,session_id,root_turn_id,prompt,source,next_at,status,created_at)
          VALUES (?,?,?,?,'agent_decided',?,'pending',?)
          ON CONFLICT(id) DO UPDATE SET root_turn_id=excluded.root_turn_id,
            prompt=excluded.prompt,next_at=excluded.next_at,status='pending',last_fired_at=NULL",
     )
-    .bind(format!("model-availability-{session}"))
+    .bind(&id)
     .bind(session).bind(root)
     .bind(format!("{notice}。系统自动重试/自愈：模型可用时间已到，重新检查凭据、使用时段和用户额度硬上限，继续原任务。"))
     .bind(at_ms.saturating_add(999).div_euclid(1000)).bind(now_secs())
     .execute(pool).await?;
-    Ok(())
+    Ok(id)
 }
 
 /// R2：创建唤醒。时限、提示文本、上限都在落库前校验，因此被拒时不留任何行。

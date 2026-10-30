@@ -283,6 +283,11 @@ pub async fn sweep(db: &SqlitePool, now_ms: i64) -> sqlx::Result<usize> {
         if cover.is_covered() || now_ms.saturating_sub(updated_at) < WAKE_EXPIRY_MS {
             continue;
         }
+        // M210/R1：模型可用性等待有自己的恢复时间，不是「唤醒源失效」，
+        // 也不能被升级成让用户决定做法的问题。
+        if super::usage_windows::model_wait::load(db, &session_id).await?.is_some() {
+            continue;
+        }
         let what = waiting_for.unwrap_or_else(|| "未命名事项".to_string());
         let next = ThinState {
             state: SessionState::WaitingUser,
@@ -351,17 +356,24 @@ pub async fn settle_error(db: &SqlitePool, session_id: &str, root_turn_id: &str,
         ThinState::ended("cancelled：回合已取消", "本会话记录")
     } else if let Some(unavailable) = super::failover::ModelUnavailable::parse(error_text) {
         let at = unavailable.resume_at_ms.unwrap_or_else(|| now().saturating_add(60_000));
-        super::background_tasks::persist_model_wakeup(db, session_id, root_turn_id, at, &unavailable.notice).await?;
+        let wake = super::background_tasks::persist_model_wakeup(db, session_id, root_turn_id, at, &unavailable.notice).await?;
+        // M210/R1：模型可用性等待是一等事实，与「自动重试次数」分开记账——
+        // 它不该把会话推进到「自动重试 2 次仍未推进，请决定」。
+        super::usage_windows::model_wait::record(db, session_id, &unavailable.notice, unavailable.resume_at_ms).await?;
         ThinState {
             waiting_for: Some(unavailable.notice.clone()),
             reason: Some(unavailable.notice),
-            wake_source: Some(format!("model-availability-{session_id}")),
+            wake_source: Some(format!("模型可用性唤醒 {wake}")),
             ..after_no_model(at.saturating_sub(now()))
         }
     } else if error_text.contains("no_model_available") {
         let at = now().saturating_add(60_000);
-        super::background_tasks::persist_model_wakeup(db, session_id, root_turn_id, at, "模型暂不可用").await?;
-        after_no_model(60_000)
+        let wake = super::background_tasks::persist_model_wakeup(db, session_id, root_turn_id, at, "模型暂不可用").await?;
+        super::usage_windows::model_wait::record(db, session_id, "当前没有可用模型；系统自动重试/自愈，到点自动继续。", None).await?;
+        ThinState {
+            wake_source: Some(format!("模型可用性唤醒 {wake}")),
+            ..after_no_model(60_000)
+        }
     } else {
         record_technical_failure(db, session_id, &first_line(error_text)).await?
     };
@@ -439,6 +451,8 @@ pub async fn settle_outcome(
         }
     }
     if outcome_settles_final(finished, blocked, final_text) {
+        // M210：模型真正跑出一个回合 = 模型等待结束。
+        super::usage_windows::model_wait::clear(db, session_id).await?;
         settle_final(db, session_id, root_turn_id, external_what).await
     } else {
         settle_error(
@@ -784,5 +798,81 @@ mod m197_tests {
         assert!(label.contains("外部事项"), "{label}");
         assert!(label.contains("下一次检查"), "{label}");
         assert_ne!(label.trim(), "等唤醒：", "empty wait reason must not be projected");
+    }
+}
+
+/// M210：没有可用模型 = 「等模型可用」，不是「自动重试用尽」。
+#[cfg(test)]
+mod m210_tests {
+    use super::*;
+
+    async fn db() -> SqlitePool {
+        let db = crate::storage::db::connect("sqlite::memory:").await.unwrap();
+        sqlx::query("INSERT INTO sessions(id,title,cwd,model_id,created_at,updated_at,delivery_mode) VALUES ('m210','synthetic','/synthetic','model',1,1,'thin')")
+            .execute(&db).await.unwrap();
+        db
+    }
+
+    /// M210/R4：额度上限 + 致命错误 → `waiting_wake`，唤醒落在 resets_at，没有提问。
+    #[tokio::test]
+    async fn m210_quota_cap_plus_fatal_waits_until_reset() {
+        let db = db().await;
+        let reset_at = chrono::Utc::now().timestamp_millis() + 14 * 60 * 1000;
+        let notice = format!(
+            "当前没有可用模型：ChatGPT / gpt-5.5（本窗口额度已到 80% 上限，{} 恢复）；DeepSeek / deepseek-v4-pro（调用失败：HTTP 500 upstream）。系统自动重试/自愈，到点自动继续。",
+            chrono::DateTime::from_timestamp_millis(reset_at)
+                .unwrap()
+                .with_timezone(&chrono_tz::Asia::Shanghai)
+                .format("%H:%M")
+        );
+        let error = super::super::failover::ModelUnavailable {
+            resume_at_ms: Some(reset_at),
+            notice: notice.clone(),
+        }
+        .encode();
+        let state = settle_error(&db, "m210", "m210-root", &error).await.unwrap();
+        assert_eq!(state.state, SessionState::WaitingWake, "{state:?}");
+        assert!(state.question.is_none(), "model availability must never ask the user");
+        assert_eq!(state.consecutive_failures, 0, "a model wait is not a technical failure");
+        assert!(state.wake_source.as_deref().is_some_and(|s| s.contains("模型可用性唤醒")), "{state:?}");
+
+        let wake: (String, i64) = sqlx::query_as(
+            "SELECT id, next_at FROM wakeup_schedules WHERE session_id='m210' AND status='pending' AND id LIKE 'model-availability-%'",
+        ).fetch_one(&db).await.unwrap();
+        assert!((wake.1 * 1000 - reset_at).abs() <= 1000, "the wake must land on resets_at: {} vs {reset_at}", wake.1 * 1000);
+        assert!(wake.0.starts_with("model-availability-m210"), "{}", wake.0);
+
+        let wait = super::super::usage_windows::model_wait::load(&db, "m210").await.unwrap().expect("model wait is a durable fact");
+        assert_eq!(wait.resume_at_ms, Some(reset_at));
+        assert_eq!(wait.reason, notice);
+        db.close().await;
+    }
+
+    /// M210：模型真正跑出回合后等待结束，不再重挂唤醒。
+    #[tokio::test]
+    async fn m210_successful_turn_clears_the_model_wait() {
+        let db = db().await;
+        let error = super::super::failover::ModelUnavailable {
+            resume_at_ms: Some(chrono::Utc::now().timestamp_millis() + 60_000),
+            notice: "当前没有可用模型：DeepSeek / deepseek-v4-pro（调用失败：HTTP 500）。".into(),
+        }
+        .encode();
+        settle_error(&db, "m210", "m210-root", &error).await.unwrap();
+        assert!(super::super::usage_windows::model_wait::load(&db, "m210").await.unwrap().is_some());
+        let state = settle_outcome(&db, "m210", "m210-root", true, false, "任务已完成并交付。", "FinalAnswer", None)
+            .await
+            .unwrap();
+        assert!(state.question.is_none(), "{state:?}");
+        assert!(
+            super::super::usage_windows::model_wait::load(&db, "m210").await.unwrap().is_none(),
+            "a real answer means the model is available again"
+        );
+        // 等待清掉之后不得再挂模型唤醒：否则「已可用」的会话会被反复叫醒。
+        crate::agent::thin_derive::refresh(&db, "m210").await.unwrap();
+        let pending: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM wakeup_schedules WHERE session_id='m210' AND status='pending' AND id LIKE 'model-availability-%'",
+        ).fetch_one(&db).await.unwrap();
+        assert_eq!(pending, 0);
+        db.close().await;
     }
 }

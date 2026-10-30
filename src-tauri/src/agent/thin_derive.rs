@@ -388,6 +388,18 @@ async fn repair_waiting_wake_source(db: &SqlitePool, session: &str) -> sqlx::Res
         if monitor > 0 { return Ok(()); }
     }
     let what = state.waiting_for.clone().unwrap_or_default().trim().to_string();
+    // M210/R1/R5：模型可用性等待是系统自愈，不计入自动重试次数、也不升级成提问。
+    // 唤醒已经触发过而模型仍不可用（10-30 12:00 现场）时，在这里重挂下一个恢复时间。
+    if let Some(wait) = super::usage_windows::model_wait::load(db, session).await? {
+        let at = super::usage_windows::model_wait::next_at(&wait, chrono::Utc::now().timestamp_millis());
+        let root = open_root_turn(db, session).await?;
+        let wake = super::background_tasks::persist_model_wakeup(
+            db, session, root.as_deref().unwrap_or_default(), at, &wait.reason,
+        ).await?;
+        audit_wait_guard(db, session, "model_wait_rearm", &wait.reason, 0).await;
+        tracing::warn!(session, %wake, "model availability wait re-armed; not counted as a retry");
+        return Ok(());
+    }
     // R1：没有等待对象 = 没有待办，不能停在「等唤醒」。
     if what.is_empty() {
         let ended = ThinState::ended("没有待办事项，任务已结束", "本会话记录");
@@ -689,6 +701,19 @@ async fn unfinished_delivery(db: &SqlitePool, session: &str) -> sqlx::Result<Opt
     })
 }
 
+/// M210：会话里还没结算的回合，用于给模型可用性唤醒挂上正确的 `root_turn_id`。
+async fn open_root_turn(db: &SqlitePool, session: &str) -> sqlx::Result<Option<String>> {
+    if !has_table(db, "chat_turn_state").await? { return Ok(None); }
+    sqlx::query_scalar(
+        "SELECT root_turn_id FROM chat_turn_state
+          WHERE session_id=? AND completed_at IS NULL
+          ORDER BY updated_at DESC LIMIT 1",
+    )
+    .bind(session)
+    .fetch_optional(db)
+    .await
+}
+
 /// M188: only process-local ownership is execution evidence. Persisted rows
 /// survive a restart and must never manufacture an executor.
 async fn has_active_work(_db: &SqlitePool, session: &str) -> sqlx::Result<bool> {
@@ -753,6 +778,20 @@ pub(crate) async fn reconcile_orphan_turns(db: &SqlitePool) -> sqlx::Result<u64>
                 .bind(&session).bind(&root).fetch_one(db).await?;
             if pending > 0 { continue; }
         }
+        // M210/R1/R5/R6：模型可用性等待不是孤儿。唤醒已经触发过而模型仍不可用时，
+        // 重挂下一个恢复时间（新 id），保持 waiting_wake —— 没有重启就不能写
+        // `orphaned_by_restart`（10-30 12:00 现场）。
+        if let Some(wait) = super::usage_windows::model_wait::load(db, &session).await? {
+            let pending_model: i64 = if has_wakes {
+                sqlx::query_scalar("SELECT COUNT(*) FROM wakeup_schedules WHERE session_id=? AND status='pending' AND id LIKE 'model-availability-%'")
+                    .bind(&session).fetch_one(db).await?
+            } else { 0 };
+            if pending_model == 0 {
+                let at = super::usage_windows::model_wait::next_at(&wait, chrono::Utc::now().timestamp_millis());
+                super::background_tasks::persist_model_wakeup(db, &session, &root, at, &wait.reason).await?;
+            }
+            continue;
+        }
         if has_interruptions {
             let interrupted: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM thin_restart_interruptions WHERE root_turn_id=?")
                 .bind(&root).fetch_one(db).await?;
@@ -800,6 +839,22 @@ pub async fn derive_state(db: &SqlitePool, session: &str) -> sqlx::Result<ThinSt
     super::thin_state::ensure(db).await?;
     ensure_pr_monitor(db, session).await?;
     let has_monitor = has_table(db, "thin_external_observations").await?;
+    // M210/R1/R5：模型可用性等待重新挂上下一个恢复时间（新 id），让下面的
+    // wake_source 指向真实 pending 行，也就永远走不到「自动重试 N 次后问用户」。
+    if let Some(wait) = super::usage_windows::model_wait::load(db, session).await? {
+        state.waiting_for = Some(wait.reason.clone());
+        state.reason = Some(wait.reason.clone());
+        let pending_model: Option<String> = sqlx::query_scalar(
+            "SELECT id FROM wakeup_schedules WHERE session_id=? AND status='pending' AND id LIKE 'model-availability-%' LIMIT 1",
+        ).bind(session).fetch_optional(db).await?;
+        if pending_model.is_none() {
+            let at = super::usage_windows::model_wait::next_at(&wait, chrono::Utc::now().timestamp_millis());
+            let root = open_root_turn(db, session).await?;
+            super::background_tasks::persist_model_wakeup(
+                db, session, root.as_deref().unwrap_or_default(), at, &wait.reason,
+            ).await?;
+        }
+    }
     let repair_fires = self_continue_fires(db, session).await?;
     let mut tx = crate::storage::db::begin_write(db).await?;
     let wake: Option<String> = sqlx::query_scalar("SELECT id FROM wakeup_schedules WHERE session_id=? AND status='pending' ORDER BY next_at,id LIMIT 1")
@@ -3467,3 +3522,143 @@ pub(crate) use merged_settlement::{
     ask_user_and_cancel, safety_tick, settle_ended_and_cancel, settle_merged_sessions,
     waiting_wake_without_wake_source,
 };
+
+/// M210：模型全不可用是「等模型可用」，不是「自动重试 2 次仍未推进」。
+#[cfg(test)]
+mod m210_tests {
+    use super::*;
+    use crate::agent::thin_state::{SessionState, ThinState};
+
+    async fn fixture() -> SqlitePool {
+        let db = crate::storage::db::connect("sqlite::memory:").await.unwrap();
+        sqlx::query("INSERT INTO sessions(id,title,cwd,model_id,created_at,updated_at,delivery_mode) VALUES ('m210','synthetic','/synthetic','model',1,1,'thin')")
+            .execute(&db).await.unwrap();
+        super::super::background_tasks::ensure_schema(&db).await.unwrap();
+        db
+    }
+
+    async fn save_wait(db: &SqlitePool, what: &str) {
+        super::super::thin_state::save(db, "m210", &ThinState {
+            state: SessionState::WaitingWake,
+            waiting_for: Some(what.to_string()),
+            wake_source: Some("已登记的唤醒源：模型可用性".into()),
+            ..ThinState::running()
+        }).await.unwrap();
+    }
+
+    async fn seed_fired_model_wake(db: &SqlitePool) {
+        let now = chrono::Utc::now().timestamp();
+        sqlx::query("INSERT INTO wakeup_schedules(id,session_id,root_turn_id,prompt,source,next_at,status,fire_count,created_at,last_fired_at) VALUES ('model-availability-m210','m210','m210-root','等模型可用','agent_decided',?, 'fired',1,?,?)")
+            .bind(now - 60).bind(now - 120).bind(now - 60).execute(db).await.unwrap();
+    }
+
+    async fn seed_repair_exhausted(db: &SqlitePool) {
+        let now = chrono::Utc::now().timestamp();
+        for (index, fired) in [(1, 1), (2, 1)] {
+            sqlx::query("INSERT INTO wakeup_schedules(id,session_id,prompt,source,next_at,status,fire_count,created_at,last_fired_at) VALUES (?,?,?,'agent_decided',?, 'fired',?,?,?)")
+                .bind(format!("thin-source-repair-m210-{index}"))
+                .bind("m210")
+                .bind("接续中断回合")
+                .bind(now - 60).bind(fired).bind(now - 300).bind(now - 60)
+                .execute(db).await.unwrap();
+        }
+    }
+
+    /// M210/R1/R5：唤醒已触发而模型仍不可用 → 重挂新 id，保持等待，绝不问用户。
+    #[tokio::test]
+    async fn m210_fired_model_wake_rearms_with_new_id_instead_of_asking() {
+        let db = fixture().await;
+        save_wait(&db, "系统自动重试/自愈：等模型可用后继续原任务").await;
+        seed_fired_model_wake(&db).await;
+        seed_repair_exhausted(&db).await;
+        super::super::usage_windows::model_wait::record(
+            &db, "m210",
+            "当前没有可用模型：ChatGPT 已达订阅用量上限，14:05 重置；DeepSeek 调用失败：HTTP 500 upstream",
+            Some(chrono::Utc::now().timestamp_millis() + 14 * 60 * 1000),
+        ).await.unwrap();
+
+        reconcile_waiting_wake_sources(&db).await.unwrap();
+
+        let state = super::super::thin_state::load(&db, "m210").await.unwrap().unwrap();
+        assert_eq!(state.state, SessionState::WaitingWake, "{state:?}");
+        assert!(state.question.is_none(), "no question may be raised for a model wait: {state:?}");
+
+        let pending: Vec<String> = sqlx::query_scalar(
+            "SELECT id FROM wakeup_schedules WHERE session_id='m210' AND status='pending' AND id LIKE 'model-availability-%'",
+        ).fetch_all(&db).await.unwrap();
+        assert_eq!(pending.len(), 1, "exactly one re-armed model wake: {pending:?}");
+        assert_ne!(pending[0], "model-availability-m210", "a fired wake must not be reused: {}",
+            pending[0]);
+        assert!(pending[0].starts_with("model-availability-m210-re"), "{}", pending[0]);
+
+        let repair: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM wakeup_schedules WHERE session_id='m210' AND id LIKE 'thin-source-repair-%' AND status='pending'",
+        ).fetch_one(&db).await.unwrap();
+        assert_eq!(repair, 0, "a model wait must not consume the bounded self-repair budget");
+        db.close().await;
+    }
+
+    /// M210/R1：即使自动重试次数已经用尽，模型等待也不升级成「请决定做法」。
+    #[tokio::test]
+    async fn m210_model_wait_never_becomes_a_question() {
+        let db = fixture().await;
+        save_wait(&db, "系统自动重试/自愈：等模型可用后继续原任务").await;
+        seed_repair_exhausted(&db).await;
+        super::super::usage_windows::model_wait::record(&db, "m210", "当前没有可用模型：DeepSeek 调用失败：HTTP 500", None)
+            .await.unwrap();
+
+        let state = refresh(&db, "m210").await.unwrap();
+        assert_eq!(state.state, SessionState::WaitingWake, "derive_state must keep waiting: {state:?}");
+        assert!(state.question.is_none(), "model availability is system-owned: {state:?}");
+        let source = state.wake_source.unwrap_or_default();
+        assert!(source.contains("model-availability-"), "the projection must name the wake: {source}");
+        db.close().await;
+    }
+
+    /// M210/R6：没有重启就不能把模型等待的回合写成孤儿。
+    #[tokio::test]
+    async fn m210_no_orphan_marker_without_restart() {
+        let db = fixture().await;
+        // 会话执行器已不在（等价于 12:00 那次唤醒投递后什么都没起来）。
+        {
+            let control = crate::ChatRunControl::pending();
+            crate::register_session_executor("m210", &control);
+        }
+        sqlx::query("INSERT INTO chat_turn_state(root_turn_id,session_id,phase,status,updated_at,started_at) VALUES ('m210-root','m210','working','active',1,1)")
+            .execute(&db).await.unwrap();
+        super::super::usage_windows::model_wait::record(&db, "m210", "当前没有可用模型：ChatGPT 已达订阅用量上限", Some(chrono::Utc::now().timestamp_millis() + 600_000))
+            .await.unwrap();
+
+        let retired = reconcile_orphan_turns(&db).await.unwrap();
+        assert_eq!(retired, 0, "a session waiting on model availability is not a restart orphan");
+
+        let reason: Option<String> = sqlx::query_scalar("SELECT terminal_reason FROM chat_turn_state WHERE root_turn_id='m210-root'")
+            .fetch_one(&db).await.unwrap();
+        assert!(reason.is_none(), "no restart happened, so no orphan marker: {reason:?}");
+        let pending: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM wakeup_schedules WHERE session_id='m210' AND status='pending' AND id LIKE 'model-availability-%'",
+        ).fetch_one(&db).await.unwrap();
+        assert_eq!(pending, 1, "the wait must be re-armed instead of abandoned");
+        db.close().await;
+    }
+
+    /// M210/R6 反向：真正重启前遗留的回合仍然被清理（M200 语义不回退）。
+    #[tokio::test]
+    async fn m210_pre_birth_turn_still_orphaned() {
+        let db = fixture().await;
+        {
+            let control = crate::ChatRunControl::pending();
+            crate::register_session_executor("m210", &control);
+        }
+        let birth = crate::storage::db::current_process_started_at_ms().expect("process start");
+        sqlx::query("INSERT INTO chat_turn_state(root_turn_id,session_id,phase,status,updated_at,started_at) VALUES ('m210-root','m210','working','active',?,1)")
+            .bind(birth - 3_600_000).execute(&db).await.unwrap();
+
+        let retired = reconcile_orphan_turns(&db).await.unwrap();
+        assert_eq!(retired, 1, "a turn last touched before this process started is a real restart orphan");
+        let reason: Option<String> = sqlx::query_scalar("SELECT terminal_reason FROM chat_turn_state WHERE root_turn_id='m210-root'")
+            .fetch_one(&db).await.unwrap();
+        assert_eq!(reason.as_deref(), Some("orphaned_by_restart"));
+        db.close().await;
+    }
+}

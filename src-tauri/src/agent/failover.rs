@@ -406,12 +406,52 @@ pub struct RouteChange {
     pub kind: RouteChangeKind,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct RouteAttemptSnapshot {
     pub endpoint: String,
     pub model: String,
     pub status: String,
     pub failure_code: Option<String>,
+    /// M210/R3：服务方返回的 HTTP 状态码（`PROVIDER_FATAL` 时必填，能解析就填）。
+    pub provider_status: Option<i64>,
+    /// M210/R3：脱敏后的服务方错误摘要（不含密钥）。
+    pub failure_summary: Option<String>,
+}
+
+/// M210/R3：从失败原因里取服务方的 HTTP 状态码。
+pub(crate) fn provider_status(reason: &str) -> Option<i64> {
+    for marker in ["http ", "HTTP ", "status ", "Status ", "status_code=", "code="] {
+        if let Some(rest) = reason.split(marker).nth(1) {
+            let digits: String = rest.trim_start().chars().take_while(|c| c.is_ascii_digit()).collect();
+            if let Ok(status) = digits.parse::<i64>() {
+                if (100..=599).contains(&status) { return Some(status); }
+            }
+        }
+    }
+    None
+}
+
+/// M210/R3：脱敏的服务方错误摘要——保留「谁说了什么」，抹掉密钥类令牌。
+pub(crate) fn failure_summary(reason: &str) -> Option<String> {
+    let trimmed = reason.trim();
+    if trimmed.is_empty() { return None; }
+    let mut redacted = String::new();
+    for token in trimmed.split_whitespace() {
+        if token.len() > 8
+            && (token.starts_with("sk-")
+                || token.starts_with("Bearer")
+                || token.to_ascii_lowercase().contains("api_key")
+                || token.to_ascii_lowercase().contains("apikey"))
+        {
+            redacted.push_str("[redacted] ");
+        } else {
+            redacted.push_str(token);
+            redacted.push(' ');
+        }
+    }
+    let summary = redacted.trim();
+    let capped: String = summary.chars().take(240).collect();
+    (!capped.is_empty()).then_some(capped)
 }
 
 impl RouteChange {
@@ -653,7 +693,7 @@ impl ActiveRouteState {
                         }
                     };
                     if let Some(next) = cause.until_ms { next_available = Some(next_available.map_or(next, |old: i64| old.min(next))); }
-                    skipped.push(RouteAttemptSnapshot { endpoint: route.endpoint_name.clone(), model: route.model_id.clone(), status: "skipped".into(), failure_code: Some(code) });
+                    skipped.push(RouteAttemptSnapshot { endpoint: route.endpoint_name.clone(), model: route.model_id.clone(), status: "skipped".into(), failure_code: Some(code), ..Default::default() });
                     causes.push(cause);
                     return None;
                 }
@@ -875,6 +915,9 @@ impl ActiveRouteState {
                 model: model.clone(),
                 status: "failed".into(),
                 failure_code: Some(failure_code(reason).into()),
+                // M210/R3：致命错误必须留下服务方状态码与脱敏摘要。
+                provider_status: provider_status(reason),
+                failure_summary: failure_summary(reason),
             })
             .collect::<Vec<_>>();
         attempts.extend(inner.usage_skips.clone());
@@ -885,6 +928,8 @@ impl ActiveRouteState {
                 model: current.model_id.clone(),
                 status: "succeeded".into(),
                 failure_code: None,
+                provider_status: None,
+                failure_summary: None,
             });
         }
         attempts
@@ -929,6 +974,11 @@ impl ActiveRouteState {
         }
         let primary = inner.failures.first().map(|(_, _, reason)| concise_reason(reason))
             .unwrap_or_else(|| concise_reason(final_reason));
+        // M210/R2：所有候选都只给出致命错误时，没有「到点就好」的原因，但这仍然
+        // 是「没有可用模型」，不是「需要用户换个做法」。用 5 分钟窗口继续，并把
+        // 服务方原因（脱敏）写进那句人话里。
+        let all_fatal = !inner.failures.is_empty()
+            && inner.failures.iter().all(|(_, _, reason)| failure_code(reason) == "PROVIDER_FATAL");
         let attempts = inner.candidates.iter().filter_map(|candidate| {
             let label = format!("{} / {}", endpoint_label(&candidate.endpoint_name), candidate.model_id);
             if let Some((_, _, reason)) = inner.failures.iter().find(|(endpoint, model, _)|
@@ -947,6 +997,17 @@ impl ActiveRouteState {
                     next.map(|clock| format!("，{clock} 起可用")).unwrap_or_default())
             })
         }).collect::<Vec<_>>().join("；");
+        if all_fatal {
+            let detail = if attempts.is_empty() { primary.clone() } else { attempts.clone() };
+            let at = super::usage_windows::now_ms().saturating_add(super::usage_windows::model_wait::FATAL_RETRY_MS);
+            return ModelUnavailable {
+                resume_at_ms: Some(at),
+                notice: format!(
+                    "当前没有可用模型：{detail}。系统自动重试/自愈：5 分钟后重新检查凭据、使用时段和用户额度硬上限，继续原任务。"
+                ),
+            }
+            .encode();
+        }
         format!(
             "首选端点失败：{primary}\n所有可用模型端点均不可用：{attempts}。目标与失败证据已保留；系统将按退避策略重新观测可用路由。"
         )
@@ -1669,6 +1730,7 @@ mod tests {
                 endpoint: "deepseek".into(), model: "deepseek-synthetic".into(),
                 status: "skipped".into(),
                 failure_code: Some("outside_usage_window:{\"next_available_ms\":1791950400000}".into()),
+                ..Default::default()
             });
             inner.current_index = 2;
         }
@@ -2061,5 +2123,79 @@ mod tests {
             EndpointHealthRegistry::new(Duration::from_secs(120)),
         );
         assert_eq!(state.current().endpoint_name, "deepseek");
+    }
+}
+
+/// M210：没有可用模型时的现场（v1.91.65 10-30 08:44）。
+#[cfg(test)]
+mod m210_tests {
+    use super::*;
+    use crate::config::settings::ApiStyle;
+    use std::time::Duration;
+
+    fn route(endpoint: &str, model: &str) -> RouteCandidate {
+        RouteCandidate {
+            endpoint_name: endpoint.into(),
+            model_id: model.into(),
+            base_url: "https://synthetic.invalid".into(),
+            credential_ref: Some(format!("{endpoint}-key-ref")),
+            legacy_inline_api_key: None,
+            supports_vision: false,
+            api_style: ApiStyle::Openai,
+        }
+    }
+
+    fn state_with(failures: Vec<(&str, &str, &str)>) -> ActiveRouteState {
+        let mut plan = RouteCandidatePlan::new(route("deepseek", "deepseek-v4-pro"));
+        plan.push_fallback(route("chatgpt", "gpt-5.5"));
+        let state = ActiveRouteState::from_plan_with_health(
+            plan,
+            EndpointHealthRegistry::new(Duration::from_secs(120)),
+        );
+        {
+            let mut inner = state.inner.lock().unwrap();
+            for (endpoint, model, reason) in failures {
+                inner.failures.push((endpoint.to_string(), model.to_string(), reason.to_string()));
+            }
+        }
+        state
+    }
+
+    /// M210/R3：`PROVIDER_FATAL` 必须持久化服务方状态码与脱敏摘要。
+    #[test]
+    fn m210_fatal_attempt_persists_provider_status_and_summary() {
+        let state = state_with(vec![(
+            "deepseek",
+            "deepseek-v4-pro",
+            "provider returned an unexpected error: HTTP 422 upstream rejected api_key=sk-live-abc123456789",
+        )]);
+        let attempts = state.attempt_snapshots(false);
+        let deepseek = attempts.iter().find(|a| a.endpoint == "deepseek").expect("failed route must be journaled");
+        assert_eq!(deepseek.failure_code.as_deref(), Some("PROVIDER_FATAL"));
+        assert_eq!(deepseek.provider_status, Some(422));
+        let summary = deepseek.failure_summary.as_deref().expect("fatal needs a provider summary");
+        assert!(summary.contains("upstream"), "{summary}");
+        assert!(summary.contains("[redacted]"), "{summary}");
+        assert!(!summary.contains("sk-live-abc123456789"), "summary must not leak keys: {summary}");
+    }
+
+    /// M210/R2：全为致命错误时仍然是没有可用模型，并说出供应商与服务方原因。
+    #[test]
+    fn m210_fatal_only_notice_names_provider_reason() {
+        let state = state_with(vec![
+            ("deepseek", "deepseek-v4-pro", "provider returned an unexpected error: HTTP 422 upstream returned 422"),
+            ("chatgpt", "gpt-5.5", "provider returned an unexpected error: HTTP 402 payment required"),
+        ]);
+        let message = state.exhausted_error("no_model_available");
+        let unavailable = ModelUnavailable::parse(&message).expect("fatal-only must still be a model wait, not a retry loop");
+        let resume = unavailable.resume_at_ms.expect("fatal-only waits on a 5 minute window");
+        assert!(resume > crate::agent::usage_windows::now_ms(), "resume must be in the future");
+        assert!(unavailable.notice.contains("当前没有可用模型"), "{}", unavailable.notice);
+        assert!(unavailable.notice.contains("5 分钟"), "{}", unavailable.notice);
+        assert!(
+            unavailable.notice.contains("PROVIDER_FATAL") || unavailable.notice.contains("upstream"),
+            "the notice must name the provider reason: {}",
+            unavailable.notice
+        );
     }
 }

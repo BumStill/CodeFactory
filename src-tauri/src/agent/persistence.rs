@@ -50,8 +50,9 @@ pub async fn persist_model_route_attempts(
         sqlx::query(
             "INSERT INTO model_route_attempts
              (id, root_turn_id, session_id, endpoint, model, policy, status,
-              failure_code, output_started, side_effect_started, created_at, completed_at)
-             VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+              failure_code, provider_status, failure_summary,
+              output_started, side_effect_started, created_at, completed_at)
+             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         )
         .bind(Uuid::new_v4().to_string())
         .bind(root_turn_id)
@@ -61,6 +62,8 @@ pub async fn persist_model_route_attempts(
         .bind(policy)
         .bind(&attempt.status)
         .bind(&attempt.failure_code)
+        .bind(attempt.provider_status)
+        .bind(&attempt.failure_summary)
         .bind(i64::from(output_started))
         .bind(i64::from(side_effect_started))
         .bind(&now)
@@ -737,7 +740,8 @@ mod tests {
                 id TEXT PRIMARY KEY, root_turn_id TEXT, session_id TEXT,
                 endpoint TEXT, model TEXT, policy TEXT, status TEXT,
                 failure_code TEXT, output_started INTEGER,
-                side_effect_started INTEGER, created_at TEXT, completed_at TEXT
+                side_effect_started INTEGER, created_at TEXT, completed_at TEXT,
+                provider_status INTEGER, failure_summary TEXT
             )",
         )
         .execute(&db)
@@ -1352,15 +1356,17 @@ mod tests {
                 model: "deepseek-v4-pro".into(),
                 status: "skipped".into(),
                 failure_code: Some(
-                    r#"outside_usage_window:{"rule":{"mode":"official_off_peak","timezone":"Asia/Shanghai"},"next_available_ms":1800000000000}"#
+                    r#"outside_usage_window:{"rule":{"mode":"official_off_peak","timezone":"Asia/Shanghai","next_available_ms":1800000000000}"#
                         .into(),
                 ),
+                ..Default::default()
             },
             super::super::failover::RouteAttemptSnapshot {
                 endpoint: "deepseek".into(),
                 model: "deepseek-flash".into(),
                 status: "succeeded".into(),
                 failure_code: None,
+                ..Default::default()
             },
         ];
         persist_model_route_attempts(&db, "s1", "user-1", "prefer", &attempts, true, false)
@@ -1396,12 +1402,14 @@ mod tests {
                 model: "gpt-5.5".into(),
                 status: "failed".into(),
                 failure_code: Some("AUTH_EXPIRED".into()),
+                ..Default::default()
             },
             super::super::failover::RouteAttemptSnapshot {
                 endpoint: "deepseek".into(),
                 model: "deepseek-v4-pro".into(),
                 status: "succeeded".into(),
                 failure_code: None,
+                ..Default::default()
             },
         ];
         persist_model_route_attempts(&db, "s1", "user-1", "prefer", &attempts, true, false)
