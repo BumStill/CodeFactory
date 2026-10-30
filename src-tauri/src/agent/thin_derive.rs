@@ -308,10 +308,22 @@ fn observe_command(cwd: &str, args: &[&str]) -> Option<String> {
     super::delivery::bounded_delivery_output(super::delivery::dev_command("gh").current_dir(cwd).args(args)).ok()
 }
 
+/// M203：启动对账不能把当前进程新建的会话或 transport 当作存量。
+async fn current_process_admission(db: &SqlitePool, session: &str) -> sqlx::Result<bool> {
+    let Some(birth) = crate::storage::db::current_process_started_at_ms() else { return Ok(true); };
+    let fresh: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sessions WHERE id=? AND created_at>=?")
+        .bind(session).bind(birth).fetch_one(db).await?;
+    if fresh > 0 { return Ok(true); }
+    if !has_table(db, "chat_run_controls").await? { return Ok(false); }
+    let owned: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM chat_run_controls WHERE session_id=? AND created_process_instance=? AND status='active'")
+        .bind(session).bind(crate::agent::objective::current_process_instance()).fetch_one(db).await?;
+    Ok(owned > 0)
+}
+
 /// M174: reconcile every persisted waiting session once per process startup.
 /// Reuse the bounded, durable observer; no parallel unbudgeted GitHub poller.
 pub(crate) async fn reconcile_waiting_on_startup(db: &SqlitePool) -> sqlx::Result<usize> {
-    Ok(reconcile_waiting_wake_sources(db).await?.scanned)
+    Ok(reconcile_waiting_sources(db, true).await?.scanned)
 }
 
 /// M197/R3：`waiting_wake` 的周期对账报告（启动一次 + 之后每 180 秒）。
@@ -326,6 +338,10 @@ pub struct WakeReconcileReport {
 /// 有源等待 / 人话提问 / 已结束；最后跑一次失效守卫 sweep。
 /// 全程只读本地持久事实（GH 观测由既有 ≥180s 心跳与配额策略负责），幂等。
 pub async fn reconcile_waiting_wake_sources(db: &SqlitePool) -> sqlx::Result<WakeReconcileReport> {
+    reconcile_waiting_sources(db, false).await
+}
+
+async fn reconcile_waiting_sources(db: &SqlitePool, startup: bool) -> sqlx::Result<WakeReconcileReport> {
     if has_table(db, "thin_delivery_refs").await? {
         let legacy: Vec<String> = sqlx::query_scalar("SELECT session_id FROM thin_delivery_refs WHERE branch='pr-' || pr_number").fetch_all(db).await?;
         for session in legacy { clear_text_pr_association(db, &session).await?; }
@@ -335,6 +351,7 @@ pub async fn reconcile_waiting_wake_sources(db: &SqlitePool) -> sqlx::Result<Wak
     let sessions: Vec<String> = sqlx::query_scalar("SELECT state.session_id FROM thin_session_state state JOIN sessions session ON session.id=state.session_id WHERE state.state='waiting_wake' AND session.delivery_mode='thin'")
         .fetch_all(db).await?;
     for session in &sessions {
+        if startup && current_process_admission(db, session).await? { continue; }
         ensure_pr_monitor(db, session).await?;
         heartbeat_external(db, session).await?;
         repair_waiting_wake_source(db, session).await?;
@@ -354,6 +371,12 @@ pub async fn reconcile_waiting_wake_sources(db: &SqlitePool) -> sqlx::Result<Wak
 /// 定时唤醒）立即补一个真实来源并写明来源（系统自动重试/自愈）；补不出来且自愈
 /// 次数用尽的，转成对用户的人话提问；已经无事可做的直接结束。
 async fn repair_waiting_wake_source(db: &SqlitePool, session: &str) -> sqlx::Result<()> {
+    // M203/R2：首回合 admission 尚未落库，不是中断任务，也没有可补的等待。
+    if current_process_admission(db, session).await? {
+        let turns: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM chat_turn_state WHERE session_id=?")
+            .bind(session).fetch_one(db).await?;
+        if turns == 0 { return Ok(()); }
+    }
     if crate::session_executor_alive(session) != Some(false) { return Ok(()); }
     let Some(state) = super::thin_state::load(db, session).await? else { return Ok(()) };
     if state.state != SessionState::WaitingWake { return Ok(()); }
@@ -709,6 +732,12 @@ pub(crate) async fn reconcile_orphan_turns(db: &SqlitePool) -> sqlx::Result<u64>
     let has_wakes = has_table(db, "wakeup_schedules").await?;
     for (root, session, revision) in rows {
         let Some(birth) = crate::storage::db::current_process_started_at_ms() else { continue; };
+        let has_controls = has_table(db, "chat_run_controls").await?;
+        if has_controls {
+            let owned: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM chat_run_controls WHERE root_turn_id=? AND created_process_instance=?")
+                .bind(&root).bind(crate::agent::objective::current_process_instance()).fetch_one(db).await?;
+            if owned > 0 { continue; }
+        }
         let activity: i64 = sqlx::query_scalar("SELECT MAX(updated_at) FROM chat_turn_state WHERE session_id=?")
             .bind(&session).fetch_one(db).await?;
         let message_activity: Option<i64> = if has_table(db, "messages").await? {
@@ -748,6 +777,7 @@ pub(crate) async fn reconcile_running_liveness(db: &SqlitePool) -> sqlx::Result<
     super::thin_state::ensure(db).await?;
     let sessions: Vec<String> = sqlx::query_scalar("SELECT session_id FROM thin_session_state WHERE state='running'").fetch_all(db).await?;
     for session in sessions {
+        if current_process_admission(db, &session).await? { continue; }
         if crate::session_executor_alive(&session) != Some(false) { continue; }
         tracing::warn!(session, "running without executor; automatic recovery rederives projection");
         refresh(db, &session).await?;
@@ -1910,6 +1940,56 @@ mod tests {
             .execute(&db).await.unwrap();
         let state = derive_state(&db, "derive").await.unwrap();
         assert_eq!(state.state, SessionState::WaitingWake);
+    }
+
+    #[tokio::test]
+    async fn m203_current_process_turn_survives_startup_admission_gap() {
+        let db = fixture().await;
+        let now = chrono::Utc::now().timestamp_millis();
+        sqlx::query("INSERT INTO chat_turn_state(root_turn_id,session_id,phase,status,started_at,updated_at) VALUES ('m203-root','derive','working','active',?,?)")
+            .bind(now).bind(now).execute(&db).await.unwrap();
+        sqlx::query("INSERT INTO chat_run_controls(run_instance_id,session_id,root_turn_id,status,created_process_instance,created_at,updated_at) VALUES ('m203-run','derive','m203-root','active',?,?,?)")
+            .bind(crate::agent::objective::current_process_instance()).bind(now).bind(now).execute(&db).await.unwrap();
+        assert_eq!(reconcile_orphan_turns(&db).await.unwrap(), 0);
+        let reason: Option<String> = sqlx::query_scalar("SELECT terminal_reason FROM chat_turn_state WHERE root_turn_id='m203-root'").fetch_one(&db).await.unwrap();
+        assert!(reason.is_none());
+    }
+
+    #[tokio::test]
+    async fn m203_first_turn_not_started_gets_no_source_repair() {
+        let db = fixture().await;
+        super::super::background_tasks::ensure_wake_schema(&db).await.unwrap();
+        sqlx::query("UPDATE sessions SET created_at=? WHERE id='derive'")
+            .bind(chrono::Utc::now().timestamp_millis()).execute(&db).await.unwrap();
+        m197_wait("derive", &db, "系统自动重试/自愈：接续中断回合").await;
+        repair_waiting_wake_source(&db, "derive").await.unwrap();
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM wakeup_schedules WHERE session_id='derive' AND id LIKE 'thin-source-repair-%'")
+            .fetch_one(&db).await.unwrap();
+        assert_eq!(count, 0, "first admission is not a stock interrupted wait");
+    }
+
+    #[tokio::test]
+    async fn m203_startup_skips_fresh_session_then_first_executor_runs() {
+        let db = fixture().await;
+        super::super::background_tasks::ensure_wake_schema(&db).await.unwrap();
+        let now = chrono::Utc::now().timestamp_millis();
+        sqlx::query("UPDATE sessions SET created_at=? WHERE id='derive'").bind(now).execute(&db).await.unwrap();
+        sqlx::query("INSERT INTO messages(id,session_id,role,content,created_at) VALUES ('m203-user','derive','user','synthetic create_and_send',?)")
+            .bind(now).execute(&db).await.unwrap();
+        m197_wait("derive", &db, "系统自动重试/自愈：接续中断回合").await;
+        for _ in 0..2 { reconcile_waiting_on_startup(&db).await.unwrap(); }
+        let wakes: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM wakeup_schedules WHERE session_id='derive'").fetch_one(&db).await.unwrap();
+        assert_eq!(wakes, 0);
+        sqlx::query("INSERT INTO chat_turn_state(root_turn_id,session_id,phase,status,started_at,updated_at) VALUES ('m203-user','derive','working','active',?,?)")
+            .bind(now).bind(now).execute(&db).await.unwrap();
+        let control = crate::ChatRunControl::pending();
+        crate::register_session_executor("derive", &control);
+        reconcile_waiting_on_startup(&db).await.unwrap();
+        let state = refresh(&db, "derive").await.unwrap();
+        crate::unregister_session_executor("derive", &control);
+        assert_eq!(state.state, SessionState::Running);
+        let reason: Option<String> = sqlx::query_scalar("SELECT terminal_reason FROM chat_turn_state WHERE root_turn_id='m203-user'").fetch_one(&db).await.unwrap();
+        assert!(reason.is_none());
     }
 
     async fn fixture() -> SqlitePool {
