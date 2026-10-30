@@ -442,10 +442,12 @@ const MAX_SELF_CONTINUE: i64 = 2;
 
 async fn arm_durable_wake(db: &SqlitePool, session: &str, prefix: &str, prompt: &str) -> sqlx::Result<()> {
     let at = chrono::Utc::now().timestamp();
-    sqlx::query("INSERT INTO wakeup_schedules(id,session_id,prompt,source,next_at,status,created_at) VALUES (?,?,?,'agent_decided',?,'pending',?) ON CONFLICT(id) DO UPDATE SET prompt=excluded.prompt,next_at=excluded.next_at,status='pending' WHERE wakeup_schedules.status<>'pending'")
-        .bind(format!("{prefix}-{session}")).bind(session)
-        .bind(prompt)
-        .bind(at).bind(at).execute(db).await?;
+    let mut tx = crate::storage::db::begin_write(db).await?;
+    sqlx::query("INSERT INTO wakeup_schedules(id,session_id,prompt,source,next_at,status,created_at) SELECT ?,?,?,'agent_decided',?,'pending',? WHERE NOT EXISTS (SELECT 1 FROM wakeup_schedules WHERE session_id=? AND status='pending' AND id LIKE ?)")
+        .bind(format!("{prefix}-{session}-{}", uuid::Uuid::new_v4())).bind(session)
+        .bind(prompt).bind(at).bind(at).bind(session).bind(format!("{prefix}-%"))
+        .execute(&mut *tx).await?;
+    tx.commit().await?;
     Ok(())
 }
 
@@ -877,7 +879,7 @@ pub async fn derive_state(db: &SqlitePool, session: &str) -> sqlx::Result<ThinSt
             super::thin_state::ask_user(db, session, &format!("我原本在等「{}」，系统自动重试 {repair_fires} 次后仍未推进。请决定换个做法继续还是结束？", state.waiting_for.as_deref().unwrap_or("原任务"))).await?;
             return Ok(super::thin_state::load(db, session).await?.unwrap());
         }
-        let id = format!("thin-source-repair-{session}");
+        let id = format!("thin-source-repair-{session}-{}", uuid::Uuid::new_v4());
         let now = chrono::Utc::now().timestamp();
         sqlx::query("INSERT INTO wakeup_schedules(id,session_id,prompt,source,next_at,status,created_at) VALUES (?,?,?,'agent_decided',?,'pending',?) ON CONFLICT(id) DO UPDATE SET status='pending',next_at=excluded.next_at,prompt=excluded.prompt")
             .bind(&id).bind(session).bind(format!("系统自动重试/自愈：{}；核对事实并接续原任务。", state.waiting_for.as_deref().unwrap_or("接续中断回合")))
@@ -1090,7 +1092,8 @@ async fn derive_candidate(db: &SqlitePool, session: &str) -> sqlx::Result<ThinSt
         // 唤醒后 running 30 分钟、零助手回复。
         if latest_user.is_some_and(|time| time > cutoff)
             && wake_without_a_turn(db, session, latest_user.unwrap_or_default()).await? {
-            return Ok(ThinState::ended("定时唤醒未开始回合（上一回合已结算）", "本会话记录"));
+            // M209: absence of an assistant is missing execution, not completion.
+            return Ok(executor_missing_state());
         }
         // A newly admitted message is a fact even before the transport is registered.
         if terminal.is_some() && pending_background + due_wakes == 0 {
@@ -1467,6 +1470,29 @@ mod tests {
 
     /// R1/R5：唤醒已经触发完、又没挂新唤醒的会话，不会永远停在 `waiting_wake`：
     /// 系统自己能推进的立即补一个真实来源（系统自动重试/自愈），不是问用户。
+    #[tokio::test]
+    async fn m209_reopened_repair_uses_fresh_identity() {
+        let db = fixture().await;
+        m197_fired_repair(&db, "derive", 1).await;
+        arm_durable_wake(&db, "derive", "thin-source-repair", "resume").await.unwrap();
+        let old: (String, i64) = sqlx::query_as("SELECT status,fire_count FROM wakeup_schedules WHERE id='thin-source-repair-derive'").fetch_one(&db).await.unwrap();
+        assert_eq!(old, ("done".into(), 1), "historical firing receipt must remain immutable");
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM wakeup_schedules WHERE status='pending' AND fire_count=0").fetch_one(&db).await.unwrap();
+        assert_eq!(count, 1);
+        arm_durable_wake(&db, "derive", "thin-source-repair", "resume").await.unwrap();
+        let pending: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM wakeup_schedules WHERE status='pending'").fetch_one(&db).await.unwrap();
+        assert_eq!(pending, 1, "reconcile is idempotent while a wake is pending");
+    }
+
+    #[tokio::test]
+    async fn m209_unanswered_system_wake_is_recovered_not_ended() {
+        let db = fixture().await;
+        sqlx::raw_sql("CREATE TABLE IF NOT EXISTS thin_system_wake_roots(root_turn_id TEXT PRIMARY KEY); INSERT INTO thin_system_wake_roots VALUES ('wake'); INSERT INTO messages(id,session_id,role,content,created_at) VALUES ('old','derive','assistant','done',100),('wake','derive','user','定时唤醒 synthetic：resume\n节奏：一次性',200);").execute(&db).await.unwrap();
+        let state = refresh(&db, "derive").await.unwrap();
+        assert_eq!(state.state, SessionState::WaitingWake, "unanswered delivery must retain an automatic continuation: {state:?}");
+        assert!(super::super::background_tasks::wake_source_cover(&db, "derive").await.pending_wakeups > 0);
+    }
+
     #[tokio::test]
     async fn m197_wake_without_source_is_never_left_waiting() {
         let db = fixture().await;

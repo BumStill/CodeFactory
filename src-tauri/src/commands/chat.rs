@@ -6282,6 +6282,25 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[tokio::test]
+    async fn m209_system_wake_admits_a_fresh_turn_after_settlement() {
+        use crate::agent::objective::TurnOrigin;
+        let pool = crate::storage::db::connect("sqlite::memory:").await.unwrap();
+        sqlx::query("INSERT INTO sessions(id,title,cwd,model_id,created_at,updated_at,delivery_mode) VALUES ('synthetic-wake','fixture','/synthetic','model',1,1,'thin')").execute(&pool).await.unwrap();
+        let first = admit_persisted_chat_turn_with_origin(&pool, &crate::ChatRunControl::pending(), "synthetic-wake", Some("old-wake-root"), "original task", TurnOrigin::User).await.unwrap();
+        sqlx::query("UPDATE chat_turn_state SET status='completed',terminal_reason='completed',completed_at=1 WHERE root_turn_id=?").bind(&first.root_turn_id).execute(&pool).await.unwrap();
+        sqlx::query("UPDATE objectives SET status='completed',decision_type='complete',evidence_ref='synthetic-receipt',reached_acceptance=requested_acceptance,completed_at=1,recovery_owner=NULL,remediation_id=NULL,lease_owner=NULL,lease_expires_at=NULL WHERE id=?").bind(&first.objective.id).execute(&pool).await.unwrap();
+        sqlx::query("UPDATE chat_run_controls SET status='completed',settled_at=1,updated_at=1 WHERE session_id='synthetic-wake'").execute(&pool).await.unwrap();
+        let second = admit_persisted_chat_turn_with_origin(&pool, &crate::ChatRunControl::pending(), "synthetic-wake", None, "resume", TurnOrigin::SystemWake).await.unwrap();
+        assert_ne!(second.root_turn_id, first.root_turn_id);
+        assert_eq!(second.objective.id, first.objective.id, "recovery must not allocate an unrelated task/worktree");
+        assert!(!second.already_settled, "old settled root must not suppress this wake");
+        let status: String = sqlx::query_scalar("SELECT status FROM chat_turn_state WHERE root_turn_id=?").bind(&second.root_turn_id).fetch_one(&pool).await.unwrap();
+        assert_eq!(status, "active");
+        let tagged: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM thin_system_wake_roots WHERE root_turn_id=?").bind(&second.root_turn_id).fetch_one(&pool).await.unwrap();
+        assert_eq!(tagged, 1);
+    }
+
     /// M206: a fresh human admission reopens any ended projection atomically.
     #[tokio::test]
     async fn m206_ended_session_admission_reopens_and_records_exact_started_root() {
