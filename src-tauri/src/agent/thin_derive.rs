@@ -390,8 +390,8 @@ async fn repair_waiting_wake_source(db: &SqlitePool, session: &str) -> sqlx::Res
     let what = state.waiting_for.clone().unwrap_or_default().trim().to_string();
     // M210/R1/R5：模型可用性等待是系统自愈，不计入自动重试次数、也不升级成提问。
     // 唤醒已经触发过而模型仍不可用（10-30 12:00 现场）时，在这里重挂下一个恢复时间。
-    if let Some(wait) = super::model_wait::load(db, session).await? {
-        let at = super::model_wait::next_at(&wait, chrono::Utc::now().timestamp_millis());
+    if let Some(wait) = super::usage_windows::model_wait::load(db, session).await? {
+        let at = super::usage_windows::model_wait::next_at(&wait, chrono::Utc::now().timestamp_millis());
         let root = open_root_turn(db, session).await?;
         let wake = super::background_tasks::persist_model_wakeup(
             db, session, root.as_deref().unwrap_or_default(), at, &wait.reason,
@@ -781,13 +781,13 @@ pub(crate) async fn reconcile_orphan_turns(db: &SqlitePool) -> sqlx::Result<u64>
         // M210/R1/R5/R6：模型可用性等待不是孤儿。唤醒已经触发过而模型仍不可用时，
         // 重挂下一个恢复时间（新 id），保持 waiting_wake —— 没有重启就不能写
         // `orphaned_by_restart`（10-30 12:00 现场）。
-        if let Some(wait) = super::model_wait::load(db, &session).await? {
+        if let Some(wait) = super::usage_windows::model_wait::load(db, &session).await? {
             let pending_model: i64 = if has_wakes {
                 sqlx::query_scalar("SELECT COUNT(*) FROM wakeup_schedules WHERE session_id=? AND status='pending' AND id LIKE 'model-availability-%'")
                     .bind(&session).fetch_one(db).await?
             } else { 0 };
             if pending_model == 0 {
-                let at = super::model_wait::next_at(&wait, chrono::Utc::now().timestamp_millis());
+                let at = super::usage_windows::model_wait::next_at(&wait, chrono::Utc::now().timestamp_millis());
                 super::background_tasks::persist_model_wakeup(db, &session, &root, at, &wait.reason).await?;
             }
             continue;
@@ -841,14 +841,14 @@ pub async fn derive_state(db: &SqlitePool, session: &str) -> sqlx::Result<ThinSt
     let has_monitor = has_table(db, "thin_external_observations").await?;
     // M210/R1/R5：模型可用性等待重新挂上下一个恢复时间（新 id），让下面的
     // wake_source 指向真实 pending 行，也就永远走不到「自动重试 N 次后问用户」。
-    if let Some(wait) = super::model_wait::load(db, session).await? {
+    if let Some(wait) = super::usage_windows::model_wait::load(db, session).await? {
         state.waiting_for = Some(wait.reason.clone());
         state.reason = Some(wait.reason.clone());
         let pending_model: Option<String> = sqlx::query_scalar(
             "SELECT id FROM wakeup_schedules WHERE session_id=? AND status='pending' AND id LIKE 'model-availability-%' LIMIT 1",
         ).bind(session).fetch_optional(db).await?;
         if pending_model.is_none() {
-            let at = super::model_wait::next_at(&wait, chrono::Utc::now().timestamp_millis());
+            let at = super::usage_windows::model_wait::next_at(&wait, chrono::Utc::now().timestamp_millis());
             let root = open_root_turn(db, session).await?;
             super::background_tasks::persist_model_wakeup(
                 db, session, root.as_deref().unwrap_or_default(), at, &wait.reason,
@@ -3571,7 +3571,7 @@ mod m210_tests {
         save_wait(&db, "系统自动重试/自愈：等模型可用后继续原任务").await;
         seed_fired_model_wake(&db).await;
         seed_repair_exhausted(&db).await;
-        super::super::model_wait::record(
+        super::super::usage_windows::model_wait::record(
             &db, "m210",
             "当前没有可用模型：ChatGPT 已达订阅用量上限，14:05 重置；DeepSeek 调用失败：HTTP 500 upstream",
             Some(chrono::Utc::now().timestamp_millis() + 14 * 60 * 1000),
@@ -3604,7 +3604,7 @@ mod m210_tests {
         let db = fixture().await;
         save_wait(&db, "系统自动重试/自愈：等模型可用后继续原任务").await;
         seed_repair_exhausted(&db).await;
-        super::super::model_wait::record(&db, "m210", "当前没有可用模型：DeepSeek 调用失败：HTTP 500", None)
+        super::super::usage_windows::model_wait::record(&db, "m210", "当前没有可用模型：DeepSeek 调用失败：HTTP 500", None)
             .await.unwrap();
 
         let state = refresh(&db, "m210").await.unwrap();
@@ -3626,7 +3626,7 @@ mod m210_tests {
         }
         sqlx::query("INSERT INTO chat_turn_state(root_turn_id,session_id,phase,status,updated_at,started_at) VALUES ('m210-root','m210','working','active',1,1)")
             .execute(&db).await.unwrap();
-        super::super::model_wait::record(&db, "m210", "当前没有可用模型：ChatGPT 已达订阅用量上限", Some(chrono::Utc::now().timestamp_millis() + 600_000))
+        super::super::usage_windows::model_wait::record(&db, "m210", "当前没有可用模型：ChatGPT 已达订阅用量上限", Some(chrono::Utc::now().timestamp_millis() + 600_000))
             .await.unwrap();
 
         let retired = reconcile_orphan_turns(&db).await.unwrap();

@@ -999,7 +999,7 @@ impl ActiveRouteState {
         }).collect::<Vec<_>>().join("；");
         if all_fatal {
             let detail = if attempts.is_empty() { primary.clone() } else { attempts.clone() };
-            let at = super::usage_windows::now_ms().saturating_add(super::model_wait::FATAL_RETRY_MS);
+            let at = super::usage_windows::now_ms().saturating_add(super::usage_windows::model_wait::FATAL_RETRY_MS);
             return ModelUnavailable {
                 resume_at_ms: Some(at),
                 notice: format!(

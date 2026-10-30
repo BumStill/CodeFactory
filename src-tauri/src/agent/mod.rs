@@ -41,7 +41,6 @@ mod power_assertion;
 pub(crate) mod permission_gateway;
 pub(crate) mod permission_intent;
 pub mod persistence;
-pub(crate) mod model_wait;
 pub(crate) mod provider_recovery;
 pub mod quota_cap;
 pub mod quota_live;

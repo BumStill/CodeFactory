@@ -285,7 +285,7 @@ pub async fn sweep(db: &SqlitePool, now_ms: i64) -> sqlx::Result<usize> {
         }
         // M210/R1：模型可用性等待有自己的恢复时间，不是「唤醒源失效」，
         // 也不能被升级成让用户决定做法的问题。
-        if super::model_wait::load(db, &session_id).await?.is_some() {
+        if super::usage_windows::model_wait::load(db, &session_id).await?.is_some() {
             continue;
         }
         let what = waiting_for.unwrap_or_else(|| "未命名事项".to_string());
@@ -359,7 +359,7 @@ pub async fn settle_error(db: &SqlitePool, session_id: &str, root_turn_id: &str,
         let wake = super::background_tasks::persist_model_wakeup(db, session_id, root_turn_id, at, &unavailable.notice).await?;
         // M210/R1：模型可用性等待是一等事实，与「自动重试次数」分开记账——
         // 它不该把会话推进到「自动重试 2 次仍未推进，请决定」。
-        super::model_wait::record(db, session_id, &unavailable.notice, unavailable.resume_at_ms).await?;
+        super::usage_windows::model_wait::record(db, session_id, &unavailable.notice, unavailable.resume_at_ms).await?;
         ThinState {
             waiting_for: Some(unavailable.notice.clone()),
             reason: Some(unavailable.notice),
@@ -369,7 +369,7 @@ pub async fn settle_error(db: &SqlitePool, session_id: &str, root_turn_id: &str,
     } else if error_text.contains("no_model_available") {
         let at = now().saturating_add(60_000);
         let wake = super::background_tasks::persist_model_wakeup(db, session_id, root_turn_id, at, "模型暂不可用").await?;
-        super::model_wait::record(db, session_id, "当前没有可用模型；系统自动重试/自愈，到点自动继续。", None).await?;
+        super::usage_windows::model_wait::record(db, session_id, "当前没有可用模型；系统自动重试/自愈，到点自动继续。", None).await?;
         ThinState {
             wake_source: Some(format!("模型可用性唤醒 {wake}")),
             ..after_no_model(60_000)
@@ -452,7 +452,7 @@ pub async fn settle_outcome(
     }
     if outcome_settles_final(finished, blocked, final_text) {
         // M210：模型真正跑出一个回合 = 模型等待结束。
-        super::model_wait::clear(db, session_id).await?;
+        super::usage_windows::model_wait::clear(db, session_id).await?;
         settle_final(db, session_id, root_turn_id, external_what).await
     } else {
         settle_error(
@@ -842,7 +842,7 @@ mod m210_tests {
         assert!((wake.1 * 1000 - reset_at).abs() <= 1000, "the wake must land on resets_at: {} vs {reset_at}", wake.1 * 1000);
         assert!(wake.0.starts_with("model-availability-m210"), "{}", wake.0);
 
-        let wait = super::super::model_wait::load(&db, "m210").await.unwrap().expect("model wait is a durable fact");
+        let wait = super::super::usage_windows::model_wait::load(&db, "m210").await.unwrap().expect("model wait is a durable fact");
         assert_eq!(wait.resume_at_ms, Some(reset_at));
         assert_eq!(wait.reason, notice);
         db.close().await;
@@ -858,13 +858,13 @@ mod m210_tests {
         }
         .encode();
         settle_error(&db, "m210", "m210-root", &error).await.unwrap();
-        assert!(super::super::model_wait::load(&db, "m210").await.unwrap().is_some());
+        assert!(super::super::usage_windows::model_wait::load(&db, "m210").await.unwrap().is_some());
         let state = settle_outcome(&db, "m210", "m210-root", true, false, "任务已完成并交付。", "FinalAnswer", None)
             .await
             .unwrap();
         assert!(state.question.is_none(), "{state:?}");
         assert!(
-            super::super::model_wait::load(&db, "m210").await.unwrap().is_none(),
+            super::super::usage_windows::model_wait::load(&db, "m210").await.unwrap().is_none(),
             "a real answer means the model is available again"
         );
         // 等待清掉之后不得再挂模型唤醒：否则「已可用」的会话会被反复叫醒。
