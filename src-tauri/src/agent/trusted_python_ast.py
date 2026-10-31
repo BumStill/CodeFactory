@@ -3,22 +3,51 @@
 
 Unknown syntax fails closed. Only literals, string transformations and file
 handles opened on statically known workspace paths are capabilities here.
+
+M215: `io.open`, `pathlib.Path(...).read_text/write_text`, `with` blocks and
+absolute paths inside the workspace root are proved. Anything else stays
+unproved and the failure names the source line that could not be proved, so the
+approval text can say which line blocked the command.
 """
 import ast
 import pathlib
 import sys
 
+# M215: the prover speaks to the approval gate through stdio. A Windows host
+# console defaults to a legacy code page (cp936/cp1252), so Chinese diagnostic
+# text used to reach the gate as "\u7b2c2\u884c..." and the body was decoded
+# with that same code page on the way in. Pin both directions to UTF-8.
+try:
+    sys.stdin.reconfigure(encoding='utf-8', errors='replace')
+except (AttributeError, ValueError, OSError):
+    pass
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding='utf-8', errors='backslashreplace')
+    except (AttributeError, ValueError, OSError):
+        pass
+
 root = pathlib.Path(sys.argv[1]).resolve() if len(sys.argv) > 1 and sys.argv[1] else None
-STR, INT, BOOL, FILE, NONE = 'str', 'int', 'bool', 'file', 'none'
+STR, INT, BOOL, FILE, NONE, MODULE, PATH = 'str', 'int', 'bool', 'file', 'none', 'module', 'path'
 values = {}
 functions = {}
+MODULES = ('io', 'pathlib')
+ENCODINGS = ('utf-8', 'UTF-8', 'utf8')
 
 
 def path(value):
     if not isinstance(value, str) or not value or '\\' in value:
         raise ValueError('dynamic or nonportable path')
     p = pathlib.PurePosixPath(value)
-    if p.is_absolute() or ':' in value or any(x in ('..', '.', '~') for x in p.parts):
+    if p.is_absolute():
+        # M215: an absolute path is a capability only inside the workspace root.
+        if root is None:
+            raise ValueError('absolute path without a workspace root')
+        resolved = pathlib.Path(value).resolve()
+        if root not in resolved.parents:
+            raise ValueError('outside path')
+        return value
+    if ':' in value or any(x in ('..', '.', '~') for x in p.parts):
         raise ValueError('outside path')
     for part in p.parts:
         if part.startswith(('$', '~')) or part in ('.git', '.ssh', '.aws', '.gnupg', '.netrc', 'credentials') or part.startswith('.env') or part.endswith(('.pem', '.key')) or part in ('id_rsa', 'id_ed25519'):
@@ -28,6 +57,35 @@ def path(value):
         if resolved == root or root not in resolved.parents:
             raise ValueError('symlink escape')
     return value
+
+
+def opened(args):
+    """A file handle on a proved workspace path, in a mode that is a file edit."""
+    if not 1 <= len(args) <= 2:
+        raise ValueError('arity')
+    if args[0][0] != STR:
+        raise ValueError('path type')
+    path(args[0][1])
+    mode = args[1][1] if len(args) == 2 else 'r'
+    if mode not in ('r', 'w', 'a', 'rt', 'wt', 'at'):
+        raise ValueError('mode')
+    return (FILE, mode)
+
+
+def module_call(dotted, args):
+    if dotted == 'io.open':
+        return opened(args)
+    if dotted == 'pathlib.Path' and len(args) == 1 and args[0][0] == STR:
+        return (PATH, path(args[0][1]))
+    raise ValueError('module capability')
+
+
+def keywords(call):
+    # A literal UTF-8 encoding changes bytes on disk, never which file or which
+    # effect, so it is the only keyword the prover accepts.
+    for word in call.keywords:
+        if word.arg != 'encoding' or not isinstance(word.value, ast.Constant) or word.value.value not in ENCODINGS:
+            raise ValueError('keyword effect')
 
 
 def expr(n, env):
@@ -55,15 +113,17 @@ def expr(n, env):
         if any(t[0] not in (STR, INT, BOOL, NONE) for t in args): raise ValueError('comparison capability')
         if not all(isinstance(x, (ast.Eq, ast.NotEq, ast.Gt, ast.GtE, ast.Lt, ast.LtE)) for x in n.ops): raise ValueError('comparison')
         return (BOOL, None)
-    if isinstance(n, ast.Call) and not n.keywords:
+    if isinstance(n, ast.Call):
+        keywords(n)
         args = [expr(x, env) for x in n.args]
         if isinstance(n.func, ast.Name):
-            if n.func.id == 'open' and 1 <= len(args) <= 2:
-                if args[0][0] != STR: raise ValueError('path type')
-                path(args[0][1])
-                mode = args[1][1] if len(args) == 2 else 'r'
-                if mode not in ('r', 'w', 'a', 'rt', 'wt', 'at'): raise ValueError('mode')
-                return (FILE, mode)
+            if n.func.id == 'open':
+                return opened(args)
+            if n.func.id == 'print':
+                if any(x[0] not in (STR, INT, BOOL, NONE) for x in args): raise ValueError('print capability')
+                return (NONE, None)
+            if n.func.id in env and env[n.func.id][0] == MODULE:
+                return module_call(env[n.func.id][1], args)
             if n.func.id in functions:
                 fn = functions[n.func.id]
                 names = [a.arg for a in fn.args.args]
@@ -83,6 +143,12 @@ def expr(n, env):
         if isinstance(n.func, ast.Attribute):
             receiver = expr(n.func.value, env)
             method = n.func.attr
+            if receiver[0] == MODULE:
+                return module_call(receiver[1] + '.' + method, args)
+            if receiver[0] == PATH:
+                if method == 'read_text' and not args: return (STR, None)
+                if method == 'write_text' and len(args) == 1 and args[0][0] == STR: return (INT, None)
+                if method == 'open': return opened(args)
             if receiver[0] == FILE:
                 if method == 'read' and not args and receiver[1] in ('r', 'rt'): return (STR, None)
                 if method == 'write' and len(args) == 1 and args[0][0] == STR and receiver[1] in ('w', 'wt', 'a', 'at'): return (INT, None)
@@ -94,25 +160,58 @@ def expr(n, env):
 
 
 def statements(body, env, in_function=False):
+    # M215: an unproved case reports the source line, so the approval reason can
+    # name exactly what could not be proved instead of a bare refusal.
     for n in body:
-        if isinstance(n, ast.Assign) and all(isinstance(x, ast.Name) for x in n.targets):
-            value = expr(n.value, env)
-            for name in n.targets:
-                if name.id.startswith('__') or name.id in ('open',): raise ValueError('builtin replacement')
-                env[name.id] = value
-        elif isinstance(n, ast.Expr):
-            expr(n.value, env)
-        elif isinstance(n, ast.Assert):
-            if expr(n.test, env)[0] != BOOL: raise ValueError('assertion')
-            if n.msg is not None and expr(n.msg, env)[0] != STR: raise ValueError('assert message')
-        elif isinstance(n, ast.Global) and in_function:
-            if any(x not in env for x in n.names): raise ValueError('unknown global')
-        elif isinstance(n, ast.FunctionDef) and not in_function:
-            if n.decorator_list or n.returns or n.args.vararg or n.args.kwarg or n.args.kwonlyargs or n.args.posonlyargs or any(x.annotation for x in n.args.args): raise ValueError('function effects')
-            if n.name in env or n.name == 'open': raise ValueError('shadowed name')
-            functions[n.name] = n
-        else:
-            raise ValueError('unsupported statement: ' + type(n).__name__)
+        try:
+            statement(n, env, in_function)
+        except ValueError as error:
+            message = str(error)
+            if not message.startswith('第'):
+                message = '第%s行无法证明：%s' % (getattr(n, 'lineno', '?'), message)
+            raise ValueError(message)
+
+
+def statement(n, env, in_function=False):
+    if isinstance(n, ast.Assign) and all(isinstance(x, ast.Name) for x in n.targets):
+        value = expr(n.value, env)
+        for name in n.targets:
+            if name.id.startswith('__') or name.id in ('open',): raise ValueError('builtin replacement')
+            env[name.id] = value
+    elif isinstance(n, ast.Expr):
+        expr(n.value, env)
+    elif isinstance(n, ast.Assert):
+        if expr(n.test, env)[0] != BOOL: raise ValueError('assertion')
+        if n.msg is not None and expr(n.msg, env)[0] != STR: raise ValueError('assert message')
+    elif isinstance(n, ast.Import):
+        # Only the two modules M215 can prove. `os`, `subprocess`, `socket` and
+        # `shutil` stay unprovable imports, never inert data.
+        for alias in n.names:
+            if alias.name not in MODULES or (alias.asname or alias.name) not in MODULES: raise ValueError('module ' + alias.name)
+            env[alias.asname or alias.name] = (MODULE, alias.name)
+    elif isinstance(n, ast.ImportFrom):
+        if n.level or n.module not in MODULES: raise ValueError('module import')
+        for alias in n.names:
+            if n.module == 'pathlib' and alias.name == 'Path': env[alias.asname or 'Path'] = (MODULE, 'pathlib.Path')
+            elif n.module == 'io' and alias.name == 'open': pass
+            else: raise ValueError('module import')
+    elif isinstance(n, ast.With):
+        if len(n.items) != 1: raise ValueError('multiple with items')
+        item = n.items[0]
+        handle = expr(item.context_expr, env)
+        if handle[0] != FILE: raise ValueError('with context is not a proved file handle')
+        if item.optional_vars is not None:
+            if not isinstance(item.optional_vars, ast.Name): raise ValueError('with target')
+            env[item.optional_vars.id] = handle
+        statements(n.body, env, in_function)
+    elif isinstance(n, ast.Global) and in_function:
+        if any(x not in env for x in n.names): raise ValueError('unknown global')
+    elif isinstance(n, ast.FunctionDef) and not in_function:
+        if n.decorator_list or n.returns or n.args.vararg or n.args.kwarg or n.args.kwonlyargs or n.args.posonlyargs or any(x.annotation for x in n.args.args): raise ValueError('function effects')
+        if n.name in env or n.name == 'open': raise ValueError('shadowed name')
+        functions[n.name] = n
+    else:
+        raise ValueError('unsupported statement: ' + type(n).__name__)
 
 def node_statements(source):
     # Parse a deliberately small JavaScript grammar without evaluating JS.
@@ -202,5 +301,12 @@ try:
         saved = functions.pop(name)
         try: statements(fn.body, local, in_function=True)
         finally: functions[name] = saved
-except (ValueError, SyntaxError, TypeError, RecursionError, OSError, KeyError):
+except SyntaxError as error:
+    print('第%s行语法错误：%s' % (error.lineno, error.msg), file=sys.stderr)
+    sys.exit(1)
+except ValueError as error:
+    print(str(error), file=sys.stderr)
+    sys.exit(1)
+except (TypeError, RecursionError, OSError, KeyError):
+    print('脚本包含无法静态证明的结构', file=sys.stderr)
     sys.exit(1)

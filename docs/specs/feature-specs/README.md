@@ -43,6 +43,7 @@
 - `skill-lifecycle-system.md`: Skill package、安装事务、审核/激活、按需运行时与证据合同的领域主规格。
 - `skill-command-recovery.md`: 上述主规格的 P0 修复切片，限定 Skill payload 保留、稳定 skill root、命令错误/超时诊断、变化后重试与 system-owned 恢复。
 - `edit-line-stats-visibility.md`: 会话中文件编辑行的 `+X −Y` 行数展示、回合改动总和、颜色与溢出边界的可读性规格。
+- `m215-trusted-heredoc-own-workspace.md`: trusted 模式下只改本会话工作区的 `python`/`node` heredoc 与 `cd "$(pwd)" && git merge` 直接放行；不可证明时拒绝理由带脚本行号。
 
 ## 模板
 - `requirements-traceability-template.md`

@@ -33,34 +33,105 @@ pub(super) fn sensitive(command: &str) -> bool {
 /// No shell suffix, custom executable, wrapper, substitution or redirection is
 /// accepted. The validator parses AST only; it never evaluates model code.
 pub(super) fn python_heredoc_proved(root: Option<&Path>, command: &str) -> bool {
-    if command.len() > 256 * 1024 { return false; }
-    let Some((header, rest)) = command.split_once('\n') else { return false; };
-    let header = header.trim().strip_prefix("cd \"$(pwd)\"; ").unwrap_or(header.trim());
-    let Some((runner, delimiter)) = header.split_once(" <<") else { return false; };
+    python_heredoc_proof(root, command).is_ok()
+}
+
+/// M215: the same proof, but a refusal carries the reason (including the script
+/// line the prover could not prove) so the approval text can name it instead of
+/// only saying "unproved".
+pub(super) fn python_heredoc_proof(root: Option<&Path>, command: &str) -> Result<(), String> {
+    if command.len() > 256 * 1024 { return Err("脚本超过 256 KiB".into()); }
+    let Some((header, rest)) = command.split_once('\n') else { return Err("heredoc 缺少换行".into()); };
+    // M215: `cd <this workspace> &&` is how a heredoc actually starts; the
+    // prefix is proved against the registered root, never ignored.
+    let header = heredoc_header_prefix(header.trim(), root)?;
+    let Some((runner, delimiter)) = header.split_once(" <<") else { return Err("缺少 `<<` heredoc 起始符".into()); };
     let node = ["node", "node -"].contains(&runner);
-    if !node && !["python3 -", "python -"].contains(&runner) { return false; }
-    let Some(delimiter) = delimiter.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')) else { return false; };
-    if delimiter.is_empty() || !delimiter.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') { return false; }
+    if !node && !["python3 -", "python -"].contains(&runner) {
+        return Err(format!("不接受的解释器入口：{runner}"));
+    }
+    let Some(delimiter) = delimiter.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')) else {
+        return Err("heredoc 分隔符必须用单引号关闭展开".into());
+    };
+    if delimiter.is_empty() || !delimiter.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return Err("heredoc 分隔符不合法".into());
+    }
     let mut body = String::new();
     let mut lines = rest.lines();
     let mut closed = false;
     while let Some(line) = lines.next() {
         if line == delimiter {
             closed = true;
-            if lines.any(|l| !l.trim().is_empty()) { return false; }
+            if lines.any(|l| !l.trim().is_empty()) { return Err("heredoc 之后仍有 shell 内容".into()); }
             break;
         }
         body.push_str(line);
         body.push('\n');
     }
-    if !closed { return false; }
+    if !closed { return Err("heredoc 分隔符未闭合".into()); }
     let mut cmd = Command::new(if cfg!(windows) { "python" } else { "python3" });
     cmd.args(["-I", "-c", include_str!("trusted_python_ast.py")]);
     if let Some(root) = root { cmd.arg(root); } else { cmd.arg(""); }
     if node { cmd.arg("node"); }
-    let Ok(mut child) = cmd.no_window().stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null()).spawn() else { return false; };
-    let written = child.stdin.take().is_some_and(|mut input| input.write_all(body.as_bytes()).is_ok());
-    written && child.wait().is_ok_and(|s| s.success())
+    let Ok(mut child) = cmd.no_window().stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::piped()).spawn() else {
+        return Err(format!("无法启动{}证明进程", if node { " node " } else { " python " }));
+    };
+    let Some(mut input) = child.stdin.take() else { return Err("无法写入证明脚本".into()); };
+    if input.write_all(body.as_bytes()).is_err() { return Err("证明脚本写入失败".into()); }
+    drop(input);
+    let Ok(output) = child.wait_with_output() else { return Err("证明进程异常退出".into()); };
+    if output.status.success() { return Ok(()); }
+    let reason = decode_prover_escapes(String::from_utf8_lossy(&output.stderr).trim());
+    Err(if reason.is_empty() { "脚本包含无法静态证明的结构".into() } else { reason })
+}
+
+/// M215: prover diagnostics travel through the host console, and a Windows code
+/// page that cannot encode CJK escapes them as `\uXXXX`. Decode those escapes so
+/// the approval text names the line in readable Chinese on every platform.
+pub(crate) fn decode_prover_escapes(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\\' || chars.peek() != Some(&'u') {
+            out.push(c);
+            continue;
+        }
+        chars.next();
+        let mut digits = String::with_capacity(4);
+        while digits.len() < 4 {
+            match chars.peek() {
+                Some(&d) if d.is_ascii_hexdigit() => { digits.push(d); chars.next(); }
+                _ => break,
+            }
+        }
+        match u32::from_str_radix(&digits, 16).ok().and_then(char::from_u32) {
+            Some(decoded) if digits.len() == 4 => out.push(decoded),
+            _ => { out.push('\\'); out.push('u'); out.push_str(&digits); }
+        }
+    }
+    out
+}
+
+/// M215: strip an optional `cd <path>` prefix that only re-enters this
+/// workspace. Anything else (subdirectory, other root, unparsable) stays
+/// unproved.
+fn heredoc_header_prefix<'a>(header: &'a str, root: Option<&Path>) -> Result<&'a str, String> {
+    let Some(rest) = header.strip_prefix("cd ") else { return Ok(header) };
+    let mut split = None;
+    for separator in [" && ", "; "] {
+        if let Some(parts) = rest.split_once(separator) { split = Some(parts); break; }
+    }
+    let Some((target, tail)) = split else { return Err("heredoc 头部的 cd 没有可证明的分隔符".into()); };
+    let target = target.trim().trim_matches('"').trim_matches('\'');
+    let identity = matches!(target, "$(pwd)" | "${PWD}" | "$PWD" | "`pwd`");
+    // Compare physical paths: a macOS temp root is reached through a symlink, so
+    // the literal root text and its canonical form differ.
+    let same_root = root.is_some_and(|root| {
+        let Ok(target) = root.join(target).canonicalize() else { return false };
+        target == root.canonicalize().unwrap_or_else(|_| root.to_path_buf())
+    });
+    if !identity && !same_root { return Err(format!("heredoc 头部 cd 目标不是本工作区：{target}")); }
+    Ok(tail.trim())
 }
 
 /// Git subcommands that move the working tree, the index or a local branch.
@@ -821,6 +892,19 @@ fn workspace_at(roots: &[std::path::PathBuf], cwd: &Path, path: &str) -> Option<
     roots.iter().find(|root| **root == real).cloned()
 }
 
+/// M215: `cd "$(pwd)"` re-enters the current directory — `pwd` resolves to the
+/// physical path of the same tree — so it neither moves the cwd nor changes
+/// which files a relative path names. `segments()` refuses command
+/// substitution outright, so the identity prefix is proved and removed here.
+/// Every other substitution still fails closed.
+fn strip_identity_cd(command: &str) -> &str {
+    let command = command.trim_start();
+    for prefix in ["cd \"$(pwd)\" && ", "cd \"$(pwd)\"; ", "cd \"$(pwd)\"\n"] {
+        if let Some(rest) = command.strip_prefix(prefix) { return rest.trim_start(); }
+    }
+    command
+}
+
 /// Returns the exact roots needing snapshots and explicit rm paths. The caller
 /// supplies only session-owned, identity-verified registrations, never a prefix.
 fn prove(roots: &[std::path::PathBuf], cwd: &Path, command: &str) -> Option<Vec<(std::path::PathBuf, Vec<String>)>> {
@@ -830,7 +914,7 @@ fn prove(roots: &[std::path::PathBuf], cwd: &Path, command: &str) -> Option<Vec<
         if git(root, &["rev-parse", "--show-toplevel"]).and_then(|p| Path::new(&p).canonicalize().ok()).as_ref() != Some(root)
             || git(root, &["ls-files", "--stage"]).is_none_or(|s| s.lines().any(|l| l.starts_with("160000 "))) { return None; }
     }
-    let segments = segments(command)?;
+    let segments = segments(strip_identity_cd(command))?;
     let mut touched = std::collections::BTreeMap::<std::path::PathBuf, Vec<String>>::new();
     let mut removed = std::collections::BTreeSet::new();
     let mut previous_pipe = false;
