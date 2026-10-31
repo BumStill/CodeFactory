@@ -94,6 +94,7 @@ function KnowledgeLibrariesPanel() {
     scanSummaries,
     loading,
     scanning,
+    failures,
     error,
     loadLibraries,
     registerLibrary,
@@ -106,6 +107,10 @@ function KnowledgeLibrariesPanel() {
 
   useEffect(() => {
     void loadLibraries();
+    // 索引由后端自动维护（文件监听 + 定时对账），这里只做轻量状态轮询，
+    // 让“正在更新 / 最近更新 / 失败文件”在用户不动手时也保持真实。
+    const timer = window.setInterval(() => void loadLibraries(), 4000);
+    return () => window.clearInterval(timer);
   }, [loadLibraries]);
 
   const addLibrary = async () => {
@@ -157,6 +162,9 @@ function KnowledgeLibrariesPanel() {
             <p className="mt-1 text-label text-gray-600">
               启用的资料会自动供普通会话和新建自主任务检索；无需在 Session 中重复配置。
             </p>
+            <p className="mt-1 text-caption text-gray-600">
+              文件夹里的新增、修改、删除和改名会被自动同步进索引，不需要手动扫描。
+            </p>
           </div>
           <button
             onClick={() => void addLibrary()}
@@ -190,7 +198,9 @@ function KnowledgeLibrariesPanel() {
           <ul className="grid gap-3 md:grid-cols-2">
             {libraries.map((library) => {
               const summary = scanSummaries[library.id];
-              const isScanning = scanning[library.id] ?? false;
+              const libraryFailures = failures[library.id] ?? [];
+              const isScanning =
+                (scanning[library.id] ?? false) || library.scan_status === "scanning";
               return (
                 <li key={library.id} className="rounded-lg border border-border bg-surface-1 p-4">
                   <div className="flex items-start gap-3">
@@ -209,15 +219,42 @@ function KnowledgeLibrariesPanel() {
                       <p className="mt-1 truncate font-mono text-caption text-gray-600" title={library.root_path}>
                         {library.root_path}
                       </p>
-                      <p className="mt-2 text-caption text-gray-500">
-                        {summary
-                          ? `${summary.indexed_documents} 文档 · ${summary.chunks_indexed} 片段 · ${summary.failed_documents} 失败`
-                          : scanStatusText(library.scan_status)}
+                      <p className="mt-2 flex items-center gap-1.5 text-caption text-gray-500">
+                        {isScanning && (
+                          <span className="inline-flex items-center gap-1 rounded bg-accent/15 px-1.5 py-0.5 text-accent">
+                            <Loader2 size={14} className="animate-spin" /> 正在更新
+                          </span>
+                        )}
+                        <span>
+                          {summary
+                            ? `${summary.indexed_documents} 文档 · ${summary.chunks_indexed} 片段 · ${summary.failed_documents} 失败`
+                            : scanStatusText(library.scan_status)}
+                        </span>
                       </p>
                       {library.last_scan_at && (
                         <p className="mt-0.5 text-caption text-gray-700">
-                          最近扫描：{new Date(library.last_scan_at).toLocaleString()}
+                          最近更新：{new Date(library.last_scan_at).toLocaleString()}
                         </p>
+                      )}
+                      {libraryFailures.length > 0 && (
+                        <details
+                          className="mt-2 rounded border border-amber-500/20 bg-amber-500/5 px-2 py-1 text-caption text-amber-700 dark:text-amber-300"
+                          aria-label={`知识库 ${library.name} 的失败文件`}
+                        >
+                          <summary className="cursor-pointer">
+                            {libraryFailures.length} 个文件无法建立索引
+                          </summary>
+                          <ul className="mt-1 space-y-1">
+                            {libraryFailures.map((failure) => (
+                              <li key={failure.path}>
+                                <span className="break-all font-mono">{failure.path}</span>
+                                <span className="block text-amber-600 dark:text-amber-400">
+                                  {failure.error}
+                                </span>
+                              </li>
+                            ))}
+                          </ul>
+                        </details>
                       )}
                     </div>
                   </div>

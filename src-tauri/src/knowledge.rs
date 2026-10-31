@@ -34,13 +34,151 @@ pub struct KnowledgeChunkDetail {
     pub metadata_json: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct KnowledgeScanSummary {
     pub library_id: String,
+    /// Files that matched a supported kind and were visited in this pass.
     pub scanned_files: usize,
+    /// Documents whose chunks were (re)written in this pass.
     pub indexed_documents: usize,
     pub failed_documents: usize,
     pub chunks_indexed: usize,
+    /// Documents that did not exist in the index before this pass.
+    pub added_documents: usize,
+    /// Documents whose content hash changed and were re-chunked.
+    pub updated_documents: usize,
+    /// Documents skipped because their bytes are already indexed.
+    pub unchanged_documents: usize,
+    /// Index rows dropped because the file no longer exists on disk.
+    pub removed_documents: usize,
+    /// True when this call merged into a scan that was already running.
+    pub coalesced: bool,
+}
+
+impl KnowledgeScanSummary {
+    fn new(library_id: &str) -> Self {
+        Self {
+            library_id: library_id.to_string(),
+            ..Default::default()
+        }
+    }
+}
+
+/// One document that could not be indexed, surfaced so the knowledge UI can
+/// show *which* file failed and why instead of only a count.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KnowledgeDocumentFailure {
+    pub path: String,
+    pub kind: String,
+    pub error: String,
+    pub updated_at: String,
+}
+
+/// How indexing references a file on disk: cheap metadata first, content hash
+/// only when the metadata moved. `skipped` means "already indexed, cost zero".
+const DOCUMENT_STATE_SELECT: &str =
+    "SELECT id, hash, mtime, size, status, error FROM knowledge_documents
+     WHERE library_id = ? AND path = ?";
+
+#[derive(Debug, Clone)]
+struct DocumentState {
+    id: String,
+    hash: String,
+    mtime: i64,
+    size: i64,
+    status: String,
+}
+
+enum IndexOutcome {
+    /// Chunks were written; `added` distinguishes a new file from a re-index.
+    Parsed { chunks: usize, added: bool },
+    /// Bytes are identical to the indexed copy, only bookkeeping was refreshed.
+    Unchanged,
+    /// Metadata was identical: extraction never ran.
+    Skipped,
+}
+
+/// Counts real extraction passes per library. Incremental behaviour is only
+/// trustworthy if we can prove a rescan did *not* parse an unchanged file
+/// (M191 R3); per-library keys keep that proof immune to parallel tests.
+static PARSE_COUNTS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, usize>>> =
+    std::sync::OnceLock::new();
+
+fn record_parse(library_id: &str) {
+    let counts = PARSE_COUNTS.get_or_init(Default::default);
+    let mut counts = match counts.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    *counts.entry(library_id.to_string()).or_insert(0) += 1;
+}
+
+/// Document extraction passes for one library. Test-only: it is how "a rescan
+/// really skipped extraction" becomes machine-checkable.
+#[cfg(test)]
+pub fn parse_count_for(library_id: &str) -> usize {
+    let counts = PARSE_COUNTS.get_or_init(Default::default);
+    let counts = match counts.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    counts.get(library_id).copied().unwrap_or(0)
+}
+
+#[derive(Default)]
+struct ScanSlot {
+    /// A scan was requested while one was already running: run one more pass
+    /// after the current one so no change is silently dropped.
+    rerun: bool,
+}
+
+fn scan_slots() -> &'static std::sync::Mutex<std::collections::HashMap<String, ScanSlot>> {
+    static SLOTS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, ScanSlot>>,
+    > = std::sync::OnceLock::new();
+    SLOTS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn lock_scan_slots() -> std::sync::MutexGuard<'static, std::collections::HashMap<String, ScanSlot>>
+{
+    match scan_slots().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+/// Exclusive per-library scan ownership. Dropping releases the slot, so an
+/// aborted or panicking scan can never wedge auto-indexing (M191 R5).
+struct ScanLease {
+    library_id: String,
+}
+
+impl ScanLease {
+    fn acquire(library_id: &str) -> Option<Self> {
+        let mut slots = lock_scan_slots();
+        if let Some(slot) = slots.get_mut(library_id) {
+            slot.rerun = true;
+            return None;
+        }
+        slots.insert(library_id.to_string(), ScanSlot::default());
+        Some(Self {
+            library_id: library_id.to_string(),
+        })
+    }
+
+    fn take_rerun(&self) -> bool {
+        let mut slots = lock_scan_slots();
+        slots
+            .get_mut(&self.library_id)
+            .map(|slot| std::mem::replace(&mut slot.rerun, false))
+            .unwrap_or(false)
+    }
+}
+
+impl Drop for ScanLease {
+    fn drop(&mut self) {
+        lock_scan_slots().remove(&self.library_id);
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -263,7 +401,30 @@ pub async fn enabled_library_context(
     })
 }
 
+/// Bring one library index up to date with the folder on disk.
+///
+/// One scan per library at a time: a concurrent caller never runs a second
+/// pass over the same folder, it records that another pass is needed and
+/// returns immediately (M191 R5). Changes that arrive mid-scan are then picked
+/// up by exactly one follow-up pass before the slot is released.
 pub async fn scan_library(
+    pool: &SqlitePool,
+    library_id: &str,
+) -> crate::errors::Result<KnowledgeScanSummary> {
+    let Some(lease) = ScanLease::acquire(library_id) else {
+        let mut summary = KnowledgeScanSummary::new(library_id);
+        summary.coalesced = true;
+        return Ok(summary);
+    };
+
+    let mut summary = scan_library_once(pool, library_id).await?;
+    while lease.take_rerun() {
+        summary = scan_library_once(pool, library_id).await?;
+    }
+    Ok(summary)
+}
+
+async fn scan_library_once(
     pool: &SqlitePool,
     library_id: &str,
 ) -> crate::errors::Result<KnowledgeScanSummary> {
@@ -274,13 +435,8 @@ pub async fn scan_library(
         .execute(pool)
         .await?;
 
-    let mut summary = KnowledgeScanSummary {
-        library_id: library_id.to_string(),
-        scanned_files: 0,
-        indexed_documents: 0,
-        failed_documents: 0,
-        chunks_indexed: 0,
-    };
+    let mut summary = KnowledgeScanSummary::new(library_id);
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     for entry in WalkDir::new(&library.root_path)
         .follow_links(false)
@@ -295,16 +451,40 @@ pub async fn scan_library(
             continue;
         };
         summary.scanned_files += 1;
+        seen.insert(path.to_string_lossy().to_string());
         match index_document(pool, &library, path, kind).await {
-            Ok(chunks) => {
+            Ok(IndexOutcome::Parsed { chunks, added }) => {
                 summary.indexed_documents += 1;
                 summary.chunks_indexed += chunks;
+                if added {
+                    summary.added_documents += 1;
+                } else {
+                    summary.updated_documents += 1;
+                }
+            }
+            Ok(IndexOutcome::Unchanged) | Ok(IndexOutcome::Skipped) => {
+                summary.unchanged_documents += 1;
             }
             Err(e) => {
                 summary.failed_documents += 1;
                 record_failed_document(pool, &library, path, kind, &e.to_string()).await?;
             }
         }
+    }
+
+    // Files removed or renamed since the last pass must stop answering
+    // retrieval: drop the document row and every chunk behind it.
+    let indexed_paths: Vec<String> =
+        sqlx::query_scalar("SELECT path FROM knowledge_documents WHERE library_id = ?")
+            .bind(library_id)
+            .fetch_all(pool)
+            .await?;
+    for path in indexed_paths {
+        if seen.contains(&path) {
+            continue;
+        }
+        remove_document(pool, library_id, &path).await?;
+        summary.removed_documents += 1;
     }
 
     let status = if summary.failed_documents > 0 {
@@ -324,6 +504,90 @@ pub async fn scan_library(
     .await?;
 
     Ok(summary)
+}
+
+/// Drop one document and its chunks in a single transaction.
+async fn remove_document(
+    pool: &SqlitePool,
+    library_id: &str,
+    path: &str,
+) -> crate::errors::Result<()> {
+    let mut tx = pool.begin().await?;
+    sqlx::query(
+        "DELETE FROM knowledge_chunks WHERE document_id IN
+         (SELECT id FROM knowledge_documents WHERE library_id = ? AND path = ?)",
+    )
+    .bind(library_id)
+    .bind(path)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query("DELETE FROM knowledge_documents WHERE library_id = ? AND path = ?")
+        .bind(library_id)
+        .bind(path)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Startup repairs: a scan that was running when the process died must not
+/// leave `scanning` forever, and must not leave childless/partial rows behind.
+pub async fn recover_interrupted_scans(pool: &SqlitePool) -> crate::errors::Result<usize> {
+    sqlx::query(
+        "DELETE FROM knowledge_chunks WHERE document_id IN
+         (SELECT id FROM knowledge_documents WHERE status = 'scanning')",
+    )
+    .execute(pool)
+    .await?;
+    let requeued = sqlx::query(
+        "UPDATE knowledge_documents
+         SET status = 'pending', error = 'Interrupted by restart; queued for re-index'
+         WHERE status = 'scanning'",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query("UPDATE knowledge_libraries SET scan_status = 'idle' WHERE scan_status = 'scanning'")
+        .execute(pool)
+        .await?;
+    Ok(requeued.rows_affected() as usize)
+}
+
+/// Startup / periodic reconciliation: index every enabled library so files
+/// added while the app was closed (or the watcher missed) are picked up.
+pub async fn reconcile_all_libraries(pool: &SqlitePool) -> crate::errors::Result<Vec<String>> {
+    recover_interrupted_scans(pool).await?;
+    let mut scanned = Vec::new();
+    for library in list_libraries(pool).await?.into_iter().filter(|l| l.enabled) {
+        match scan_library(pool, &library.id).await {
+            Ok(_) => scanned.push(library.id),
+            Err(e) => tracing::warn!("knowledge reconcile failed for {}: {e}", library.id),
+        }
+    }
+    Ok(scanned)
+}
+
+/// Documents currently failing to index, for the knowledge page status line.
+pub async fn library_failures(
+    pool: &SqlitePool,
+    library_id: &str,
+) -> crate::errors::Result<Vec<KnowledgeDocumentFailure>> {
+    let rows = sqlx::query(
+        "SELECT path, kind, COALESCE(error, ''), updated_at FROM knowledge_documents
+         WHERE library_id = ? AND status = 'error' ORDER BY path",
+    )
+    .bind(library_id)
+    .fetch_all(pool)
+    .await?;
+    let mut failures = Vec::with_capacity(rows.len());
+    for row in rows {
+        failures.push(KnowledgeDocumentFailure {
+            path: row.try_get("path")?,
+            kind: row.try_get("kind")?,
+            error: row.try_get(2)?,
+            updated_at: row.try_get("updated_at")?,
+        });
+    }
+    Ok(failures)
 }
 
 pub async fn search(
@@ -468,6 +732,15 @@ async fn library_by_root(
     Ok(row.as_ref().map(row_to_library))
 }
 
+/// Public view of one library, used by the registration command so the UI
+/// reflects `scanning` immediately after adding a folder.
+pub async fn library_by_id_public(
+    pool: &SqlitePool,
+    id: &str,
+) -> crate::errors::Result<KnowledgeLibrary> {
+    library_by_id(pool, id).await
+}
+
 async fn library_by_id(pool: &SqlitePool, id: &str) -> crate::errors::Result<KnowledgeLibrary> {
     let row = sqlx::query(
         "SELECT id, name, root_path, enabled, created_at, last_scan_at, scan_status
@@ -498,9 +771,7 @@ async fn index_document(
     library: &KnowledgeLibrary,
     path: &Path,
     kind: &str,
-) -> crate::errors::Result<usize> {
-    let bytes = std::fs::read(path)?;
-    let hash = stable_hash_hex(&bytes);
+) -> crate::errors::Result<IndexOutcome> {
     let metadata = std::fs::metadata(path)?;
     let mtime = metadata
         .modified()
@@ -510,9 +781,40 @@ async fn index_document(
         .unwrap_or(0);
     let size = metadata.len() as i64;
     let path_str = path.to_string_lossy().to_string();
-    let document_id = existing_document_id(pool, &library.id, &path_str)
-        .await?
-        .unwrap_or_else(|| Uuid::new_v4().to_string());
+    let existing = load_document_state(pool, &library.id, &path_str).await?;
+
+    // Cheap path: same size and same second-resolution mtime as the indexed
+    // copy means nothing was touched — no read, no extraction, no chunk churn.
+    if let Some(previous) = &existing {
+        if previous.status == "indexed"
+            && !previous.hash.is_empty()
+            && previous.mtime == mtime
+            && previous.size == size
+        {
+            return Ok(IndexOutcome::Skipped);
+        }
+    }
+
+    let bytes = std::fs::read(path)?;
+    let hash = stable_hash_hex(&bytes);
+    let now = Utc::now().to_rfc3339();
+
+    // Metadata moved but bytes did not (Office re-save, copy, touch): refresh
+    // bookkeeping only, so re-indexing never re-embeds identical content.
+    if let Some(previous) = &existing {
+        if previous.status == "indexed" && !previous.hash.is_empty() && previous.hash == hash {
+            sqlx::query("UPDATE knowledge_documents SET mtime = ?, size = ?, updated_at = ? WHERE id = ?")
+                .bind(mtime)
+                .bind(size)
+                .bind(&now)
+                .bind(&previous.id)
+                .execute(pool)
+                .await?;
+            return Ok(IndexOutcome::Unchanged);
+        }
+    }
+
+    record_parse(&library.id);
     let chunks = extract_document(path, kind)?;
     if chunks.is_empty() {
         return Err(crate::errors::AppError::Other(format!(
@@ -520,12 +822,19 @@ async fn index_document(
             path.display()
         )));
     }
+    let added = existing.is_none();
+    let document_id = existing
+        .as_ref()
+        .map(|previous| previous.id.clone())
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
     let title = chunks
         .first()
         .map(|chunk| first_words(&chunk.text, 12))
         .filter(|s| !s.is_empty());
-    let now = Utc::now().to_rfc3339();
 
+    // One transaction per document: a crash or write error leaves either the
+    // previous complete chunk set or the new one, never half of each (M191 R4).
+    let mut tx = pool.begin().await?;
     sqlx::query(
         "INSERT INTO knowledge_documents
          (id, library_id, path, kind, hash, mtime, size, title, status, error, updated_at)
@@ -549,12 +858,12 @@ async fn index_document(
     .bind(size)
     .bind(&title)
     .bind(&now)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
 
     sqlx::query("DELETE FROM knowledge_chunks WHERE document_id = ?")
         .bind(&document_id)
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
     for (idx, chunk) in chunks.iter().enumerate() {
         sqlx::query(
@@ -573,11 +882,34 @@ async fn index_document(
         .bind(&chunk.heading)
         .bind(estimate_tokens(&chunk.text))
         .bind(&chunk.metadata_json)
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
     }
+    tx.commit().await?;
 
-    Ok(chunks.len())
+    Ok(IndexOutcome::Parsed {
+        chunks: chunks.len(),
+        added,
+    })
+}
+
+async fn load_document_state(
+    pool: &SqlitePool,
+    library_id: &str,
+    path: &str,
+) -> crate::errors::Result<Option<DocumentState>> {
+    let row = sqlx::query(DOCUMENT_STATE_SELECT)
+        .bind(library_id)
+        .bind(path)
+        .fetch_optional(pool)
+        .await?;
+    Ok(row.map(|row| DocumentState {
+        id: row.get::<String, _>("id"),
+        hash: row.get::<String, _>("hash"),
+        mtime: row.get::<i64, _>("mtime"),
+        size: row.get::<i64, _>("size"),
+        status: row.get::<String, _>("status"),
+    }))
 }
 
 async fn record_failed_document(
@@ -1272,6 +1604,458 @@ mod tests {
                     && error.as_deref().unwrap_or("").contains("Invalid docx zip")
             }),
             "broken document should be recorded as error without aborting: {rows:?}"
+        );
+    }
+
+    // ---------- M191: personal knowledge base auto-update ----------
+
+    use sqlx::SqlitePool;
+
+    async fn memory_pool() -> SqlitePool {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("open in-memory db");
+        super::ensure_schema(&pool).await.expect("knowledge schema");
+        pool
+    }
+
+    fn fixture_root(tag: &str) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "codefactory-kb-{tag}-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).expect("create fixture root");
+        // Library roots are canonicalized on registration; fixtures must use the
+        // same spelling so stored document paths match (macOS /var -> /private/var).
+        std::fs::canonicalize(&root).expect("canonical fixture root")
+    }
+
+    async fn search_hits(pool: &SqlitePool, library_id: &str, query: &str) -> Vec<super::KnowledgeSearchResult> {
+        super::search(
+            pool,
+            super::KnowledgeSearchQuery {
+                query: query.into(),
+                library_id: Some(library_id.to_string()),
+                library_ids: None,
+                kind: None,
+                top_k: Some(10),
+                session_id: None,
+                task_id: None,
+            },
+        )
+        .await
+        .expect("search knowledge")
+    }
+
+    async fn indexed_documents(pool: &SqlitePool, library_id: &str) -> i64 {
+        sqlx::query_scalar(
+            "SELECT COUNT(*) FROM knowledge_documents WHERE library_id = ? AND status = 'indexed'",
+        )
+        .bind(library_id)
+        .fetch_one(pool)
+        .await
+        .expect("count indexed documents")
+    }
+
+    async fn await_indexed(pool: &SqlitePool, library_id: &str, expected: i64) {
+        for _ in 0..200 {
+            if indexed_documents(pool, library_id).await >= expected {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        panic!("library {library_id} did not index {expected} document(s) in time");
+    }
+
+    /// R1 + R2: registering a folder indexes it with no manual scan, and an
+    /// edited file is re-indexed through the same background entry point the
+    /// watcher uses — old chunks must not survive the edit.
+    #[tokio::test]
+    async fn background_index_builds_on_registration_and_follows_edits() {
+        let pool = memory_pool().await;
+        let root = fixture_root("auto-edit");
+        let file = root.join("note.docx");
+        write_docx(file.clone(), "Atlas launch plan");
+        let library = super::add_library(&pool, "kb".into(), root.to_string_lossy().into())
+            .await
+            .expect("add library");
+
+        // Same entry point the register command / watcher uses.
+        crate::knowledge_watch::spawn_scan(pool.clone(), library.id.clone());
+        await_indexed(&pool, &library.id, 1).await;
+        assert!(
+            !search_hits(&pool, &library.id, "Atlas").await.is_empty(),
+            "registration alone must make the document retrievable"
+        );
+
+        write_docx(file, "Beacon delivery memo");
+        crate::knowledge_watch::spawn_scan(pool.clone(), library.id.clone());
+        for _ in 0..200 {
+            if !search_hits(&pool, &library.id, "Beacon").await.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let hits = search_hits(&pool, &library.id, "Beacon").await;
+        let stale = search_hits(&pool, &library.id, "Atlas").await;
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert!(!hits.is_empty(), "edited content must become retrievable");
+        assert!(
+            stale.is_empty(),
+            "chunks of the superseded revision must be replaced, got: {stale:?}"
+        );
+        assert_eq!(indexed_documents(&pool, &library.id).await, 1);
+    }
+
+    /// R2: files deleted on disk must stop answering retrieval.
+    #[tokio::test]
+    async fn deleted_file_leaves_no_documents_or_chunks() {
+        let pool = memory_pool().await;
+        let root = fixture_root("delete");
+        write_docx(root.join("keep.docx"), "Atlas keeps its place");
+        write_docx(root.join("gone.docx"), "Beacon retires");
+        let library = super::add_library(&pool, "kb".into(), root.to_string_lossy().into())
+            .await
+            .expect("add library");
+        super::scan_library(&pool, &library.id).await.expect("first scan");
+
+        std::fs::remove_file(root.join("gone.docx")).expect("delete source file");
+        let summary = super::scan_library(&pool, &library.id)
+            .await
+            .expect("second scan");
+        let beacon = search_hits(&pool, &library.id, "Beacon").await;
+        let atlas = search_hits(&pool, &library.id, "Atlas").await;
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert_eq!(summary.removed_documents, 1, "summary: {summary:?}");
+        assert_eq!(indexed_documents(&pool, &library.id).await, 1);
+        assert!(beacon.is_empty(), "deleted document still retrievable: {beacon:?}");
+        assert!(!atlas.is_empty(), "surviving document must stay indexed");
+    }
+
+    /// R2: a rename is a removal plus an addition, not a duplicated document.
+    #[tokio::test]
+    async fn renamed_file_moves_its_index_entry() {
+        let pool = memory_pool().await;
+        let root = fixture_root("rename");
+        write_docx(root.join("draft.docx"), "Atlas anniversary draft");
+        let library = super::add_library(&pool, "kb".into(), root.to_string_lossy().into())
+            .await
+            .expect("add library");
+        super::scan_library(&pool, &library.id).await.expect("first scan");
+
+        std::fs::rename(root.join("draft.docx"), root.join("final.docx")).expect("rename");
+        let summary = super::scan_library(&pool, &library.id)
+            .await
+            .expect("second scan");
+        let hits = search_hits(&pool, &library.id, "Atlas").await;
+        let paths: Vec<String> =
+            sqlx::query_scalar("SELECT path FROM knowledge_documents WHERE library_id = ?")
+                .bind(&library.id)
+                .fetch_all(&pool)
+                .await
+                .expect("document paths");
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert_eq!(summary.removed_documents, 1, "summary: {summary:?}");
+        assert_eq!(summary.added_documents, 1, "summary: {summary:?}");
+        assert_eq!(paths.len(), 1);
+        assert!(paths[0].ends_with("final.docx"), "paths: {paths:?}");
+        assert!(hits.iter().all(|hit| hit.path.ends_with("final.docx")));
+    }
+
+    /// R3: a rescan of an untouched folder must not extract or rewrite anything.
+    #[tokio::test]
+    async fn rescan_of_unchanged_folder_does_no_extraction() {
+        let pool = memory_pool().await;
+        let root = fixture_root("unchanged");
+        write_docx(root.join("a.docx"), "Atlas unchanged one");
+        write_docx(root.join("b.docx"), "Atlas unchanged two");
+        let library = super::add_library(&pool, "kb".into(), root.to_string_lossy().into())
+            .await
+            .expect("add library");
+        super::scan_library(&pool, &library.id).await.expect("first scan");
+        let chunk_ids: Vec<String> = sqlx::query_scalar("SELECT id FROM knowledge_chunks ORDER BY id")
+            .fetch_all(&pool)
+            .await
+            .expect("chunk ids");
+        let parses_before = super::parse_count_for(&library.id);
+        let updated_before: String =
+            sqlx::query_scalar("SELECT updated_at FROM knowledge_documents ORDER BY path LIMIT 1")
+                .fetch_one(&pool)
+                .await
+                .expect("updated_at");
+
+        let summary = super::scan_library(&pool, &library.id)
+            .await
+            .expect("second scan");
+        let chunk_ids_after: Vec<String> =
+            sqlx::query_scalar("SELECT id FROM knowledge_chunks ORDER BY id")
+                .fetch_all(&pool)
+                .await
+                .expect("chunk ids after");
+        let updated_after: String =
+            sqlx::query_scalar("SELECT updated_at FROM knowledge_documents ORDER BY path LIMIT 1")
+                .fetch_one(&pool)
+                .await
+                .expect("updated_at after");
+        let parses_after = super::parse_count_for(&library.id);
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert_eq!(parses_after, parses_before, "rescan re-extracted documents");
+        assert_eq!(summary.unchanged_documents, 2, "summary: {summary:?}");
+        assert_eq!(summary.indexed_documents, 0);
+        assert_eq!(summary.chunks_indexed, 0);
+        assert_eq!(chunk_ids_after, chunk_ids, "chunks must not be rewritten");
+        assert_eq!(updated_after, updated_before, "untouched rows must not churn");
+    }
+
+    /// R3: a touched-but-identical file (Office re-save, copy) refreshes
+    /// metadata only — the content hash decides, not the mtime.
+    #[tokio::test]
+    async fn touched_but_identical_file_is_not_reindexed() {
+        let pool = memory_pool().await;
+        let root = fixture_root("touched");
+        let file = root.join("a.docx");
+        write_docx(file.clone(), "Atlas identical content");
+        let library = super::add_library(&pool, "kb".into(), root.to_string_lossy().into())
+            .await
+            .expect("add library");
+        super::scan_library(&pool, &library.id).await.expect("first scan");
+        let bytes = std::fs::read(&file).expect("read fixture");
+        let chunk_ids: Vec<String> = sqlx::query_scalar("SELECT id FROM knowledge_chunks ORDER BY id")
+            .fetch_all(&pool)
+            .await
+            .expect("chunk ids");
+        let parses_before = super::parse_count_for(&library.id);
+        let mtime_before: i64 = sqlx::query_scalar("SELECT mtime FROM knowledge_documents")
+            .fetch_one(&pool)
+            .await
+            .expect("mtime");
+
+        // Same bytes, new mtime: wait past the second-resolution mtime clock.
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        std::fs::write(&file, &bytes).expect("rewrite identical bytes");
+
+        let summary = super::scan_library(&pool, &library.id)
+            .await
+            .expect("second scan");
+        let chunk_ids_after: Vec<String> =
+            sqlx::query_scalar("SELECT id FROM knowledge_chunks ORDER BY id")
+                .fetch_all(&pool)
+                .await
+                .expect("chunk ids after");
+        let mtime_after: i64 = sqlx::query_scalar("SELECT mtime FROM knowledge_documents")
+            .fetch_one(&pool)
+            .await
+            .expect("mtime after");
+        let parses_after = super::parse_count_for(&library.id);
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert!(mtime_after > mtime_before, "fixture must move the mtime");
+        assert_eq!(
+            parses_after, parses_before,
+            "identical bytes must not be re-extracted just because mtime moved"
+        );
+        assert_eq!(summary.unchanged_documents, 1, "summary: {summary:?}");
+        assert_eq!(summary.indexed_documents, 0);
+        assert_eq!(chunk_ids_after, chunk_ids, "chunks must keep their identity");
+    }
+
+    /// R1: files added while the app was closed are picked up by the startup
+    /// reconcile pass (no user action, no watcher event to rely on).
+    #[tokio::test]
+    async fn startup_reconcile_indexes_files_added_while_app_was_closed() {
+        let pool = memory_pool().await;
+        let root = fixture_root("reconcile");
+        write_docx(root.join("first.docx"), "Atlas first memo");
+        let library = super::add_library(&pool, "kb".into(), root.to_string_lossy().into())
+            .await
+            .expect("add library");
+        super::scan_library(&pool, &library.id).await.expect("first scan");
+
+        write_docx(root.join("second.docx"), "Beacon added while closed");
+        let scanned = super::reconcile_all_libraries(&pool)
+            .await
+            .expect("startup reconcile");
+        let hits = search_hits(&pool, &library.id, "Beacon").await;
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert_eq!(scanned, vec![library.id.clone()]);
+        assert_eq!(indexed_documents(&pool, &library.id).await, 2);
+        assert!(!hits.is_empty(), "offline addition must be indexed on start");
+    }
+
+    /// R4: a scan killed by an app crash must not leave `scanning` forever or
+    /// half-written chunks behind; the next pass completes the document.
+    #[tokio::test]
+    async fn interrupted_scan_state_is_repaired_on_restart() {
+        let pool = memory_pool().await;
+        let root = fixture_root("crash");
+        write_docx(root.join("a.docx"), "Atlas crash recovery");
+        let library = super::add_library(&pool, "kb".into(), root.to_string_lossy().into())
+            .await
+            .expect("add library");
+        // Simulate the observable state of a scan killed mid-way.
+        sqlx::query("UPDATE knowledge_libraries SET scan_status = 'scanning' WHERE id = ?")
+            .bind(&library.id)
+            .execute(&pool)
+            .await
+            .expect("mark library scanning");
+        sqlx::query(
+            "INSERT INTO knowledge_documents
+             (id, library_id, path, kind, hash, mtime, size, title, status, error, updated_at)
+             VALUES ('half-doc', ?, ?, 'docx', '', 0, 0, NULL, 'scanning', NULL, '2026-01-01')",
+        )
+        .bind(&library.id)
+        .bind(root.join("a.docx").to_string_lossy().to_string())
+        .execute(&pool)
+        .await
+        .expect("insert partial document");
+        sqlx::query(
+            "INSERT INTO knowledge_chunks
+             (id, document_id, chunk_index, content_type, text, token_estimate, metadata_json)
+             VALUES ('half-chunk', 'half-doc', 0, 'page', 'partial Atlas', 2, '{}')",
+        )
+        .execute(&pool)
+        .await
+        .expect("insert partial chunk");
+
+        let requeued = super::recover_interrupted_scans(&pool)
+            .await
+            .expect("recover interrupted scans");
+        let status: String = sqlx::query_scalar("SELECT scan_status FROM knowledge_libraries WHERE id = ?")
+            .bind(&library.id)
+            .fetch_one(&pool)
+            .await
+            .expect("library status");
+        let chunks_after_recovery: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM knowledge_chunks")
+            .fetch_one(&pool)
+            .await
+            .expect("chunk count");
+        let summary = super::scan_library(&pool, &library.id)
+            .await
+            .expect("scan after recovery");
+        let doc_status: String = sqlx::query_scalar(
+            "SELECT status FROM knowledge_documents WHERE library_id = ? AND path = ?",
+        )
+        .bind(&library.id)
+        .bind(root.join("a.docx").to_string_lossy().to_string())
+        .fetch_one(&pool)
+        .await
+        .expect("document status");
+        let final_chunks: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM knowledge_chunks")
+            .fetch_one(&pool)
+            .await
+            .expect("final chunk count");
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert_eq!(requeued, 1, "the interrupted document must be requeued");
+        assert_ne!(status, "scanning", "library must not stay stuck scanning");
+        assert_eq!(chunks_after_recovery, 0, "partial chunks must be dropped");
+        assert_eq!(summary.added_documents + summary.updated_documents, 1);
+        assert_eq!(doc_status, "indexed");
+        assert!(final_chunks >= 1, "document must be fully indexed again");
+    }
+
+    /// R4 + R5: an aborted scan releases its library and leaves no orphan or
+    /// half-written document behind.
+    #[tokio::test]
+    async fn aborted_scan_releases_the_library_and_leaves_no_partial_rows() {
+        let pool = memory_pool().await;
+        let root = fixture_root("abort");
+        for index in 0..5 {
+            write_docx(
+                root.join(format!("doc-{index}.docx")),
+                &format!("Atlas document {index}"),
+            );
+        }
+        let library = super::add_library(&pool, "kb".into(), root.to_string_lossy().into())
+            .await
+            .expect("add library");
+
+        let aborted = tokio::time::timeout(
+            std::time::Duration::from_micros(1),
+            super::scan_library(&pool, &library.id),
+        )
+        .await;
+        assert!(aborted.is_err(), "fixture scan should have been cut short");
+
+        let summary = super::scan_library(&pool, &library.id)
+            .await
+            .expect("scan must not be wedged by the aborted pass");
+        let orphans: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM knowledge_chunks c
+             LEFT JOIN knowledge_documents d ON d.id = c.document_id
+             WHERE d.id IS NULL",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("orphan chunks");
+        let empty_documents: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM knowledge_documents d
+             WHERE d.status = 'indexed'
+               AND NOT EXISTS (SELECT 1 FROM knowledge_chunks c WHERE c.document_id = d.id)",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("documents without chunks");
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert_eq!(summary.indexed_documents, 5, "summary: {summary:?}");
+        assert_eq!(orphans, 0, "chunk rows must never outlive their document");
+        assert_eq!(empty_documents, 0, "indexed documents must own chunks");
+    }
+
+    /// R5: exactly one pass per library; concurrent requests coalesce into a
+    /// single follow-up instead of racing over the same folder.
+    #[test]
+    fn scan_lease_is_exclusive_and_coalesces_followups() {
+        let lease = super::ScanLease::acquire("lease-kb").expect("first acquire wins");
+        assert!(
+            super::ScanLease::acquire("lease-kb").is_none(),
+            "a second pass over the same library must not start"
+        );
+        assert!(lease.take_rerun(), "the late request must schedule one rerun");
+        assert!(!lease.take_rerun(), "the rerun flag is consumed once");
+        assert!(
+            super::ScanLease::acquire("lease-other-kb").is_some(),
+            "different libraries stay independent"
+        );
+        drop(lease);
+        assert!(
+            super::ScanLease::acquire("lease-kb").is_some(),
+            "releasing must let the next pass run"
+        );
+    }
+
+    /// R6: the UI needs the failing file and the reason, not just a count.
+    #[tokio::test]
+    async fn library_failures_report_paths_and_reasons() {
+        let pool = memory_pool().await;
+        let root = fixture_root("failures");
+        write_docx(root.join("ok.docx"), "Atlas fine");
+        std::fs::write(root.join("broken.docx"), b"not-a-zip").expect("write broken docx");
+        let library = super::add_library(&pool, "kb".into(), root.to_string_lossy().into())
+            .await
+            .expect("add library");
+        super::scan_library(&pool, &library.id).await.expect("scan");
+
+        let failures = super::library_failures(&pool, &library.id)
+            .await
+            .expect("failures");
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert_eq!(failures.len(), 1, "failures: {failures:?}");
+        assert!(failures[0].path.ends_with("broken.docx"));
+        assert_eq!(failures[0].kind, "docx");
+        assert!(
+            failures[0].error.contains("Invalid docx zip"),
+            "failure must explain the cause: {}",
+            failures[0].error
         );
     }
 
