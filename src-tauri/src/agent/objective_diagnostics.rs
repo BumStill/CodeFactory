@@ -187,6 +187,58 @@ pub struct SessionDiagnostics {
     pub run_controls: Vec<RunControlRow>,
     pub recent_events: Vec<EventRow>,
     pub messages: MessageStats,
+    /// M214：前缀缓存健康度（按本会话调用顺序统计断裂率）。
+    pub prompt_cache: PromptCacheHealth,
+}
+
+/// M214：模型调用的前缀缓存健康度。
+///
+/// 断裂定义与验收口径一致：`cached_tokens < 上一次 input_tokens × 0.8`。
+/// 第一次调用没有可复用前缀，不计为断裂。
+#[derive(Debug, Serialize, Default)]
+pub struct PromptCacheHealth {
+    pub calls: usize,
+    pub breaks: usize,
+    /// 断裂调用占比（0.0–1.0）。
+    pub break_ratio: f64,
+    /// 窗口内整体缓存命中率（cached / input）。
+    pub cache_hit_ratio: f64,
+    pub alert_threshold: f64,
+    /// 断裂率超过阈值时为 true——健康检查据此报「缓存断裂率 > 20%」。
+    pub alert: bool,
+}
+
+impl PromptCacheHealth {
+    fn from_samples(samples: &[crate::agent::prefix_stability::UsageSample]) -> Self {
+        let diagnostics = crate::agent::prefix_stability::CacheDiagnostics::from_samples(samples);
+        Self {
+            calls: diagnostics.calls,
+            breaks: diagnostics.breaks,
+            break_ratio: diagnostics.break_ratio(),
+            cache_hit_ratio: diagnostics.cache_hit_ratio(),
+            alert_threshold: crate::agent::prefix_stability::CACHE_BREAK_ALERT_RATIO,
+            alert: diagnostics.exceeds_alert_threshold(),
+        }
+    }
+}
+
+/// 读出本会话按时间排序的 token 账目，交给前缀缓存诊断。
+async fn prompt_cache_health(db: &SqlitePool, session_id: &str) -> anyhow::Result<PromptCacheHealth> {
+    if !has_table(db, "model_usage_events").await? {
+        return Ok(PromptCacheHealth::default());
+    }
+    let rows: Vec<(i64, i64)> = sqlx::query_as(
+        "SELECT input_tokens, cached_tokens FROM model_usage_events \
+         WHERE session_id=? ORDER BY created_at ASC, rowid ASC",
+    )
+    .bind(session_id)
+    .fetch_all(db)
+    .await?;
+    let samples: Vec<crate::agent::prefix_stability::UsageSample> = rows
+        .into_iter()
+        .map(|(input, cached)| crate::agent::prefix_stability::UsageSample::new(input, cached))
+        .collect();
+    Ok(PromptCacheHealth::from_samples(&samples))
 }
 
 async fn count(db: &SqlitePool, sql: &str, session: &str, table: &str) -> sqlx::Result<i64> {
@@ -317,6 +369,7 @@ pub async fn collect(
 
     let cached_row = cached.as_ref().map(StateRow::from);
     let cache_matches_facts = cached_row.as_ref().is_some_and(|row| row.state == derived.state.as_str());
+    let prompt_cache = prompt_cache_health(db, session_id).await?;
     Ok(SessionDiagnostics {
         schema: "codefactory.session_diagnostics.v1".into(),
         session_id: session_id.to_string(),
@@ -328,6 +381,7 @@ pub async fn collect(
         thin_session_state: cached_row,
         derived_state: StateRow::from(&derived),
         cache_matches_facts,
+        prompt_cache,
         evidence: Evidence {
             executor_alive: crate::session_executor_alive(session_id),
             live_run_control_this_process: live_run_control(db, session_id).await?,
@@ -563,6 +617,56 @@ mod tests {
             .await
             .unwrap();
         db
+    }
+
+    async fn insert_usage(db: &SqlitePool, session: &str, request: &str, input: i64, cached: i64) {
+        sqlx::query(
+            "INSERT INTO model_usage_events (
+                id, request_id, attempt_id, session_id, task_id, surface, provider, endpoint, model,
+                input_tokens, output_tokens, reasoning_tokens, cached_tokens,
+                actual_cost_usd, estimated_cost_usd, cost_source, source, created_at
+             ) VALUES (?,?,?,?,NULL,'chat','deepseek','deepseek','deepseek-chat',?,?,0,?,NULL,NULL,'provider','provider_usage',?)",
+        )
+        .bind(format!("{request}-event"))
+        .bind(request)
+        .bind(request)
+        .bind(session)
+        .bind(input)
+        .bind(64)
+        .bind(cached)
+        .bind(format!("2026-10-31T04:00:0{}.000Z", request.len() % 10))
+        .execute(db)
+        .await
+        .unwrap();
+    }
+
+    /// M214 R4：健康检查必须能报出「缓存断裂率 > 20%」。
+    #[tokio::test]
+    async fn m214_diagnostics_report_prompt_cache_break_rate() {
+        let healthy = fixture("diag-cache-ok").await;
+        insert_usage(&healthy, "diag-cache-ok", "r1", 10_000, 0).await;
+        insert_usage(&healthy, "diag-cache-ok", "r2", 12_000, 11_000).await;
+        insert_usage(&healthy, "diag-cache-ok", "r3", 14_000, 13_000).await;
+        let diag = collect(&healthy, "diag-cache-ok", "v", "macos", "zsh").await.unwrap();
+        assert_eq!(diag.prompt_cache.calls, 3, "每次调用都要计入");
+        assert_eq!(diag.prompt_cache.breaks, 0, "复用前缀的调用不算断裂");
+        assert!(!diag.prompt_cache.alert);
+        // 24_000 cached / 36_000 input
+        assert!((diag.prompt_cache.cache_hit_ratio - 24_000.0 / 36_000.0).abs() < 1e-9);
+
+        let broken = fixture("diag-cache-broken").await;
+        for (index, input) in [10_000, 12_000, 14_000, 16_000].iter().enumerate() {
+            insert_usage(&broken, "diag-cache-broken", &format!("b{index}"), *input, 0).await;
+        }
+        let diag = collect(&broken, "diag-cache-broken", "v", "macos", "zsh").await.unwrap();
+        assert_eq!(diag.prompt_cache.calls, 4);
+        assert_eq!(diag.prompt_cache.breaks, 3, "第一次调用不计，其余全部断裂");
+        assert!((diag.prompt_cache.break_ratio - 0.75).abs() < 1e-9);
+        assert!(diag.prompt_cache.alert, "断裂率 75% 必须报警");
+        assert_eq!(
+            diag.prompt_cache.alert_threshold,
+            crate::agent::prefix_stability::CACHE_BREAK_ALERT_RATIO
+        );
     }
 
     #[tokio::test]

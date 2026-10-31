@@ -1310,6 +1310,10 @@ impl AgentLoop {
             }
         }
         first_request_latency::record("delivery_readiness", delivery_started);
+        // M214: the volatile date block goes LAST. Everything above it is
+        // byte-identical between calls, so the provider can bill it as a
+        // cached prefix instead of full-price input on every round.
+        let system_prompt = with_volatile_time_tail(system_prompt);
         let api_style = self.api_style.clone();
 
         let result = match api_style {
@@ -2755,6 +2759,31 @@ fn project_knowledge_blocks(cwd: &Path) -> Vec<context_budget::Block> {
 /// knowledge only; the live loop ([`AgentLoop::run`]) assembles the full
 /// budgeted prompt (which also folds in skills + user context).
 fn build_system_prompt_for(mode: AgentMode, cwd: &Path) -> String {
+    with_volatile_time_tail(stable_system_prompt_for(mode, cwd))
+}
+
+fn user_visible_time_context() -> String {
+    // M214: date precision only — a `HH:MM:SS` value here changes on every
+    // call and therefore destroys the provider prefix cache. This block is
+    // rendered LAST (see `volatile_time_tail`), so everything above it stays a
+    // reusable prefix.
+    prefix_stability::volatile_time_context()
+}
+
+/// Append the volatile tail to a fully assembled system prompt.
+///
+/// The tail must be added **after** every stable section (contracts,
+/// compliance booster, delivery readiness) so the whole stable region stays a
+/// byte-identical prefix across calls. See `prefix_stability`.
+fn with_volatile_time_tail(mut prompt: String) -> String {
+    prompt.push_str("\n\n");
+    prompt.push_str(&user_visible_time_context());
+    prompt
+}
+
+/// The stable part of the session prompt: contracts + project knowledge, with
+/// no per-request value in it.
+fn stable_system_prompt_for(mode: AgentMode, cwd: &Path) -> String {
     context_budget::assemble(
         base_system_prompt(mode, cwd),
         project_knowledge_blocks(cwd),
@@ -2762,24 +2791,19 @@ fn build_system_prompt_for(mode: AgentMode, cwd: &Path) -> String {
     )
 }
 
-fn user_visible_time_context() -> String {
-    let now = chrono::Local::now();
-    let offset = now.format("%:z").to_string();
-    let zone = iana_time_zone::get_timezone().unwrap_or_else(|_| "system local time zone".into());
-    format!(
-        "# User-Visible Time\n\
-         User local time: {}\n\
-         User time zone: {}\n\
-         UTC offset: {}\n\
-         IANA zone: {}\n\
-         Default to the user's local time in progress updates, waits, ETAs, and summaries. \n\
-         Do not show raw UTC/API timestamps in normal user-facing prose; convert them to the user's local time first. \n\
-         Mention UTC only when the user asks for raw evidence, audit details, or exact API/log fields.",
-        now.format("%Y-%m-%d %H:%M:%S"),
-        zone,
-        offset,
-        zone
-    )
+/// [`stable_system_prompt_for`] with the volatile tail rendered for a specific
+/// instant — the seam tests use to prove prefix stability across a session.
+#[cfg(test)]
+fn render_system_prompt_at(
+    mode: AgentMode,
+    cwd: &Path,
+    now: chrono::DateTime<chrono::Local>,
+    zone: &str,
+) -> String {
+    let mut prompt = stable_system_prompt_for(mode, cwd);
+    prompt.push_str("\n\n");
+    prompt.push_str(&prefix_stability::volatile_time_block(now, zone));
+    prompt
 }
 
 /// Fixed agent contract plus the exact project root for this session. Keeping
@@ -2799,7 +2823,7 @@ fn base_system_prompt(mode: AgentMode, cwd: &Path) -> String {
          Use this exact path or paths relative to it. Do not assume `/workspace` or another container path.",
         mode.system_prompt(),
         EXECUTION_COMPLETION_CONTRACT,
-        user_visible_time_context(),
+        prefix_stability::USER_VISIBLE_TIME_CONTRACT,
         cwd.to_string_lossy()
     )
 }
@@ -4159,29 +4183,58 @@ mod tests {
     // These tests guard against accidentally regressing either by reverting
     // a constant or losing the autonomous prompt branch.
 
+    /// M214: the base prompt keeps the time *contract* and nothing that
+    /// changes per request. The clock used to live here with second precision,
+    /// which broke the provider prefix cache on every call.
     #[test]
-    fn base_prompt_injects_local_time_context_for_user_visible_updates() {
+    fn base_prompt_carries_only_the_stable_user_visible_time_contract() {
         let prompt = base_system_prompt(AgentMode::Interactive, Path::new("/projects/CodeFactory"));
         assert!(prompt.contains("# User-Visible Time"));
-        assert!(prompt.contains("User local time:"));
-        assert!(prompt.contains("User time zone:"));
+        assert!(prompt.contains("rendered at the very end of this system prompt"));
         assert!(prompt.contains("Default to the user's local time"));
         assert!(prompt.contains("Do not show raw UTC/API timestamps"));
         assert!(prompt.contains("only when the user asks for raw evidence"));
+        assert!(
+            !prompt.contains("User local time:"),
+            "the volatile local time must not be in the stable base prompt"
+        );
+        assert!(
+            !prompt.contains("# Current Local Date"),
+            "the volatile date block must be appended last, not baked into the base prompt"
+        );
     }
 
+    /// M214: the volatile tail is still machine-parseable, still not UTC-only,
+    /// but its precision is the date — so a whole session reuses one prefix.
     #[test]
-    fn local_time_context_is_machine_parseable_and_not_utc_only() {
+    fn volatile_time_tail_is_machine_parseable_date_precise_and_not_utc_only() {
         let context = user_visible_time_context();
-        assert!(context.contains("# User-Visible Time"));
-        assert!(context.contains("User local time:"));
+        assert!(context.starts_with("# Current Local Date"));
         assert!(context.contains("User time zone:"));
-        let local_line = context
-            .lines()
-            .find(|line| line.starts_with("User local time:"))
-            .expect("local time line");
-        assert!(!local_line.ends_with('Z'));
         assert!(context.contains("UTC offset:"));
+        let date_line = context
+            .lines()
+            .find_map(|line| line.strip_prefix("Current local date: "))
+            .expect("current local date line");
+        chrono::NaiveDate::parse_from_str(date_line.trim(), "%Y-%m-%d")
+            .expect("the tail must expose a parseable local date");
+        assert!(
+            !date_line.contains(':'),
+            "a clock time in the volatile block would change every call"
+        );
+        let offset_line = context
+            .lines()
+            .find_map(|line| line.strip_prefix("UTC offset: "))
+            .expect("utc offset line");
+        assert!(
+            chrono::DateTime::parse_from_str(
+                &format!("2026-10-31T00:00:00{}", offset_line.trim()),
+                "%Y-%m-%dT%H:%M:%S%:z"
+            )
+            .is_ok(),
+            "UTC offset must be a machine-parseable +HH:MM value, got {offset_line:?}"
+        );
+        assert!(!offset_line.ends_with('Z'), "the tail must not be UTC-only");
     }
 
     #[test]
@@ -5933,4 +5986,439 @@ mod tests {
         assert!(validate_openai_sse_completion(true, 0, 1).is_err());
         assert!(validate_openai_sse_completion(true, 8, 0).is_err());
     }
+}
+
+/// M214 — prompt prefix stability for provider prefix caching.
+///
+/// DeepSeek (and every other provider that bills a cached prefix) only gets a
+/// cache hit when the request's **longest common prefix** with the previous
+/// request is reused. A single byte of churn near the top of the system prompt
+/// destroys the whole hit, so the order in which we render prompt sections is
+/// a cost contract, not cosmetic.
+///
+/// The module lives inline here (not in its own product file) so the prompt
+/// prefix contract is owned by the same file that assembles the prompt.
+pub mod prefix_stability {
+    // SPDX-License-Identifier: Apache-2.0
+    //! M214 — prompt prefix stability for provider prefix caching.
+    //!
+    //! DeepSeek (and every other provider that bills a cached prefix) only gets a
+    //! cache hit when the request's **longest common prefix** with the previous
+    //! request is reused. A single byte of churn near the top of the system prompt
+    //! destroys the whole hit, so the order in which we render prompt sections is
+    //! a cost contract, not cosmetic:
+    //!
+    //! stable → volatile. Persona, contracts, tool definitions and project
+    //! knowledge come first; anything that varies per request (the current date and
+    //! time zone) is rendered **last** and at a precision that survives a long
+    //! session.
+    //!
+    //! This module owns the volatile tail plus the cache-hit diagnostics.
+
+    /// Health-check threshold: report a problem when more than 20% of calls in the
+    /// observed window broke the prefix cache.
+    pub const CACHE_BREAK_ALERT_RATIO: f64 = 0.20;
+
+    /// A call counts as reusing the prefix when its cached tokens are at least this
+    /// share of the previous call's total input.
+    pub const CACHE_REUSE_DEMAND_RATIO: f64 = 0.8;
+
+    /// Heading of the volatile tail block. Everything before it must stay
+    /// byte-stable for the whole session.
+    pub const VOLATILE_TIME_MARKER: &str = "# Current Local Date";
+
+    /// The volatile tail: the current local **date**, its zone and UTC offset.
+    ///
+    /// Date precision is deliberate. A `HH:MM:SS` clock inside the prompt head
+    /// changes on every call, so no request ever shares a cached prefix with the
+    /// previous one (M214: 25 minutes / ¥7 with cached tokens ≈ 0). A date changes
+    /// the prefix at most once per day, so a long session keeps one stable prefix.
+    /// Anything that truly needs the exact wall clock reads it from a tool.
+    pub fn volatile_time_block(now: chrono::DateTime<chrono::Local>, zone: &str) -> String {
+        format!(
+            "{VOLATILE_TIME_MARKER}\n\
+             Current local date: {}\n\
+             User time zone: {}\n\
+             UTC offset: {}\n\
+             IANA zone: {}\n\
+             This block is the only per-request value in the prompt and is rendered last, so \
+             everything above it stays a reusable provider prefix. Do not restate the date or \
+             time in user-facing prose unless the user asked for it; when an exact clock time is \
+             needed, read it from a tool instead of guessing.",
+            now.format("%Y-%m-%d"),
+            zone,
+            now.format("%:z"),
+            zone,
+        )
+    }
+
+    /// [`volatile_time_block`] for the current instant and the system IANA zone.
+    pub fn volatile_time_context() -> String {
+        let now = chrono::Local::now();
+        let zone = iana_time_zone::get_timezone().unwrap_or_else(|_| "system local time zone".into());
+        volatile_time_block(now, &zone)
+    }
+
+    /// Stable contract text that replaces the old "here is the current clock"
+    /// section. Byte-identical on every request.
+    pub const USER_VISIBLE_TIME_CONTRACT: &str = "# User-Visible Time\n\
+         The current local date, time zone and UTC offset are rendered at the very end of this \
+         system prompt (the final `Current Local Date` block); read them from there and never \
+         invent a date or a clock time.\n\
+         Default to the user's local time in progress updates, waits, ETAs, and summaries.\n\
+         Do not show raw UTC/API timestamps in normal user-facing prose; convert them to the \
+         user's local time first.\n\
+         Mention UTC only when the user asks for raw evidence, audit details, or exact API/log fields.";
+
+    /// Number of leading wire messages `next` shares byte-for-byte with `previous`.
+    ///
+    /// Providers cache by prompt prefix, so a rendered request is only cheap when
+    /// this equals `previous.len()` (the new request merely *appends*). A smaller
+    /// value means an already-sent message was rewritten mid-session — the one
+    /// legal cause is an explicit compaction point.
+    ///
+    /// This is the R2/R3 assertion API: it makes "the request only grew" a
+    /// checkable claim (byte-compared wire messages) instead of an assumption.
+    /// The production-facing view of the same fact is
+    /// [`CacheDiagnostics`] / [`UsageSample::cache_hit_ratio`], fed from
+    /// `model_usage_events`.
+    #[allow(dead_code)]
+    pub fn shared_message_prefix(previous: &[codefactory_agent_loop::types::ChatMessage], next: &[codefactory_agent_loop::types::ChatMessage]) -> usize {
+        let mut shared = 0;
+        for (before, after) in previous.iter().zip(next.iter()) {
+            let same = match (serde_json::to_string(before), serde_json::to_string(after)) {
+                (Ok(left), Ok(right)) => left == right,
+                _ => false,
+            };
+            if !same {
+                break;
+            }
+            shared += 1;
+        }
+        shared
+    }
+
+    /// One model call's token accounting, as recorded in `model_usage_events`.
+    #[derive(Debug, Clone, Copy, Default, PartialEq)]
+    pub struct UsageSample {
+        pub input_tokens: i64,
+        pub cached_tokens: i64,
+    }
+
+    impl UsageSample {
+        pub fn new(input_tokens: i64, cached_tokens: i64) -> Self {
+            Self {
+                input_tokens,
+                cached_tokens,
+            }
+        }
+
+        /// Share of this call's input that hit the provider cache (0.0–1.0).
+        pub fn cache_hit_ratio(&self) -> f64 {
+            if self.input_tokens <= 0 {
+                return 0.0;
+            }
+            (self.cached_tokens.max(0) as f64 / self.input_tokens as f64).clamp(0.0, 1.0)
+        }
+    }
+
+    /// Whether a call broke the prefix: it reused less than
+    /// [`CACHE_REUSE_DEMAND_RATIO`] of what the previous call already sent.
+    pub fn breaks_prefix(previous_input_tokens: i64, sample: UsageSample) -> bool {
+        if previous_input_tokens <= 0 {
+            return false;
+        }
+        let demanded = previous_input_tokens as f64 * CACHE_REUSE_DEMAND_RATIO;
+        (sample.cached_tokens.max(0) as f64) < demanded
+    }
+
+    /// Aggregate cache health over an ordered run of calls.
+    #[derive(Debug, Clone, Copy, Default, PartialEq)]
+    pub struct CacheDiagnostics {
+        pub calls: usize,
+        pub breaks: usize,
+        pub cached_tokens: i64,
+        pub input_tokens: i64,
+    }
+
+    impl CacheDiagnostics {
+        /// Diagnose an ordered (oldest → newest) run of calls belonging to one
+        /// session. The first call cannot break the prefix: there is nothing to
+        /// reuse yet.
+        pub fn from_samples(samples: &[UsageSample]) -> Self {
+            let mut diagnostics = Self::default();
+            let mut previous_input = 0i64;
+            for (index, sample) in samples.iter().enumerate() {
+                diagnostics.calls += 1;
+                diagnostics.input_tokens += sample.input_tokens.max(0);
+                diagnostics.cached_tokens += sample.cached_tokens.max(0);
+                if index > 0 && breaks_prefix(previous_input, *sample) {
+                    diagnostics.breaks += 1;
+                }
+                previous_input = sample.input_tokens;
+            }
+            diagnostics
+        }
+
+        /// Fraction of calls that broke the prefix (0.0–1.0).
+        pub fn break_ratio(&self) -> f64 {
+            if self.calls == 0 {
+                return 0.0;
+            }
+            self.breaks as f64 / self.calls as f64
+        }
+
+        /// Overall cache-hit share of all input tokens in the window.
+        pub fn cache_hit_ratio(&self) -> f64 {
+            if self.input_tokens <= 0 {
+                return 0.0;
+            }
+            (self.cached_tokens.max(0) as f64 / self.input_tokens as f64).clamp(0.0, 1.0)
+        }
+
+        /// Health check: the observed break rate is above
+        /// [`CACHE_BREAK_ALERT_RATIO`].
+        pub fn exceeds_alert_threshold(&self) -> bool {
+            self.break_ratio() > CACHE_BREAK_ALERT_RATIO
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::super::{render_system_prompt_at, stable_system_prompt_for, AgentMode};
+        use super::{
+            breaks_prefix, shared_message_prefix, CacheDiagnostics, UsageSample, VOLATILE_TIME_MARKER,
+        };
+        use chrono::{Local, TimeZone};
+        use codefactory_agent_loop::types::{ChatMessage, MessageContent};
+        use std::path::Path;
+
+        fn at(hour: u32, minute: u32) -> chrono::DateTime<Local> {
+            Local
+                .with_ymd_and_hms(2026, 10, 31, hour, minute, 0)
+                .single()
+                .expect("valid local instant")
+        }
+
+        fn at_day(day: u32) -> chrono::DateTime<Local> {
+            Local
+                .with_ymd_and_hms(2026, 10, day, 9, 0, 0)
+                .single()
+                .expect("valid local instant")
+        }
+
+        fn cwd() -> &'static Path {
+            Path::new("/projects/CodeFactory")
+        }
+
+        fn render(now: chrono::DateTime<Local>) -> String {
+            render_system_prompt_at(AgentMode::Interactive, cwd(), now, "Asia/Singapore")
+        }
+
+        /// Find a `HH:MM:SS` wall clock in `text`.
+        fn find_wall_clock(text: &str) -> Option<String> {
+            let chars: Vec<char> = text.chars().collect();
+            let digit = |c: char| c.is_ascii_digit();
+            for i in 0..chars.len().saturating_sub(7) {
+                if digit(chars[i])
+                    && digit(chars[i + 1])
+                    && chars[i + 2] == ':'
+                    && digit(chars[i + 3])
+                    && digit(chars[i + 4])
+                    && chars[i + 5] == ':'
+                    && digit(chars[i + 6])
+                    && digit(chars[i + 7])
+                {
+                    return Some(chars[i..i + 8].iter().collect());
+                }
+            }
+            None
+        }
+
+        /// R1: no second-precision clock anywhere in the rendered system prompt.
+        ///
+        /// Measured root cause of M214: the old head carried `11:26:13`, so every
+        /// call of a 25-minute session shared zero cached prefix.
+        #[test]
+        fn rendered_system_prompt_carries_no_wall_clock() {
+            let prompt = render(at(11, 26));
+            assert!(
+                find_wall_clock(&prompt).is_none(),
+                "system prompt contains a second-precision clock ({:?}), which breaks the provider \
+                 prefix cache on every call",
+                find_wall_clock(&prompt)
+            );
+        }
+
+        /// R1: the volatile block is the last section, so everything above it is a
+        /// reusable prefix.
+        #[test]
+        fn volatile_time_block_is_the_last_section() {
+            let prompt = render(at(11, 26));
+            let start = prompt
+                .find(VOLATILE_TIME_MARKER)
+                .expect("system prompt must end with the volatile date block");
+            let headings_after = prompt[start..].lines().filter(|l| l.starts_with("# ")).count();
+            assert_eq!(
+                headings_after, 1,
+                "the volatile block must be the final section; {headings_after} headings follow it, \
+                 so any later stable section is pushed out of the cached prefix"
+            );
+        }
+
+        /// R3 (cross-turn): two requests 25 minutes apart on the same day render a
+        /// byte-identical system prompt, so the second request reuses the first
+        /// request's whole prefix.
+        #[test]
+        fn same_day_requests_render_an_identical_system_prompt() {
+            assert_eq!(
+                render(at(9, 0)),
+                render(at(9, 25)),
+                "a 25-minute gap inside one day must not change a single byte of the system prompt"
+            );
+        }
+
+        /// R1: date rollover is the only legitimate prompt change — and it is
+        /// confined to the volatile tail.
+        #[test]
+        fn date_rollover_changes_only_the_volatile_tail() {
+            let first = render(at_day(31));
+            let second = render(at_day(30));
+            assert_ne!(first, second, "the date itself must still reach the model");
+            let head = |prompt: &str| {
+                prompt[..prompt.find(VOLATILE_TIME_MARKER).expect("marker")].to_string()
+            };
+            assert_eq!(
+                head(&first),
+                head(&second),
+                "everything above the volatile block must survive a date rollover unchanged"
+            );
+        }
+
+        /// The stable core must not depend on the clock at all.
+        #[test]
+        fn stable_core_ignores_the_time_of_day() {
+            let core = stable_system_prompt_for(AgentMode::Interactive, cwd());
+            assert!(!core.contains(VOLATILE_TIME_MARKER));
+            assert!(find_wall_clock(&core).is_none());
+            assert!(
+                core.contains("# User-Visible Time"),
+                "the stable core still has to carry the user-visible time contract"
+            );
+        }
+
+        /// R2/R3 (cross-turn): the next turn only *appends*; the shared prefix is
+        /// every message the previous request already sent.
+        #[test]
+        fn next_turn_appends_to_the_previous_request() {
+            let system_first = render(at(9, 0));
+            let system_next = render(at(9, 25));
+            let first = vec![
+                message("system", &system_first),
+                message("user", "fix the failing test"),
+                message("assistant", "looking at it"),
+            ];
+            let mut next = first.clone();
+            next[0] = message("system", &system_next);
+            next.push(message("user", "and then run the suite"));
+
+            assert_eq!(
+                shared_message_prefix(&first, &next),
+                first.len(),
+                "turn two must reuse the entire turn-one request as its prefix"
+            );
+        }
+
+        /// R3 (automatic recovery round): retrying a failed call re-sends the same
+        /// request, so the recovery round is a full cache hit instead of a second
+        /// full-price call.
+        #[test]
+        fn automatic_recovery_round_resends_the_identical_prefix() {
+            let request = vec![
+                message("system", &render(at(9, 0))),
+                message("user", "run the tests"),
+            ];
+            let retry = request.clone();
+            assert_eq!(
+                shared_message_prefix(&request, &retry),
+                request.len(),
+                "a recovery round must replay the exact same prefix"
+            );
+        }
+
+        /// R2: rewriting an already-sent message is detected, not silently assumed
+        /// to be cacheable. Compaction is the explicit, intentional exception.
+        #[test]
+        fn rewritten_history_is_visible_as_a_prefix_break() {
+            let request = vec![
+                message("system", &render(at(9, 0))),
+                message("user", "long task"),
+                message("assistant", "big tool output"),
+                message("tool", "very long output body"),
+            ];
+            // Compaction collapses the middle of the history.
+            let compacted = vec![
+                request[0].clone(),
+                message("user", "long task"),
+                message("assistant", "summarised tool output"),
+            ];
+            assert_eq!(
+                shared_message_prefix(&request, &compacted),
+                2,
+                "a rewritten message must be reported as the first divergence"
+            );
+        }
+
+        /// R4: a run where the provider cached nothing is flagged; a healthy run is
+        /// not. The break definition matches the M214 acceptance criterion
+        /// (`cached < previous input × 0.8`).
+        #[test]
+        fn cache_diagnostics_flag_a_broken_prefix_run() {
+            let broken = CacheDiagnostics::from_samples(&[
+                UsageSample::new(10_000, 0),
+                UsageSample::new(12_000, 0),
+                UsageSample::new(14_000, 0),
+                UsageSample::new(16_000, 2_000),
+            ]);
+            assert_eq!(broken.calls, 4);
+            assert_eq!(broken.breaks, 3, "the first call cannot break anything");
+            assert!(broken.exceeds_alert_threshold(), "0% cache reuse must alert");
+            assert!(
+                broken.cache_hit_ratio() < 0.05,
+                "a run that cached almost nothing must report a near-zero hit ratio, got {}",
+                broken.cache_hit_ratio()
+            );
+
+            let healthy = CacheDiagnostics::from_samples(&[
+                UsageSample::new(10_000, 0),
+                UsageSample::new(12_000, 10_000),
+                UsageSample::new(14_000, 12_500),
+                UsageSample::new(16_000, 15_000),
+            ]);
+            assert_eq!(healthy.breaks, 0);
+            assert!(!healthy.exceeds_alert_threshold());
+            assert!(healthy.cache_hit_ratio() > 0.7);
+        }
+
+        /// R4: the exact boundary of the break rule.
+        #[test]
+        fn break_threshold_matches_the_acceptance_criterion() {
+            // previous input 10_000 → 80% demand = 8_000 cached tokens.
+            assert!(breaks_prefix(10_000, UsageSample::new(10_000, 7_999)));
+            assert!(!breaks_prefix(10_000, UsageSample::new(10_000, 8_000)));
+            assert!(!breaks_prefix(0, UsageSample::new(10_000, 0)));
+        }
+
+        fn message(role: &str, text: &str) -> ChatMessage {
+            ChatMessage {
+                role: role.into(),
+                content: MessageContent::Text(text.into()),
+                tool_calls: None,
+                tool_call_id: None,
+                name: None,
+                reasoning_content: None,
+            }
+        }
+    }
+
 }
