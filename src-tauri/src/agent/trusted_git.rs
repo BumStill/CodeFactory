@@ -81,8 +81,35 @@ pub(super) fn python_heredoc_proof(root: Option<&Path>, command: &str) -> Result
     drop(input);
     let Ok(output) = child.wait_with_output() else { return Err("证明进程异常退出".into()); };
     if output.status.success() { return Ok(()); }
-    let reason = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let reason = decode_prover_escapes(String::from_utf8_lossy(&output.stderr).trim());
     Err(if reason.is_empty() { "脚本包含无法静态证明的结构".into() } else { reason })
+}
+
+/// M215: prover diagnostics travel through the host console, and a Windows code
+/// page that cannot encode CJK escapes them as `\uXXXX`. Decode those escapes so
+/// the approval text names the line in readable Chinese on every platform.
+pub(crate) fn decode_prover_escapes(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\\' || chars.peek() != Some(&'u') {
+            out.push(c);
+            continue;
+        }
+        chars.next();
+        let mut digits = String::with_capacity(4);
+        while digits.len() < 4 {
+            match chars.peek() {
+                Some(&d) if d.is_ascii_hexdigit() => { digits.push(d); chars.next(); }
+                _ => break,
+            }
+        }
+        match u32::from_str_radix(&digits, 16).ok().and_then(char::from_u32) {
+            Some(decoded) if digits.len() == 4 => out.push(decoded),
+            _ => { out.push('\\'); out.push('u'); out.push_str(&digits); }
+        }
+    }
+    out
 }
 
 /// M215: strip an optional `cd <path>` prefix that only re-enters this

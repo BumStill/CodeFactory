@@ -45,9 +45,14 @@ Release-Urgency: default
   `PermissionOutcome::Allow`。
 - 既有 M198/R2 拦截用例（`import os`、`../outside`、未闭合 heredoc、heredoc 之后仍有 shell）
   必须全部保持不可证明。
+- 跨平台 stdio：证明器把 stdin/stdout/stderr 固定为 UTF-8（旧代码页会把中文诊断输出成
+  `\u7b2c2\u884c...`），`trusted_git.rs` 再用 `decode_prover_escapes` 兜底还原 `\uXXXX`，
+  保证 Windows 上的审批理由同样是可读中文行号。回归用例
+  `m215_prover_reason_survives_a_legacy_console_code_page` 以 `PYTHONIOENCODING=cp1252`
+  运行证明器并断言 stderr 是未转义的 UTF-8。
 
 ## 证据
 
-- `cargo test --test m198_trusted_heredoc`：27 passed（含 25 条既有 M198/trusted 用例）。
+- `cargo test --test m198_trusted_heredoc`：28 passed（含 25 条既有 M198/trusted 用例）。
 - `cargo test --lib m198`：M198 真实解释器执行用例（含新增 M215 断言）。
 - 直接运行 `trusted_python_ast.py`：6 条放行样例 exit 0，7 条拦截样例 exit 1 且带行号。

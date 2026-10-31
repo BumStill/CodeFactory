@@ -13,6 +13,20 @@ import ast
 import pathlib
 import sys
 
+# M215: the prover speaks to the approval gate through stdio. A Windows host
+# console defaults to a legacy code page (cp936/cp1252), so Chinese diagnostic
+# text used to reach the gate as "\u7b2c2\u884c..." and the body was decoded
+# with that same code page on the way in. Pin both directions to UTF-8.
+try:
+    sys.stdin.reconfigure(encoding='utf-8', errors='replace')
+except (AttributeError, ValueError, OSError):
+    pass
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding='utf-8', errors='backslashreplace')
+    except (AttributeError, ValueError, OSError):
+        pass
+
 root = pathlib.Path(sys.argv[1]).resolve() if len(sys.argv) > 1 and sys.argv[1] else None
 STR, INT, BOOL, FILE, NONE, MODULE, PATH = 'str', 'int', 'bool', 'file', 'none', 'module', 'path'
 values = {}
