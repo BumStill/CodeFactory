@@ -685,7 +685,7 @@ impl ActiveRouteState {
                 let window_cause = route.unavailable_cause(&config, now, ignore_windows);
                 let mut spend_cause = config
                     .endpoint_daily_spend_cap(&route.endpoint_name)
-                    .and_then(|spend| super::daily_spend::cap_wait_cause(&spend, &route.endpoint_name, now));
+                    .and_then(|spend| super::quota_cap::daily_spend::cap_wait_cause(&spend, &route.endpoint_name, now));
                 // R3：预算用完和时段再次开放撞在一起时，等**较晚**的那个，
                 // 否则会在时段仍未开放时提前醒来空转。
                 if let (Some(spend), Some(window_until)) = (
@@ -710,9 +710,9 @@ impl ActiveRouteState {
                                 format!("subscription_quota_cap:{}", serde_json::json!({"resets_at_ms":cause.until_ms}))
                             }
                             WaitCauseKind::DailySpendCap => {
-                                spend_blocked.push(super::daily_spend::display_name(&route.endpoint_name));
+                                spend_blocked.push(super::quota_cap::daily_spend::display_name(&route.endpoint_name));
                                 let spend = config.endpoint_daily_spend_cap(&route.endpoint_name).unwrap_or_default();
-                                let status = super::daily_spend::status_for(&route.endpoint_name, &spend, now);
+                                let status = super::quota_cap::daily_spend::status_for(&route.endpoint_name, &spend, now);
                                 format!("daily_spend_cap:{}", serde_json::json!({"spent":status.spent_cny,"cap":status.cap_cny,"resets_at_ms":cause.until_ms}))
                             }
                         };

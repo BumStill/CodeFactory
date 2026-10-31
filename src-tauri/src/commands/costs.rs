@@ -203,14 +203,6 @@ fn validate_usage_event(event: &UsageEventInput) -> crate::errors::Result<()> {
             ));
         }
         "provider_actual" | "model_price_estimate" | "subscription" | "local" | "unknown" => {}
-        // M212：按配置单价算出的**人民币**估算，只带 estimated_cost_cny，
-        // 不带任何美元字段，所以不会和 provider_actual 混淆。
-        "configured_price" if event.actual_cost_usd.is_some() || event.estimated_cost_usd.is_some() => {
-            return Err(AppError::Other(
-                "configured_price cannot carry per-token dollars".into(),
-            ));
-        }
-        "configured_price" => {}
         other => {
             return Err(AppError::Other(format!(
                 "unsupported usage cost source: {other}"
@@ -242,24 +234,12 @@ pub async fn record_usage_event(
             .to_rfc3339_opts(SecondsFormat::Millis, true),
         None => Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
     };
-    // M212：有单价表的端点同时记一份**人民币**估算。它只在没有供应商美元
-    // 实际花费时成为 cost_source，避免同一笔花费被算成两种钱。
-    let priced_cny = crate::agent::daily_spend::price_usage(
-        &event.endpoint,
-        event.input_tokens,
-        event.cached_tokens,
-        event.output_tokens,
-    );
-    let cost_source = match (event.cost_source.as_str(), priced_cny) {
-        ("unknown", Some(_)) => crate::agent::daily_spend::CONFIGURED_PRICE_COST_SOURCE.to_string(),
-        _ => event.cost_source.clone(),
-    };
     let result = sqlx::query(
         "INSERT OR IGNORE INTO model_usage_events (
             id, request_id, attempt_id, session_id, task_id, surface, provider, endpoint, model,
             input_tokens, output_tokens, reasoning_tokens, cached_tokens,
-            actual_cost_usd, estimated_cost_usd, estimated_cost_cny, cost_source, source, created_at
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'provider_usage', ?)",
+            actual_cost_usd, estimated_cost_usd, cost_source, source, created_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'provider_usage', ?)",
     )
     .bind(Uuid::new_v4().to_string())
     .bind(&event.request_id)
@@ -276,28 +256,10 @@ pub async fn record_usage_event(
     .bind(event.cached_tokens)
     .bind(event.actual_cost_usd)
     .bind(event.estimated_cost_usd)
-    .bind(priced_cny)
-    .bind(&cost_source)
+    .bind(&event.cost_source)
     .bind(created_at)
     .execute(db)
     .await?;
-    // R7 的兜底账本：只在这次插入真的落地时累加，重放的持久化回调不会
-    // 把同一笔花费算两次。
-    if result.rows_affected() == 1 {
-        if let (Some(cost_cny), true) = (
-            priced_cny,
-            matches!(
-                cost_source.as_str(),
-                "unknown" | crate::agent::daily_spend::CONFIGURED_PRICE_COST_SOURCE
-            ),
-        ) {
-            crate::agent::daily_spend::ledger().record_estimated(
-                &event.endpoint,
-                cost_cny,
-                crate::agent::usage_windows::now_ms(),
-            );
-        }
-    }
     Ok(result.rows_affected() == 1)
 }
 
@@ -1057,85 +1019,5 @@ mod tests {
         };
 
         validate_usage_event(&event).expect("session title usage must be accepted");
-    }
-}
-
-// ---------------------------------------------------------------- M212
-// 按端点的每日人民币预算（例如 DeepSeek 每天 ¥10）。
-
-/// 按端点今日预算的只读视图。不含凭据、base_url 或密钥引用。
-#[derive(Debug, Clone, Serialize)]
-pub struct EndpointSpendReport {
-    pub currency: String,
-    pub statuses: Vec<crate::agent::daily_spend::EndpointSpendStatus>,
-}
-
-/// 只报告**有预算概念**的端点：显式配置过，或命中内置默认值（DeepSeek）。
-pub fn endpoint_spend_report(
-    settings: &crate::config::settings::Settings,
-    now_ms: i64,
-) -> EndpointSpendReport {
-    let mut names: Vec<String> = settings.endpoint_daily_spend_caps.keys().cloned().collect();
-    names.extend(
-        settings
-            .endpoints
-            .keys()
-            .filter(|name| name.to_ascii_lowercase().contains("deepseek"))
-            .cloned(),
-    );
-    names.sort();
-    names.dedup();
-    let statuses = names
-        .into_iter()
-        .filter_map(|name| {
-            settings
-                .endpoint_daily_spend_cap(&name)
-                .map(|config| crate::agent::daily_spend::status_for(&name, &config, now_ms))
-        })
-        .collect();
-    EndpointSpendReport {
-        currency: crate::agent::daily_spend::CURRENCY.to_string(),
-        statuses,
-    }
-}
-
-/// 用法页面与只读入口共用：今日花了多少、上限多少、什么时候重置。
-#[tauri::command]
-pub fn get_endpoint_spend_status() -> EndpointSpendReport {
-    let settings = crate::config::settings::load();
-    endpoint_spend_report(&settings, crate::agent::usage_windows::now_ms())
-}
-
-#[cfg(test)]
-mod m212_daily_spend_tests {
-    use super::*;
-
-    fn at(iso: &str) -> i64 {
-        DateTime::parse_from_rfc3339(iso).expect("valid").timestamp_millis()
-    }
-
-    #[test]
-    fn report_lists_deepseek_with_the_builtin_daily_cap() {
-        let mut settings = crate::config::settings::Settings::default();
-        settings.endpoint_daily_spend_caps.insert(
-            "deepseek".into(),
-            crate::agent::daily_spend::default_config(),
-        );
-        let now = at("2026-10-30T02:00:00Z"); // 10:00 +08:00
-        let report = endpoint_spend_report(&settings, now);
-        assert_eq!(report.currency, "CNY");
-        let status = report
-            .statuses
-            .iter()
-            .find(|status| status.endpoint == "deepseek")
-            .expect("deepseek reported");
-        assert_eq!(status.cap_cny, 10.0);
-        assert_eq!(status.reset_at_ms, Some(at("2026-10-30T16:00:00Z")));
-        assert!(!status.cap_reached);
-        // The display sentence the user reads in the usage page.
-        let headline = status.headline();
-        assert!(headline.starts_with("DeepSeek 今日 ¥"), "{headline}");
-        assert!(headline.ends_with(" / ¥10.00（估算）"), "{headline}");
-        assert_eq!(status.cap_notice(), None);
     }
 }

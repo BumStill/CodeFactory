@@ -190,7 +190,7 @@ pub struct Settings {
     /// a missing entry means "no cap" except DeepSeek, which ships with the
     /// built-in ¥10/day default the user asked for.
     #[serde(default)]
-    pub endpoint_daily_spend_caps: HashMap<String, crate::agent::daily_spend::DailySpendConfig>,
+    pub endpoint_daily_spend_caps: HashMap<String, crate::agent::quota_cap::daily_spend::DailySpendConfig>,
     /// CF-WINDOW-R1: JSON [endpoint, model] tuple keys, default unrestricted.
     #[serde(default)]
     pub model_usage_windows: HashMap<String, crate::agent::usage_windows::UsageWindow>,
@@ -276,12 +276,12 @@ impl Settings {
     pub fn endpoint_daily_spend_cap(
         &self,
         endpoint_name: &str,
-    ) -> Option<crate::agent::daily_spend::DailySpendConfig> {
+    ) -> Option<crate::agent::quota_cap::daily_spend::DailySpendConfig> {
         if let Some(config) = self.endpoint_daily_spend_caps.get(endpoint_name) {
             return Some(*config);
         }
         if endpoint_name.to_ascii_lowercase().contains("deepseek") {
-            return Some(crate::agent::daily_spend::default_config());
+            return Some(crate::agent::quota_cap::daily_spend::default_config());
         }
         None
     }
@@ -297,10 +297,10 @@ impl Settings {
                     .keys()
                     .filter(|name| self.endpoint_daily_spend_caps.get(*name).is_none())
                     .filter(|name| name.to_ascii_lowercase().contains("deepseek"))
-                    .map(|name| (name.to_string(), crate::agent::daily_spend::default_config())),
+                    .map(|name| (name.to_string(), crate::agent::quota_cap::daily_spend::default_config())),
             )
             .collect();
-        crate::agent::daily_spend::install_configs(configs);
+        crate::agent::quota_cap::daily_spend::install_configs(configs);
     }
 }
 
