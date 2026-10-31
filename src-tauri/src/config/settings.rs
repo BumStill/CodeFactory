@@ -186,6 +186,11 @@ pub struct Settings {
     /// Only consulted for subscription (ChatGPT) endpoints.
     #[serde(default)]
     pub subscription_quota_caps: HashMap<String, QuotaCapConfig>,
+    /// M212: per-endpoint daily spend cap in CNY (¥). Keyed by endpoint name;
+    /// a missing entry means "no cap" except DeepSeek, which ships with the
+    /// built-in ¥10/day default the user asked for.
+    #[serde(default)]
+    pub endpoint_daily_spend_caps: HashMap<String, crate::agent::daily_spend::DailySpendConfig>,
     /// CF-WINDOW-R1: JSON [endpoint, model] tuple keys, default unrestricted.
     #[serde(default)]
     pub model_usage_windows: HashMap<String, crate::agent::usage_windows::UsageWindow>,
@@ -264,6 +269,38 @@ impl Settings {
             .get(endpoint_name)
             .map(|endpoint| endpoint.api_style == ApiStyle::Chatgpt)
             .unwrap_or(false)
+    }
+
+    /// M212：该端点的每日人民币预算。配置优先，缺省时 DeepSeek 走内置 ¥10
+    /// 默认值；其它端点没有配置就是不设上限（`None`）。
+    pub fn endpoint_daily_spend_cap(
+        &self,
+        endpoint_name: &str,
+    ) -> Option<crate::agent::daily_spend::DailySpendConfig> {
+        if let Some(config) = self.endpoint_daily_spend_caps.get(endpoint_name) {
+            return Some(*config);
+        }
+        if endpoint_name.to_ascii_lowercase().contains("deepseek") {
+            return Some(crate::agent::daily_spend::default_config());
+        }
+        None
+    }
+
+    /// 记账侧统一入口：把已解析的按端点预算同步给进程内的账本登记表。
+    pub fn install_daily_spend_configs(&self) {
+        let configs = self
+            .endpoint_daily_spend_caps
+            .clone()
+            .into_iter()
+            .chain(
+                self.endpoints
+                    .keys()
+                    .filter(|name| self.endpoint_daily_spend_caps.get(*name).is_none())
+                    .filter(|name| name.to_ascii_lowercase().contains("deepseek"))
+                    .map(|name| (name.to_string(), crate::agent::daily_spend::default_config())),
+            )
+            .collect();
+        crate::agent::daily_spend::install_configs(configs);
     }
 }
 
@@ -661,6 +698,9 @@ impl Default for Settings {
         Self {
             endpoints,
             default_endpoint: "openrouter".into(),
+            // M212：DeepSeek 的 ¥10/天 由 `endpoint_daily_spend_cap()` 的
+            // 内置默认值提供，所以这里不需要预置条目。
+            endpoint_daily_spend_caps: HashMap::new(),
             vision_assistant: None,
             default_model: "anthropic/claude-opus-4-7".into(),
             default_model_policy: default_model_policy(),
@@ -1589,6 +1629,9 @@ pub fn save(settings: &Settings) -> crate::errors::Result<()> {
         }
         crate::desktop_context::DesktopContext::Normal => {}
     }
+    // M212：记账侧（record_usage_event）没有 settings 句柄，所以预算单价表
+    // 在每次保存时同步给进程内登记表。保存失败时保持旧值即可。
+    settings.install_daily_spend_configs();
     save_to_path(&config_path(), settings)
 }
 

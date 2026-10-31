@@ -2164,6 +2164,7 @@ pub fn run() {
             commands::costs::get_usage_dashboard,
             commands::costs::get_usage_day_detail,
             commands::costs::get_usage_budget_status,
+            commands::costs::get_endpoint_spend_status,
             commands::costs::get_session_usage,
         ])
         .run(context)

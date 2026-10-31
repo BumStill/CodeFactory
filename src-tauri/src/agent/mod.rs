@@ -18,6 +18,7 @@ pub(crate) mod thin_restart;
 pub(crate) mod thin_state;
 #[cfg(not(test))]
 pub(crate) mod delivery_recovery_smoke;
+pub mod daily_spend;
 pub mod delivery_run;
 pub mod dispatch;
 pub mod events;
