@@ -1372,38 +1372,19 @@ mod tests {
         let db = fixture().await;
         super::super::execution_workspace::ensure_schema(&db).await.unwrap();
         ensure_external(&db).await.unwrap();
-        // The in-memory fixture pool is a single connection; the workspace/objective
-        // parent rows here are synthetic, so parent-envelope FKs are not the subject.
-        sqlx::query("PRAGMA foreign_keys=OFF").execute(&db).await.unwrap();
         db
     }
 
     async fn m211_workspace(db: &SqlitePool, id: &str, branch: &str, state: &str, materialize: bool) {
         let path = std::env::temp_dir().join(format!("m211-{}-{id}", std::process::id()));
         if materialize { std::fs::create_dir_all(&path).unwrap(); }
-        // Parent objective rows must satisfy whatever NOT NULL columns the live
-        // schema declares; fill them generically instead of pinning a column list.
-        let columns: Vec<(String, String, i64, Option<String>, i64)> =
-            sqlx::query_as("SELECT name,type,\"notnull\",dflt_value,pk FROM pragma_table_info('objectives')")
-                .fetch_all(db).await.unwrap();
-        let mut names = vec!["id".to_string()];
-        let mut values = vec![format!("'objective-{id}'")];
-        for (name, kind, not_null, default, pk) in columns {
-            if pk == 1 || default.is_some() || not_null == 0 || name == "id" { continue; }
-            let value = match kind.to_ascii_lowercase().as_str() {
-                "integer" | "int" | "real" | "numeric" => {
-                    if name == "revision" { "1".to_string() } else { "0".to_string() }
-                }
-                _ if name == "status" => "'active'".to_string(),
-                _ => "''".to_string(),
-            };
-            names.push(name);
-            values.push(value);
-        }
-        sqlx::query(&format!("INSERT OR IGNORE INTO objectives({}) VALUES ({})", names.join(","), values.join(",")))
-            .execute(db).await.unwrap_or_else(|error| panic!("objective fixture {names:?} {values:?}: {error}"));
-        sqlx::query("INSERT INTO execution_workspaces(id,objective_id,session_id,repo_identity,repo_root,git_common_dir,worktree_path,worktree_identity,branch_name,base_ref,base_sha,head_sha,state,created_at,updated_at) VALUES (?,'objective-' || ?, 'derive','synthetic','/synthetic','/synthetic/.git',?,'wt-' || ?,?,'HEAD','sha','sha',?,1,1)")
-            .bind(id).bind(id).bind(path.to_string_lossy().to_string()).bind(id).bind(branch).bind(state).execute(db).await.unwrap();
+        // Only the columns the live schema actually requires: the same minimal
+        // parent row the other workspace fixtures create.
+        let objective = format!("objective-{id}");
+        sqlx::query("INSERT INTO objectives(id,kind,session_id,root_turn_id,status,decision_type,domain,requested_acceptance,created_at,updated_at) VALUES (?,'local_mutation','derive',?,'active','continue','chat','validated_change',1,1)")
+            .bind(&objective).bind(&objective).execute(db).await.unwrap();
+        sqlx::query("INSERT INTO execution_workspaces(id,objective_id,session_id,repo_identity,repo_root,git_common_dir,worktree_path,worktree_identity,branch_name,base_ref,base_sha,head_sha,state,created_at,updated_at) VALUES (?,?, 'derive','synthetic','/synthetic','/synthetic/.git',?,?,?,'HEAD','sha','sha',?,1,1)")
+            .bind(format!("ws-{id}")).bind(&objective).bind(path.to_string_lossy().to_string()).bind(format!("wt-{id}")).bind(branch).bind(state).execute(db).await.unwrap();
     }
 
     async fn m211_merged_previous_objective(db: &SqlitePool) {

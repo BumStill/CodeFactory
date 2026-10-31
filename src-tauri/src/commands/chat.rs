@@ -1432,11 +1432,23 @@ pub(crate) async fn thin_executor_liveness_smoke() -> anyhow::Result<serde_json:
                 Err(error) => return Err(error.into()),
             }
         };
-        stream.set_read_timeout(Some(Duration::from_secs(15)))?;
+        // A cold Windows runner can be slow to hand the first request over. The
+        // fixture must keep reading within its own deadline instead of abandoning
+        // a request that is merely slow — otherwise the client only sees an opaque
+        // transport error ("channel closed"/"error sending request") and the real
+        // cause is lost.
+        stream.set_read_timeout(Some(Duration::from_secs(2)))?;
         let mut request = Vec::new();
         let mut chunk = [0u8; 4096];
         loop {
-            let count = stream.read(&mut chunk)?;
+            let count = match stream.read(&mut chunk) {
+                Ok(count) => count,
+                Err(error) if matches!(error.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {
+                    anyhow::ensure!(std::time::Instant::now() < deadline, "model request body never completed");
+                    continue;
+                }
+                Err(error) => return Err(error.into()),
+            };
             anyhow::ensure!(count > 0, "truncated model request");
             request.extend_from_slice(&chunk[..count]);
             if let Some(end) = request.windows(4).position(|part| part == b"\r\n\r\n") {
@@ -1472,7 +1484,10 @@ pub(crate) async fn thin_executor_liveness_smoke() -> anyhow::Result<serde_json:
         Arc::new(crate::mcp::McpManager::new()), None, crate::agent::AgentMode::Interactive,
     ).with_cancel(control.cancel.clone());
     let runner = tokio::spawn(async move { agent.run(history).await });
-    tokio::time::timeout(Duration::from_secs(30), arrived_rx).await??;
+    tokio::time::timeout(Duration::from_secs(60), arrived_rx)
+        .await
+        .map_err(|_| anyhow::anyhow!("first model request never arrived"))?
+        .map_err(|_| anyhow::anyhow!("synthetic provider thread exited before the first model request"))?;
     for _ in 0..3 {
         anyhow::ensure!(!runner.is_finished(), "model wait was not exercised");
         let state = crate::agent::thin_derive::refresh(&pool, &session).await?;
