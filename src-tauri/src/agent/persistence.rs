@@ -649,6 +649,13 @@ impl Persistence for SqlitePersistence {
         if self.anonymous {
             return Ok(false);
         }
+        let spend_probe = (
+            row.endpoint.to_string(),
+            row.input_tokens,
+            row.cached_tokens,
+            row.output_tokens,
+            row.cost_source.to_string(),
+        );
         let event = crate::commands::costs::UsageEventInput {
             request_id: row.request_id,
             session_id: row.session_id.to_string(),
@@ -666,9 +673,30 @@ impl Persistence for SqlitePersistence {
             cost_source: row.cost_source,
             created_at: None,
         };
-        crate::commands::costs::record_usage_event(&self.db, event)
+        let inserted = crate::commands::costs::record_usage_event(&self.db, event)
             .await
-            .map_err(perr)
+            .map_err(perr)?;
+        // M212：单价估算只在"这笔用量真的落库"时进每日预算账本，重放的持久化
+        // 回调不会把同一次请求的花费算两次；供应商给了美元实际花费时以它为准，
+        // 不再叠加人民币估算。
+        if inserted {
+            if let (Some(spend_cny), "unknown") = (
+                crate::agent::quota_cap::daily_spend::price_usage(
+                    &spend_probe.0,
+                    spend_probe.1,
+                    spend_probe.2,
+                    spend_probe.3,
+                ),
+                spend_probe.4.as_str(),
+            ) {
+                crate::agent::quota_cap::daily_spend::ledger().record_estimated(
+                    &spend_probe.0,
+                    spend_cny,
+                    crate::agent::usage_windows::now_ms(),
+                );
+            }
+        }
+        Ok(inserted)
     }
 }
 

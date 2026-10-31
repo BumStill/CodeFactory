@@ -174,7 +174,7 @@ pub fn wait_notice(label: &str, next_available_ms: Option<i64>) -> String {
 /// 等待只有在"时间会让它变好"时才成立——时段会到点、额度会重置；缺凭据不会
 /// 自己好，它需要用户动作，所以它是一条**原因**，不是一条等待理由。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum WaitCauseKind { UsageWindow, QuotaCap, MissingCredential }
+pub enum WaitCauseKind { UsageWindow, QuotaCap, DailySpendCap, MissingCredential }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WaitCause {
@@ -199,6 +199,8 @@ impl WaitCause {
             (WaitCauseKind::UsageWindow, None) => format!("{} 不在允许使用时段", self.label),
             (WaitCauseKind::QuotaCap, Some(clock)) => format!("{} 已达订阅用量上限，{clock} 重置", self.label),
             (WaitCauseKind::QuotaCap, None) => format!("{} 已达订阅用量上限", self.label),
+            (WaitCauseKind::DailySpendCap, Some(clock)) => format!("{} 今日预算已用完，{clock} 后继续", self.label),
+            (WaitCauseKind::DailySpendCap, None) => format!("{} 今日预算已用完", self.label),
             (WaitCauseKind::MissingCredential, _) => format!("{} 尚未配置凭据", self.label),
         }
     }
