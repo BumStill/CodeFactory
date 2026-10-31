@@ -268,7 +268,7 @@
       "category": "permission_safety",
       "priority": "P1",
       "source_kind": "product_contract",
-      "change_patterns": ["src/components/*Permission*.tsx", "src/stores/permission*.ts", "src-tauri/src/permissions*.rs", "src-tauri/src/agent/permission_gateway.rs", "src-tauri/src/agent/trusted_git.rs", "src-tauri/src/tools/shell_policy.rs", "src/acceptance/permission-mode.tsx", "scripts/verify-permission-mode-headless.mjs"],
+      "change_patterns": ["src/components/*Permission*.tsx", "src/stores/permission*.ts", "src-tauri/src/permissions*.rs", "src-tauri/src/agent/permission_gateway.rs", "src-tauri/src/agent/trusted_git.rs", "src-tauri/src/agent/trusted_python_ast.py", "src-tauri/src/tools/shell_policy.rs", "src/acceptance/permission-mode.tsx", "scripts/verify-permission-mode-headless.mjs"],
       "automated_by": ["pnpm:test:permission-mode:headless", "rust:m139_readonly_compositions_skip_approval", "rust:m139_standard_write_waits_then_approval_continues", "rust:m159_gateway_session_identity_backup_and_remote_fence", "rust:m159_standard_reset_still_requests_approval", "rust:m172_read_only_git_queries_are_not_sensitive", "rust:m172_destructive_git_actions_still_ask", "rust:m172_credential_exposure_asks", "rust:m172_mixed_read_only_command_is_not_a_delivery_request", "path:src/components/ToolCallCard.workspace.test.tsx"],
       "required_evidence": ["L1", "L3"],
       "gates": ["pull_request", "manual_canary"]
