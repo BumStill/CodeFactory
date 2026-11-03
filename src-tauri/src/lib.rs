@@ -1667,6 +1667,12 @@ pub fn run() {
             agent::usage_windows::hydrate_session_overrides();
 
             let pool = tauri::async_runtime::block_on(storage::db::connect(&db_url))?;
+            agent::daily_spend_live::install_database(pool.clone());
+            tauri::async_runtime::block_on(agent::daily_spend_live::rebuild(
+                &pool, &settings, agent::quota_cap::daily_spend::ledger(), chrono::Utc::now().timestamp_millis(),
+            ))?;
+            let spend_settings = settings.clone();
+            tauri::async_runtime::spawn(async move { agent::daily_spend_live::refresh(&spend_settings, true).await; });
 
             // Continuously claim expired identity-complete delivery runs, then
             // resume only already-authorized work. This also recovers a lost
