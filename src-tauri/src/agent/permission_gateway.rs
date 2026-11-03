@@ -147,8 +147,12 @@ impl PermissionGateway for DesktopPermissionGateway {
         }
         // M198: heredoc is executable interpreter input, not shell segments.
         // Require the same identity-verified registration used by local Git.
+        // M221: a message heredoc (`git commit -F - <<'MSG'`) is data instead, and
+        // proving it only lifts the interpreter gate — a remote segment in the
+        // same command still answers to delivery authority below.
+        let mut heredoc_proved = false;
         if policy.full_access && tool_call.function.name == "bash"
-            && bash_command.is_some_and(|c| c.contains("<<"))
+            && bash_command.is_some_and(super::trusted_git::has_unquoted_heredoc)
         {
             let command = bash_command.unwrap_or_default();
             let key = format!("bash({command})");
@@ -161,7 +165,8 @@ impl PermissionGateway for DesktopPermissionGateway {
                         // M215: a refusal names the script line that could not be
                         // proved instead of only restating "unproved".
                         match super::trusted_git::python_heredoc_proof(Some(&root), command) {
-                            Ok(()) => return PermissionOutcome::Allow,
+                            Ok(()) if !remote => return PermissionOutcome::Allow,
+                            Ok(()) => heredoc_proved = true,
                             Err(reason) => return self.request_permission_with_reason(
                                 tool_call,
                                 args.clone(),
@@ -172,11 +177,16 @@ impl PermissionGateway for DesktopPermissionGateway {
                     }
                 }
             }
-            return self.request_permission(tool_call, args.clone(), bash_command).await;
+            if !heredoc_proved {
+                return self.request_permission(tool_call, args.clone(), bash_command).await;
+            }
         }
         // M159: delivery authority is not authority to force-push, delete a
         // remote ref, or discard local work. Prove and snapshot first.
-        if policy.full_access && tool_call.function.name == "bash"
+        // M221: a proved heredoc already answered this for its read-only and
+        // local-write segments; re-asking with `base = None` would only lose the
+        // premise it was proved on.
+        if policy.full_access && !heredoc_proved && tool_call.function.name == "bash"
             && bash_command.is_some_and(super::trusted_git::sensitive)
         {
             let key = format!("bash({})", bash_command.unwrap_or_default());
@@ -460,7 +470,7 @@ impl DesktopPermissionGateway {
         // durable prompt JSON; never trust a model-supplied `_permission`.
         let (rule, reason) = if let Some((rule, reason)) = override_reason {
             (rule, reason)
-        } else if bash_command.is_some_and(|c| c.contains("<<")) {
+        } else if bash_command.is_some_and(super::trusted_git::has_unquoted_heredoc) {
             ("trusted.heredoc.unproved", "无法证明解释器仅访问已登记工作区内的文件；可能包含越界路径、外部操作、未闭合输入或不支持的语法。".to_string())
         } else if let Some(command) = bash_command {
             match crate::tools::shell_policy::classify_command(command) {
@@ -1803,5 +1813,105 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(intents, 0, "an owned remote write must not create a prompt");
+    }
+
+    /// M221 R1/R2/R3: a commit message heredoc is data, not a program. In this
+    /// session's own workspace it is allowed under write permission and really
+    /// commits; a remote segment in the same command still follows delivery
+    /// authority, and another repository still asks.
+    #[tokio::test]
+    async fn m221_local_commit_message_heredoc_is_allowed() {
+        let gateway = durable_test_gateway().await;
+        sqlx::query("UPDATE sessions SET permission_mode='trusted'").execute(&gateway.db).await.unwrap();
+        sqlx::query("ALTER TABLE sessions ADD COLUMN delivery_authorized INTEGER NOT NULL DEFAULT 0").execute(&gateway.db).await.unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("workspace");
+        std::fs::create_dir(&root).unwrap();
+        m159_git(&root, &["init", "-q"]);
+        m159_git(&root, &["config", "user.name", "Synthetic"]);
+        m159_git(&root, &["config", "user.email", "synthetic@example.invalid"]);
+        m159_git(&root, &["config", "core.autocrlf", "false"]);
+        std::fs::write(root.join("tracked.txt"), "base").unwrap();
+        m159_git(&root, &["add", "."]);
+        m159_git(&root, &["commit", "-qm", "synthetic"]);
+        let remote = temp.path().join("remote.git");
+        m159_git(temp.path(), &["init", "--bare", "-q", remote.to_str().unwrap()]);
+        m159_git(&root, &["remote", "add", "origin", remote.to_str().unwrap()]);
+        super::super::execution_workspace::ensure_schema(&gateway.db).await.unwrap();
+        let common = m159_git(&root, &["rev-parse", "--path-format=absolute", "--git-common-dir"]);
+        let branch = m159_git(&root, &["branch", "--show-current"]);
+        let head = m159_git(&root, &["rev-parse", "HEAD"]);
+        let repo = super::super::delivery::resolve_repo(&root, None).unwrap();
+        let identity = super::super::delivery::capture_delivery_identity(&repo).unwrap();
+        let (repo_identity, worktree_identity) = (identity.repo_identity, identity.worktree_identity);
+        sqlx::query("INSERT INTO execution_workspaces(id,objective_id,session_id,repo_identity,repo_root,git_common_dir,worktree_path,worktree_identity,branch_name,base_ref,base_sha,head_sha,state,created_at,updated_at) VALUES ('synthetic-workspace','5eea633e-59f9-42bc-91f8-0a19a5c49711','permission-test',?,?,?,?,?,?, 'HEAD',?,?,'active',1,1)")
+            .bind(repo_identity).bind(root.to_string_lossy().as_ref()).bind(common).bind(root.to_string_lossy().as_ref()).bind(worktree_identity).bind(branch).bind(&head).bind(&head).execute(&gateway.db).await.unwrap();
+        std::fs::write(root.join("tracked.txt"), "m221 change").unwrap();
+        let authorize = |command: &'static str| {
+            let gateway = gateway.clone();
+            async move {
+                let args = serde_json::json!({ "command": command });
+                let call = ToolCall { id: format!("m221-{command}"), r#type: "function".into(), function: FunctionCall { name: "bash".into(), arguments: args.to_string() } };
+                gateway.authorize(&call, &args, Some(command)).await
+            }
+        };
+        let shell = if cfg!(windows) {
+            let exec = std::path::PathBuf::from(m159_git(&root, &["--exec-path"]));
+            exec.ancestors().map(|p| p.join("bin/bash.exe")).find(|p| p.is_file()).expect("Git Bash")
+        } else { std::path::PathBuf::from("sh") };
+        // R1/R2: the field shape, judgement plus a real commit.
+        let commit = "git add -A && git commit -q -F - <<'MSG'\nM221: local commit message heredoc\nMSG\ngit log --oneline -1";
+        assert_eq!(authorize(commit).await, PermissionOutcome::Allow, "{commit}");
+        let output = std::process::Command::new(&shell).no_window().current_dir(&root).args(["-c", commit]).output().unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        assert!(m159_git(&root, &["log", "--oneline", "-1"]).contains("M221: local commit message heredoc"));
+        // R2: the pipeline spelling of the same statement.
+        let piped = "cat <<'MSG' | git commit -q --allow-empty -F -\nM221: piped commit message\nMSG";
+        assert_eq!(authorize(piped).await, PermissionOutcome::Allow, "{piped}");
+        let output = std::process::Command::new(&shell).no_window().current_dir(&root).args(["-c", piped]).output().unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        assert!(m159_git(&root, &["log", "--oneline", "-1"]).contains("M221: piped commit message"));
+        let intents: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM permission_intents").fetch_one(&gateway.db).await.unwrap();
+        assert_eq!(intents, 0, "a local commit message heredoc must not create a prompt");
+        // R3: the same commit plus a remote write follows delivery authority.
+        let push = "git add -A && git commit -q -F - <<'MSG'\nM221: commit before push\nMSG\ngit push -q origin HEAD";
+        assert_ne!(authorize(push).await, PermissionOutcome::Allow, "no delivery authority yet: {push}");
+        sqlx::query("UPDATE sessions SET delivery_authorized=1 WHERE id='permission-test'").execute(&gateway.db).await.unwrap();
+        assert_eq!(authorize(push).await, PermissionOutcome::Allow, "delivery authorized: {push}");
+        // R3: another repository still asks, and the reason names the boundary.
+        let elsewhere = temp.path().join("elsewhere");
+        std::fs::create_dir(&elsewhere).unwrap();
+        m159_git(&elsewhere, &["init", "-q"]);
+        let prompts_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM permission_intents").fetch_one(&gateway.db).await.unwrap();
+        let outside = format!("git -C {} commit --allow-empty -F - <<'MSG'\nM221: other repository\nMSG", elsewhere.display());
+        let outside: &'static str = Box::leak(outside.into_boxed_str());
+        assert!(matches!(authorize(outside).await, PermissionOutcome::Deny(_)), "{outside}");
+        let untouched = std::process::Command::new("git").no_window().current_dir(&elsewhere).args(["rev-parse", "--verify", "HEAD"]).output().unwrap();
+        assert!(!untouched.status.success(), "the other repository must stay untouched");
+        let prompts_after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM permission_intents").fetch_one(&gateway.db).await.unwrap();
+        assert_eq!(prompts_after, prompts_before + 1, "the outside repository must produce exactly one prompt");
+    }
+
+    /// M221b: the field sample the user reported. A quoted `<<` inside a grep
+    /// pattern is an argument, so this read-only probe must not reach the
+    /// heredoc gate at all.
+    #[tokio::test]
+    async fn m221b_quoted_double_angle_probe_is_not_a_heredoc() {
+        let gateway = durable_test_gateway().await;
+        sqlx::query("UPDATE sessions SET permission_mode='trusted'").execute(&gateway.db).await.unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("workspace");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("probe.rs"), "a\nb\nc\nd\ne\nf\n").unwrap();
+        let command = format!(
+            "cd \"{}\" && sed -n 1,5p probe.rs && grep -n \"heredoc\\|<<\" probe.rs | head -30",
+            root.display()
+        );
+        let args = serde_json::json!({ "command": command });
+        let call = ToolCall { id: "m221b".into(), r#type: "function".into(), function: FunctionCall { name: "bash".into(), arguments: args.to_string() } };
+        let outcome = gateway.authorize(&call, &args, Some(command.as_str())).await;
+        assert_eq!(outcome, PermissionOutcome::Allow, "{command}");
+        let intents: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM permission_intents").fetch_one(&gateway.db).await.unwrap();
+        assert_eq!(intents, 0, "a quoted << is not a heredoc: {command}");
     }
 }
