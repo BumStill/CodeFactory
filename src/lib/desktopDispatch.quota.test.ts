@@ -21,6 +21,12 @@ describe("CF-QUOTA-R2 background settings integration", () => {
     mocks.invoke.mockReset();
     mocks.invoke.mockImplementation(async (command, args) => command === "save_settings" ? args.newSettings : []);
   });
+  it("M217 forwards readonly usage_status to the durable spend command", async () => {
+    const report = { currency: "CNY", statuses: [{ endpoint: "deepseek", spent_cny: 12, cap_cny: 10, cap_reached: true }] };
+    mocks.invoke.mockResolvedValue(report);
+    expect(await dispatch("usage_status")).toEqual({ ok: true, result: report });
+    expect(mocks.invoke).toHaveBeenCalledWith("get_endpoint_spend_status");
+  });
   it("returns the same usage/caps/reset readings as settings without exposing credentials", async () => {
     const readings = [{ endpoint: "subscription", source: "本地估算", five_hour_percent: 37,
       weekly_percent: 12, five_hour_cap_percent: 80, weekly_cap_percent: 80,

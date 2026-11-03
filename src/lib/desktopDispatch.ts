@@ -20,6 +20,7 @@
 /** 事件名，必须与 `headless_dispatch.rs` 的 `DISPATCH_REQUEST_EVENT` 一致。 */
 export const DISPATCH_REQUEST_EVENT = "dispatch:request";
 
+import { invoke } from "./tauri";
 import type { QuotaCapInput } from "./subscriptionQuota";
 import { isDispatchRequestError } from "./dispatchErrors";
 
@@ -266,6 +267,9 @@ export async function applyDispatchRequest(
         if (!handlers.setSessionUsageWindowOverride) return invalid("set_session_usage_window_override is not available");
         if (typeof body.ignore !== "boolean") return invalid("ignore must be a boolean");
         result = await handlers.setSessionUsageWindowOverride({ sessionId: requiredString(body.session_id, "session_id"), ignore: body.ignore });
+        break;
+      case "usage_status":
+        result = await invoke("get_endpoint_spend_status");
         break;
       case "get_quota":
         if (!handlers.getQuota) return invalid("get_quota is not available");

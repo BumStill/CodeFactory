@@ -26,6 +26,8 @@ pub struct SubscriptionQuotaStatus {
     pub weekly_resets_at_ms: Option<i64>,
     /// True while CodeFactory is handing this endpoint's turns to the next one.
     pub over_cap: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub daily_spend: Option<crate::agent::quota_cap::daily_spend::EndpointSpendStatus>,
 }
 
 /// CF-QUOTA-R4. Read the current subscription metering state. Used by the
@@ -41,8 +43,20 @@ pub async fn subscription_quota_status(
     let now_ms = chrono::Utc::now().timestamp_millis();
     let budget = crate::agent::quota_cap::SubscriptionBudget::default();
     let mut statuses = Vec::new();
+    crate::agent::daily_spend_live::refresh(&settings, false).await;
     for (name, endpoint) in settings.endpoints.iter() {
         if endpoint.api_style != ApiStyle::Chatgpt {
+            if let Some(config) = settings.endpoint_daily_spend_cap(name) {
+                let spend = crate::agent::quota_cap::daily_spend::status_for(name, &config, now_ms);
+                statuses.push(SubscriptionQuotaStatus {
+                    endpoint: name.clone(), label: crate::agent::failover::endpoint_label(name),
+                    observed_at_ms: Some(now_ms), refresh_error: None, credits: None,
+                    source: if spend.source.is_estimate() { "本地估算" } else { "余额" },
+                    five_hour_percent: 0, weekly_percent: 0, five_hour_cap_percent: 0, weekly_cap_percent: 0,
+                    five_hour_resets_at_ms: None, weekly_resets_at_ms: None,
+                    over_cap: spend.cap_reached, daily_spend: Some(spend),
+                });
+            }
             continue;
         }
         let cap = settings.quota_cap_for(name);
@@ -75,6 +89,7 @@ pub async fn subscription_quota_status(
             five_hour_resets_at_ms: snapshot.and_then(|quota| quota.five_hour.resets_at_ms),
             weekly_resets_at_ms: snapshot.and_then(|quota| quota.weekly.resets_at_ms),
             over_cap,
+            daily_spend: None,
         });
     }
     statuses.sort_by(|a, b| a.endpoint.cmp(&b.endpoint));

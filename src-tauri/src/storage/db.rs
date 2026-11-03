@@ -436,6 +436,8 @@ async fn ensure_schema(pool: &SqlitePool) -> crate::errors::Result<()> {
     ensure_column(pool, "model_usage_events", "attempt_id", "TEXT").await?;
     // M212：按端点每日预算用的人民币估算（元），与 estimated_cost_usd 并存。
     ensure_column(pool, "model_usage_events", "estimated_cost_cny", "REAL").await?;
+    sqlx::query("CREATE TABLE IF NOT EXISTS endpoint_daily_balances (endpoint TEXT NOT NULL, day_start_ms INTEGER NOT NULL, opening_cny REAL NOT NULL, topped_up_cny REAL NOT NULL DEFAULT 0, current_cny REAL NOT NULL, PRIMARY KEY(endpoint, day_start_ms))")
+        .execute(pool).await?;
     sqlx::query("UPDATE model_usage_events SET attempt_id = request_id WHERE attempt_id IS NULL")
         .execute(pool)
         .await?;
