@@ -1432,11 +1432,23 @@ pub(crate) async fn thin_executor_liveness_smoke() -> anyhow::Result<serde_json:
                 Err(error) => return Err(error.into()),
             }
         };
-        stream.set_read_timeout(Some(Duration::from_secs(15)))?;
+        // A cold Windows runner can be slow to hand the first request over. The
+        // fixture must keep reading within its own deadline instead of abandoning
+        // a request that is merely slow — otherwise the client only sees an opaque
+        // transport error ("channel closed"/"error sending request") and the real
+        // cause is lost.
+        stream.set_read_timeout(Some(Duration::from_secs(2)))?;
         let mut request = Vec::new();
         let mut chunk = [0u8; 4096];
         loop {
-            let count = stream.read(&mut chunk)?;
+            let count = match stream.read(&mut chunk) {
+                Ok(count) => count,
+                Err(error) if matches!(error.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {
+                    anyhow::ensure!(std::time::Instant::now() < deadline, "model request body never completed");
+                    continue;
+                }
+                Err(error) => return Err(error.into()),
+            };
             anyhow::ensure!(count > 0, "truncated model request");
             request.extend_from_slice(&chunk[..count]);
             if let Some(end) = request.windows(4).position(|part| part == b"\r\n\r\n") {
@@ -1472,7 +1484,10 @@ pub(crate) async fn thin_executor_liveness_smoke() -> anyhow::Result<serde_json:
         Arc::new(crate::mcp::McpManager::new()), None, crate::agent::AgentMode::Interactive,
     ).with_cancel(control.cancel.clone());
     let runner = tokio::spawn(async move { agent.run(history).await });
-    tokio::time::timeout(Duration::from_secs(30), arrived_rx).await??;
+    tokio::time::timeout(Duration::from_secs(60), arrived_rx)
+        .await
+        .map_err(|_| anyhow::anyhow!("first model request never arrived"))?
+        .map_err(|_| anyhow::anyhow!("synthetic provider thread exited before the first model request"))?;
     for _ in 0..3 {
         anyhow::ensure!(!runner.is_finished(), "model wait was not exercised");
         let state = crate::agent::thin_derive::refresh(&pool, &session).await?;
@@ -2952,7 +2967,13 @@ async fn admit_persisted_chat_turn_with_origin(
         );
     }
     crate::agent::workspace_recovery_budget::ensure(pool).await?;
+    // Persist wake identity before the transaction so terminal guards never
+    // mistake a system continuation for a fresh human request.
+    sqlx::query("CREATE TABLE IF NOT EXISTS thin_system_wake_roots(root_turn_id TEXT PRIMARY KEY)").execute(pool).await?;
     let mut tx = crate::storage::db::begin_write(pool).await?;
+    if matches!(origin, crate::agent::objective::TurnOrigin::SystemWake) {
+        sqlx::query("INSERT OR IGNORE INTO thin_system_wake_roots(root_turn_id) VALUES (?)").bind(&root_turn_id).execute(&mut *tx).await?;
+    }
     // A new user intent supersedes a previous workspace-recovery conclusion.
     if matches!(origin, crate::agent::objective::TurnOrigin::User) {
         sqlx::query("DELETE FROM workspace_recovery_budget WHERE session_id=?")
@@ -3349,9 +3370,9 @@ async fn admit_persisted_chat_turn_with_origin(
     let has_thin_state: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='thin_session_state'",
     ).fetch_one(&mut *tx).await?;
-    if fresh_user_message && control_status != "cancel_requested" && has_thin_state == 1 {
-        sqlx::query("DELETE FROM thin_session_state WHERE session_id=? AND state='ended' AND reason LIKE 'cancelled%'")
-            .bind(session_id).execute(&mut *tx).await?;
+    if fresh_user_message && matches!(origin, crate::agent::objective::TurnOrigin::User) && control_status != "cancel_requested" && has_thin_state == 1 {
+        sqlx::query("UPDATE thin_session_state SET state='running',reason=NULL,waiting_for=NULL,wake_source=NULL,question=NULL,updated_at=? WHERE session_id=?")
+            .bind(now).bind(session_id).execute(&mut *tx).await?;
     }
     tx.commit().await?;
     Ok(ChatAdmissionReceipt {
@@ -6274,6 +6295,40 @@ mod tests {
         assert_eq!(history, 2, "the new turn must carry the earlier user message");
         pool.close().await;
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn m209_system_wake_admits_a_fresh_turn_after_settlement() {
+        use crate::agent::objective::TurnOrigin;
+        let pool = crate::storage::db::connect("sqlite::memory:").await.unwrap();
+        sqlx::query("INSERT INTO sessions(id,title,cwd,model_id,created_at,updated_at,delivery_mode) VALUES ('synthetic-wake','fixture','/synthetic','model',1,1,'thin')").execute(&pool).await.unwrap();
+        let first = admit_persisted_chat_turn_with_origin(&pool, &crate::ChatRunControl::pending(), "synthetic-wake", Some("old-wake-root"), "original task", TurnOrigin::User).await.unwrap();
+        sqlx::query("UPDATE chat_turn_state SET status='completed',terminal_reason='completed',completed_at=1 WHERE root_turn_id=?").bind(&first.root_turn_id).execute(&pool).await.unwrap();
+        sqlx::query("UPDATE objectives SET status='completed',decision_type='complete',evidence_ref='synthetic-receipt',reached_acceptance=requested_acceptance,completed_at=1,recovery_owner=NULL,remediation_id=NULL,lease_owner=NULL,lease_expires_at=NULL WHERE id=?").bind(&first.objective.id).execute(&pool).await.unwrap();
+        sqlx::query("UPDATE chat_run_controls SET status='completed',settled_at=1,updated_at=1 WHERE session_id='synthetic-wake'").execute(&pool).await.unwrap();
+        let second = admit_persisted_chat_turn_with_origin(&pool, &crate::ChatRunControl::pending(), "synthetic-wake", None, "resume", TurnOrigin::SystemWake).await.unwrap();
+        assert_ne!(second.root_turn_id, first.root_turn_id);
+        assert_eq!(second.objective.id, first.objective.id, "recovery must not allocate an unrelated task/worktree");
+        assert!(!second.already_settled, "old settled root must not suppress this wake");
+        let status: String = sqlx::query_scalar("SELECT status FROM chat_turn_state WHERE root_turn_id=?").bind(&second.root_turn_id).fetch_one(&pool).await.unwrap();
+        assert_eq!(status, "active");
+        let tagged: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM thin_system_wake_roots WHERE root_turn_id=?").bind(&second.root_turn_id).fetch_one(&pool).await.unwrap();
+        assert_eq!(tagged, 1);
+    }
+
+    /// M206: a fresh human admission reopens any ended projection atomically.
+    #[tokio::test]
+    async fn m206_ended_session_admission_reopens_and_records_exact_started_root() {
+        let pool = crate::storage::db::connect("sqlite::memory:").await.unwrap();
+        sqlx::query("INSERT INTO sessions(id,title,cwd,model_id,created_at,updated_at,delivery_mode) VALUES ('m206-admit','synthetic','/synthetic','model',1,1,'thin')").execute(&pool).await.unwrap();
+        crate::agent::thin_state::save(&pool,"m206-admit", &crate::agent::thin_state::ThinState::ended("PR #917 已合并", "synthetic")).await.unwrap();
+        let receipt = admit_persisted_chat_turn(&pool,&crate::ChatRunControl::pending(),"m206-admit",Some("m206-new-root"),"synthetic next task").await.unwrap();
+        assert_eq!(receipt.root_turn_id,"m206-new-root");
+        assert!(!receipt.already_settled);
+        assert_eq!(crate::agent::thin_state::load(&pool,"m206-admit").await.unwrap().unwrap().state,crate::agent::thin_state::SessionState::Running);
+        let durable = crate::agent::dispatch::load_delivery_receipt(&pool,"m206-admit","m206-new-root","synthetic next task").await.unwrap().unwrap();
+        assert_eq!(durable.status,"started");
+        assert!(durable.turn_exists);
     }
 
     /// M129 R3: two open candidates is a bookkeeping ambiguity, not a refusal.

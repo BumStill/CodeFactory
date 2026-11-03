@@ -50,8 +50,9 @@ pub async fn persist_model_route_attempts(
         sqlx::query(
             "INSERT INTO model_route_attempts
              (id, root_turn_id, session_id, endpoint, model, policy, status,
-              failure_code, output_started, side_effect_started, created_at, completed_at)
-             VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+              failure_code, provider_status, failure_summary,
+              output_started, side_effect_started, created_at, completed_at)
+             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         )
         .bind(Uuid::new_v4().to_string())
         .bind(root_turn_id)
@@ -61,6 +62,8 @@ pub async fn persist_model_route_attempts(
         .bind(policy)
         .bind(&attempt.status)
         .bind(&attempt.failure_code)
+        .bind(attempt.provider_status)
+        .bind(&attempt.failure_summary)
         .bind(i64::from(output_started))
         .bind(i64::from(side_effect_started))
         .bind(&now)
@@ -646,6 +649,13 @@ impl Persistence for SqlitePersistence {
         if self.anonymous {
             return Ok(false);
         }
+        let spend_probe = (
+            row.endpoint.to_string(),
+            row.input_tokens,
+            row.cached_tokens,
+            row.output_tokens,
+            row.cost_source.to_string(),
+        );
         let event = crate::commands::costs::UsageEventInput {
             request_id: row.request_id,
             session_id: row.session_id.to_string(),
@@ -663,9 +673,30 @@ impl Persistence for SqlitePersistence {
             cost_source: row.cost_source,
             created_at: None,
         };
-        crate::commands::costs::record_usage_event(&self.db, event)
+        let inserted = crate::commands::costs::record_usage_event(&self.db, event)
             .await
-            .map_err(perr)
+            .map_err(perr)?;
+        // M212：单价估算只在"这笔用量真的落库"时进每日预算账本，重放的持久化
+        // 回调不会把同一次请求的花费算两次；供应商给了美元实际花费时以它为准，
+        // 不再叠加人民币估算。
+        if inserted {
+            if let (Some(spend_cny), "unknown") = (
+                crate::agent::quota_cap::daily_spend::price_usage(
+                    &spend_probe.0,
+                    spend_probe.1,
+                    spend_probe.2,
+                    spend_probe.3,
+                ),
+                spend_probe.4.as_str(),
+            ) {
+                crate::agent::quota_cap::daily_spend::ledger().record_estimated(
+                    &spend_probe.0,
+                    spend_cny,
+                    crate::agent::usage_windows::now_ms(),
+                );
+            }
+        }
+        Ok(inserted)
     }
 }
 
@@ -737,7 +768,8 @@ mod tests {
                 id TEXT PRIMARY KEY, root_turn_id TEXT, session_id TEXT,
                 endpoint TEXT, model TEXT, policy TEXT, status TEXT,
                 failure_code TEXT, output_started INTEGER,
-                side_effect_started INTEGER, created_at TEXT, completed_at TEXT
+                side_effect_started INTEGER, created_at TEXT, completed_at TEXT,
+                provider_status INTEGER, failure_summary TEXT
             )",
         )
         .execute(&db)
@@ -1352,15 +1384,17 @@ mod tests {
                 model: "deepseek-v4-pro".into(),
                 status: "skipped".into(),
                 failure_code: Some(
-                    r#"outside_usage_window:{"rule":{"mode":"official_off_peak","timezone":"Asia/Shanghai"},"next_available_ms":1800000000000}"#
+                    r#"outside_usage_window:{"rule":{"mode":"official_off_peak","timezone":"Asia/Shanghai","next_available_ms":1800000000000}"#
                         .into(),
                 ),
+                ..Default::default()
             },
             super::super::failover::RouteAttemptSnapshot {
                 endpoint: "deepseek".into(),
                 model: "deepseek-flash".into(),
                 status: "succeeded".into(),
                 failure_code: None,
+                ..Default::default()
             },
         ];
         persist_model_route_attempts(&db, "s1", "user-1", "prefer", &attempts, true, false)
@@ -1396,12 +1430,14 @@ mod tests {
                 model: "gpt-5.5".into(),
                 status: "failed".into(),
                 failure_code: Some("AUTH_EXPIRED".into()),
+                ..Default::default()
             },
             super::super::failover::RouteAttemptSnapshot {
                 endpoint: "deepseek".into(),
                 model: "deepseek-v4-pro".into(),
                 status: "succeeded".into(),
                 failure_code: None,
+                ..Default::default()
             },
         ];
         persist_model_route_attempts(&db, "s1", "user-1", "prefer", &attempts, true, false)

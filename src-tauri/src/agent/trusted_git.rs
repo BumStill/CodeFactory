@@ -3,6 +3,11 @@
 use std::{path::{Component, Path}, process::{Command, Stdio}, io::Write};
 use crate::util::no_window::NoWindow;
 
+// The very same policy source used by standalone shell calls; also available
+// to the standalone integration harnesses that include this proof module.
+#[path = "../tools/shell_policy.rs"]
+mod standalone_shell_policy;
+
 /// M172-R1: ask for the M159 proof/snapshot only when an **executable segment**
 /// runs a Git action that can discard local work.
 ///
@@ -28,34 +33,105 @@ pub(super) fn sensitive(command: &str) -> bool {
 /// No shell suffix, custom executable, wrapper, substitution or redirection is
 /// accepted. The validator parses AST only; it never evaluates model code.
 pub(super) fn python_heredoc_proved(root: Option<&Path>, command: &str) -> bool {
-    if command.len() > 256 * 1024 { return false; }
-    let Some((header, rest)) = command.split_once('\n') else { return false; };
-    let header = header.trim().strip_prefix("cd \"$(pwd)\"; ").unwrap_or(header.trim());
-    let Some((runner, delimiter)) = header.split_once(" <<") else { return false; };
+    python_heredoc_proof(root, command).is_ok()
+}
+
+/// M215: the same proof, but a refusal carries the reason (including the script
+/// line the prover could not prove) so the approval text can name it instead of
+/// only saying "unproved".
+pub(super) fn python_heredoc_proof(root: Option<&Path>, command: &str) -> Result<(), String> {
+    if command.len() > 256 * 1024 { return Err("脚本超过 256 KiB".into()); }
+    let Some((header, rest)) = command.split_once('\n') else { return Err("heredoc 缺少换行".into()); };
+    // M215: `cd <this workspace> &&` is how a heredoc actually starts; the
+    // prefix is proved against the registered root, never ignored.
+    let header = heredoc_header_prefix(header.trim(), root)?;
+    let Some((runner, delimiter)) = header.split_once(" <<") else { return Err("缺少 `<<` heredoc 起始符".into()); };
     let node = ["node", "node -"].contains(&runner);
-    if !node && !["python3 -", "python -"].contains(&runner) { return false; }
-    let Some(delimiter) = delimiter.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')) else { return false; };
-    if delimiter.is_empty() || !delimiter.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') { return false; }
+    if !node && !["python3 -", "python -"].contains(&runner) {
+        return Err(format!("不接受的解释器入口：{runner}"));
+    }
+    let Some(delimiter) = delimiter.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')) else {
+        return Err("heredoc 分隔符必须用单引号关闭展开".into());
+    };
+    if delimiter.is_empty() || !delimiter.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return Err("heredoc 分隔符不合法".into());
+    }
     let mut body = String::new();
     let mut lines = rest.lines();
     let mut closed = false;
     while let Some(line) = lines.next() {
         if line == delimiter {
             closed = true;
-            if lines.any(|l| !l.trim().is_empty()) { return false; }
+            if lines.any(|l| !l.trim().is_empty()) { return Err("heredoc 之后仍有 shell 内容".into()); }
             break;
         }
         body.push_str(line);
         body.push('\n');
     }
-    if !closed { return false; }
+    if !closed { return Err("heredoc 分隔符未闭合".into()); }
     let mut cmd = Command::new(if cfg!(windows) { "python" } else { "python3" });
     cmd.args(["-I", "-c", include_str!("trusted_python_ast.py")]);
     if let Some(root) = root { cmd.arg(root); } else { cmd.arg(""); }
     if node { cmd.arg("node"); }
-    let Ok(mut child) = cmd.no_window().stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null()).spawn() else { return false; };
-    let written = child.stdin.take().is_some_and(|mut input| input.write_all(body.as_bytes()).is_ok());
-    written && child.wait().is_ok_and(|s| s.success())
+    let Ok(mut child) = cmd.no_window().stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::piped()).spawn() else {
+        return Err(format!("无法启动{}证明进程", if node { " node " } else { " python " }));
+    };
+    let Some(mut input) = child.stdin.take() else { return Err("无法写入证明脚本".into()); };
+    if input.write_all(body.as_bytes()).is_err() { return Err("证明脚本写入失败".into()); }
+    drop(input);
+    let Ok(output) = child.wait_with_output() else { return Err("证明进程异常退出".into()); };
+    if output.status.success() { return Ok(()); }
+    let reason = decode_prover_escapes(String::from_utf8_lossy(&output.stderr).trim());
+    Err(if reason.is_empty() { "脚本包含无法静态证明的结构".into() } else { reason })
+}
+
+/// M215: prover diagnostics travel through the host console, and a Windows code
+/// page that cannot encode CJK escapes them as `\uXXXX`. Decode those escapes so
+/// the approval text names the line in readable Chinese on every platform.
+pub(crate) fn decode_prover_escapes(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\\' || chars.peek() != Some(&'u') {
+            out.push(c);
+            continue;
+        }
+        chars.next();
+        let mut digits = String::with_capacity(4);
+        while digits.len() < 4 {
+            match chars.peek() {
+                Some(&d) if d.is_ascii_hexdigit() => { digits.push(d); chars.next(); }
+                _ => break,
+            }
+        }
+        match u32::from_str_radix(&digits, 16).ok().and_then(char::from_u32) {
+            Some(decoded) if digits.len() == 4 => out.push(decoded),
+            _ => { out.push('\\'); out.push('u'); out.push_str(&digits); }
+        }
+    }
+    out
+}
+
+/// M215: strip an optional `cd <path>` prefix that only re-enters this
+/// workspace. Anything else (subdirectory, other root, unparsable) stays
+/// unproved.
+fn heredoc_header_prefix<'a>(header: &'a str, root: Option<&Path>) -> Result<&'a str, String> {
+    let Some(rest) = header.strip_prefix("cd ") else { return Ok(header) };
+    let mut split = None;
+    for separator in [" && ", "; "] {
+        if let Some(parts) = rest.split_once(separator) { split = Some(parts); break; }
+    }
+    let Some((target, tail)) = split else { return Err("heredoc 头部的 cd 没有可证明的分隔符".into()); };
+    let target = target.trim().trim_matches('"').trim_matches('\'');
+    let identity = matches!(target, "$(pwd)" | "${PWD}" | "$PWD" | "`pwd`");
+    // Compare physical paths: a macOS temp root is reached through a symlink, so
+    // the literal root text and its canonical form differ.
+    let same_root = root.is_some_and(|root| {
+        let Ok(target) = root.join(target).canonicalize() else { return false };
+        target == root.canonicalize().unwrap_or_else(|_| root.to_path_buf())
+    });
+    if !identity && !same_root { return Err(format!("heredoc 头部 cd 目标不是本工作区：{target}")); }
+    Ok(tail.trim())
 }
 
 /// Git subcommands that move the working tree, the index or a local branch.
@@ -213,6 +289,14 @@ fn git_segment_is_sensitive(args: &[String]) -> bool {
     // require the session-owned proof and snapshot.
     if lower == "worktree" && args.get(index + 1).is_some_and(|a| a == "list") {
         return false;
+    }
+    if lower == "branch" {
+        return !codefactory_agent_core::command_segment_is_read_only_probe(
+            &std::iter::once("git").chain(args[index..].iter().map(String::as_str)).collect::<Vec<_>>().join(" "),
+        );
+    }
+    if lower == "fetch" {
+        return !fetch_args(&args[index + 1..].iter().map(String::as_str).collect::<Vec<_>>());
     }
     if DESTRUCTIVE_GIT_SUBCOMMANDS.contains(&lower.as_str()) {
         return true;
@@ -388,7 +472,13 @@ fn legacy_rewrite(root: &Path, command: &str) -> bool {
 /// subshells or inherited variables. Quotes retain literal vs expansion meaning.
 #[derive(Default)]
 struct Word { text: String, expanded: bool, redirect: bool }
-struct Segment { words: Vec<Word>, separator: char }
+struct Segment { words: Vec<Word>, separator: char, raw: String }
+
+/// Lossless segment text for the permission gateway: quoted script data is
+/// never reconstructed or reinterpreted as shell operators.
+pub(super) fn command_segments(command: &str) -> Option<Vec<String>> {
+    Some(segments(command)?.into_iter().map(|segment| segment.raw).collect())
+}
 fn segments(command: &str) -> Option<Vec<Segment>> {
     let mut chars = command.chars().peekable();
     let mut result = Vec::new();
@@ -397,6 +487,7 @@ fn segments(command: &str) -> Option<Vec<Segment>> {
     let mut started = false;
     let mut quote = None;
     let mut variables = std::collections::HashMap::<String, String>::new();
+    let mut raw_start = 0;
     while let Some(c) = chars.next() {
         if matches!(c, '\n' | '\r' | '`') { return None; }
         if c == '\\' {
@@ -438,7 +529,10 @@ fn segments(command: &str) -> Option<Vec<Segment>> {
             };
             if words.is_empty() { return None; }
             record_assignment(&words, &mut variables)?;
-            result.push(Segment { words: std::mem::take(&mut words), separator });
+            let end = command.len() - chars.clone().map(char::len_utf8).sum::<usize>();
+            let delimiter_len = if matches!(separator, '&' | 'o') { 2 } else { 1 };
+            result.push(Segment { words: std::mem::take(&mut words), separator, raw: command[raw_start..end - delimiter_len].trim().into() });
+            raw_start = end;
             continue;
         }
         if quote.is_none() && c == '>' {
@@ -466,7 +560,7 @@ fn segments(command: &str) -> Option<Vec<Segment>> {
     if started { words.push(word); }
     if words.is_empty() { return None; }
     record_assignment(&words, &mut variables)?;
-    result.push(Segment { words, separator: ';' });
+    result.push(Segment { words, separator: ';', raw: command[raw_start..].trim().into() });
     Some(result)
 }
 fn record_assignment(words: &[Word], variables: &mut std::collections::HashMap<String, String>) -> Option<()> {
@@ -763,32 +857,6 @@ fn local_denylist(root: &Path, args: &[&str]) -> bool {
     !message && bounded_args(root, &checked)
 }
 
-/// Workspace task runners already allowed independently in trusted mode.
-/// Validate parsed argv, not reconstructed shell text: arguments stay data.
-fn workspace_runner(root: &Path, argv: &[&str]) -> bool {
-    let Some((program, args)) = argv.split_first() else { return false; };
-    let name = program.rsplit(['/', '\\']).next().unwrap_or(program).trim_end_matches(".exe");
-    if ["python", "python3", "node"].contains(&name) {
-        let Some((script, rest)) = args.split_first() else { return false; };
-        return !script.starts_with('-') && safe_path(root, script)
-            && root.join(script).is_file() && bounded_args(root, rest);
-    }
-    if name == "pnpm" {
-        let (task, rest) = match args {
-            ["run", task, rest @ ..] => (*task, rest),
-            [task, rest @ ..] => (*task, rest),
-            _ => return false,
-        };
-        if !bounded_args(root, rest) { return false; }
-        let manifest = root.join("package.json");
-        if !safe_path(root, "package.json") { return false; }
-        return std::fs::read(manifest).ok()
-            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
-            .is_some_and(|json| json["scripts"][task].is_string());
-    }
-    false
-}
-
 /// Fetch reads a remote, unlike push. Ref specs and URLs are not local paths.
 /// Keep executable transport overrides and external remote helpers fenced.
 fn fetch_args(rest: &[&str]) -> bool {
@@ -800,20 +868,6 @@ fn fetch_args(rest: &[&str]) -> bool {
                 && !word.chars().any(|c| c.is_control() || c.is_whitespace())
         }
     })
-}
-
-fn readonly_filter(root: &Path, argv: &[&str]) -> bool {
-    let Some((verb, rest)) = argv.split_first() else { return false };
-    if !bounded_args(root, rest) { return false; }
-    if rest.iter().any(|w| !w.starts_with('-') && !safe_path(root, w)) { return false; }
-    match *verb {
-        "ls" | "rg" | "find" => !rest.iter().any(|w| matches!(*w, "--pre" | "--pre-glob" | "-exec" | "-execdir" | "-delete" | "-fprint" | "-fprintf") || w.starts_with("--pre=")),
-        "head" | "tail" | "wc" | "uniq" | "cat" => rest.iter().all(|w| !w.starts_with('-') || w.chars().skip(1).all(|c| c.is_ascii_digit() || "nclwqbsvET".contains(c))),
-        "sort" => rest.iter().all(|w| !w.starts_with('-') || ["-n", "-r", "-u", "-f", "--numeric-sort", "--reverse", "--unique"].contains(w)),
-        "grep" => rest.iter().all(|w| !w.starts_with('-') || ["-n", "-i", "-v", "-E", "-F", "-c", "-h", "--"].contains(w)),
-        "sed" => matches!(rest, ["-n", range, paths @ ..] if range.strip_suffix('p').is_some_and(|r| !r.is_empty() && r.split(',').all(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()))) && paths.iter().all(|p| safe_path(root, p))),
-        _ => false,
-    }
 }
 
 /// Exact single PR metadata mutation. Compound commands, repository overrides,
@@ -838,6 +892,19 @@ fn workspace_at(roots: &[std::path::PathBuf], cwd: &Path, path: &str) -> Option<
     roots.iter().find(|root| **root == real).cloned()
 }
 
+/// M215: `cd "$(pwd)"` re-enters the current directory — `pwd` resolves to the
+/// physical path of the same tree — so it neither moves the cwd nor changes
+/// which files a relative path names. `segments()` refuses command
+/// substitution outright, so the identity prefix is proved and removed here.
+/// Every other substitution still fails closed.
+fn strip_identity_cd(command: &str) -> &str {
+    let command = command.trim_start();
+    for prefix in ["cd \"$(pwd)\" && ", "cd \"$(pwd)\"; ", "cd \"$(pwd)\"\n"] {
+        if let Some(rest) = command.strip_prefix(prefix) { return rest.trim_start(); }
+    }
+    command
+}
+
 /// Returns the exact roots needing snapshots and explicit rm paths. The caller
 /// supplies only session-owned, identity-verified registrations, never a prefix.
 fn prove(roots: &[std::path::PathBuf], cwd: &Path, command: &str) -> Option<Vec<(std::path::PathBuf, Vec<String>)>> {
@@ -847,7 +914,7 @@ fn prove(roots: &[std::path::PathBuf], cwd: &Path, command: &str) -> Option<Vec<
         if git(root, &["rev-parse", "--show-toplevel"]).and_then(|p| Path::new(&p).canonicalize().ok()).as_ref() != Some(root)
             || git(root, &["ls-files", "--stage"]).is_none_or(|s| s.lines().any(|l| l.starts_with("160000 "))) { return None; }
     }
-    let segments = segments(command)?;
+    let segments = segments(strip_identity_cd(command))?;
     let mut touched = std::collections::BTreeMap::<std::path::PathBuf, Vec<String>>::new();
     let mut removed = std::collections::BTreeSet::new();
     let mut previous_pipe = false;
@@ -879,10 +946,15 @@ fn prove(roots: &[std::path::PathBuf], cwd: &Path, command: &str) -> Option<Vec<
             if removed.contains(&cwd) { return None; }
             continue;
         }
-        if readonly_filter(&cwd, &argv) { continue; }
-        if !piped && !removed.contains(&cwd) && workspace_runner(&cwd, &argv) {
-            touched.entry(cwd.clone()).or_default();
-            continue;
+        // M207: non-Git commands use the same shell safety decision as a
+        // standalone trusted call. Do not impose a second path/runner whitelist.
+        if argv.first() != Some(&"git") && argv.first() != Some(&"rm") {
+            let standalone = segment.raw.as_str();
+            if matches!(standalone_shell_policy::classify_command(standalone), standalone_shell_policy::ShellCommandPolicy::Allow { .. })
+                && !codefactory_agent_loop::policy::is_delivery_command(standalone)
+                && !sensitive(standalone)
+            { continue; }
+            return None;
         }
         let (root, args) = match argv.as_slice() {
             ["git", "-C", path, rest @ ..] => (workspace_at(&roots, &cwd, path)?, rest),
@@ -896,20 +968,23 @@ fn prove(roots: &[std::path::PathBuf], cwd: &Path, command: &str) -> Option<Vec<
         };
         if removed.contains(&root) { return None; }
         has_git = true;
-        let readonly = match args {
-            ["status", rest @ ..] => rest.iter().all(|p| {
-                ["--porcelain", "--short", "-s", "-sb", "--branch", "--porcelain=v1", "--untracked-files=no"]
-                    .contains(p)
-            }),
-            ["log", rest @ ..] => rest.iter().all(|p| {
-                ["-1", "--oneline", "--no-decorate", "--graph", "--all", "--stat", "-n"].contains(p)
-                    || p.chars().all(|c| c.is_ascii_digit())
-                    || (p.len() > 1 && p.starts_with('-') && p[1..].chars().all(|c| c.is_ascii_digit()))
-            }),
-            ["diff", rest @ ..] => rest.iter().all(|p| ["--stat", "--name-only", "--cached", "--staged", "--check"].contains(p)),
-            ["merge-base", "--is-ancestor", left, right] => revision(left) && revision(right),
-            _ => false,
-        };
+        // Queries do not need path confinement or a snapshot. Reject execution
+        // and output overrides before using the shared Git query classifier.
+        let readonly = (codefactory_agent_core::command_segment_is_read_only_probe(&segment.raw)
+            || matches!(args, ["stash", "list", ..] | ["stash", "show", ..] | ["worktree", "list", ..])
+            || matches!(args, ["config", "core.hooksPath"] | ["config", "--get", "core.hooksPath"] | ["config", "--local", "--get", "core.hooksPath"]))
+            && args.first() != Some(&"fetch")
+            && !args.iter().any(|word| {
+                let option = word.split('=').next().unwrap_or(word);
+                ["--ext-diff", "--textconv", "--output", "--output-directory", "--upload-pack", "--receive-pack"].contains(&option)
+            });
+        if readonly { continue; }
+        if args.first() == Some(&"reset") && args.iter().any(|word| *word == "--hard") {
+            let revisions: Vec<_> = args[1..].iter().filter(|word| !word.starts_with('-')).copied().collect();
+            if revisions.len() > 1 { return None; }
+            let revision = revisions.first().copied().unwrap_or("HEAD");
+            if !legacy_rewrite(&root, &format!("git reset --hard {revision}")) { return None; }
+        }
         if args.first() == Some(&"worktree") {
             match args {
                 ["worktree", "remove", flags @ ..] | ["worktree", "add", flags @ ..] => {
@@ -985,9 +1060,9 @@ pub(super) fn backup_registered(roots: &[std::path::PathBuf], cwd: &Path, comman
     let targets = prove(roots, cwd, command)?;
     let mut refs = Vec::new();
     for (root, paths) in targets { refs.push(snapshot(&root, &paths)?); }
-    // Even read-only proven compositions retain an auditable snapshot.
-    if refs.is_empty() { refs.push(snapshot(cwd, &[])?); }
-    Some(refs.join(","))
+    // An empty target set means the command contains only proved queries.
+    // Do not turn an unrelated conflicted index into a read-only approval.
+    Some(if refs.is_empty() { "read-only".into() } else { refs.join(",") })
 }
 
 /// Snapshot via a private index; never stash away or rewrite the live index.

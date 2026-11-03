@@ -406,12 +406,52 @@ pub struct RouteChange {
     pub kind: RouteChangeKind,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct RouteAttemptSnapshot {
     pub endpoint: String,
     pub model: String,
     pub status: String,
     pub failure_code: Option<String>,
+    /// M210/R3：服务方返回的 HTTP 状态码（`PROVIDER_FATAL` 时必填，能解析就填）。
+    pub provider_status: Option<i64>,
+    /// M210/R3：脱敏后的服务方错误摘要（不含密钥）。
+    pub failure_summary: Option<String>,
+}
+
+/// M210/R3：从失败原因里取服务方的 HTTP 状态码。
+pub(crate) fn provider_status(reason: &str) -> Option<i64> {
+    for marker in ["http ", "HTTP ", "status ", "Status ", "status_code=", "code="] {
+        if let Some(rest) = reason.split(marker).nth(1) {
+            let digits: String = rest.trim_start().chars().take_while(|c| c.is_ascii_digit()).collect();
+            if let Ok(status) = digits.parse::<i64>() {
+                if (100..=599).contains(&status) { return Some(status); }
+            }
+        }
+    }
+    None
+}
+
+/// M210/R3：脱敏的服务方错误摘要——保留「谁说了什么」，抹掉密钥类令牌。
+pub(crate) fn failure_summary(reason: &str) -> Option<String> {
+    let trimmed = reason.trim();
+    if trimmed.is_empty() { return None; }
+    let mut redacted = String::new();
+    for token in trimmed.split_whitespace() {
+        if token.len() > 8
+            && (token.starts_with("sk-")
+                || token.starts_with("Bearer")
+                || token.to_ascii_lowercase().contains("api_key")
+                || token.to_ascii_lowercase().contains("apikey"))
+        {
+            redacted.push_str("[redacted] ");
+        } else {
+            redacted.push_str(token);
+            redacted.push(' ');
+        }
+    }
+    let summary = redacted.trim();
+    let capped: String = summary.chars().take(240).collect();
+    (!capped.is_empty()).then_some(capped)
 }
 
 impl RouteChange {
@@ -625,7 +665,7 @@ impl ActiveRouteState {
             let now = super::usage_windows::now_ms();
             let config = settings.read().await;
             if !durable_wait && config.model_usage_windows.is_empty() && config.endpoint_usage_windows.is_empty()
-                && !self.inner.lock().expect("active route mutex poisoned").candidates.iter().any(|route| config.endpoint_is_subscription(&route.endpoint_name)) { return Ok(None); }
+                && !self.inner.lock().expect("active route mutex poisoned").candidates.iter().any(|route| config.endpoint_is_subscription(&route.endpoint_name) || config.endpoint_daily_spend_cap(&route.endpoint_name).is_some()) { return Ok(None); }
             let delay = {
             let mut inner = self.inner.lock().expect("active route mutex poisoned");
             let from = inner.candidates[inner.current_index].clone();
@@ -634,27 +674,52 @@ impl ActiveRouteState {
             // CF-WINDOW-R4/R5：换模型和等待都要如实说出原因，所以分开记两类。
             let mut window_blocked: Vec<String> = Vec::new();
             let mut quota_blocked: Vec<String> = Vec::new();
+            // M212：按端点的每日人民币预算用完了，和订阅额度一样是"会自己好"
+            // 的等待理由，但原因文案不同（明天 0 点重置）。
+            let mut spend_blocked: Vec<String> = Vec::new();
             // M86：等待说明要列出**全部**原因（时段、额度、缺凭据）与最早可用时间。
             let mut causes: Vec<super::usage_windows::WaitCause> = Vec::new();
             let selected = inner.candidates.iter().enumerate().find_map(|(index, route)| {
                 let label = endpoint_label(&route.endpoint_name);
                 if inner.failed_indices.contains(&index) || !self.health.is_available(&route.endpoint_name) { return None; }
-                if let Some(cause) = route.unavailable_cause(&config, now, ignore_windows) {
+                let window_cause = route.unavailable_cause(&config, now, ignore_windows);
+                let mut spend_cause = config
+                    .endpoint_daily_spend_cap(&route.endpoint_name)
+                    .and_then(|spend| super::quota_cap::daily_spend::cap_wait_cause(&spend, &route.endpoint_name, now));
+                // R3：预算用完和时段再次开放撞在一起时，等**较晚**的那个，
+                // 否则会在时段仍未开放时提前醒来空转。
+                if let (Some(spend), Some(window_until)) = (
+                    spend_cause.as_mut(),
+                    window_cause.as_ref().and_then(|cause| cause.until_ms),
+                ) {
+                    spend.until_ms = Some(spend.until_ms.map_or(window_until, |spend_until| spend_until.max(window_until)));
+                }
+                let blocking: Vec<super::usage_windows::WaitCause> =
+                    window_cause.into_iter().chain(spend_cause).collect();
+                if !blocking.is_empty() {
                     use super::usage_windows::WaitCauseKind;
-                    let code = match cause.kind {
-                        WaitCauseKind::MissingCredential => "route_prefilter:missing_credential".to_string(),
-                        WaitCauseKind::UsageWindow => {
-                            window_blocked.push(route.model_id.clone());
-                            format!("outside_usage_window:{}", serde_json::json!({"rule":super::usage_windows::effective_rule(&config, &route.endpoint_name, &route.model_id),"next_available_ms":cause.until_ms}))
-                        }
-                        WaitCauseKind::QuotaCap => {
-                            quota_blocked.push(route.model_id.clone());
-                            format!("subscription_quota_cap:{}", serde_json::json!({"resets_at_ms":cause.until_ms}))
-                        }
-                    };
-                    if let Some(next) = cause.until_ms { next_available = Some(next_available.map_or(next, |old: i64| old.min(next))); }
-                    skipped.push(RouteAttemptSnapshot { endpoint: route.endpoint_name.clone(), model: route.model_id.clone(), status: "skipped".into(), failure_code: Some(code) });
-                    causes.push(cause);
+                    for cause in blocking {
+                        let code = match cause.kind {
+                            WaitCauseKind::MissingCredential => "route_prefilter:missing_credential".to_string(),
+                            WaitCauseKind::UsageWindow => {
+                                window_blocked.push(route.model_id.clone());
+                                format!("outside_usage_window:{}", serde_json::json!({"rule":super::usage_windows::effective_rule(&config, &route.endpoint_name, &route.model_id),"next_available_ms":cause.until_ms}))
+                            }
+                            WaitCauseKind::QuotaCap => {
+                                quota_blocked.push(route.model_id.clone());
+                                format!("subscription_quota_cap:{}", serde_json::json!({"resets_at_ms":cause.until_ms}))
+                            }
+                            WaitCauseKind::DailySpendCap => {
+                                spend_blocked.push(super::quota_cap::daily_spend::display_name(&route.endpoint_name));
+                                let spend = config.endpoint_daily_spend_cap(&route.endpoint_name).unwrap_or_default();
+                                let status = super::quota_cap::daily_spend::status_for(&route.endpoint_name, &spend, now);
+                                format!("daily_spend_cap:{}", serde_json::json!({"spent":status.spent_cny,"cap":status.cap_cny,"resets_at_ms":cause.until_ms}))
+                            }
+                        };
+                        if let Some(next) = cause.until_ms { next_available = Some(next_available.map_or(next, |old: i64| old.min(next))); }
+                        skipped.push(RouteAttemptSnapshot { endpoint: route.endpoint_name.clone(), model: route.model_id.clone(), status: "skipped".into(), failure_code: Some(code), ..Default::default() });
+                        causes.push(cause);
+                    }
                     return None;
                 }
                 Some(index)
@@ -662,7 +727,7 @@ impl ActiveRouteState {
             for skip in skipped {
                 if !inner.usage_skips.iter().any(|old| old == &skip) { inner.usage_skips.push(skip); }
             }
-            let blocked_causes = |window_blocked: &[String], quota_blocked: &[String], next_available: Option<i64>| {
+            let blocked_causes = |window_blocked: &[String], quota_blocked: &[String], spend_blocked: &[String], next_available: Option<i64>| {
                 let resume = next_available
                     .and_then(chrono::DateTime::from_timestamp_millis)
                     .map(|at| at.with_timezone(&chrono_tz::Asia::Shanghai).format("%m-%d %H:%M").to_string());
@@ -677,6 +742,13 @@ impl ActiveRouteState {
                 if !quota_blocked.is_empty() {
                     causes.push(format!("{} 已达订阅用量上限", quota_blocked.join("、")));
                 }
+                if !spend_blocked.is_empty() {
+                    causes.push(format!(
+                        "{} 今日预算已用完{}",
+                        spend_blocked.join("、"),
+                        resume.as_deref().map(|clock| format!("，{clock} 后继续")).unwrap_or_default()
+                    ));
+                }
                 causes
             };
             if let Some(index) = selected {
@@ -688,7 +760,7 @@ impl ActiveRouteState {
                     reason: format!(
                         "已切到 {}{}",
                         to.model_id,
-                        blocked_causes(&window_blocked, &quota_blocked, next_available)
+                        blocked_causes(&window_blocked, &quota_blocked, &spend_blocked, next_available)
                             .first()
                             .map(|cause| format!("：{cause}"))
                             .unwrap_or_default()
@@ -720,6 +792,7 @@ impl ActiveRouteState {
                     let mut origins: Vec<&str> = Vec::new();
                     if !window_blocked.is_empty() { origins.push("outside_usage_window"); }
                     if !quota_blocked.is_empty() { origins.push("subscription_quota_cap"); }
+                    if !spend_blocked.is_empty() { origins.push("daily_spend_cap"); }
                     if decision.causes.iter().any(|cause| cause.kind == super::usage_windows::WaitCauseKind::MissingCredential) { origins.push("missing_credential"); }
                     // 会话里显示的就是 reason：全部原因 + 最早可用时间 + 这不
                     // 是技术失败。label 是短标签，界面用 reason 那一行。
@@ -875,6 +948,9 @@ impl ActiveRouteState {
                 model: model.clone(),
                 status: "failed".into(),
                 failure_code: Some(failure_code(reason).into()),
+                // M210/R3：致命错误必须留下服务方状态码与脱敏摘要。
+                provider_status: provider_status(reason),
+                failure_summary: failure_summary(reason),
             })
             .collect::<Vec<_>>();
         attempts.extend(inner.usage_skips.clone());
@@ -885,6 +961,8 @@ impl ActiveRouteState {
                 model: current.model_id.clone(),
                 status: "succeeded".into(),
                 failure_code: None,
+                provider_status: None,
+                failure_summary: None,
             });
         }
         attempts
@@ -929,6 +1007,11 @@ impl ActiveRouteState {
         }
         let primary = inner.failures.first().map(|(_, _, reason)| concise_reason(reason))
             .unwrap_or_else(|| concise_reason(final_reason));
+        // M210/R2：所有候选都只给出致命错误时，没有「到点就好」的原因，但这仍然
+        // 是「没有可用模型」，不是「需要用户换个做法」。用 5 分钟窗口继续，并把
+        // 服务方原因（脱敏）写进那句人话里。
+        let all_fatal = !inner.failures.is_empty()
+            && inner.failures.iter().all(|(_, _, reason)| failure_code(reason) == "PROVIDER_FATAL");
         let attempts = inner.candidates.iter().filter_map(|candidate| {
             let label = format!("{} / {}", endpoint_label(&candidate.endpoint_name), candidate.model_id);
             if let Some((_, _, reason)) = inner.failures.iter().find(|(endpoint, model, _)|
@@ -947,6 +1030,17 @@ impl ActiveRouteState {
                     next.map(|clock| format!("，{clock} 起可用")).unwrap_or_default())
             })
         }).collect::<Vec<_>>().join("；");
+        if all_fatal {
+            let detail = if attempts.is_empty() { primary.clone() } else { attempts.clone() };
+            let at = super::usage_windows::now_ms().saturating_add(super::usage_windows::model_wait::FATAL_RETRY_MS);
+            return ModelUnavailable {
+                resume_at_ms: Some(at),
+                notice: format!(
+                    "当前没有可用模型：{detail}。系统自动重试/自愈：5 分钟后重新检查凭据、使用时段和用户额度硬上限，继续原任务。"
+                ),
+            }
+            .encode();
+        }
         format!(
             "首选端点失败：{primary}\n所有可用模型端点均不可用：{attempts}。目标与失败证据已保留；系统将按退避策略重新观测可用路由。"
         )
@@ -1669,6 +1763,7 @@ mod tests {
                 endpoint: "deepseek".into(), model: "deepseek-synthetic".into(),
                 status: "skipped".into(),
                 failure_code: Some("outside_usage_window:{\"next_available_ms\":1791950400000}".into()),
+                ..Default::default()
             });
             inner.current_index = 2;
         }
@@ -2061,5 +2156,79 @@ mod tests {
             EndpointHealthRegistry::new(Duration::from_secs(120)),
         );
         assert_eq!(state.current().endpoint_name, "deepseek");
+    }
+}
+
+/// M210：没有可用模型时的现场（v1.91.65 10-30 08:44）。
+#[cfg(test)]
+mod m210_tests {
+    use super::*;
+    use crate::config::settings::ApiStyle;
+    use std::time::Duration;
+
+    fn route(endpoint: &str, model: &str) -> RouteCandidate {
+        RouteCandidate {
+            endpoint_name: endpoint.into(),
+            model_id: model.into(),
+            base_url: "https://synthetic.invalid".into(),
+            credential_ref: Some(format!("{endpoint}-key-ref")),
+            legacy_inline_api_key: None,
+            supports_vision: false,
+            api_style: ApiStyle::Openai,
+        }
+    }
+
+    fn state_with(failures: Vec<(&str, &str, &str)>) -> ActiveRouteState {
+        let mut plan = RouteCandidatePlan::new(route("deepseek", "deepseek-v4-pro"));
+        plan.push_fallback(route("chatgpt", "gpt-5.5"));
+        let state = ActiveRouteState::from_plan_with_health(
+            plan,
+            EndpointHealthRegistry::new(Duration::from_secs(120)),
+        );
+        {
+            let mut inner = state.inner.lock().unwrap();
+            for (endpoint, model, reason) in failures {
+                inner.failures.push((endpoint.to_string(), model.to_string(), reason.to_string()));
+            }
+        }
+        state
+    }
+
+    /// M210/R3：`PROVIDER_FATAL` 必须持久化服务方状态码与脱敏摘要。
+    #[test]
+    fn m210_fatal_attempt_persists_provider_status_and_summary() {
+        let state = state_with(vec![(
+            "deepseek",
+            "deepseek-v4-pro",
+            "provider returned an unexpected error: HTTP 422 upstream rejected api_key=sk-live-abc123456789",
+        )]);
+        let attempts = state.attempt_snapshots(false);
+        let deepseek = attempts.iter().find(|a| a.endpoint == "deepseek").expect("failed route must be journaled");
+        assert_eq!(deepseek.failure_code.as_deref(), Some("PROVIDER_FATAL"));
+        assert_eq!(deepseek.provider_status, Some(422));
+        let summary = deepseek.failure_summary.as_deref().expect("fatal needs a provider summary");
+        assert!(summary.contains("upstream"), "{summary}");
+        assert!(summary.contains("[redacted]"), "{summary}");
+        assert!(!summary.contains("sk-live-abc123456789"), "summary must not leak keys: {summary}");
+    }
+
+    /// M210/R2：全为致命错误时仍然是没有可用模型，并说出供应商与服务方原因。
+    #[test]
+    fn m210_fatal_only_notice_names_provider_reason() {
+        let state = state_with(vec![
+            ("deepseek", "deepseek-v4-pro", "provider returned an unexpected error: HTTP 422 upstream returned 422"),
+            ("chatgpt", "gpt-5.5", "provider returned an unexpected error: HTTP 402 payment required"),
+        ]);
+        let message = state.exhausted_error("no_model_available");
+        let unavailable = ModelUnavailable::parse(&message).expect("fatal-only must still be a model wait, not a retry loop");
+        let resume = unavailable.resume_at_ms.expect("fatal-only waits on a 5 minute window");
+        assert!(resume > crate::agent::usage_windows::now_ms(), "resume must be in the future");
+        assert!(unavailable.notice.contains("当前没有可用模型"), "{}", unavailable.notice);
+        assert!(unavailable.notice.contains("5 分钟"), "{}", unavailable.notice);
+        assert!(
+            unavailable.notice.contains("PROVIDER_FATAL") || unavailable.notice.contains("upstream"),
+            "the notice must name the provider reason: {}",
+            unavailable.notice
+        );
     }
 }

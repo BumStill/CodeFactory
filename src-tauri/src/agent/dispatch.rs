@@ -2170,6 +2170,14 @@ pub(crate) async fn load_delivery_receipt(
             .bind(session)
             .fetch_one(db)
             .await?;
+    if next_at.is_none() {
+        if turn_exists == 0 { return Ok(None); }
+        let started: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM chat_run_controls WHERE root_turn_id=? AND session_id=? AND status='active' AND created_process_instance=?")
+            .bind(root).bind(session).bind(crate::agent::objective::current_process_instance()).fetch_one(db).await?;
+        let answered: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages answer JOIN messages user ON user.id=? WHERE answer.session_id=user.session_id AND answer.role='assistant' AND answer.created_at>=user.created_at")
+            .bind(root).fetch_one(db).await?;
+        if started == 0 && answered == 0 { return Ok(None); }
+    }
     Ok(Some(DurableDispatchReceipt {
         session_id: session.into(),
         root_turn_id: root.into(),
@@ -2197,6 +2205,14 @@ pub async fn dispatch_delivery_receipt(
 #[cfg(test)]
 mod m200_receipt_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn m206_receipt_rejects_persisted_message_without_started_turn() {
+        let db = crate::storage::db::connect("sqlite::memory:").await.unwrap();
+        sqlx::query("INSERT INTO sessions(id,title,cwd,model_id,created_at,updated_at) VALUES ('receipt','synthetic','/synthetic','model',1,1)").execute(&db).await.unwrap();
+        sqlx::query("INSERT INTO messages(id,session_id,role,content,created_at) VALUES ('unstarted','receipt','user','next task',100)").execute(&db).await.unwrap();
+        assert!(load_delivery_receipt(&db,"receipt","unstarted","next task").await.unwrap().is_none());
+    }
 
     #[tokio::test]
     async fn m200_receipt_requires_the_exact_persisted_row_and_reports_a_pending_model_wake() {

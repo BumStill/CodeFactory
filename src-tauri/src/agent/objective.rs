@@ -2855,6 +2855,7 @@ impl ObjectiveStore {
         .flatten()
         .filter(|value| !value.is_empty());
 
+        let mut recovery_objective: Option<String> = None;
         let mut candidates = Vec::new();
         if let Some(objective_id) = current_binding.as_ref() {
             let exists: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM objectives WHERE id=?")
@@ -2929,9 +2930,24 @@ impl ObjectiveStore {
             if let Some(previous) = previous {
                 candidates.push(previous);
             } else {
-                // Late notices after completion/cancellation are stale work,
-                // never authorization for a new Objective/worktree.
-                bail!("system wake has no unfinished objective to continue");
+                // M209: recover only the exact task of a genuine unanswered
+                // human root. A wake is not authority to create another task.
+                recovery_objective = sqlx::query_scalar(
+                    "SELECT objective.id FROM messages user
+                     JOIN chat_turn_state turn ON turn.root_turn_id=user.id AND turn.session_id=user.session_id
+                     JOIN objectives objective ON objective.id=turn.objective_id AND objective.session_id=user.session_id
+                     WHERE user.session_id=? AND user.role='user' AND user.id<>?
+                       AND objective.status IN ('completed','legacy_orphan')
+                       AND NOT EXISTS (SELECT 1 FROM thin_system_wake_roots wake WHERE wake.root_turn_id=user.id)
+                       AND NOT EXISTS (SELECT 1 FROM messages answer WHERE answer.session_id=user.session_id AND answer.role='assistant' AND answer.created_at>=user.created_at)
+                       AND NOT EXISTS (SELECT 1 FROM chat_session_cancel_intents stop WHERE stop.session_id=user.session_id AND stop.requested_at>=user.created_at)
+                     ORDER BY user.created_at DESC,user.id DESC LIMIT 1")
+                    .bind(session_id).bind(root_turn_id).fetch_optional(&mut **tx).await?;
+                if let Some(previous) = &recovery_objective {
+                    candidates.push(previous.clone());
+                } else {
+                    bail!("system wake has no unfinished objective to continue");
+                }
             }
         }
         candidates.sort();
@@ -2990,8 +3006,8 @@ impl ObjectiveStore {
             // M169: reviving a settled Objective is only allowed for the one
             // that still owns this session's unfinished delivery, and that fact
             // was read from durable delivery state above (never from wording).
-            let revives_open_delivery =
-                open_delivery_objective_id_in_tx(tx, session_id).await?.as_deref()
+            let revives_open_delivery = recovery_objective.as_deref() == Some(objective_id.as_str())
+                || open_delivery_objective_id_in_tx(tx, session_id).await?.as_deref()
                     == Some(objective_id.as_str());
             let next_revision = objective.revision + 1;
             let next_recovery_generation =

@@ -187,6 +187,58 @@ pub struct SessionDiagnostics {
     pub run_controls: Vec<RunControlRow>,
     pub recent_events: Vec<EventRow>,
     pub messages: MessageStats,
+    /// M214：前缀缓存健康度（按本会话调用顺序统计断裂率）。
+    pub prompt_cache: PromptCacheHealth,
+}
+
+/// M214：模型调用的前缀缓存健康度。
+///
+/// 断裂定义与验收口径一致：`cached_tokens < 上一次 input_tokens × 0.8`。
+/// 第一次调用没有可复用前缀，不计为断裂。
+#[derive(Debug, Serialize, Default)]
+pub struct PromptCacheHealth {
+    pub calls: usize,
+    pub breaks: usize,
+    /// 断裂调用占比（0.0–1.0）。
+    pub break_ratio: f64,
+    /// 窗口内整体缓存命中率（cached / input）。
+    pub cache_hit_ratio: f64,
+    pub alert_threshold: f64,
+    /// 断裂率超过阈值时为 true——健康检查据此报「缓存断裂率 > 20%」。
+    pub alert: bool,
+}
+
+impl PromptCacheHealth {
+    fn from_samples(samples: &[crate::agent::prefix_stability::UsageSample]) -> Self {
+        let diagnostics = crate::agent::prefix_stability::CacheDiagnostics::from_samples(samples);
+        Self {
+            calls: diagnostics.calls,
+            breaks: diagnostics.breaks,
+            break_ratio: diagnostics.break_ratio(),
+            cache_hit_ratio: diagnostics.cache_hit_ratio(),
+            alert_threshold: crate::agent::prefix_stability::CACHE_BREAK_ALERT_RATIO,
+            alert: diagnostics.exceeds_alert_threshold(),
+        }
+    }
+}
+
+/// 读出本会话按时间排序的 token 账目，交给前缀缓存诊断。
+async fn prompt_cache_health(db: &SqlitePool, session_id: &str) -> anyhow::Result<PromptCacheHealth> {
+    if !has_table(db, "model_usage_events").await? {
+        return Ok(PromptCacheHealth::default());
+    }
+    let rows: Vec<(i64, i64)> = sqlx::query_as(
+        "SELECT input_tokens, cached_tokens FROM model_usage_events \
+         WHERE session_id=? ORDER BY created_at ASC, rowid ASC",
+    )
+    .bind(session_id)
+    .fetch_all(db)
+    .await?;
+    let samples: Vec<crate::agent::prefix_stability::UsageSample> = rows
+        .into_iter()
+        .map(|(input, cached)| crate::agent::prefix_stability::UsageSample::new(input, cached))
+        .collect();
+    Ok(PromptCacheHealth::from_samples(&samples))
 }
 
 async fn count(db: &SqlitePool, sql: &str, session: &str, table: &str) -> sqlx::Result<i64> {
@@ -204,8 +256,8 @@ pub async fn collect(
     platform: &str,
     shell: &str,
 ) -> anyhow::Result<SessionDiagnostics> {
-    let derived = super::thin_derive::derive_state(db, session_id).await?;
     let cached = super::thin_state::load(db, session_id).await?;
+    let derived = super::thin_derive::derive_state(db, session_id).await?;
     let delivery_mode: Option<String> =
         sqlx::query_scalar("SELECT delivery_mode FROM sessions WHERE id=?")
             .bind(session_id)
@@ -317,6 +369,7 @@ pub async fn collect(
 
     let cached_row = cached.as_ref().map(StateRow::from);
     let cache_matches_facts = cached_row.as_ref().is_some_and(|row| row.state == derived.state.as_str());
+    let prompt_cache = prompt_cache_health(db, session_id).await?;
     Ok(SessionDiagnostics {
         schema: "codefactory.session_diagnostics.v1".into(),
         session_id: session_id.to_string(),
@@ -328,6 +381,7 @@ pub async fn collect(
         thin_session_state: cached_row,
         derived_state: StateRow::from(&derived),
         cache_matches_facts,
+        prompt_cache,
         evidence: Evidence {
             executor_alive: crate::session_executor_alive(session_id),
             live_run_control_this_process: live_run_control(db, session_id).await?,
@@ -441,10 +495,10 @@ pub async fn reset_session_state(db: &SqlitePool, session_id: &str) -> anyhow::R
 
     // 事实重算；仍被判成 running 说明缓存自持，这里直接落一个诚实的终态。
     let mut state = super::thin_derive::derive_state(db, session_id).await?;
-    if state.state == SessionState::Running
+    if !super::thin_derive::unanswered_user(db, session_id).await? && (state.state == SessionState::Running
         || (state.state == SessionState::WaitingWake
             && (state.wake_source.as_deref() == Some("系统周期恢复扫描")
-                || state.waiting_for.as_deref() == Some("系统自动重试/自愈：接续中断回合"))) {
+                || state.waiting_for.as_deref() == Some("系统自动重试/自愈：接续中断回合")))) {
         super::background_tasks::cancel_session_wakeups(db, session_id).await;
         state = ThinState::ended("已手动重置会话状态：残留运行状态已清理", "本会话记录");
         super::thin_state::save(db, session_id, &state).await?;
@@ -565,6 +619,56 @@ mod tests {
         db
     }
 
+    async fn insert_usage(db: &SqlitePool, session: &str, request: &str, input: i64, cached: i64) {
+        sqlx::query(
+            "INSERT INTO model_usage_events (
+                id, request_id, attempt_id, session_id, task_id, surface, provider, endpoint, model,
+                input_tokens, output_tokens, reasoning_tokens, cached_tokens,
+                actual_cost_usd, estimated_cost_usd, cost_source, source, created_at
+             ) VALUES (?,?,?,?,NULL,'chat','deepseek','deepseek','deepseek-chat',?,?,0,?,NULL,NULL,'provider','provider_usage',?)",
+        )
+        .bind(format!("{request}-event"))
+        .bind(request)
+        .bind(request)
+        .bind(session)
+        .bind(input)
+        .bind(64)
+        .bind(cached)
+        .bind(format!("2026-10-31T04:00:0{}.000Z", request.len() % 10))
+        .execute(db)
+        .await
+        .unwrap();
+    }
+
+    /// M214 R4：健康检查必须能报出「缓存断裂率 > 20%」。
+    #[tokio::test]
+    async fn m214_diagnostics_report_prompt_cache_break_rate() {
+        let healthy = fixture("diag-cache-ok").await;
+        insert_usage(&healthy, "diag-cache-ok", "r1", 10_000, 0).await;
+        insert_usage(&healthy, "diag-cache-ok", "r2", 12_000, 11_000).await;
+        insert_usage(&healthy, "diag-cache-ok", "r3", 14_000, 13_000).await;
+        let diag = collect(&healthy, "diag-cache-ok", "v", "macos", "zsh").await.unwrap();
+        assert_eq!(diag.prompt_cache.calls, 3, "每次调用都要计入");
+        assert_eq!(diag.prompt_cache.breaks, 0, "复用前缀的调用不算断裂");
+        assert!(!diag.prompt_cache.alert);
+        // 24_000 cached / 36_000 input
+        assert!((diag.prompt_cache.cache_hit_ratio - 24_000.0 / 36_000.0).abs() < 1e-9);
+
+        let broken = fixture("diag-cache-broken").await;
+        for (index, input) in [10_000, 12_000, 14_000, 16_000].iter().enumerate() {
+            insert_usage(&broken, "diag-cache-broken", &format!("b{index}"), *input, 0).await;
+        }
+        let diag = collect(&broken, "diag-cache-broken", "v", "macos", "zsh").await.unwrap();
+        assert_eq!(diag.prompt_cache.calls, 4);
+        assert_eq!(diag.prompt_cache.breaks, 3, "第一次调用不计，其余全部断裂");
+        assert!((diag.prompt_cache.break_ratio - 0.75).abs() < 1e-9);
+        assert!(diag.prompt_cache.alert, "断裂率 75% 必须报警");
+        assert_eq!(
+            diag.prompt_cache.alert_threshold,
+            crate::agent::prefix_stability::CACHE_BREAK_ALERT_RATIO
+        );
+    }
+
     #[tokio::test]
     async fn m183_diagnostics_expose_overdue_wakes_without_prompt_content() {
         let db = fixture("diag-overdue").await;
@@ -593,12 +697,12 @@ mod tests {
         let report = collect(&db, "diag", "1.0.0", "windows", "powershell").await.unwrap();
         assert_eq!(report.schema, "codefactory.session_diagnostics.v1");
         assert_eq!(report.thin_session_state.as_ref().unwrap().state, "running");
-        assert_eq!(report.derived_state.state, "ended");
+        assert_eq!(report.derived_state.state, "waiting_wake");
         assert!(!report.cache_matches_facts);
         assert_eq!(report.messages.count, 1);
         let json = serde_json::to_string(&report).unwrap();
         assert!(!json.contains("帮我改一下这个函数"), "诊断不得携带消息正文");
-        assert!(json.contains("已随进程退出"), "诊断要说明为什么被判成结束");
+        assert!(json.contains("系统自动重试"), "M206：未回应用户任务必须保留自动恢复归属");
         assert_eq!(report.evidence.orphan_run_controls, 1);
         assert_eq!(report.run_controls.len(), 1);
         assert!(!report.run_controls[0].live_in_this_process);
@@ -623,7 +727,7 @@ mod tests {
         assert!(outcome.reset, "无活执行者时必须允许重置：{:?}", outcome.reason);
         assert_eq!(outcome.settled_cancel_intents, 1);
         assert_eq!(outcome.retired_run_controls, 1);
-        assert_eq!(outcome.resulting_state, "ended");
+        assert_eq!(outcome.resulting_state, "waiting_wake");
         assert_eq!(outcome.messages_before, 1);
         assert_eq!(outcome.messages_after, 1, "R9：重置绝不删除消息");
         let intents: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM chat_session_cancel_intents WHERE session_id='stuck'")
@@ -637,14 +741,10 @@ mod tests {
             .unwrap();
         assert_eq!(status, "completed");
         // 重置后下一条消息不会再被残留状态挡住。
-        assert_eq!(super::super::thin_derive::derive_state(&db, "stuck").await.unwrap().state, SessionState::Ended);
+        assert_eq!(super::super::thin_derive::derive_state(&db, "stuck").await.unwrap().state, SessionState::WaitingWake);
         let settled = super::super::thin_state::load(&db, "stuck").await.unwrap().unwrap();
-        assert_eq!(settled.state, SessionState::Ended);
-        let reason = settled.reason.unwrap_or_default();
-        assert!(
-            reason.contains("没有活着的执行者") || reason.contains("已手动重置"),
-            "重置后必须给出可解释的终态，实际：{reason}"
-        );
+        assert_eq!(settled.state, SessionState::WaitingWake);
+        assert!(settled.wake_source.is_some(), "M206：未回应任务必须绑定持久恢复来源");
     }
 
     /// R3：活着的回合不允许被重置。

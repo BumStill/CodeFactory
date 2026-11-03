@@ -126,6 +126,31 @@ fn process_start_token(_pid: u32) -> Option<String> {
     None
 }
 
+/// Wall-clock process birth, used only to prove prior-process activity.
+/// Failure to obtain OS evidence must fail closed (never label a turn orphaned).
+pub(crate) fn current_process_started_at_ms() -> Option<i64> {
+    let token = current_process_start_token()?;
+    #[cfg(target_os = "macos")]
+    {
+        let (seconds, micros) = token.split_once(':')?;
+        Some(seconds.parse::<i64>().ok()?.checked_mul(1000)? + micros.parse::<i64>().ok()? / 1000)
+    }
+    #[cfg(windows)]
+    {
+        Some((token.parse::<u64>().ok()? / 10_000).checked_sub(11_644_473_600_000)? as i64)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let stat = std::fs::read_to_string("/proc/stat").ok()?;
+        let boot = stat.lines().find_map(|line| line.strip_prefix("btime "))?.parse::<i64>().ok()?;
+        let ticks = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+        if ticks <= 0 { return None; }
+        Some(boot * 1000 + token.parse::<i64>().ok()? * 1000 / ticks as i64)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+    { let _ = token; None }
+}
+
 pub(crate) fn current_process_start_token() -> Option<String> {
     process_start_token(std::process::id())
 }
@@ -409,6 +434,8 @@ async fn ensure_schema(pool: &SqlitePool) -> crate::errors::Result<()> {
     .execute(pool)
     .await?;
     ensure_column(pool, "model_usage_events", "attempt_id", "TEXT").await?;
+    // M212：按端点每日预算用的人民币估算（元），与 estimated_cost_usd 并存。
+    ensure_column(pool, "model_usage_events", "estimated_cost_cny", "REAL").await?;
     sqlx::query("UPDATE model_usage_events SET attempt_id = request_id WHERE attempt_id IS NULL")
         .execute(pool)
         .await?;
@@ -1495,6 +1522,21 @@ async fn ensure_schema(pool: &SqlitePool) -> crate::errors::Result<()> {
     sqlx::query(
         "CREATE INDEX IF NOT EXISTS idx_model_route_attempts_turn
          ON model_route_attempts(session_id, root_turn_id, created_at)",
+    )
+    .execute(pool)
+    .await?;
+    // M210/R3：`PROVIDER_FATAL` 要留下服务方状态码与脱敏摘要。只加列，旧库照常可读。
+    ensure_column(pool, "model_route_attempts", "provider_status", "INTEGER").await?;
+    ensure_column(pool, "model_route_attempts", "failure_summary", "TEXT").await?;
+    // M210/R1：模型可用性等待是一等持久事实（有自己的恢复时间与重试计数）。
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS model_availability_waits (
+            session_id   TEXT PRIMARY KEY,
+            reason       TEXT NOT NULL,
+            resume_at_ms INTEGER,
+            attempts     INTEGER NOT NULL DEFAULT 0,
+            updated_at   INTEGER NOT NULL
+        )",
     )
     .execute(pool)
     .await?;

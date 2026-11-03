@@ -1010,23 +1010,47 @@ async fn ensure_wakeup_schema(pool: &SqlitePool) -> sqlx::Result<()> {
 }
 
 /// 系统模型等待不受用户工具的 60 秒/6 小时输入范围约束；绝对恢复时间直接落盘。
-/// 固定 session ID 去重，避免同一等待的重复结算产生多个续跑回合。
+///
+/// M210/R5：同一次等待续期时沿用仍在 pending 的那一行（避免同一等待出现两个唤醒）；
+/// 唤醒已经触发过、模型仍不可用时，重挂**新 id** 的唤醒，让会话保持
+/// `waiting_wake` 而不是被孤儿清理或升级成提问。
 pub(crate) async fn persist_model_wakeup(
     pool: &SqlitePool, session: &str, root: &str, at_ms: i64, notice: &str,
-) -> sqlx::Result<()> {
+) -> sqlx::Result<String> {
     ensure_wakeup_schema(pool).await?;
+    let base = format!("model-availability-{session}");
+    let pending: Option<String> = sqlx::query_scalar(
+        "SELECT id FROM wakeup_schedules
+          WHERE session_id=? AND status='pending' AND id LIKE 'model-availability-%'
+          ORDER BY next_at ASC, created_at ASC LIMIT 1",
+    )
+    .bind(session)
+    .fetch_optional(pool)
+    .await?;
+    let id = match pending {
+        Some(id) => id,
+        None => {
+            let seen: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM wakeup_schedules WHERE session_id=? AND id LIKE 'model-availability-%'",
+            )
+            .bind(session)
+            .fetch_one(pool)
+            .await?;
+            if seen == 0 { base } else { format!("{base}-re{seen}") }
+        }
+    };
     sqlx::query(
         "INSERT INTO wakeup_schedules(id,session_id,root_turn_id,prompt,source,next_at,status,created_at)
          VALUES (?,?,?,?,'agent_decided',?,'pending',?)
          ON CONFLICT(id) DO UPDATE SET root_turn_id=excluded.root_turn_id,
            prompt=excluded.prompt,next_at=excluded.next_at,status='pending',last_fired_at=NULL",
     )
-    .bind(format!("model-availability-{session}"))
+    .bind(&id)
     .bind(session).bind(root)
     .bind(format!("{notice}。系统自动重试/自愈：模型可用时间已到，重新检查凭据、使用时段和用户额度硬上限，继续原任务。"))
     .bind(at_ms.saturating_add(999).div_euclid(1000)).bind(now_secs())
     .execute(pool).await?;
-    Ok(())
+    Ok(id)
 }
 
 /// R2：创建唤醒。时限、提示文本、上限都在落库前校验，因此被拒时不留任何行。
@@ -1229,6 +1253,7 @@ pub fn wakeup_text(wakeup: &WakeupSchedule, occurrence: i64, late: bool) -> Stri
 /// `next_at` 做比较并交换，因此并发/重启都不会重复投递同一次到点。
 /// M205：恢复预算耗尽不是无限等待的许可。拒绝、终态与取消在同一事务提交。
 async fn reject_exhausted_wakes(pool: &SqlitePool, session: &str, wakes: &[WakeupSchedule], now: i64) -> sqlx::Result<bool> {
+    if super::thin_derive::unanswered_user(pool, session).await? { return Ok(false); }
     let budget: Option<(i64, Option<String>, Option<String>)> = sqlx::query_as(
         "SELECT attempts,settled_reason,last_error FROM workspace_recovery_budget WHERE session_id=?")
         .bind(session).fetch_optional(pool).await?;
@@ -1287,10 +1312,20 @@ pub async fn drain_due_wakeups_at(pool: &SqlitePool, sink: &dyn WakeSink, now: i
             match super::workspace_recovery_budget::due(pool, &session, now).await {
                 Ok(true) => {},
                 Ok(false) => {
-                    if let Err(error) = reject_exhausted_wakes(pool, &session, &wakes, now).await {
-                        tracing::warn!(%error, session, "wake rejection persistence failed; system automatic recovery next tick");
+                    // M209: a prior workspace conclusion cannot veto an unanswered
+                    // task. Delivery has its own backoff so retries cannot spin.
+                    if super::thin_derive::unanswered_user(pool, &session).await.unwrap_or(false) {
+                        let delivery_key = format!("wake-delivery:{session}");
+                        super::workspace_recovery_budget::ensure(pool).await.ok();
+                        let next: Option<i64> = sqlx::query_scalar("SELECT next_at FROM workspace_recovery_budget WHERE session_id=?")
+                            .bind(&delivery_key).fetch_optional(pool).await.unwrap_or(Some(i64::MAX));
+                        if next.is_some_and(|next| next > now) { return 0; }
+                    } else {
+                        if let Err(error) = reject_exhausted_wakes(pool, &session, &wakes, now).await {
+                            tracing::warn!(%error, session, "wake rejection persistence failed; system automatic recovery next tick");
+                        }
+                        return 0;
                     }
-                    return 0;
                 },
                 Err(error) => {
                     tracing::warn!(%error, session, "wake budget unavailable; system automatic recovery next tick");
@@ -1307,6 +1342,7 @@ pub async fn drain_due_wakeups_at(pool: &SqlitePool, sink: &dyn WakeSink, now: i
                 wakeup_text(wake, wake.fire_count + 1, now.saturating_sub(wake.next_at) >= wake.every_sec.unwrap_or(1).max(1) as i64)
             }).collect::<Vec<_>>().join("\n\n");
             if !deliver_wake(sink, session.clone(), text, due).await {
+                let _ = super::workspace_recovery_budget::fail(pool, &format!("wake-delivery:{session}"), now, "唤醒准入失败；系统自动重试/自愈").await;
                 let attempts = super::workspace_recovery_budget::fail(pool, &session, now, "唤醒投递失败；系统自动重试/自愈").await.unwrap_or(0);
                 if attempts >= 3 {
                     if let Err(error) = reject_exhausted_wakes(pool, &session, &wakes, now).await {
@@ -1316,6 +1352,7 @@ pub async fn drain_due_wakeups_at(pool: &SqlitePool, sink: &dyn WakeSink, now: i
                 return 0;
             }
             let _ = super::workspace_recovery_budget::clear(pool, &session).await;
+            let _ = super::workspace_recovery_budget::clear(pool, &format!("wake-delivery:{session}")).await;
             for wake in &wakes {
                 let cycle = wake.every_sec.or(wake.after_sec).unwrap_or(60).max(1) as i64;
                 if now.saturating_sub(wake.next_at) > cycle.saturating_mul(2) {
@@ -2374,6 +2411,27 @@ mod tests {
         assert_eq!(drain_pending_wakes(&reopened, sink(&Arc::new(Recorder::default()))).await, 0);
         reopened.close().await;
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn m209_reused_pending_repair_ignores_stale_workspace_budget() {
+        let pool = crate::storage::db::connect("sqlite::memory:").await.unwrap();
+        ensure_schema(&pool).await.unwrap();
+        super::super::workspace_recovery_budget::ensure(&pool).await.unwrap();
+        sqlx::raw_sql("INSERT INTO sessions(id,title,cwd,model_id,created_at,updated_at,delivery_mode) VALUES ('synthetic-reopen','fixture','/synthetic','model',1,1,'thin');
+            INSERT INTO messages(id,session_id,role,content,created_at) VALUES ('new-intent','synthetic-reopen','user','continue interrupted task',200);
+            INSERT INTO workspace_recovery_budget(session_id,attempts,next_at,settled_reason) VALUES ('synthetic-reopen',3,999999,'old task settled');").execute(&pool).await.unwrap();
+        for count in [0_i64, 1, 4] {
+            sqlx::query("INSERT INTO wakeup_schedules(id,session_id,prompt,source,next_at,status,fire_count,created_at) VALUES (?,'synthetic-reopen','resume','agent_decided',100,'pending',?,1)")
+                .bind(format!("thin-source-repair-synthetic-{count}")).bind(count).execute(&pool).await.unwrap();
+        }
+        let recorder = Arc::new(Recorder::default());
+        assert_eq!(drain_due_wakeups_at(&pool, sink(&recorder), 20000).await, 1);
+        assert_eq!(recorder.take().len(), 1);
+        let pending: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM wakeup_schedules WHERE status='pending' AND next_at<20000-120").fetch_one(&pool).await.unwrap();
+        assert_eq!(pending, 0, "all fire counts must be handled in one scan");
+        let counts: Vec<i64> = sqlx::query_scalar("SELECT fire_count FROM wakeup_schedules ORDER BY fire_count").fetch_all(&pool).await.unwrap();
+        assert_eq!(counts, vec![1,2,5]);
     }
 
     #[tokio::test]

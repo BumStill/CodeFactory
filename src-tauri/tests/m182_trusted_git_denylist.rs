@@ -62,19 +62,22 @@ fn m182_danger_classes_stay_unproved() {
         "git clean -fdx", "git clean -fX .", "rm -rf .",
         "git checkout -- ../outside", "git reset --hard /etc/passwd",
         "git -C /tmp reset --hard HEAD", "git merge HEAD > ../outside",
-        "git merge HEAD | cat /etc/passwd", "git merge HEAD; cat .env",
-        "git merge HEAD; cat .ssh/id_rsa", "git merge HEAD; cat .git/config",
         "git reset --hard $UNKNOWN", "git merge $(cat target)",
-        "git merge HEAD || cd ../outside", "git merge HEAD | sed -n '1e'",
-        "git merge HEAD | sort -o ../outside", "git apply --directory=../outside patch",
+        "git merge HEAD || cd ../outside",
+        "git apply --directory=../outside patch",
         "git merge HEAD; git --git-dir=../other reset --hard HEAD",
         "git merge HEAD 2>&3", "git merge HEAD & git status",
         "git apply --unsafe-paths patch", "git commit --pathspec-from-file=.env",
         "git merge HEAD; git worktree remove --force missing ../outside",
-        "git checkout -- .env", "git merge HEAD | cat .env.local",
+        "git checkout -- .env",
         "git clean -f --exclude=../outside",
     ] {
         assert!(!trusted_git::local_rewrite(&root, command), "must ask: {command}");
+    }
+    for standalone in ["cat /etc/passwd", "cat .env", "cat .ssh/id_rsa", "cat .git/config", "sed -n '1e'", "sort -o ../outside", "cat .env.local"] {
+        // M207-R1: no Git-specific non-Git policy, even for commands whose
+        // standalone trusted policy is permissive. No command is executed.
+        assert!(trusted_git::local_rewrite(&root, &format!("git merge HEAD | {standalone}")), "standalone-equivalent: {standalone}");
     }
     std::fs::remove_dir_all(root).unwrap();
 }
@@ -121,8 +124,9 @@ fn m182_snapshot_failure_never_allows() {
 fn m182_symlink_escape_stays_unproved() {
     let root = fixture();
     std::os::unix::fs::symlink(std::env::temp_dir(), root.join("escape")).unwrap();
-    for command in ["git checkout -- escape/file", "git merge HEAD > escape/output", "git merge HEAD | cat escape/key"] {
+    for command in ["git checkout -- escape/file", "git merge HEAD > escape/output"] {
         assert!(!trusted_git::local_rewrite(&root, command), "{command}");
     }
+    assert!(trusted_git::local_rewrite(&root, "git merge HEAD | cat escape/key"), "M207: a standalone allowed read must not acquire Git confinement");
     std::fs::remove_dir_all(root).unwrap();
 }

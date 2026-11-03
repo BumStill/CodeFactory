@@ -152,9 +152,19 @@ impl PermissionGateway for DesktopPermissionGateway {
             { return permission_recovery_rejected(); }
             if let Some(root) = self.managed_workspace_root().await {
                 if let Some(roots) = registered_git_roots(&self.db, &self.session_id).await {
-                    if roots.iter().any(|r| r.canonicalize().ok() == root.canonicalize().ok())
-                        && super::trusted_git::python_heredoc_proved(Some(&root), command)
-                    { return PermissionOutcome::Allow; }
+                    if roots.iter().any(|r| r.canonicalize().ok() == root.canonicalize().ok()) {
+                        // M215: a refusal names the script line that could not be
+                        // proved instead of only restating "unproved".
+                        match super::trusted_git::python_heredoc_proof(Some(&root), command) {
+                            Ok(()) => return PermissionOutcome::Allow,
+                            Err(reason) => return self.request_permission_with_reason(
+                                tool_call,
+                                args.clone(),
+                                bash_command,
+                                Some(("trusted.heredoc.unproved", format!("无法证明解释器仅访问本会话工作区内的文件：{reason}"))),
+                            ).await,
+                        }
+                    }
                 }
             }
             return self.request_permission(tool_call, args.clone(), bash_command).await;
@@ -386,10 +396,24 @@ impl DesktopPermissionGateway {
         args: serde_json::Value,
         bash_command: Option<&str>,
     ) -> PermissionOutcome {
+        self.request_permission_with_reason(tc, args, bash_command, None).await
+    }
+
+    /// M215: a prover that knows *why* it refused supplies that reason (the
+    /// script line it could not prove) instead of the generic family text.
+    async fn request_permission_with_reason(
+        &self,
+        tc: &ToolCall,
+        args: serde_json::Value,
+        bash_command: Option<&str>,
+        override_reason: Option<(&'static str, String)>,
+    ) -> PermissionOutcome {
         let mut args = args;
         // Diagnostic metadata is server-owned and travels in the existing
         // durable prompt JSON; never trust a model-supplied `_permission`.
-        let (rule, reason) = if bash_command.is_some_and(|c| c.contains("<<")) {
+        let (rule, reason) = if let Some((rule, reason)) = override_reason {
+            (rule, reason)
+        } else if bash_command.is_some_and(|c| c.contains("<<")) {
             ("trusted.heredoc.unproved", "无法证明解释器仅访问已登记工作区内的文件；可能包含越界路径、外部操作、未闭合输入或不支持的语法。".to_string())
         } else if let Some(command) = bash_command {
             match crate::tools::shell_policy::classify_command(command) {
@@ -927,6 +951,13 @@ mod tests {
         let args = serde_json::json!({"command":local});
         let call = ToolCall { id: "m198-safe".into(), r#type: "function".into(), function: FunctionCall { name: "bash".into(), arguments: args.to_string() } };
         assert_eq!(gateway.authorize(&call, &args, Some(&local)).await, PermissionOutcome::Allow);
+        // M215 R1: the shape the model actually wrote in the 2026-10-31 trusted
+        // session — `cd "$(pwd)" && python3 -` with `io.open` on its own file.
+        let m215 = "cd \"$(pwd)\" && python3 - <<'PY'\nimport io\np='tracked.txt'\ns=io.open(p, encoding='utf-8').read()\nio.open(p,'w', encoding='utf-8').write(s.replace('base','m215 rewritten'))\nprint('done')\nPY";
+        let m215 = if cfg!(windows) { m215.replace("python3 -", "python -") } else { m215.into() };
+        let m215_args = serde_json::json!({"command":m215});
+        let m215_call = ToolCall { id: "m215-safe".into(), r#type: "function".into(), function: FunctionCall { name: "bash".into(), arguments: m215_args.to_string() } };
+        assert_eq!(gateway.authorize(&m215_call, &m215_args, Some(&m215)).await, PermissionOutcome::Allow);
         let shell = if cfg!(windows) {
             let exec = std::path::PathBuf::from(m159_git(&root, &["--exec-path"]));
             exec.ancestors().map(|p| p.join("bin/bash.exe")).find(|p| p.is_file()).expect("Git Bash")
@@ -996,8 +1027,47 @@ mod tests {
                 assert!(!super::super::trusted_git::registered_rewrite(&[root.clone()], &root, &command), "negative family must stay fenced: {command}");
             }
         }
-        for command in ["git merge HEAD; python3 ../outside.py", "git merge HEAD; pnpm --dir ../outside run check", "git merge HEAD; python3 -c 'print(1)'", "git fetch --upload-pack=evil origin; git merge HEAD", "git fetch 'ext::evil'; git merge HEAD", "git merge HEAD; git push origin other", "git merge HEAD; git branch -D someone-else"] {
+        // M207 explicitly replaces the M204 runner whitelist: these ordinary
+        // non-Git segments must match their standalone trusted decision.
+        for command in ["python3 ../outside.py", "pnpm --dir ../outside run check", "python3 -c 'print(1)'"] {
+            let args = serde_json::json!({"command":command});
+            assert!(matches!(super::super::decide_permission_for_call(&super::super::permission_policy_for_mode("trusted"), "bash", &args, Some(command), false, Some(&root)), super::super::PermissionDecision::Allow));
+            assert!(super::super::trusted_git::registered_rewrite(&[root.clone()], &root, &format!("git merge HEAD; {command}")));
+        }
+        for command in ["git fetch --upload-pack=evil origin; git merge HEAD", "git fetch 'ext::evil'; git merge HEAD", "git merge HEAD; git push origin other", "git merge HEAD; git branch -D someone-else"] {
             assert!(!super::super::trusted_git::registered_rewrite(&[root.clone()], &root, command), "must remain unproved: {command}");
+        }
+        assert_eq!(sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM permission_intents").fetch_one(&gateway.db).await.unwrap(), intents_before);
+        // M207: compare the actual gateway outcomes, not a hand-written allow
+        // oracle. Deterministic random combinations cover operators and quotes.
+        let mut pool = vec![
+            "git show HEAD".to_string(), "git rev-parse HEAD".into(),
+            "git branch --list".into(), "git stash list".into(),
+            "git config core.hooksPath .githooks".into(),
+            "python3.11 tools/governance/run_scenario_harness_gate.py --stage local".into(),
+            format!("grep -n -E 'synthetic' '{}'", outside.display()),
+            "tail -12".into(), "git merge HEAD".into(),
+        ];
+        for base in m198_family.as_array().unwrap().iter().filter(|case| case["allow"] == true).map(|case| case["command"].as_str().unwrap()).chain(std::iter::once(m204_original)) {
+            pool.extend(super::super::trusted_git::command_segments(base).unwrap());
+        }
+        for command in &pool {
+            let args = serde_json::json!({"command":command});
+            let call = ToolCall { id: "m207-single".into(), r#type: "function".into(), function: FunctionCall { name: "bash".into(), arguments: args.to_string() } };
+            assert_eq!(gateway.authorize(&call, &args, Some(command)).await, PermissionOutcome::Allow, "standalone: {command}");
+        }
+        let mut seed = 207_u64;
+        for _ in 0..200 {
+            let mut selected = Vec::new();
+            for _ in 0..3 {
+                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                selected.push(pool[(seed >> 32) as usize % pool.len()].clone());
+            }
+            let separator = ["; ", " && ", " || "][seed as usize % 3];
+            let command = selected.join(separator);
+            let args = serde_json::json!({"command":command});
+            let call = ToolCall { id: "m207-composed".into(), r#type: "function".into(), function: FunctionCall { name: "bash".into(), arguments: args.to_string() } };
+            assert_eq!(gateway.authorize(&call, &args, Some(&command)).await, PermissionOutcome::Allow, "composition: {command}");
         }
         assert_eq!(sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM permission_intents").fetch_one(&gateway.db).await.unwrap(), intents_before);
         // M204-R3: a real unmerged index makes write-tree fail. This is a
