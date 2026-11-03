@@ -1,13 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
 import { create } from "zustand";
 import { invoke } from "../lib/tauri";
-import type { KnowledgeLibrary, KnowledgeScanSummary } from "../lib/tauri";
+import type {
+  KnowledgeDocumentFailure,
+  KnowledgeLibrary,
+  KnowledgeScanSummary,
+} from "../lib/tauri";
 
 interface KnowledgeState {
   libraries: KnowledgeLibrary[];
   scanSummaries: Record<string, KnowledgeScanSummary>;
   loading: boolean;
   scanning: Record<string, boolean>;
+  /** Files that currently fail to index, per library (M191 R6). */
+  failures: Record<string, KnowledgeDocumentFailure[]>;
   error: string | null;
 
   loadLibraries: () => Promise<void>;
@@ -22,13 +28,29 @@ export const useKnowledgeStore = create<KnowledgeState>((set, get) => ({
   scanSummaries: {},
   loading: false,
   scanning: {},
+  failures: {},
   error: null,
 
   loadLibraries: async () => {
     set({ loading: true, error: null });
     try {
       const libraries = await invoke<KnowledgeLibrary[]>("list_knowledge_libraries");
-      set({ libraries, loading: false });
+      // Auto-indexing happens in the backend, so refresh the per-file failure
+      // list alongside the libraries; the panel polls this while mounted.
+      const failures: Record<string, KnowledgeDocumentFailure[]> = {};
+      await Promise.all(
+        libraries.map(async (library) => {
+          try {
+            failures[library.id] = await invoke<KnowledgeDocumentFailure[]>(
+              "list_knowledge_library_failures",
+              { libraryId: library.id },
+            );
+          } catch {
+            failures[library.id] = [];
+          }
+        }),
+      );
+      set({ libraries, failures, loading: false });
     } catch (e) {
       set({ loading: false, error: String(e) });
     }
@@ -91,9 +113,12 @@ export const useKnowledgeStore = create<KnowledgeState>((set, get) => ({
       set((s) => {
         const scanSummaries = { ...s.scanSummaries };
         delete scanSummaries[libraryId];
+        const failures = { ...s.failures };
+        delete failures[libraryId];
         return {
           libraries: s.libraries.filter((library) => library.id !== libraryId),
           scanSummaries,
+          failures,
         };
       });
     } catch (e) {
