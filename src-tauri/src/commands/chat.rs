@@ -2218,7 +2218,12 @@ async fn settle_chat_objective_from_error(
             current.revision
         )));
     }
-    let unavailable = crate::agent::failover::ModelUnavailable::parse(error_text);
+    let mut unavailable = crate::agent::failover::ModelUnavailable::parse(error_text);
+    if let (Some(wait), Some(session)) = (unavailable.clone(), current.session_id.as_deref()) {
+        let (mut wait, terminal) = crate::agent::usage_windows::model_wait::bound_transient(db, session, error_text, wait).await?;
+        if terminal { wait.resume_at_ms = None; }
+        unavailable = Some(wait);
+    }
     let signal = if auth_expired {
         RouteSignal::AuthorizationRequired {
             domain: RecoveryDomain::Auth,
