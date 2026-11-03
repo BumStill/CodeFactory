@@ -870,21 +870,105 @@ fn fetch_args(rest: &[&str]) -> bool {
     })
 }
 
-/// Exact single PR metadata mutation. Compound commands, repository overrides,
-/// edits of another resource and implicit current-PR selection are not grants.
-pub(super) fn own_pr_metadata_target(command: &str) -> Option<i64> {
+/// M208: a remote write this session may own. Ownership (which PR, which branch,
+/// whether that PR is merged) is proved against the durable delivery records by
+/// the caller — this type only carries what the command itself names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum OwnRemoteAction {
+    PrMetadata(i64),
+    PushBranch(String),
+    DeleteBranch(String),
+}
+
+/// M208: the remote writes a command performs on the session's *own* resources.
+///
+/// Judged segment by segment (M207 principle): every segment is either an own
+/// remote write this prover recognises, or an ordinary command that already
+/// passes the standalone shell decision on its own. One segment that cannot be
+/// placed takes the whole command back to the normal gate, so a mixed command
+/// can never launder a foreign write through an owned one.
+pub(super) fn own_remote_actions(command: &str) -> Option<Vec<OwnRemoteAction>> {
     let segments = segments(command)?;
-    if segments.len() != 1 || segments[0].words.iter().any(|w| w.redirect) { return None; }
-    let words: Vec<_> = segments[0].words.iter().map(|w| w.text.as_str()).collect();
-    let ["gh", "pr", action, number, rest @ ..] = words.as_slice() else { return None; };
-    let number = number.parse::<i64>().ok().filter(|n| *n > 0)?;
-    let mut pairs = rest.chunks_exact(2);
-    let allowed = pairs.by_ref().all(|pair| !pair[1].is_empty() && match *action {
-        "edit" => ["--add-label", "--remove-label"].contains(&pair[0]),
-        "comment" => pair[0] == "--body",
+    let mut actions = Vec::new();
+    for segment in &segments {
+        if segment.words.iter().any(|word| word.redirect) { return None; }
+        match own_remote_action(segment) {
+            Some(action) => actions.push(action),
+            None if ordinary_segment(&segment.raw) => {}
+            None => return None,
+        }
+    }
+    (!actions.is_empty()).then_some(actions)
+}
+
+/// A segment needing no allowance of its own: the same decision a standalone
+/// trusted call would get, minus anything remote or destructive.
+fn ordinary_segment(raw: &str) -> bool {
+    matches!(standalone_shell_policy::classify_command(raw), standalone_shell_policy::ShellCommandPolicy::Allow { .. })
+        && !codefactory_agent_loop::policy::is_delivery_command(raw)
+        && !sensitive(raw)
+}
+
+fn own_remote_action(segment: &Segment) -> Option<OwnRemoteAction> {
+    let words: Vec<&str> = segment.words.iter().map(|w| w.text.as_str()).collect();
+    match words.as_slice() {
+        ["gh", "pr", action, number, rest @ ..] => {
+            let number = number.parse::<i64>().ok().filter(|n| *n > 0)?;
+            own_pr_metadata_args(action, rest).then_some(OwnRemoteAction::PrMetadata(number))
+        }
+        ["git", "push", rest @ ..] => own_branch_push(rest),
+        _ => None,
+    }
+}
+
+/// Exact PR metadata mutation on an explicit PR number: label add/remove, a
+/// comment body, `ready`, and title/body updates. No other action, no implicit
+/// current-PR selection, no `--body-file`, no repository override.
+fn own_pr_metadata_args(action: &str, rest: &[&str]) -> bool {
+    match action {
+        "ready" => rest.is_empty(),
+        "edit" | "comment" => {
+            let allowed: &[&str] = if action == "edit" {
+                &["--add-label", "--remove-label", "--title", "--body"]
+            } else {
+                &["--body"]
+            };
+            !rest.is_empty()
+                && rest.len() % 2 == 0
+                && rest.chunks_exact(2).all(|pair| !pair[1].is_empty() && allowed.contains(&pair[0]))
+        }
         _ => false,
-    });
-    (allowed && !rest.is_empty() && pairs.remainder().is_empty()).then_some(number)
+    }
+}
+
+/// `git push` of a plain branch ref: no force, no mirror/all/tags, no explicit
+/// `src:dst` refspec, no main/master, origin only. Deleting is carried
+/// separately so the caller can require a proven merge.
+fn own_branch_push(rest: &[&str]) -> Option<OwnRemoteAction> {
+    let mut delete = false;
+    let mut remote: Option<&str> = None;
+    let mut refspec: Option<&str> = None;
+    for word in rest {
+        match *word {
+            "--delete" | "-d" => { delete = true; continue; }
+            "-u" | "--set-upstream" | "--quiet" | "-q" | "--no-verify" => continue,
+            _ => {}
+        }
+        if word.starts_with('-') || word.is_empty() { return None; }
+        if remote.is_none() { remote = Some(word); continue; }
+        if refspec.is_some() { return None; }
+        refspec = Some(word);
+    }
+    if remote != Some("origin") { return None; }
+    let refspec = refspec?;
+    if refspec.contains(':') || refspec.contains('+') || refspec.starts_with("refs/tags/") { return None; }
+    let branch = refspec.strip_prefix("refs/heads/").unwrap_or(refspec);
+    if matches!(branch, "main" | "master") || branch.is_empty() { return None; }
+    Some(if delete {
+        OwnRemoteAction::DeleteBranch(branch.to_string())
+    } else {
+        OwnRemoteAction::PushBranch(branch.to_string())
+    })
 }
 
 fn workspace_at(roots: &[std::path::PathBuf], cwd: &Path, path: &str) -> Option<std::path::PathBuf> {
@@ -1143,5 +1227,87 @@ mod tests {
             words(r#"cd "C:\ws" && git status"#).map(|p| p[0].clone()),
             Some(vec!["cd".to_string(), r"C:\ws".to_string()])
         );
+    }
+}
+
+/// M208 regression tests: the session's own remote writes are judged segment by
+/// segment, and anything the prover cannot place falls back to the gate.
+#[cfg(test)]
+mod m208_own_remote_actions {
+    use super::{own_remote_actions, OwnRemoteAction};
+
+    const OWN_PR_LABEL: &str = "gh pr edit 929 --add-label 'merge-queue: armed'";
+    const OWN_PR_EVIDENCE: &str = "gh pr view 933 --json state,mergeable,statusCheckRollup; \
+gh pr edit 933 --remove-label 'merge-queue: blocked' --add-label 'merge-queue: armed'; \
+gh pr comment 933 --body 'CI 全绿，已打 merge-queue: armed'";
+
+    fn actions(command: &str) -> Vec<OwnRemoteAction> {
+        own_remote_actions(command).unwrap_or_else(|| panic!("must be owned: {command}"))
+    }
+
+    #[test]
+    fn m208_single_own_pr_metadata_mutation_is_owned() {
+        assert_eq!(actions(OWN_PR_LABEL), vec![OwnRemoteAction::PrMetadata(929)]);
+        assert_eq!(actions("gh pr ready 929"), vec![OwnRemoteAction::PrMetadata(929)]);
+        assert_eq!(
+            actions("gh pr edit 929 --title 'fix: x' --body 'plain'"),
+            vec![OwnRemoteAction::PrMetadata(929)]
+        );
+    }
+
+    #[test]
+    fn m208_compound_segments_are_judged_one_by_one() {
+        // The read-only `gh pr view` segment needs no allowance and contributes
+        // none; the two mutations on the same own PR do.
+        assert_eq!(
+            actions(OWN_PR_EVIDENCE),
+            vec![OwnRemoteAction::PrMetadata(933), OwnRemoteAction::PrMetadata(933)]
+        );
+        // A read-only segment beside an owned one is judged on its own and stays
+        // owned; it neither launders nor is laundered by the write beside it.
+        assert_eq!(
+            actions("git status --short && gh pr edit 929 --add-label 'merge-queue: armed'"),
+            vec![OwnRemoteAction::PrMetadata(929)]
+        );
+    }
+
+    #[test]
+    fn m208_own_branch_push_shapes_are_owned() {
+        assert_eq!(
+            actions("git push origin HEAD"),
+            vec![OwnRemoteAction::PushBranch("HEAD".into())]
+        );
+        assert_eq!(
+            actions("git push -u origin codefactory/objective-m208"),
+            vec![OwnRemoteAction::PushBranch("codefactory/objective-m208".into())]
+        );
+        assert_eq!(
+            actions("git push origin --delete codefactory/objective-m208"),
+            vec![OwnRemoteAction::DeleteBranch("codefactory/objective-m208".into())]
+        );
+    }
+
+    #[test]
+    fn m208_unowned_or_unproved_segments_fall_back_to_the_gate() {
+        for command in [
+            "gh pr edit 929 --add-label 'merge-queue: armed'; gh auth token",
+            "gh pr edit 929 --add-label 'merge-queue: armed'; rm -rf ../other",
+            "gh pr edit 929 --add-label 'merge-queue: armed'; git reset --hard",
+            "gh pr edit 929 --add-label 'merge-queue: armed'; gh pr merge 929 --squash",
+            "gh pr merge 929 --squash",
+            "gh pr close 929",
+            "gh pr edit 929 --body-file body.md",
+            "gh release delete v1.0.0",
+            "git push --force origin HEAD",
+            "git push origin main",
+            "git push origin master",
+            "git push origin HEAD:refs/heads/other",
+            "git push --mirror origin",
+        ] {
+            assert!(own_remote_actions(command).is_none(), "{command}");
+        }
+        // Read-only traffic alone is not an owned remote write: it needs no
+        // allowance, and must not create one for a later segment.
+        assert!(own_remote_actions("gh pr view 933 --json state").is_none());
     }
 }

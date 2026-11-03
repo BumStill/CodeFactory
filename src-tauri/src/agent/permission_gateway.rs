@@ -129,15 +129,20 @@ impl PermissionGateway for DesktopPermissionGateway {
         }
         let policy = resolve_session_permission_policy(&self.db, &self.session_id).await;
         if policy.full_access && tool_call.function.name == "bash" {
-            if let Some(number) = bash_command.and_then(super::trusted_git::own_pr_metadata_target) {
-                let key = format!("bash({})", bash_command.unwrap_or_default());
+            if let Some(actions) = bash_command.and_then(super::trusted_git::own_remote_actions) {
+                let command = bash_command.unwrap_or_default();
+                let key = format!("bash({command})");
                 let denied = policy.deny.iter().any(|p| super::glob_match(p, "bash") || super::glob_match(p, &key));
-                let owned = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM thin_delivery_refs r JOIN execution_workspaces w ON w.session_id=r.session_id AND w.branch_name=r.branch WHERE r.session_id=? AND r.pr_number=? AND w.state IN ('active','delivering')")
-                    .bind(&self.session_id).bind(number).fetch_one(&self.db).await.unwrap_or(0) > 0;
-                if !denied && owned && super::fetch_session_delivery_authorized(&self.db, &self.session_id).await {
+                if !denied && self.own_remote_actions_owned(&actions).await {
                     return PermissionOutcome::Allow;
                 }
-                return self.request_permission(tool_call, args.clone(), bash_command).await;
+                // Not owned. A metadata write keeps the plain confirmation that
+                // has always guarded it; a `git push` shape falls through to the
+                // remote-write path below, so a refusal still names the user
+                // decision and an approval still records the delivery grant.
+                if actions.iter().any(|action| matches!(action, super::trusted_git::OwnRemoteAction::PrMetadata(_))) {
+                    return self.request_permission(tool_call, args.clone(), bash_command).await;
+                }
             }
         }
         // M198: heredoc is executable interpreter input, not shell segments.
@@ -397,6 +402,48 @@ impl DesktopPermissionGateway {
         bash_command: Option<&str>,
     ) -> PermissionOutcome {
         self.request_permission_with_reason(tc, args, bash_command, None).await
+    }
+
+    /// M208: every remote write in the command must belong to this session — the
+    /// PR its own delivery record opened, or the branch its registered workspace
+    /// stands on. Delivery authority is the precondition, never a substitute for
+    /// ownership: another session's PR or branch still asks.
+    async fn own_remote_owned(&self, command: &str) -> bool {
+        match super::trusted_git::own_remote_actions(command) {
+            Some(actions) => self.own_remote_actions_owned(&actions).await,
+            None => false,
+        }
+    }
+
+    async fn own_remote_actions_owned(&self, actions: &[super::trusted_git::OwnRemoteAction]) -> bool {
+        if !super::fetch_session_delivery_authorized(&self.db, &self.session_id).await { return false; }
+        for action in actions {
+            let owned = match action {
+                super::trusted_git::OwnRemoteAction::PrMetadata(number) => sqlx::query_scalar::<_, i64>(
+                    "SELECT COUNT(*) FROM thin_delivery_refs r JOIN execution_workspaces w ON w.session_id=r.session_id AND w.branch_name=r.branch WHERE r.session_id=? AND r.pr_number=? AND w.state IN ('active','delivering')")
+                    .bind(&self.session_id).bind(*number).fetch_one(&self.db).await.unwrap_or(0) > 0,
+                // `git push origin HEAD` names no branch: it is this session's own
+                // branch only while the registered workspace is on a delivery
+                // branch and something of this session is actually being delivered.
+                super::trusted_git::OwnRemoteAction::PushBranch(branch) if branch == "HEAD" => sqlx::query_scalar::<_, i64>(
+                    "SELECT COUNT(*) FROM execution_workspaces w WHERE w.session_id=? AND w.state IN ('active','delivering') AND lower(w.branch_name) NOT IN ('main','master') AND EXISTS(SELECT 1 FROM thin_delivery_refs r WHERE r.session_id=w.session_id)")
+                    .bind(&self.session_id).fetch_one(&self.db).await.unwrap_or(0) > 0,
+                super::trusted_git::OwnRemoteAction::PushBranch(branch) => self.registered_delivery_branch(branch).await,
+                // M208 §8 closeout: deleting a remote ref is only a closeout step
+                // once this session's own PR is proven merged.
+                super::trusted_git::OwnRemoteAction::DeleteBranch(branch) => sqlx::query_scalar::<_, i64>(
+                    "SELECT COUNT(*) FROM thin_delivery_refs r JOIN execution_workspaces w ON w.session_id=r.session_id AND w.branch_name=r.branch AND w.state IN ('active','delivering') JOIN thin_external_observations o ON o.session_id=r.session_id AND o.pr_number=r.pr_number WHERE r.session_id=? AND r.branch=? AND o.merged_at IS NOT NULL")
+                    .bind(&self.session_id).bind(branch).fetch_one(&self.db).await.unwrap_or(0) > 0,
+            };
+            if !owned { return false; }
+        }
+        true
+    }
+
+    async fn registered_delivery_branch(&self, branch: &str) -> bool {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM execution_workspaces w WHERE w.session_id=? AND w.state IN ('active','delivering') AND (w.branch_name=? OR EXISTS(SELECT 1 FROM thin_delivery_refs r WHERE r.session_id=w.session_id AND r.branch=?))")
+            .bind(&self.session_id).bind(branch).bind(branch).fetch_one(&self.db).await.unwrap_or(0) > 0
     }
 
     /// M215: a prover that knows *why* it refused supplies that reason (the
@@ -1660,5 +1707,101 @@ mod tests {
         let screenshot =
             authorize_with_response(gateway, "screenshot-still-asks", "screenshot", false).await;
         assert_denied_for(screenshot, PermissionDenialReason::DeniedByUser);
+    }
+
+    /// M208: a delivery-authorized trusted session owns the remote writes that
+    /// belong to its own PR and its own registered branch — and nothing else.
+    #[tokio::test]
+    async fn m208_own_remote_writes_need_only_delivery_authority() {
+        const OWNED: &[&str] = &[
+            "gh pr edit 929 --add-label 'merge-queue: armed'",
+            "gh pr view 933 --json state,mergeable,statusCheckRollup; gh pr edit 933 --remove-label 'merge-queue: blocked' --add-label 'merge-queue: armed'; gh pr comment 933 --body 'CI 全绿，已打 merge-queue: armed'",
+            "gh pr ready 929",
+            "gh pr edit 929 --title 'fix: own PR' --body 'plain body'",
+            "git push origin HEAD",
+            "git push -u origin codefactory/objective-m208",
+        ];
+        const NOT_OWNED: &[&str] = &[
+            "gh pr edit 778 --add-label 'merge-queue: armed'",
+            "gh pr edit 778 --add-label 'merge-queue: armed'; gh pr edit 929 --add-label 'merge-queue: armed'",
+            "gh pr edit 929 --add-label 'merge-queue: armed'; gh auth token",
+            "gh pr merge 929 --squash",
+            "git push --force origin HEAD",
+            "git push origin main",
+            "git push origin codefactory/objective-someone-else",
+            "git push origin --delete codefactory/objective-someone-else",
+        ];
+
+        // M208 fixture: one session-owned workspace whose delivery record names
+        // the PR the session itself opened, and the proven-merged observation.
+        let gateway = test_gateway("trusted").await;
+        sqlx::raw_sql(
+            "ALTER TABLE sessions ADD COLUMN delivery_authorized INTEGER NOT NULL DEFAULT 0;
+             CREATE TABLE execution_workspaces(id TEXT PRIMARY KEY, session_id TEXT NOT NULL,
+               objective_id TEXT NOT NULL, worktree_path TEXT NOT NULL,
+               branch_name TEXT NOT NULL, state TEXT NOT NULL);
+             CREATE TABLE thin_delivery_refs(session_id TEXT NOT NULL, branch TEXT NOT NULL,
+               pr_number INTEGER NOT NULL, ceiling TEXT NOT NULL);
+             CREATE TABLE thin_external_observations(session_id TEXT PRIMARY KEY,
+               pr_number INTEGER NOT NULL, merged_at INTEGER);
+             CREATE TABLE permission_intents(prompt_key TEXT PRIMARY KEY);
+             INSERT INTO execution_workspaces VALUES ('m208-workspace','permission-test',
+               'm208-objective','/tmp/m208-worktree','codefactory/objective-m208','active');
+             INSERT INTO thin_delivery_refs VALUES ('permission-test',
+               'codefactory/objective-m208',929,'through_merge');
+             INSERT INTO thin_delivery_refs VALUES ('permission-test',
+               'codefactory/objective-m208',933,'through_merge');
+             INSERT INTO thin_external_observations VALUES ('permission-test',929,NULL);",
+        )
+        .execute(&gateway.db)
+        .await
+        .unwrap();
+
+        // Without delivery authority every one of them still asks.
+        for command in OWNED {
+            assert!(
+                !gateway.own_remote_owned(command).await,
+                "unauthorized delivery must ask: {command}"
+            );
+        }
+
+        sqlx::query("UPDATE sessions SET delivery_authorized=1 WHERE id='permission-test'")
+            .execute(&gateway.db)
+            .await
+            .unwrap();
+
+        for command in OWNED {
+            assert!(gateway.own_remote_owned(command).await, "{command}");
+            let args = serde_json::json!({ "command": command });
+            let call = ToolCall {
+                id: "m208-owned".into(),
+                r#type: "function".into(),
+                function: FunctionCall { name: "bash".into(), arguments: args.to_string() },
+            };
+            assert_eq!(
+                gateway.authorize(&call, &args, Some(command)).await,
+                PermissionOutcome::Allow,
+                "{command}"
+            );
+        }
+        for command in NOT_OWNED {
+            assert!(!gateway.own_remote_owned(command).await, "{command}");
+        }
+
+        // §8 closeout: the session's own branch may be deleted remotely only
+        // after its PR is proven merged.
+        assert!(!gateway.own_remote_owned("git push origin --delete codefactory/objective-m208").await);
+        sqlx::query("UPDATE thin_external_observations SET merged_at=1 WHERE session_id='permission-test'")
+            .execute(&gateway.db)
+            .await
+            .unwrap();
+        assert!(gateway.own_remote_owned("git push origin --delete codefactory/objective-m208").await);
+
+        // Acceptance: owning the action means no permission_intents row at all.
+        let intents: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM permission_intents")
+            .fetch_one(&gateway.db)
+            .await
+            .unwrap();
+        assert_eq!(intents, 0, "an owned remote write must not create a prompt");
     }
 }
