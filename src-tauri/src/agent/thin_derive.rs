@@ -341,6 +341,14 @@ pub async fn reconcile_waiting_wake_sources(db: &SqlitePool) -> sqlx::Result<Wak
     reconcile_waiting_sources(db, false).await
 }
 
+/// M216/R3：纯本地 30 秒巡检，不触发 GitHub 查询，也不等待网络观测。
+pub(crate) async fn patrol_waiting_wake_sources(db: &SqlitePool) -> sqlx::Result<()> {
+    super::thin_state::ensure(db).await?;
+    let sessions: Vec<String> = sqlx::query_scalar("SELECT session_id FROM thin_session_state WHERE state='waiting_wake'").fetch_all(db).await?;
+    for session in sessions { repair_waiting_wake_source(db, &session).await?; }
+    Ok(())
+}
+
 async fn reconcile_waiting_sources(db: &SqlitePool, startup: bool) -> sqlx::Result<WakeReconcileReport> {
     if has_table(db, "thin_delivery_refs").await? {
         let legacy: Vec<String> = sqlx::query_scalar("SELECT session_id FROM thin_delivery_refs WHERE branch='pr-' || pr_number").fetch_all(db).await?;
@@ -409,10 +417,18 @@ async fn repair_waiting_wake_source(db: &SqlitePool, session: &str) -> sqlx::Res
         return Ok(());
     }
     let completed = completed_external(db, session).await?;
-    if completed.is_some() && derive_state(db, session).await?.state == SessionState::Ended { return Ok(()); }
+    if completed.as_deref().is_some_and(|reason| !is_external_failure(reason))
+        && derive_state(db, session).await?.state == SessionState::Ended { return Ok(()); }
     if let Some(reason) = completed {
         // R2：外部事项已完成 → 明确的收尾唤醒（幂等，重复补建不叠加）。
-        arm_durable_wake(db, session, "thin-closeout-source", &format!("{reason}。系统自动重试/自愈：核对持久事实并继续原任务；若 PR 已合并，执行任务模板 §8 收尾后给出最终回答，不重复交付。")).await?;
+        let repair = is_external_failure(&reason);
+        let prefix = if repair { "thin-repair-source" } else { "thin-closeout-source" };
+        let prompt = if repair {
+            format!("{reason}。系统自动重试/自愈：诊断失败检查及队列退回原因，修复后在同一分支重新交付并继续监视，不向用户询问是否继续。")
+        } else {
+            format!("{reason}。系统自动重试/自愈：核对持久事实并继续原任务；若 PR 已合并，执行任务模板 §8 收尾后给出最终回答，不重复交付。")
+        };
+        arm_durable_wake(db, session, prefix, &prompt).await?;
         audit_wait_guard(db, session, "closeout_wake", &what, 0).await;
         tracing::warn!(session, "waiting_wake source missing; durable automatic repair queued");
         return Ok(());
@@ -443,9 +459,9 @@ const MAX_SELF_CONTINUE: i64 = 2;
 async fn arm_durable_wake(db: &SqlitePool, session: &str, prefix: &str, prompt: &str) -> sqlx::Result<()> {
     let at = chrono::Utc::now().timestamp();
     let mut tx = crate::storage::db::begin_write(db).await?;
-    sqlx::query("INSERT INTO wakeup_schedules(id,session_id,prompt,source,next_at,status,created_at) SELECT ?,?,?,'agent_decided',?,'pending',? WHERE NOT EXISTS (SELECT 1 FROM wakeup_schedules WHERE session_id=? AND status='pending' AND id LIKE ?)")
+    sqlx::query("INSERT INTO wakeup_schedules(id,session_id,prompt,source,next_at,status,created_at) SELECT ?,?,?,'agent_decided',?,'pending',? WHERE NOT EXISTS (SELECT 1 FROM wakeup_schedules WHERE session_id=? AND status='pending')")
         .bind(format!("{prefix}-{session}-{}", uuid::Uuid::new_v4())).bind(session)
-        .bind(prompt).bind(at).bind(at).bind(session).bind(format!("{prefix}-%"))
+        .bind(prompt).bind(at).bind(at).bind(session)
         .execute(&mut *tx).await?;
     tx.commit().await?;
     Ok(())
@@ -1654,6 +1670,43 @@ mod tests {
 
     /// R1/R5：唤醒已经触发完、又没挂新唤醒的会话，不会永远停在 `waiting_wake`：
     /// 系统自己能推进的立即补一个真实来源（系统自动重试/自愈），不是问用户。
+    #[tokio::test]
+    async fn m216_cancelled_ci_and_blocked_are_reconciled_and_delivered() {
+        let db = fixture().await;
+        ensure_external(&db).await.unwrap();
+        super::super::background_tasks::ensure_wake_schema(&db).await.unwrap();
+        sqlx::query("INSERT INTO thin_delivery_refs VALUES ('derive','synthetic',42,'ThroughMerge')").execute(&db).await.unwrap();
+        let at = chrono::Utc::now().timestamp_millis();
+        sqlx::query("INSERT INTO thin_external_observations(session_id,pr_number,ceiling,observed_at,completed_reason,closeout_queued) VALUES ('derive',42,'ThroughMerge',?,'PR #42 被合并队列退回（merge-queue: blocked）',1)")
+            .bind(at).execute(&db).await.unwrap();
+        for (id, reason) in [("thin-repair-ci", "PR #42 检查失败：check-rust"), ("thin-repair-blocked", "PR #42 被合并队列退回（merge-queue: blocked）")] {
+            sqlx::query("INSERT INTO wakeup_schedules(id,session_id,prompt,source,next_at,status,created_at) VALUES (?,'derive',?,'agent_decided',1,'cancelled',1)")
+                .bind(id).bind(reason).execute(&db).await.unwrap();
+        }
+        m197_wait("derive", &db, "PR #42 修复").await;
+        super::super::workspace_recovery_budget::ensure(&db).await.unwrap();
+        sqlx::query("INSERT INTO workspace_recovery_budget(session_id,attempts,next_at,last_error) VALUES ('derive',3,0,'唤醒投递失败；系统自动重试/自愈')").execute(&db).await.unwrap();
+        patrol_waiting_wake_sources(&db).await.unwrap();
+        patrol_waiting_wake_sources(&db).await.unwrap();
+        let pending: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM wakeup_schedules WHERE status='pending'").fetch_one(&db).await.unwrap();
+        assert_eq!(pending, 1, "cancelled receipts and a consumed subscription cannot cover waiting_wake");
+        let audit: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM session_audit_events WHERE session_id='derive' AND kind='thin_wait_guard'").fetch_one(&db).await.unwrap();
+        assert!(audit > 0, "automatic repair must be auditable");
+        struct Repair;
+        impl super::super::background_tasks::WakeSink for Repair {
+            fn enqueue(&self, _: String, text: String) -> super::super::background_tasks::WakeFuture {
+                assert!(text.contains("修复") && text.contains("blocked"));
+                assert!(!text.contains("现在执行任务模板 §8 收尾"));
+                Box::pin(async { true })
+            }
+        }
+        assert_eq!(super::super::background_tasks::drain_due_wakeups_at(&db, &Repair, at / 1000 + 120).await, 1);
+        let fires: i64 = sqlx::query_scalar("SELECT SUM(fire_count) FROM wakeup_schedules WHERE status='done'").fetch_one(&db).await.unwrap();
+        assert_eq!(fires, 1);
+        let messages: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages WHERE session_id='derive'").fetch_one(&db).await.unwrap();
+        assert_eq!(messages, 0, "local patrol must not write internal messages into chat");
+    }
+
     #[tokio::test]
     async fn m209_reopened_repair_uses_fresh_identity() {
         let db = fixture().await;

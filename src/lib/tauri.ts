@@ -725,6 +725,17 @@ export interface SubscriptionQuotaStatus {
   five_hour_resets_at_ms?: number | null;
   weekly_resets_at_ms?: number | null;
   /** True while CodeFactory is handing this endpoint's turns to the next one. */
+  daily_spend?: {
+    endpoint: string;
+    spent_cny: number;
+    cap_cny: number;
+    remaining_cny: number;
+    source: "balance" | "estimated";
+    balance_cny: number | null;
+    low_balance: boolean | null;
+    reset_at_ms: number | null;
+    cap_reached: boolean;
+  };
   over_cap: boolean;
 }
 

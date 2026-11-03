@@ -1191,15 +1191,33 @@ pub async fn cancel_wakeup(
     if !wakeup.is_pending() {
         return Ok(wakeup);
     }
+    let mut tx = crate::storage::db::begin_write(pool).await.map_err(|error| error.to_string())?;
     sqlx::query("UPDATE wakeup_schedules SET status = 'cancelled' WHERE id = ? AND status = 'pending'")
-        .bind(id)
-        .execute(pool)
-        .await
-        .map_err(|error| error.to_string())?;
+        .bind(id).execute(&mut *tx).await.map_err(|error| error.to_string())?;
+    preserve_cancelled_wait(&mut tx, session_id).await.map_err(|error| error.to_string())?;
+    tx.commit().await.map_err(|error| error.to_string())?;
     tracing::info!(wakeup = %id, session = %session_id, "wakeup cancelled");
     get_wakeup(pool, id)
         .await?
         .ok_or_else(|| format!("定时唤醒 {id} 在取消后消失。"))
+}
+
+/// M216/R2：取消与等待投影保护共用同一写事务；历史/极简库没有投影时不改语义。
+async fn preserve_cancelled_wait(tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>, session: &str) -> sqlx::Result<()> {
+    let exists: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='thin_session_state'").fetch_one(&mut **tx).await?;
+    if exists == 0 { return Ok(()); }
+    let waiting: Option<String> = sqlx::query_scalar("SELECT waiting_for FROM thin_session_state WHERE session_id=? AND state='waiting_wake'")
+        .bind(session).fetch_optional(&mut **tx).await?.flatten();
+    let Some(what) = waiting else { return Ok(()); };
+    let pending: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM wakeup_schedules WHERE session_id=? AND status='pending'").bind(session).fetch_one(&mut **tx).await?;
+    if pending > 0 { return Ok(()); }
+    let id = format!("thin-source-repair-{}", uuid::Uuid::new_v4());
+    sqlx::query("INSERT INTO wakeup_schedules(id,session_id,prompt,source,next_at,status,created_at) VALUES (?,?,?,'agent_decided',?,'pending',?)")
+        .bind(&id).bind(session).bind(format!("系统自动重试/自愈：继续处理{what}，核对当前事实并接续原任务。"))
+        .bind(now_secs()).bind(now_secs()).execute(&mut **tx).await?;
+    sqlx::query("UPDATE thin_session_state SET wake_source=?,updated_at=? WHERE session_id=? AND state='waiting_wake'")
+        .bind(format!("pending wakeup：{id}")).bind(now_secs()*1000).bind(session).execute(&mut **tx).await?;
+    Ok(())
 }
 
 /// R2：会话停止/结案时取消其全部待触发唤醒（与后台任务回收同一入口）。
@@ -1207,13 +1225,19 @@ pub async fn cancel_session_wakeups(pool: &SqlitePool, session_id: &str) -> usiz
     if ensure_wakeup_schema(pool).await.is_err() {
         return 0;
     }
-    let result = sqlx::query(
-        "UPDATE wakeup_schedules SET status = 'cancelled'
-          WHERE session_id = ? AND status = 'pending'",
-    )
-    .bind(session_id)
-    .execute(pool)
-    .await;
+    let result = async {
+        let mut tx = crate::storage::db::begin_write(pool).await?;
+        let done = sqlx::query("UPDATE wakeup_schedules SET status='cancelled' WHERE session_id=? AND status='pending'")
+            .bind(session_id).execute(&mut *tx).await?;
+        // 停止/回收是明确终态；不能留下等一个已被取消的来源。
+        let exists: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='thin_session_state'").fetch_one(&mut *tx).await?;
+        if exists > 0 {
+            sqlx::query("UPDATE thin_session_state SET state='ended',reason='cancelled：会话已停止，待触发唤醒已回收',waiting_for=NULL,wake_source=NULL,question=NULL,updated_at=? WHERE session_id=? AND state='waiting_wake'")
+                .bind(now_secs()*1000).bind(session_id).execute(&mut *tx).await?;
+        }
+        tx.commit().await?;
+        Ok::<_, sqlx::Error>(done)
+    }.await;
     match result {
         Ok(done) => {
             let cancelled = done.rows_affected() as usize;
@@ -1309,6 +1333,12 @@ pub async fn drain_due_wakeups_at(pool: &SqlitePool, sink: &dyn WakeSink, now: i
     let mut pending = FuturesUnordered::new();
     for (session, wakes) in sessions {
         pending.push(async move {
+            // M216：旧版本把准入失败记到了工作区预算，迁移时仅清除这类未结算技术记录。
+            if let Err(error) = sqlx::query("DELETE FROM workspace_recovery_budget WHERE session_id=? AND settled_reason IS NULL AND last_error='唤醒投递失败；系统自动重试/自愈'")
+                .bind(&session).execute(pool).await {
+                // 表尚未建立时由下面的 due 建立；其他错误同样留待下轮重试。
+                tracing::debug!(%error, session, "legacy admission budget repair deferred");
+            }
             match super::workspace_recovery_budget::due(pool, &session, now).await {
                 Ok(true) => {},
                 Ok(false) => {
@@ -1332,6 +1362,12 @@ pub async fn drain_due_wakeups_at(pool: &SqlitePool, sink: &dyn WakeSink, now: i
                     return 0;
                 }
             }
+            // M216：准入失败属于传输重试，不是工作区恢复失败，不能耗尽/取消修复计划。
+            let delivery_key = format!("wake-delivery:{session}");
+            if super::workspace_recovery_budget::ensure(pool).await.is_err() { return 0; }
+            let retry_at: Result<Option<i64>, _> = sqlx::query_scalar("SELECT next_at FROM workspace_recovery_budget WHERE session_id=?")
+                .bind(&delivery_key).fetch_optional(pool).await;
+            match retry_at { Ok(Some(at)) if at > now => return 0, Err(_) => return 0, _ => {} }
             let due = wakes.iter().map(|wake| wake.next_at).min().unwrap_or(now);
             if now.saturating_sub(due) > 120 {
                 tracing::warn!(session, pending_seconds = now.saturating_sub(due), "wake overdue over two minutes; automatic retry");
@@ -1342,13 +1378,10 @@ pub async fn drain_due_wakeups_at(pool: &SqlitePool, sink: &dyn WakeSink, now: i
                 wakeup_text(wake, wake.fire_count + 1, now.saturating_sub(wake.next_at) >= wake.every_sec.unwrap_or(1).max(1) as i64)
             }).collect::<Vec<_>>().join("\n\n");
             if !deliver_wake(sink, session.clone(), text, due).await {
-                let _ = super::workspace_recovery_budget::fail(pool, &format!("wake-delivery:{session}"), now, "唤醒准入失败；系统自动重试/自愈").await;
-                let attempts = super::workspace_recovery_budget::fail(pool, &session, now, "唤醒投递失败；系统自动重试/自愈").await.unwrap_or(0);
-                if attempts >= 3 {
-                    if let Err(error) = reject_exhausted_wakes(pool, &session, &wakes, now).await {
-                        tracing::warn!(%error, session, "wake rejection persistence failed; system automatic recovery next tick");
-                    }
-                }
+                // 每分钟至多一次准入失败；持续 pending，不以技术失败把任务终态化。
+                let result = sqlx::query("INSERT INTO workspace_recovery_budget(session_id,attempts,next_at,last_error) VALUES (?,1,?,'唤醒准入失败；系统自动重试/自愈') ON CONFLICT(session_id) DO UPDATE SET attempts=attempts+1,next_at=excluded.next_at,last_error=excluded.last_error")
+                    .bind(&delivery_key).bind(now + 60).execute(pool).await;
+                if let Err(error) = result { tracing::warn!(%error, session, "wake retry persistence failed; automatic retry next tick"); }
                 return 0;
             }
             let _ = super::workspace_recovery_budget::clear(pool, &session).await;
@@ -1449,7 +1482,7 @@ pub async fn wake_source_cover(pool: &SqlitePool, session_id: &str) -> WakeSourc
     };
     let external_observations: i64 = if ensure_external_table(pool).await.is_ok() {
         sqlx::query_scalar(
-            "SELECT COUNT(*) FROM thin_external_observations WHERE session_id = ? AND (completed_reason IS NULL OR (completed_reason NOT LIKE '%已合并%' AND completed_reason NOT LIKE '%已关闭但未合并%'))",
+            "SELECT COUNT(*) FROM thin_external_observations WHERE session_id = ? AND completed_reason IS NULL",
         )
         .bind(session_id)
         .fetch_one(pool)
@@ -1525,6 +1558,15 @@ pub fn start_runtime(app: tauri::AppHandle) {
             }
         });
         let sink = ChatWakeSink { app: app.clone() };
+        let patrol_pool = pool.clone();
+        tauri::async_runtime::spawn(async move {
+            loop {
+                if let Err(error) = crate::agent::thin_derive::patrol_waiting_wake_sources(&patrol_pool).await {
+                    tracing::warn!(%error, "local wake patrol failed; automatic retry next tick");
+                }
+                tokio::time::sleep(Duration::from_secs(30)).await;
+            }
+        });
         let guard_pool = pool.clone();
         tauri::async_runtime::spawn(async move {
             loop {
@@ -2411,6 +2453,73 @@ mod tests {
         assert_eq!(drain_pending_wakes(&reopened, sink(&Arc::new(Recorder::default()))).await, 0);
         reopened.close().await;
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn m216_triggered_pr_subscription_is_not_a_wake_source() {
+        let pool = memory_pool().await;
+        sqlx::query("CREATE TABLE thin_external_observations(session_id TEXT PRIMARY KEY,completed_reason TEXT)").execute(&pool).await.unwrap();
+        for reason in [Some("PR #42 检查失败：check-rust"), Some("PR #42 被合并队列退回（merge-queue: blocked）"), Some("PR #42 检查已全绿"), Some("PR #42 已合并"), None] {
+            sqlx::query("INSERT OR REPLACE INTO thin_external_observations VALUES ('fixture',?)").bind(reason).execute(&pool).await.unwrap();
+            assert_eq!(wake_source_cover(&pool, "fixture").await.is_covered(), reason.is_none(), "triggered observation: {reason:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn m216_cancelling_last_wake_preserves_wait_atomically() {
+        let pool = memory_pool().await;
+        super::super::thin_state::ensure(&pool).await.unwrap();
+        super::super::thin_state::save(&pool, "fixture", &super::super::thin_state::after_final(
+            super::super::thin_state::WaitNeed::External { what: "PR #42 修复".into(), covered: true }, "")).await.unwrap();
+        let wake = schedule_wakeup_at(&pool, wakeup_request("fixture", "PR #42 检查失败", Some(60)), 100).await.unwrap();
+        cancel_wakeup(&pool, "fixture", &wake.id).await.unwrap();
+        assert!(wake_source_cover(&pool, "fixture").await.is_covered(), "cancellation must commit a replacement with waiting state");
+        let recorder = Arc::new(Recorder::default());
+        assert_eq!(drain_due_wakeups_at(&pool, sink(&recorder), now_secs() + 120).await, 1);
+        assert_eq!(recorder.take().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn m216_stopping_wait_cancels_without_replacement() {
+        let pool = memory_pool().await;
+        super::super::thin_state::ensure(&pool).await.unwrap();
+        super::super::thin_state::save(&pool, "fixture", &super::super::thin_state::after_final(
+            super::super::thin_state::WaitNeed::External { what: "PR #42 修复".into(), covered: true }, "")).await.unwrap();
+        schedule_wakeup_at(&pool, wakeup_request("fixture", "PR #42 检查失败", Some(60)), 100).await.unwrap();
+        assert_eq!(cancel_session_wakeups(&pool, "fixture").await, 1);
+        assert_eq!(super::super::thin_state::load(&pool, "fixture").await.unwrap().unwrap().state, super::super::thin_state::SessionState::Ended);
+        assert!(!wake_source_cover(&pool, "fixture").await.is_covered());
+        let recorder = Arc::new(Recorder::default());
+        assert_eq!(drain_due_wakeups_at(&pool, sink(&recorder), now_secs() + 120).await, 0);
+        assert!(recorder.take().is_empty());
+    }
+
+    #[tokio::test]
+    async fn m216_ci_then_blocked_survives_delivery_failures() {
+        let pool = crate::storage::db::connect("sqlite::memory:").await.unwrap();
+        ensure_schema(&pool).await.unwrap();
+        super::super::workspace_recovery_budget::ensure(&pool).await.unwrap();
+        sqlx::query("INSERT INTO sessions(id,title,cwd,model_id,created_at,updated_at,delivery_mode) VALUES ('fixture','fixture','/synthetic','model',1,1,'thin')").execute(&pool).await.unwrap();
+        // A previously answered task: M209's unanswered-user escape must not hide the defect.
+        for (id, prompt, at) in [("thin-repair-ci", "PR #42 检查失败：check-rust", 100), ("thin-repair-blocked", "PR #42 被合并队列退回（merge-queue: blocked）", 110)] {
+            sqlx::query("INSERT INTO wakeup_schedules(id,session_id,prompt,source,next_at,status,created_at) VALUES (?,'fixture',?,'agent_decided',?,'pending',1)")
+                .bind(id).bind(prompt).bind(at).execute(&pool).await.unwrap();
+        }
+        struct Busy;
+        impl WakeSink for Busy {
+            fn enqueue(&self, _: String, _: String) -> WakeFuture { Box::pin(async { false }) }
+        }
+        let at = now_secs();
+        for offset in [0, 30, 60] { assert_eq!(drain_due_wakeups_at(&pool, &Busy, at + offset).await, 0); }
+        let cancelled: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM wakeup_schedules WHERE status='cancelled'").fetch_one(&pool).await.unwrap();
+        assert_eq!(cancelled, 0, "technical admission failures must not cancel repair wakes");
+        let recorder = Arc::new(Recorder::default());
+        assert_eq!(drain_due_wakeups_at(&pool, sink(&recorder), at + 120).await, 1);
+        let calls = recorder.take();
+        assert_eq!(calls.len(), 1);
+        assert!(calls[0].1.contains("check-rust") && calls[0].1.contains("merge-queue: blocked"));
+        let fired: i64 = sqlx::query_scalar("SELECT SUM(fire_count) FROM wakeup_schedules WHERE status='done'").fetch_one(&pool).await.unwrap();
+        assert_eq!(fired, 2);
     }
 
     #[tokio::test]

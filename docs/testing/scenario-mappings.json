@@ -11,6 +11,12 @@
     { "pattern": "scripts/verify-extension-bridge.mjs", "scenario_id": "RTE-002" },
     { "pattern": "src-tauri/src/agent/thin_derive.rs", "scenario_id": "HLT-004" },
     { "pattern": "src-tauri/src/agent/background_tasks.rs", "scenario_id": "HLT-004" },
-    { "pattern": "src-tauri/src/agent/thin_derive.rs", "scenario_id": "HLT-001" }
+    { "pattern": "src-tauri/src/agent/thin_derive.rs", "scenario_id": "HLT-001" },
+    { "pattern": "src-tauri/src/agent/daily_spend_live.rs", "scenario_id": "HLT-001" },
+    { "pattern": "src-tauri/src/commands/costs.rs", "scenario_id": "HLT-001" },
+    { "pattern": "src-tauri/src/commands/settings.rs", "scenario_id": "HLT-001" },
+    { "pattern": "src-tauri/src/commands/usage_acceptance_tests.rs", "scenario_id": "HLT-001" },
+    { "pattern": "src/components/SubscriptionQuotaSection.tsx", "scenario_id": "HLT-001" },
+    { "pattern": "src/lib/tauri.ts", "scenario_id": "HLT-001" }
   ]
 }

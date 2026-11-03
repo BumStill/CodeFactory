@@ -146,6 +146,7 @@ pub enum Request {
     GetUsageWindows {},
     SetUsageWindow { endpoint: String, #[serde(default)] model: Option<String>, rule: Option<crate::agent::usage_windows::UsageWindow> },
     GetQuota {},
+    UsageStatus {},
     /// CF-QUOTA-R2: partial per-endpoint cap update; no paid endpoint changes.
     SetQuotaCap {
         endpoint: String,
@@ -347,7 +348,7 @@ pub fn validate_request(request: &Request) -> Result<(), ErrorBody> {
             if let Some(model) = model { require_non_empty("model", model)?; }
             if let Some(rule) = rule { rule.validate().map_err(ErrorBody::invalid)?; }
         }
-        Request::CleanBuildCache {} | Request::GetQuota {} => {}
+        Request::CleanBuildCache {} | Request::GetQuota {} | Request::UsageStatus {} => {}
         Request::SetQuotaCap { endpoint, five_hour_percent, weekly_percent } => {
             require_non_empty("endpoint", endpoint)?;
             if five_hour_percent.is_none() && weekly_percent.is_none() {
@@ -478,7 +479,7 @@ impl AuditEntry {
             Request::SetUsageWindow { endpoint, model, rule } => {
                 entry.message = Some(format!("endpoint={endpoint}; model={}; rule={}", model.as_deref().unwrap_or("<endpoint>"), serde_json::to_string(rule).unwrap_or_default()));
             }
-            Request::GetQuota {} => {}
+            Request::GetQuota {} | Request::UsageStatus {} => {}
             Request::SetQuotaCap { endpoint, five_hour_percent, weekly_percent } => {
                 entry.message = Some(format!("endpoint={endpoint}; five_hour_percent={five_hour_percent:?}; weekly_percent={weekly_percent:?}"));
             }
@@ -510,6 +511,7 @@ pub fn operation_of(request: &Request) -> &'static str {
         Request::GetUsageWindows {} => "get_usage_windows",
         Request::SetUsageWindow { .. } => "set_usage_window",
         Request::GetQuota {} => "get_quota",
+        Request::UsageStatus {} => "usage_status",
         Request::SetQuotaCap { .. } => "set_quota_cap",
     }
 }

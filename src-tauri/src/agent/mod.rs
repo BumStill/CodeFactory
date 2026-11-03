@@ -44,6 +44,7 @@ pub mod persistence;
 pub(crate) mod provider_recovery;
 pub mod quota_cap;
 pub mod quota_live;
+pub mod daily_spend_live;
 pub mod usage_windows;
 pub mod scheduler;
 /// M151：会话级诊断与状态重置（存量会话卡「正在做 · 等待中」）。

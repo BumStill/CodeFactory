@@ -88,7 +88,7 @@ export function SubscriptionQuotaSection() {
         <p className="text-label text-gray-600">正在读取订阅用量…</p>
       ) : (
         <ul className="space-y-2">
-          {statuses.map((status) => {
+          {statuses.filter((status) => !status.daily_spend).map((status) => {
             const fiveHourHint = resetClockHint(status.five_hour_resets_at_ms);
             const weeklyHint = resetClockHint(status.weekly_resets_at_ms);
             return (

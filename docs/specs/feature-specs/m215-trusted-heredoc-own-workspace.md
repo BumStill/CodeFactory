@@ -34,6 +34,14 @@ Release-Urgency: default
   因此 Git 证明器在分词前剥离该前缀；其它命令替换（`$(...)`、反引号）继续 fail closed。
   heredoc 头部同样接受 `cd <本工作区根> &&` 与 `cd "$(pwd)" &&`，目标必须是登记根。
 
+- **R5 heredoc 前面的只读命令链不再导致拒绝**：`cd <本工作区> && grep -rl X . | head; echo ===;
+  python3 - <<'PY'` 这种「先跑几段只读命令、最后才是 heredoc」的写法，头部按顶层分隔符
+  （`;`、`|`、`&&`、换行，引号内不切分）拆段，除最后一段外每段都必须是只读命令
+  （`grep`/`head`/`echo`/`wc`/`cat` 等）、只读 Git，或落回本工作区的 `cd`；任何写操作
+  （重定向、`rm`、`git reset`、`sed -i`）或 `cd` 到工作区外仍然整体不可证明。
+  这条来自 11-03 的现场样本：`cd <本工作区> && grep -rl X . | head; echo ===; python3 - <<'PY'`
+  被报 `trusted.heredoc.unproved`，理由「不接受的解释器入口」。
+
 ## 验收
 
 - `src-tauri/tests/m198_trusted_heredoc.rs`（生产解析器直连）：
@@ -41,6 +49,11 @@ Release-Urgency: default
   `m215_unproved_heredoc_names_the_line_and_stays_closed`（7 种越界/外部能力 + 3 种越界 cd
   全部 `Err`，且错误文本含 `行无法证明`）、
   `m215_registered_workspace_merge_started_with_pwd_cd_is_proved`。
+- `src-tauri/src/agent/trusted_git.rs`：`m215_trusted_heredoc_and_read_only_git` 单元模块
+  覆盖 R1/R2/R3/R5——`field_shapes_are_proved`（现场 5 种形状）、`boundaries_still_ask`
+  （越界/越权 6 种仍拒绝）、`read_only_git_needs_no_approval_but_writes_still_do`
+  （只读 Git 放行、写操作仍敏感）、`read_only_prefix_before_heredoc_is_proved`
+  （只读命令链 + heredoc 放行；`rm`/`git reset`/越界 `cd` 仍拒绝）。
 - `src-tauri/src/agent/permission_gateway.rs`：M198 真实执行测试追加 M215 形状，断言
   `PermissionOutcome::Allow`。
 - 既有 M198/R2 拦截用例（`import os`、`../outside`、未闭合 heredoc、heredoc 之后仍有 shell）
@@ -53,6 +66,10 @@ Release-Urgency: default
 
 ## 证据
 
-- `cargo test --test m198_trusted_heredoc`：28 passed（含 25 条既有 M198/trusted 用例）。
-- `cargo test --lib m198`：M198 真实解释器执行用例（含新增 M215 断言）。
+- `cargo test --test m198_trusted_heredoc`：36 passed（含 25 条既有 M198/trusted 用例）。
+- `cargo test --lib m215`：M215 真实解释器执行用例（含新增 M215 断言）4 passed。
+- `cargo test --test m159_trusted_git --test m177_trusted_local_git --test m180_readonly_still_prompts
+  --test m182_trusted_git_denylist --test m207_trusted_git_composition`：全部 ok（33/32/30/33/30）。
 - 直接运行 `trusted_python_ast.py`：6 条放行样例 exit 0，7 条拦截样例 exit 1 且带行号。
+- `sensitive()` 不带工作区根（单元层）时同样成立：`cd "$(pwd)"` 前缀按"就是当前目录"放行，
+  因此 `m198_quoted_python_is_not_shell_syntax` 无需根也能证明，不再退化成 `trusted.heredoc.unproved`。
