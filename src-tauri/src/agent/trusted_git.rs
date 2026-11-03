@@ -46,7 +46,16 @@ pub(super) fn python_heredoc_proof(root: Option<&Path>, command: &str) -> Result
     // spaces, backslash escapes, macOS `/private` aliasing) and accept it when
     // it lands *inside* this workspace, not only on the workspace root.
     let (effective, header) = heredoc_header_prefix(header.trim(), root)?;
-    let Some((runner, delimiter)) = header.split_once(" <<") else { return Err("缺少 `<<` heredoc 起始符".into()); };
+    let base = effective.as_deref().or(root);
+    // M215 R1: read-only commands may run before the heredoc (`grep … | head;
+    // echo ===; python3 - <<'PY'`). Each earlier segment must be read-only —
+    // otherwise the whole command stays unproved. `2>&1` is a redirection, not a
+    // command separator, so it is folded away before splitting.
+    let header = header.replace("2>&1", " ").replace("2>&2", " ").replace(">&1", " ").replace(">&2", " ");
+    let mut segments = split_top_level(&header, &[';', '|', '&', '\n']);
+    let Some(heredoc_segment) = segments.pop() else { return Err("缺少 heredoc 命令".into()); };
+    for segment in segments { prefix_segment_is_read_only(base, segment)?; }
+    let Some((runner, delimiter)) = heredoc_segment.split_once(" <<") else { return Err("缺少 `<<` heredoc 起始符".into()); };
     let runner = runner.trim();
     let Some(delimiter) = delimiter.trim().strip_prefix('\'').and_then(|s| s.strip_suffix('\'')) else {
         return Err("heredoc 分隔符必须用单引号关闭展开".into());
@@ -70,7 +79,6 @@ pub(super) fn python_heredoc_proof(root: Option<&Path>, command: &str) -> Result
     // M215 R2: a body naming no outside path, no network, no subprocess and no
     // delete call is workspace-contained. A `cat` body is data written into this
     // workspace, so only the paths it mentions are judged.
-    let base = effective.as_deref().or(root);
     if let Some(result) = cat_heredoc_runner(base, runner) {
         result?;
         if let Some(base) = base { heredoc_body_contained(base, &body, true)?; }
@@ -293,6 +301,87 @@ fn heredoc_body_contained(base: &Path, body: &str, data_only: bool) -> Result<()
         }
     }
     Ok(())
+}
+
+/// M215 R1: split a header on top-level `;`/`|`/`&`/newline. Quotes keep their
+/// content together, so a separator inside `'PY'` or `"a;b"` does not split.
+fn split_top_level<'a>(input: &'a str, separators: &[char]) -> Vec<&'a str> {
+    let mut parts = Vec::new();
+    let mut quote: Option<char> = None;
+    let mut start = 0usize;
+    for (offset, ch) in input.char_indices() {
+        if let Some(opening) = quote {
+            if ch == opening { quote = None; }
+            continue;
+        }
+        if ch == '\'' || ch == '"' { quote = Some(ch); continue; }
+        if separators.contains(&ch) {
+            let part = input[start..offset].trim();
+            if !part.is_empty() { parts.push(part); }
+            start = offset + ch.len_utf8();
+        }
+    }
+    let tail = input[start..].trim();
+    if !tail.is_empty() { parts.push(tail); }
+    parts
+}
+
+/// Commands that may run before a heredoc without changing the proof: they only
+/// read. Anything else keeps the whole command unproved.
+const READ_ONLY_PREFIX: &[&str] = &[
+    "echo", "printf", "pwd", "ls", "cat", "head", "tail", "wc", "grep", "egrep", "fgrep",
+    "sed", "cut", "sort", "uniq", "tr", "nl", "basename", "dirname", "realpath", "stat",
+    "file", "du", "df", "date", "diff", "comm", "test", "[", "true", "false", "column", "jq",
+];
+
+/// M215 R1: one command placed before the heredoc. It may read files, query Git
+/// or re-enter this workspace; anything that writes, deletes or leaves the
+/// workspace keeps the approval gate.
+fn prefix_segment_is_read_only(base: Option<&Path>, segment: &str) -> Result<(), String> {
+    let words: Vec<&str> = segment.split_whitespace().collect();
+    let mut index = 0;
+    while index < words.len() {
+        let (name, _) = words[index].split_once('=').unwrap_or((words[index], ""));
+        if words[index].contains('=') && !name.is_empty()
+            && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        {
+            index += 1;
+        } else {
+            break;
+        }
+    }
+    let Some(binary) = words.get(index) else { return Ok(()) };
+    let name = binary
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(binary)
+        .trim_end_matches(".exe")
+        .to_ascii_lowercase();
+    let args = &words[index + 1..];
+    if args.iter().any(|arg| arg.starts_with('>')) {
+        return Err(format!("heredoc 之前的命令带有输出重定向：{segment}"));
+    }
+    if name == "cd" {
+        let Some(target) = args.first() else { return Err(format!("heredoc 之前的 cd 没有目标：{segment}")); };
+        let inside = match base {
+            Some(base) => physical(base, target).is_some_and(|resolved| within(base, &resolved)),
+            None => matches!(*target, "$(pwd)" | "${PWD}" | "$PWD" | "`pwd`"),
+        };
+        return inside.then_some(()).ok_or_else(|| format!("heredoc 之前的 cd 目标不可证明：{segment}"));
+    }
+    if name == "git" {
+        let subcommand = args.iter().position(|arg| !arg.starts_with('-'));
+        let read_only = subcommand.is_some_and(|at| {
+            let rest: Vec<String> = args[at + 1..].iter().map(|arg| arg.to_string()).collect();
+            read_only_git_verb(&args[at].to_ascii_lowercase(), &rest)
+        });
+        return read_only.then_some(()).ok_or_else(|| format!("heredoc 之前的 Git 不是只读：{segment}"));
+    }
+    if name == "sed" && args.iter().any(|arg| arg.starts_with("-i") || arg.starts_with("--in-place")) {
+        return Err(format!("heredoc 之前的 sed 会写文件：{segment}"));
+    }
+    if READ_ONLY_PREFIX.contains(&name.as_str()) { return Ok(()); }
+    Err(format!("heredoc 之前不是只读命令：{segment}"))
 }
 
 /// Path-looking words of a body. Quotes and shell punctuation are separators,
@@ -1594,6 +1683,33 @@ mod m215_trusted_heredoc_and_read_only_git {
             "python3 - <<'PY'\nopen('/Users/leo/.ssh/id_rsa').read()\nPY".to_string(),
             "python3 - <<'PY'\nimport subprocess\nsubprocess.run(['git', 'push'])\nPY".to_string(),
             "python3 - <<'PY'\nopen('../outside.txt', 'w').write('bad')\nPY".to_string(),
+        ] {
+            assert!(python_heredoc_proof(Some(&root), &shape).is_err(), "{shape}");
+        }
+    }
+
+    /// R1/R2: read-only commands may run before the heredoc; the proof judges
+    /// the prefix with the same "read-only only" rule and then the body.
+    #[test]
+    fn read_only_prefix_before_heredoc_is_proved() {
+        let (_temp, root) = workspace();
+        let shapes = [
+            format!(
+                "cd {} && grep -rl trusted . | head; echo ===; python3 - <<'PY'\nimport json\nprint(json.load(open('state/session.json')))\nPY",
+                root.display()
+            ),
+            "grep -rl trusted . | head; echo ===; python3 - <<'PY'\nprint('ok')\nPY".to_string(),
+            "echo start; wc -l src-tauri/Cargo.toml; cat src-tauri/Cargo.toml | head -1; cat >> src-tauri/src/agent/trusted_git.rs <<'EOF'\n// appended after read-only commands\nEOF".to_string(),
+            "ls -1 | head -3 && git status --short; python3 - <<'PY'\nprint('ok')\nPY".to_string(),
+            "git log --oneline 2>&1 | head -3; python3 - <<'PY'\nprint('ok')\nPY".to_string(),
+        ];
+        for shape in shapes {
+            assert!(python_heredoc_proof(Some(&root), &shape).is_ok(), "{shape}\n{:?}", python_heredoc_proof(Some(&root), &shape));
+        }
+        for shape in [
+            "rm -rf src; python3 - <<'PY'\nprint('ok')\nPY".to_string(),
+            "git reset --hard HEAD~1; python3 - <<'PY'\nprint('ok')\nPY".to_string(),
+            "cd /etc && grep -rl root . | head; python3 - <<'PY'\nprint('ok')\nPY".to_string(),
         ] {
             assert!(python_heredoc_proof(Some(&root), &shape).is_err(), "{shape}");
         }
