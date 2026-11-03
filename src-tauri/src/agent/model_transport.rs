@@ -2073,6 +2073,9 @@ impl ModelTransport for RoutedDesktopModelTransport {
                         attempt.commit_response(&response).await?;
                     }
                     self.route_state.mark_current_success();
+                    if let Err(error) = super::usage_windows::model_wait::clear_transient_endpoint(&self.db, &self.session_id, &route.endpoint_name).await {
+                        tracing::warn!("transient retry reset failed: {error}");
+                    }
                     // CF-QUOTA-R1 (estimate path): charge this round's real
                     // tokens to the subscription endpoint's local estimate, the
                     // one used whenever the service gave us no usage reading.
