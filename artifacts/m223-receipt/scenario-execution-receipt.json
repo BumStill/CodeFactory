@@ -1,0 +1,348 @@
+{
+  "schema_version": 2,
+  "base_sha": "8a4964c71346cc3f66605b26a2c424bdcfa1bb9c",
+  "head_sha": "909413703f704f3e1093db933217ad2e018f4b0a",
+  "scenario_ids": [
+    "HLT-001",
+    "HLT-004",
+    "UI-005"
+  ],
+  "e2e_ids": [
+    "E2E-006"
+  ],
+  "targets": [
+    {
+      "target": "binary:--delivery-recovery-smoke",
+      "outcome": "passed",
+      "runner": "windows-latest",
+      "command_sha256": "f14b0f818b274d48fa75f15743d1a94614aef3c7af0abe751b93eab1e57d5674"
+    },
+    {
+      "target": "binary:--history-session-smoke",
+      "outcome": "passed",
+      "runner": "windows-latest",
+      "command_sha256": "d05a2c76162911436dabbde45ee66e95f6c08071056c5eae0d7c72c5f09ffd90"
+    },
+    {
+      "target": "binary:--unattended-long-task-smoke",
+      "outcome": "passed",
+      "runner": "windows-latest",
+      "command_sha256": "55f4ca54a0807b60386d52ff0f573ce4dd616d68e403e8ef4fc61720e9b57927"
+    },
+    {
+      "target": "pnpm:test:startup-session:headless",
+      "outcome": "passed",
+      "runner": "windows-latest",
+      "command_sha256": "a79b2ea906c6158f90bb3cf2a847652cd8b8cd0bc85e035855fbb0945f738ac4"
+    },
+    {
+      "target": "rust:a_user_stop_reaches_every_live_objective_the_session_still_owns",
+      "outcome": "passed",
+      "runner": "windows-latest",
+      "command_sha256": "81eea231a0d921efe4bd715c31f3ddfffc72f74504346bb180363453d5b24c57"
+    },
+    {
+      "target": "rust:command_failure_envelope_survives_file_sqlite_restart",
+      "outcome": "passed",
+      "runner": "windows-latest",
+      "command_sha256": "04cd62ffcfe1d04b785d2979073614fc080f4e6c312abb72ff5c40845b8532b3"
+    },
+    {
+      "target": "rust:corrected_skill_command_closes_requested_observable_without_repeat_probes",
+      "outcome": "passed",
+      "runner": "windows-latest",
+      "command_sha256": "6d41a55e579c9e640032da7173ead3209be4ab549dd95b71fce19da31a7e02ff"
+    },
+    {
+      "target": "rust:crash_left_session_stop_fences_claim_and_is_consumed_on_restart",
+      "outcome": "passed",
+      "runner": "windows-latest",
+      "command_sha256": "4186cb5059a6d1267bb63eb9b93cab6c26d864cba04604c48fa23b9410c95887"
+    },
+    {
+      "target": "rust:durable_cancel_prevents_restart_claim_before_runtime_flag_is_polled",
+      "outcome": "passed",
+      "runner": "windows-latest",
+      "command_sha256": "ee0e2d0b45a25dab2f2080b83139067754e1baa039468a17a197aed83b485eb9"
+    },
+    {
+      "target": "rust:live_executor_without_durable_registration_survives_three_ticks",
+      "outcome": "passed",
+      "runner": "windows-latest",
+      "command_sha256": "2b758d2dd8775a585ab92ba54907e78686d957d67736c8be74f6dfa2c9b15185"
+    },
+    {
+      "target": "rust:m164_hard_cap_matrix_and_deepseek_boundary",
+      "outcome": "passed",
+      "runner": "windows-latest",
+      "command_sha256": "4bdefbce42a2d745f3cfd5cf3d8e12622dcccf54c9386bc605294a5223ecf747"
+    },
+    {
+      "target": "rust:m164_model_wait_persists_exact_wake_across_restart",
+      "outcome": "passed",
+      "runner": "windows-latest",
+      "command_sha256": "f4be4cb9848fc60e3406c884caf5c241193b3b29b2658ed8863aeca106818a59"
+    },
+    {
+      "target": "rust:m178_midturn_exhaustion_uses_live_availability",
+      "outcome": "passed",
+      "runner": "windows-latest",
+      "command_sha256": "d6888b8b84409ed9614445a69da22b73a58077b700fabfc212b91a36e8fe906c"
+    },
+    {
+      "target": "rust:m178_route_construction_has_no_unreviewed_entry",
+      "outcome": "passed",
+      "runner": "windows-latest",
+      "command_sha256": "d4a339e0548980e346152778313208f35a7d7d526b6f7204ff47041aa1e0526f"
+    },
+    {
+      "target": "rust:m178_wait_has_reason_and_survives_real_process_restart",
+      "outcome": "passed",
+      "runner": "windows-latest",
+      "command_sha256": "894f65173a08a99491de78f61a54618b61df8945917a85560f5af5cce1bb48f9"
+    },
+    {
+      "target": "rust:m189_final_answer_survives_three_recovery_sweeps",
+      "outcome": "passed",
+      "runner": "windows-latest",
+      "command_sha256": "d988c462d6d0c7d96ed761ae94c5108ce6d703c909c36d7ca67ee006ce7d0947"
+    },
+    {
+      "target": "rust:m189_restart_claim_survives_real_process_restart",
+      "outcome": "passed",
+      "runner": "windows-latest",
+      "command_sha256": "452e73d9d5b085069e8ccfd5c26f0345be3a155eacced2b09fbea6788c784885"
+    },
+    {
+      "target": "rust:persisted_command_repair_envelope_forces_diagnosis_after_restart",
+      "outcome": "passed",
+      "runner": "windows-latest",
+      "command_sha256": "b1e230a7376ab889975798b0c4d36725d657ad17ba795cba0eb716969f0c8cf3"
+    },
+    {
+      "target": "rust:powershell_skill_location_and_executable_checks_are_timeout_diagnostics",
+      "outcome": "passed",
+      "runner": "windows-latest",
+      "command_sha256": "55d6630035648fc77f6ee5ff0d327c03f3b931f8cd7c869a96796cc2dd360179"
+    },
+    {
+      "target": "rust:previous_to_current_fixture_reconciles_once_with_historical_stuck_objective",
+      "outcome": "passed",
+      "runner": "windows-latest",
+      "command_sha256": "1cc661b5d37bbe0e2a037984cee83f2f68bc8ba361a63d0f08d1fa2e61439af7"
+    },
+    {
+      "target": "rust:recovery_never_reopens_ended_even_with_stale_unfinished_controls",
+      "outcome": "passed",
+      "runner": "windows-latest",
+      "command_sha256": "7801e627ad9ad137c0f37cdcb0c7b9680bcd30abda31966ada419e26d9da0d22"
+    },
+    {
+      "target": "rust:recovery_protects_fresh_session_even_when_startup_passes_zero_grace",
+      "outcome": "passed",
+      "runner": "windows-latest",
+      "command_sha256": "f94d44376fe3f291acca58eeee5dfa908e36bfec7c1585c5895f7c33a109971c"
+    },
+    {
+      "target": "rust:recovery_uses_latest_user_activity_not_an_old_control",
+      "outcome": "passed",
+      "runner": "windows-latest",
+      "command_sha256": "c9b9f86bf69782ce40d89ace6fac92d46d6a4ec41a16fe594c7e4a9c49761a9c"
+    },
+    {
+      "target": "rust:structured_tool_metadata_is_persisted_separately_from_result_text",
+      "outcome": "passed",
+      "runner": "windows-latest",
+      "command_sha256": "64a35d841247980c6b51440f5378456375b40bf07103f8ffa7336dfcca69693e"
+    },
+    {
+      "target": "rust:terminal_facts_invalidate_old_questions_and_background_work",
+      "outcome": "passed",
+      "runner": "windows-latest",
+      "command_sha256": "70a92e91146b6f901d301c11e3bdc62bc2de9fc6e4cb0f499667b8ee71e022e6"
+    },
+    {
+      "target": "rust:timed_out_skill_install_allows_two_complementary_windows_diagnostics_then_correction",
+      "outcome": "passed",
+      "runner": "windows-latest",
+      "command_sha256": "197d204b04fa8cc0883ac23661e374eb56b5d3c6d515a7f3fb3746a6a9532529"
+    },
+    {
+      "target": "rust:typed_command_failure_requires_diagnosis_then_changed_retry_in_same_turn",
+      "outcome": "passed",
+      "runner": "windows-latest",
+      "command_sha256": "74548554ce1dae5a88ed4b406573e8a9119cf08e1a39c9876d91551a7637045d"
+    },
+    {
+      "target": "rust:uncertain_running_projection_is_not_ended_or_retimestamped",
+      "outcome": "passed",
+      "runner": "windows-latest",
+      "command_sha256": "b6cb7eab4b8ecdf5b7a7465280748c3fce5affff3c52f7799cda96f2cacd6502"
+    },
+    {
+      "target": "workflow:Delivery recovery cross-process smoke",
+      "outcome": "passed",
+      "runner": "windows-latest",
+      "command_sha256": "f14b0f818b274d48fa75f15743d1a94614aef3c7af0abe751b93eab1e57d5674",
+      "alias_of": "binary:--delivery-recovery-smoke"
+    },
+    {
+      "target": "workflow:Unattended long-task cross-process smoke",
+      "outcome": "passed",
+      "runner": "windows-latest",
+      "command_sha256": "55f4ca54a0807b60386d52ff0f573ce4dd616d68e403e8ef4fc61720e9b57927",
+      "alias_of": "binary:--unattended-long-task-smoke"
+    }
+  ],
+  "cases": [
+    {
+      "case_id": "E2E-001",
+      "raw_observations": {
+        "artifact_verified": true,
+        "build_git_sha": "909413703f704f3e1093db933217ad2e018f4b0a",
+        "case_id": "E2E-001",
+        "claimable_remediation_count": 0,
+        "cleanup_attempted": true,
+        "cleanup_ok": true,
+        "descendant_process_count": 0,
+        "human_prompt_count": 0,
+        "leaked_resource_count": 0,
+        "live_owner_count": 0,
+        "objective_status": "completed",
+        "observation_schema_version": 1,
+        "ok": true,
+        "orphan_sweep_performed": true,
+        "phase_one_was_hard_killed": true,
+        "process_restart_observed": true,
+        "replacement_process_distinct": true,
+        "replay_call_link_count": 2,
+        "same_objective": true,
+        "scenario_id": "HLT-001",
+        "scenario_ids": [
+          "CXD-002",
+          "HLT-001",
+          "HLT-002"
+        ],
+        "side_effect_receipt_count": 1,
+        "supervisor_hard_kill_issued": true,
+        "user_message_count": 1,
+        "worker_reaped": true
+      },
+      "receipt": {
+        "schema_version": 2,
+        "case_id": "E2E-001",
+        "scenario_ids": [
+          "CXD-002",
+          "HLT-001",
+          "HLT-002"
+        ],
+        "stage": "pull_request",
+        "base_sha": "8a4964c71346cc3f66605b26a2c424bdcfa1bb9c",
+        "head_sha": "909413703f704f3e1093db933217ad2e018f4b0a",
+        "canonical_target": "binary:--unattended-long-task-smoke",
+        "run_id": "sha256:00a45fb979fe3e22d52fd4f2d3e50a896763665307870404fb972834a50f98ac",
+        "evidence_sha256": "8c79bf44c102df512bfd547a511f0252d5e1c0449b7cac0a8731c31fd97c7e12",
+        "implementation": {
+          "driver_sha256": "a659cae8e199d82a21cf7700980bf114fc0eed717cfe6c3e570ac86a9114fa6f",
+          "verifier_sha256": "d6285795d30cb6f869eb6b76af2c1b0f7dff7a5e586b85b77ade83e7523adb65"
+        },
+        "runner": {
+          "name": "windows-latest",
+          "os": "windows",
+          "arch": "x86_64"
+        },
+        "build_identity": {
+          "source_sha": "909413703f704f3e1093db933217ad2e018f4b0a",
+          "executable_build_sha": "909413703f704f3e1093db933217ad2e018f4b0a",
+          "executable_sha256": null,
+          "artifact_sha256": null,
+          "version": null,
+          "tag_sha": null
+        },
+        "fixture": {
+          "manifest": {
+            "schema_version": 1,
+            "synthetic": true,
+            "source_kind": "synthetic_fixture",
+            "seed": "e2e-001-v1",
+            "capabilities": [
+              {
+                "id": "git_fixture",
+                "schema_version": 1
+              },
+              {
+                "id": "isolated_app_data",
+                "schema_version": 1
+              },
+              {
+                "id": "scripted_provider",
+                "schema_version": 1
+              },
+              {
+                "id": "sqlite_fixture",
+                "schema_version": 1
+              }
+            ]
+          },
+          "manifest_sha256": "f1336d6ac0cd26774f0e06ae19173227ae1d61a2392396d17a046679f3e17efc"
+        },
+        "oracles": {
+          "ui": {
+            "outcome": "not_required_for_stage",
+            "reason": "headless_worker_has_no_webview",
+            "observations": []
+          },
+          "durable_state": {
+            "outcome": "passed",
+            "observations": [
+              "objective_identity_stable",
+              "single_user_message",
+              "zero_human_prompt",
+              "objective_completed"
+            ]
+          },
+          "process": {
+            "outcome": "passed",
+            "observations": [
+              "replacement_process_observed",
+              "supervisor_hard_kill_issued",
+              "worker_reaped",
+              "zero_descendants",
+              "no_live_owner",
+              "no_claimable_remediation"
+            ]
+          },
+          "side_effects": {
+            "outcome": "passed",
+            "observations": [
+              "single_durable_side_effect_receipt",
+              "replay_links_reused_receipt",
+              "artifact_content_verified"
+            ]
+          },
+          "delivery": {
+            "outcome": "passed",
+            "observations": [
+              "candidate_head_bound",
+              "canonical_target_bound",
+              "implementation_digests_bound"
+            ]
+          }
+        },
+        "cleanup": {
+          "outcome": "passed",
+          "leaked_resources": 0,
+          "cleanup_attempted": true,
+          "orphan_sweep_performed": true,
+          "failure_code": "none"
+        },
+        "outcome": "passed",
+        "diagnostic_code": "case_observations_accepted"
+      },
+      "runner": "windows-latest"
+    }
+  ],
+  "receipt_errors": [
+    "aggregate_validation_failed"
+  ]
+}

@@ -52,8 +52,8 @@ jobs:
           set -euo pipefail
           # The first attempt plus at most two automatic reruns.
           if [ "$RUN_ATTEMPT" -ge "$MAX_ATTEMPTS" ]; then
-            echo "::warning::Release run $RUN_ID already used $RUN_ATTEMPT attempt(s); leaving the failure to a human. Any Draft release for $HEAD_BRANCH is reused by the next release run."
-            exit 0
+            echo "::error::Release run $RUN_ID exhausted its two infrastructure retries; recovery failed and the Draft remains unpublished. 系统自动重试/自愈预算已耗尽。"
+            exit 1
           fi
 
           JOBS=""

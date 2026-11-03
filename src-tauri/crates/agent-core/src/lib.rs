@@ -6056,6 +6056,16 @@ mod tests {
             super::smoke_worker_budget_secs(None) > 30,
             "the default must exceed the 30s that kept failing, not merely match it"
         );
+        // Strictly greater than 45 as well: the restart phases in the
+        // unattended smoke used to hard-code that wall instead of asking for
+        // this budget, so a contended Windows runner failed with
+        // "phase-two worker did not settle within 45s" while the configurable
+        // default here was already larger. A default at 45 would let that
+        // regression come back unnoticed.
+        assert!(
+            super::smoke_worker_budget_secs(None) > 45,
+            "the default must exceed the 45s wall the hard-coded phases kept losing to"
+        );
         assert_eq!(super::smoke_worker_budget_secs(Some("90")), 90);
         assert_eq!(super::smoke_worker_budget_secs(Some("  45 ")), 45);
     }

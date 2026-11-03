@@ -273,13 +273,13 @@ class AutoReleaseWaitLoopTests(unittest.TestCase):
         # Two retries, each followed by three stale grace rounds, then the
         # verdict: the release stops instead of rerunning forever.
         state = {
-            "pr_view": [dict(failing) for _ in range(12)],
+            "pr_view": [dict(failing) for _ in range(16)],
             **infra_run(333),
         }
         code, output, gh_log = self.run_wait_loop(state)
         self.assertEqual(code, 1, output)
-        self.assertIn("persisted after 2 automatic retries", output)
-        self.assertEqual(gh_log.count("RERUN 333"), 2, gh_log)
+        self.assertIn("persisted after 3 automatic retries", output)
+        self.assertEqual(gh_log.count("RERUN 333"), 3, gh_log)
 
 
 def subprocess_run(script: Path, cwd: Path, env: dict):
@@ -381,8 +381,8 @@ class ReleaseRecoveryTests(unittest.TestCase):
     def test_attempt_budget_stops_the_loop(self) -> None:
         jobs = [{"name": "build-macos", "conclusion": "cancelled", "steps": []}]
         code, output, gh_log = self.run_recovery(jobs, attempt=3)
-        self.assertEqual(code, 0, output)
-        self.assertIn("already used 3 attempt(s)", output)
+        self.assertEqual(code, 1, output)
+        self.assertIn("exhausted its two infrastructure retries", output)
         self.assertNotIn("RERUN", gh_log)
 
 

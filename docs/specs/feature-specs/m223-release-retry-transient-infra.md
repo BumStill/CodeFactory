@@ -46,6 +46,18 @@
 - **Scenario 覆盖**：`.github/workflows/auto-release.yml` 命中 `HLT-001, HLT-004, UI-005, E2E-006`（PR 声明）。
 - 证据等级：本地 shell 级功能验证为 **boundary**；本改动真正的验证是"下一次真实发版不再需要人工 rerun"，由 `release-recover.yml` 的日志与 Auto Release 的 `::warning::` 记录承载。
 
+## 2026-11-04 审查更正（以原任务 R1–R5 为准）
+
+首版实现与文档中的「PR 重跑最多两次、等待 120 分钟」不符合原任务，已撤回：
+- R2：版本 PR **每个检查最多三次**基础设施重跑；计数按检查名保存。步骤 `timeout-minutes: 60` 覆盖 API 退避、轮询与重跑等待的全部时间，并保留显式 deadline。
+- R3：Release 仍是最多两次重跑（总共三次 attempt），耗尽后以非零结果明确失败，不能把未发布的 Draft 声称为成功。
+- R2 注解使用 detailsUrl 中的数值 job 标识读取，不能拿 GraphQL node ID 调 REST check-runs 接口。
+- 合并要求 classifier 判断六个必需检查全部为 SUCCESS，额外的无关绿检查不能补足数量。
+
+CI 修复记录：Windows 第一次跨进程 smoke 在 phase-two 的硬编码 45s 超时，重跑执行通过；但旧尝试的异常收据仍被可信聚合器拒绝。未修改或削弱 validator；同步 main 并推送新 head 后重新从干净运行验证。三处 restart wait 统一采用已有的可配置 worker_observation_budget。此前 `cargo test --lib unattended_smoke::tests` 执行零个测试，不算验证证据；正式二进制跨进程 smoke 与 agent-core 单测才是有效证据。
+
+原任务 Release-Urgency: default；不擅自触发发版。下一次真实发版与安装版验收由编排方另行发起，检查自动重试日志、最终非 Draft、完整平台资产及更新元数据。
+
 ## 5. 已知边界
 
 - `release-recover.yml` 不能把已经发出的 Draft 撤回：它选择让重跑把它做完，而不是删除已经上传的资产。超过重试预算时保留 Draft 并在日志里写明"下一次发版会复用"。
