@@ -22,12 +22,51 @@ mod standalone_shell_policy;
 /// then judge the segment's own subcommand. Anything we cannot parse safely
 /// stays sensitive (fail closed).
 pub(super) fn sensitive(command: &str) -> bool {
-    if command.contains("<<") {
+    if has_unquoted_heredoc(command) {
         return !python_heredoc_proved(None, command);
     }
     let Some(segments) = executable_segments(command) else { return true };
     segments.iter().any(|words| segment_is_sensitive(words))
 }
+
+/// M221b: byte offset of the first `<<` that sits outside shell quotes. A grep
+/// pattern such as `"heredoc\|<<"` is an argument, not a heredoc — the field
+/// sample was a read-only probe refused for `heredoc 缺少换行` because of it.
+fn unquoted_double_angle(text: &str) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let mut index = 0;
+    let mut quote: Option<u8> = None;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        match quote {
+            Some(opening) => {
+                if byte == b'\\' && opening == b'"' {
+                    index += 2;
+                    continue;
+                }
+                if byte == opening { quote = None; }
+                index += 1;
+            }
+            None => {
+                if byte == b'\\' {
+                    index += 2;
+                    continue;
+                }
+                if byte == b'\'' || byte == b'"' {
+                    quote = Some(byte);
+                    index += 1;
+                    continue;
+                }
+                if byte == b'<' && bytes.get(index + 1) == Some(&b'<') { return Some(index); }
+                index += 1;
+            }
+        }
+    }
+    None
+}
+
+/// M221b: does this command open a heredoc at all? Only an unquoted `<<` does.
+pub(super) fn has_unquoted_heredoc(command: &str) -> bool { unquoted_double_angle(command).is_some() }
 
 /// M198: recognize one complete, expansion-disabled Python stdin program.
 /// No shell suffix, custom executable, wrapper, substitution or redirection is
@@ -48,7 +87,7 @@ pub(super) fn python_heredoc_proof(root: Option<&Path>, command: &str) -> Result
     let mut scanned = 0;
     for line in command.split_inclusive('\n') {
         scanned += line.len();
-        if line.contains("<<") { header_end = Some(scanned); break; }
+        if unquoted_double_angle(line).is_some() { header_end = Some(scanned); break; }
     }
     let Some(header_end) = header_end else { return Err("heredoc 缺少换行".into()); };
     let (header, rest) = command.split_at(header_end);
@@ -63,12 +102,13 @@ pub(super) fn python_heredoc_proof(root: Option<&Path>, command: &str) -> Result
     // command separator, so it is folded away before splitting.
     let header = header.replace("2>&1", " ").replace("2>&2", " ").replace(">&1", " ").replace(">&2", " ");
     let segments = split_top_level(&header, &[';', '|', '&', '\n']);
-    let Some(heredoc_at) = segments.iter().position(|segment| segment.contains(" <<")) else {
+    let Some(heredoc_at) = segments.iter().position(|segment| unquoted_double_angle(segment).is_some()) else {
         return Err("缺少 `<<` heredoc 起始符".into());
     };
     let (prefix, consumers) = (&segments[..heredoc_at], &segments[heredoc_at + 1..]);
-    let Some((runner, delimiter)) = segments[heredoc_at].split_once(" <<") else { return Err("缺少 `<<` heredoc 起始符".into()); };
-    let runner = runner.trim();
+    let Some(open) = unquoted_double_angle(segments[heredoc_at]) else { return Err("缺少 `<<` heredoc 起始符".into()); };
+    let runner = segments[heredoc_at][..open].trim();
+    let delimiter = &segments[heredoc_at][open + 2..];
     let Some(delimiter) = delimiter.trim().strip_prefix('\'').and_then(|s| s.strip_suffix('\'')) else {
         return Err("heredoc 分隔符必须用单引号关闭展开".into());
     };
@@ -2037,5 +2077,46 @@ mod m221_git_data_heredoc {
         for shape in shapes {
             assert!(python_heredoc_proof(Some(&root), &shape).is_err(), "{shape}");
         }
+    }
+}
+
+/// M221b: a `<<` inside shell quotes is an argument, not a heredoc. The field
+/// sample was a read-only probe stopped for `heredoc 缺少换行` because the grep
+/// pattern itself contained `<<`.
+#[cfg(test)]
+mod m221b_quoted_double_angle {
+    use super::{has_unquoted_heredoc, python_heredoc_proof, sensitive};
+
+    #[test]
+    fn quoted_double_angle_is_a_pattern_not_a_heredoc() {
+        let patterns = [
+            "grep -n \"heredoc\\|<<\" src-tauri/src/tools/shell_policy.rs",
+            "grep -rn 'a << b' src",
+            "rg --fixed-strings \"<<\" .",
+            "echo \"use <<EOF for heredocs\"",
+            "sed -n 2680,2770p src-tauri/src/agent/tool_backend.rs",
+        ];
+        for command in patterns {
+            assert!(!has_unquoted_heredoc(command), "{command}");
+            assert!(!sensitive(command), "{command}");
+        }
+        assert!(has_unquoted_heredoc("cat <<'EOF'\nbody\nEOF"));
+        assert!(has_unquoted_heredoc("git commit -F - <<'MSG'\nmessage\nMSG"));
+        assert!(has_unquoted_heredoc("grep \"quoted\" ; cat <<'EOF'\nbody\nEOF"));
+        assert!(!has_unquoted_heredoc("echo 'unterminated"));
+    }
+
+    #[test]
+    fn the_read_only_probe_matches_the_field_command() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        std::fs::write(root.join("probe.rs"), "a\nb\nc\nd\ne\nf\n").unwrap();
+        let command = format!(
+            "cd \"{}\" && sed -n 1,5p probe.rs && grep -n \"heredoc\\|<<\" probe.rs | head -30",
+            root.display()
+        );
+        assert!(!has_unquoted_heredoc(&command), "{command}");
+        assert!(!sensitive(&command), "{command}");
+        assert!(python_heredoc_proof(Some(&root), &command).is_err(), "not a heredoc, so the interpreter proof has nothing to prove: {command}");
     }
 }

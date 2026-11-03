@@ -152,7 +152,7 @@ impl PermissionGateway for DesktopPermissionGateway {
         // same command still answers to delivery authority below.
         let mut heredoc_proved = false;
         if policy.full_access && tool_call.function.name == "bash"
-            && bash_command.is_some_and(|c| c.contains("<<"))
+            && bash_command.is_some_and(super::trusted_git::has_unquoted_heredoc)
         {
             let command = bash_command.unwrap_or_default();
             let key = format!("bash({command})");
@@ -470,7 +470,7 @@ impl DesktopPermissionGateway {
         // durable prompt JSON; never trust a model-supplied `_permission`.
         let (rule, reason) = if let Some((rule, reason)) = override_reason {
             (rule, reason)
-        } else if bash_command.is_some_and(|c| c.contains("<<")) {
+        } else if bash_command.is_some_and(super::trusted_git::has_unquoted_heredoc) {
             ("trusted.heredoc.unproved", "无法证明解释器仅访问已登记工作区内的文件；可能包含越界路径、外部操作、未闭合输入或不支持的语法。".to_string())
         } else if let Some(command) = bash_command {
             match crate::tools::shell_policy::classify_command(command) {
@@ -1890,5 +1890,28 @@ mod tests {
         assert!(!untouched.status.success(), "the other repository must stay untouched");
         let prompts_after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM permission_intents").fetch_one(&gateway.db).await.unwrap();
         assert_eq!(prompts_after, prompts_before + 1, "the outside repository must produce exactly one prompt");
+    }
+
+    /// M221b: the field sample the user reported. A quoted `<<` inside a grep
+    /// pattern is an argument, so this read-only probe must not reach the
+    /// heredoc gate at all.
+    #[tokio::test]
+    async fn m221b_quoted_double_angle_probe_is_not_a_heredoc() {
+        let gateway = durable_test_gateway().await;
+        sqlx::query("UPDATE sessions SET permission_mode='trusted'").execute(&gateway.db).await.unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("workspace");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("probe.rs"), "a\nb\nc\nd\ne\nf\n").unwrap();
+        let command = format!(
+            "cd \"{}\" && sed -n 1,5p probe.rs && grep -n \"heredoc\\|<<\" probe.rs | head -30",
+            root.display()
+        );
+        let args = serde_json::json!({ "command": command });
+        let call = ToolCall { id: "m221b".into(), r#type: "function".into(), function: FunctionCall { name: "bash".into(), arguments: args.to_string() } };
+        let outcome = gateway.authorize(&call, &args, Some(command.as_str())).await;
+        assert_eq!(outcome, PermissionOutcome::Allow, "{command}");
+        let intents: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM permission_intents").fetch_one(&gateway.db).await.unwrap();
+        assert_eq!(intents, 0, "a quoted << is not a heredoc: {command}");
     }
 }

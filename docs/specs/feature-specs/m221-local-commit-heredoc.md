@@ -11,6 +11,7 @@
 - R1：heredoc 的消费者如果是 `git commit -F -` / `git commit --file=-` / `git tag -F -`，heredoc 正文只是提交说明这类数据，不是要执行的脚本，不应该走「解释器只访问工作区」的证明。整条命令按里面的 git 段落分别判断：工作区内的 `git add`/`git commit`/`git tag`（本地）随写权限放行；`git push` 等远端动作继续按 M208/M130 的规则判断。
 - R2：对 `cat <<EOF | git commit -F -`、`git commit -F - <<EOF` 这两种写法一视同仁。
 - R3：回归测试：上面的原始命令放行；同一种写法后面跟 `&& git push origin HEAD` 时，按交付授权判断（有授权就放行，没有就审批）；`git -C /别的仓库 commit -F - <<EOF` 仍然要审批。
+- R4（补充现场样本，11-04）：heredoc 识别必须先按 shell 引号规则切词，引号内的 `<<` 只是参数，不是 heredoc。只读命令 `cd "<本工作区>" && sed -n 2680,2770p … && grep -n "heredoc\|<<" … | head -30` 曾被判为「heredoc 缺少换行」而要求审批；这类命令不应进入 heredoc 门禁。
 
 ## 验收
 - 真机：开一个信任模式会话，原样执行上面的命令，不出现审批，并且产生本地提交。
@@ -29,6 +30,7 @@
 | R1 | `git commit -F -` / `git commit --file=-` / `git tag -F -` 的 heredoc 正文是数据；本工作区内的 `git add`/`git commit`/`git tag` 随写权限放行 | `trusted_git::m221_git_data_heredoc` 单测 + permission_gateway 集成测试真实产生本地提交 |
 | R2 | `cat <<EOF \| git commit -F -` 与 `git commit -F - <<EOF` 同等对待 | 同上，两种写法逐条断言 `Allow` |
 | R3 | 原始命令放行；带 `&& git push origin HEAD` 时按交付授权判断；`git -C <别的仓库> commit -F -` 仍审批 | permission_gateway 集成测试：`delivery_authorized=1` 放行、`=0` 生成审批；`-C` 越界产生 `permission_intents` 记录 |
+| R4 | 引号内的 `<<` 不是 heredoc，只读探针不进 heredoc 门禁 | `trusted_git::m221b_quoted_double_angle` 单测 + permission_gateway 集成测试（现场原始命令判定 `Allow`、零审批） |
 
 ## Applicable Harnesses
 
@@ -53,3 +55,6 @@
 | `git add -A && python3 - <<'PY'`（正文是脚本） | 仍走解释器证明 | 单测 |
 | `git reset --hard … ; git commit -F - <<'MSG'` | 审批 | 单测 |
 | heredoc 正文之后再有 shell 内容 | 审批 | 单测 |
+| `grep -n "heredoc\\|<<" file`、`rg --fixed-strings "<<" .`、`echo "use <<EOF"` | 不进 heredoc 门禁，只读即放行 | 单测 + 网关现场样本 |
+| 现场只读探针 `cd "<本工作区>" && sed -n … && grep -n "heredoc\\|<<" … \| head -30` | `Allow`，零审批 | 网关集成测试 |
+| 真 heredoc（`cat <<'EOF'`、`git commit -F - <<'MSG'`） | 仍按 heredoc 处理 | 单测 |
