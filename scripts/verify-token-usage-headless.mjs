@@ -156,6 +156,9 @@ async function run() {
     page.on("console", (message) => browserMessages.push(`console:${message.type()}: ${message.text()}`));
     page.on("pageerror", (error) => browserMessages.push(`pageerror:${error.stack ?? error}`));
     await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
+    if (process.env.CODEFACTORY_USAGE_THEME === "light") {
+      await page.evaluate(() => { document.documentElement.dataset.theme = "light"; });
+    }
 
     await page.getByRole("region", { name: "CodeFactory 欢迎" }).waitFor();
     const welcomeCard = page.getByRole("region", { name: "今日用量与过去 4 周趋势" });

@@ -234,12 +234,16 @@ pub async fn record_usage_event(
             .to_rfc3339_opts(SecondsFormat::Millis, true),
         None => Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
     };
+    let cost_cny = crate::agent::quota_cap::daily_spend::price_usage(
+        &event.endpoint, event.input_tokens, event.cached_tokens, event.output_tokens,
+    );
+    let recorded_at_ms = DateTime::parse_from_rfc3339(&created_at).expect("normalized timestamp").timestamp_millis();
     let result = sqlx::query(
         "INSERT OR IGNORE INTO model_usage_events (
             id, request_id, attempt_id, session_id, task_id, surface, provider, endpoint, model,
             input_tokens, output_tokens, reasoning_tokens, cached_tokens,
-            actual_cost_usd, estimated_cost_usd, cost_source, source, created_at
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'provider_usage', ?)",
+            actual_cost_usd, estimated_cost_usd, estimated_cost_cny, cost_source, source, created_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'provider_usage', ?)",
     )
     .bind(Uuid::new_v4().to_string())
     .bind(&event.request_id)
@@ -256,11 +260,21 @@ pub async fn record_usage_event(
     .bind(event.cached_tokens)
     .bind(event.actual_cost_usd)
     .bind(event.estimated_cost_usd)
+    .bind(cost_cny)
     .bind(&event.cost_source)
     .bind(created_at)
     .execute(db)
     .await?;
-    Ok(result.rows_affected() == 1)
+    let inserted = result.rows_affected() == 1;
+    if inserted {
+        if let Some(cost) = cost_cny {
+            let now = Utc::now().timestamp_millis();
+            if crate::agent::quota_cap::daily_spend::day_start_ms(recorded_at_ms) == crate::agent::quota_cap::daily_spend::day_start_ms(now) {
+                crate::agent::quota_cap::daily_spend::ledger().record_estimated(&event.endpoint, cost, now);
+            }
+        }
+    }
+    Ok(inserted)
 }
 
 fn parse_now(now_utc: Option<String>) -> crate::errors::Result<DateTime<Utc>> {

@@ -662,8 +662,9 @@ impl ActiveRouteState {
         let mut wait_notified = false;
         loop {
             if cancel.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::SeqCst)) { return Err("cancelled".into()); }
+            let config = settings.read().await.clone();
+            super::daily_spend_live::refresh(&config, false).await;
             let now = super::usage_windows::now_ms();
-            let config = settings.read().await;
             if !durable_wait && config.model_usage_windows.is_empty() && config.endpoint_usage_windows.is_empty()
                 && !self.inner.lock().expect("active route mutex poisoned").candidates.iter().any(|route| config.endpoint_is_subscription(&route.endpoint_name) || config.endpoint_daily_spend_cap(&route.endpoint_name).is_some()) { return Ok(None); }
             let delay = {

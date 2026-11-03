@@ -1109,6 +1109,7 @@ pub mod daily_spend {
         opening_balance_cny: Option<f64>,
         topped_up_cny: f64,
         current_balance_cny: Option<f64>,
+        balance_available: bool,
     }
 
     /// In-memory, per-endpoint, per-local-day spend. Recorded as usage events
@@ -1132,6 +1133,43 @@ pub mod daily_spend {
                 .entry(endpoint.to_string())
                 .or_insert_with(|| EndpointLedger { day_start_ms: day, ..Default::default() });
             guard
+        }
+
+        pub fn restore_estimates(&self, totals: HashMap<String, f64>, now_ms: i64) {
+            let mut entries = self.entries.lock().expect("spend ledger poisoned");
+            let day = day_start_ms(now_ms).unwrap_or(now_ms);
+            entries.retain(|_, entry| entry.day_start_ms == day);
+            for entry in entries.values_mut() { entry.estimated_cny = 0.0; }
+            for (endpoint, cost) in totals {
+                entries.entry(endpoint).or_insert_with(|| EndpointLedger { day_start_ms: day, ..Default::default() }).estimated_cny = cost;
+            }
+        }
+
+        pub fn restore_balance(&self, endpoint: &str, opening: f64, topped_up: f64, current: f64, now: i64) {
+            let mut entries = self.entry(endpoint, now);
+            let entry = entries.get_mut(endpoint).expect("entry");
+            entry.opening_balance_cny = Some(opening);
+            entry.topped_up_cny = topped_up;
+            entry.current_balance_cny = Some(current);
+            entry.balance_available = true;
+        }
+
+        pub fn balance_state(&self, endpoint: &str, now: i64) -> Option<(f64, f64, f64)> {
+            let entries = self.entry(endpoint, now);
+            let entry = entries.get(endpoint)?;
+            Some((entry.opening_balance_cny?, entry.topped_up_cny, entry.current_balance_cny?))
+        }
+
+        pub fn balance_unavailable(&self, endpoint: &str, now: i64) {
+            if let Some(entry) = self.entry(endpoint, now).get_mut(endpoint) { entry.balance_available = false; }
+        }
+
+        /// A first observation mid-day must not forgive usage already incurred.
+        pub fn observe_balance_with_estimate(&self, endpoint: &str, balance: f64, now: i64) {
+            if self.balance_state(endpoint, now).is_none() {
+                let estimate = self.estimated_cny(endpoint, now);
+                self.restore_balance(endpoint, balance + estimate, 0.0, balance, now);
+            } else { self.observe_balance(endpoint, balance, now); }
         }
 
         /// Add priced usage to today's estimate.
@@ -1160,6 +1198,7 @@ pub mod daily_spend {
                 _ => {}
             }
             entry.current_balance_cny = Some(balance_cny);
+            entry.balance_available = true;
         }
 
         pub fn estimated_cny(&self, endpoint: &str, now_ms: i64) -> f64 {
@@ -1170,6 +1209,7 @@ pub mod daily_spend {
         fn real_cny(&self, endpoint: &str, now_ms: i64) -> Option<f64> {
             let guard = self.entry(endpoint, now_ms);
             let entry = guard.get(endpoint)?;
+            if !entry.balance_available { return None; }
             let opening = entry.opening_balance_cny?;
             let current = entry.current_balance_cny?;
             Some(real_spend_cny(opening, entry.topped_up_cny, current))
@@ -1597,9 +1637,10 @@ pub fn endpoint_spend_report(
 
 /// 用法页面与只读入口共用：今日花了多少、上限多少、什么时候重置。
 #[tauri::command]
-pub fn get_endpoint_spend_status() -> EndpointSpendReport {
-    let settings = crate::config::settings::load();
-    endpoint_spend_report(&settings, crate::agent::usage_windows::now_ms())
+pub async fn get_endpoint_spend_status(state: tauri::State<'_, crate::AppState>) -> Result<EndpointSpendReport, crate::errors::AppError> {
+    let settings = state.settings.read().await.clone();
+    crate::agent::daily_spend_live::refresh(&settings, false).await;
+    Ok(endpoint_spend_report(&settings, crate::agent::usage_windows::now_ms()))
 }
 
 #[cfg(test)]

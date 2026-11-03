@@ -5,6 +5,8 @@
 //! implementation. They exercise the real SQLite startup path so a green result
 //! proves more than an isolated query over a test-only schema.
 
+#![cfg(test)]
+
 use serde_json::Value;
 use sqlx::migrate::MigrateDatabase;
 use sqlx::Row;
@@ -76,6 +78,80 @@ fn day<'a>(dashboard: &'a Value, date: &str) -> &'a Value {
         .iter()
         .find(|entry| entry["local_date"] == date)
         .unwrap_or_else(|| panic!("missing heatmap day {date}: {dashboard}"))
+}
+
+#[tokio::test]
+async fn m217_usage_cost_is_persisted_for_restart() {
+    let (_dir, pool) = migrated_pool().await;
+    let mut event = usage_event("m217-priced", "m217", "interactive", "2026-10-31T02:00:00Z", 2_000_000, 300_000);
+    event.endpoint = "deepseek-m217".into();
+    event.cached_tokens = 500_000;
+    assert!(record_usage_event(&pool, event.clone()).await.unwrap());
+    assert!(!record_usage_event(&pool, event).await.unwrap());
+    let cost: Option<f64> = sqlx::query_scalar("SELECT estimated_cost_cny FROM model_usage_events WHERE request_id = 'm217-priced'")
+        .fetch_one(&pool).await.unwrap();
+    assert!((cost.expect("R1 must persist CNY") - 1.85).abs() < 1e-9);
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn m217_restart_rebuild_includes_legacy_null_and_preserves_balance() {
+    use crate::agent::{daily_spend_live, quota_cap::daily_spend::{SpendLedger, SpendSource}};
+    let (_dir, pool) = migrated_pool().await;
+    let now = chrono::DateTime::parse_from_rfc3339("2026-10-31T02:00:00Z").unwrap().timestamp_millis();
+    for (id, input) in [("m217-current", 8_000_000), ("m217-legacy", 7_000_000)] {
+        let mut event = usage_event(id, "m217", "interactive", "2026-10-31T02:00:00Z", input, 0);
+        event.endpoint = "deepseek-m217-restart".into();
+        record_usage_event(&pool, event).await.unwrap();
+    }
+    sqlx::query("UPDATE model_usage_events SET estimated_cost_cny = NULL WHERE request_id = 'm217-legacy'").execute(&pool).await.unwrap();
+    let settings = crate::config::settings::Settings::default();
+    let fresh = SpendLedger::default();
+    daily_spend_live::rebuild(&pool, &settings, &fresh, now).await.unwrap();
+    let config = settings.endpoint_daily_spend_cap("deepseek-m217-restart").unwrap();
+    let status = fresh.status("deepseek-m217-restart", &config, now);
+    assert_eq!(status.spent_cny, 12.0);
+    assert!(status.cap_reached);
+    // R5: admission uses the same restored state, not an isolated arithmetic probe.
+    let endpoint = "deepseek-m217-route";
+    sqlx::query("UPDATE model_usage_events SET endpoint = ? WHERE endpoint = 'deepseek-m217-restart'").bind(endpoint).execute(&pool).await.unwrap();
+    daily_spend_live::rebuild(&pool, &settings, crate::agent::quota_cap::daily_spend::ledger(), now).await.unwrap();
+    let _clock = crate::agent::usage_windows::clock_test_lock();
+    crate::agent::usage_windows::set_clock_override_ms(Some(now));
+    use crate::agent::failover::{ActiveRouteState, RouteCandidate, RouteCandidatePlan, EndpointHealthRegistry, ModelUnavailable};
+    let route = RouteCandidate { endpoint_name: endpoint.into(), model_id: "synthetic".into(), base_url: "https://synthetic.invalid".into(), credential_ref: Some("synthetic-reference".into()), legacy_inline_api_key: None, supports_vision: false, api_style: crate::config::settings::ApiStyle::Openai };
+    let state = ActiveRouteState::from_plan_with_health(RouteCandidatePlan::new(route), EndpointHealthRegistry::new(std::time::Duration::from_secs(120)));
+    state.attach_usage_settings(std::sync::Arc::new(tokio::sync::RwLock::new(crate::config::settings::Settings::default())));
+    let error = state.admit_model_availability(None, false, None).await.unwrap_err();
+    let wait = ModelUnavailable::parse(&error).expect("durable availability wait");
+    assert_eq!(wait.resume_at_ms, status.reset_at_ms.map(|at| at + 250));
+    assert!(wait.notice.contains("预算"));
+    assert!(state.attempt_snapshots(true).iter().any(|attempt| attempt.status == "skipped" && attempt.failure_code.as_deref().is_some_and(|code| code.starts_with("daily_spend_cap:"))));
+    crate::agent::usage_windows::set_clock_override_ms(None);
+    sqlx::query("UPDATE model_usage_events SET endpoint = 'deepseek-m217-restart' WHERE endpoint = ?").bind(endpoint).execute(&pool).await.unwrap();
+    assert_eq!(status.reset_at_ms, crate::agent::quota_cap::daily_spend::next_reset_ms(now));
+    daily_spend_live::observe_and_persist(&pool, &fresh, "deepseek-m217-restart", 20.0, now).await.unwrap();
+    daily_spend_live::observe_and_persist(&pool, &fresh, "deepseek-m217-restart", 18.5, now).await.unwrap();
+    daily_spend_live::observe_and_persist(&pool, &fresh, "deepseek-m217-restart", 28.5, now).await.unwrap();
+    let restarted = SpendLedger::default();
+    let restarted_settings = crate::config::settings::Settings::default();
+    daily_spend_live::rebuild(&pool, &restarted_settings, &restarted, now).await.unwrap();
+    let status = restarted.status("deepseek-m217-restart", &config, now);
+    assert_eq!(status.source, SpendSource::Balance);
+    assert_eq!(status.spent_cny, 13.5);
+    assert!(status.cap_reached);
+    restarted.balance_unavailable("deepseek-m217-restart", now);
+    assert_eq!(restarted.status("deepseek-m217-restart", &config, now).source, SpendSource::Estimated);
+    let tomorrow = status.reset_at_ms.unwrap();
+    daily_spend_live::rebuild(&pool, &restarted_settings, &restarted, tomorrow).await.unwrap();
+    assert_eq!(restarted.status("deepseek-m217-restart", &config, tomorrow).spent_cny, 0.0);
+}
+
+#[test]
+fn m217_usage_status_is_a_readonly_dispatch_operation() {
+    let request = crate::headless_dispatch::parse_request(r#"{"operation":"usage_status"}"#).unwrap();
+    assert_eq!(crate::headless_dispatch::operation_of(&request), "usage_status");
+    assert!(crate::headless_dispatch::parse_request(r#"{"operation":"usage_status","key_ref":"secret"}"#).is_err());
 }
 
 #[tokio::test]
