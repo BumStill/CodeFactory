@@ -7,7 +7,7 @@
 ## 当前规模
 
 <!-- scenario-registry-summary:start -->
-- 逻辑 Scenario：`32`（P0 `15`，P1 `17`，P2 `0`）
+- 逻辑 Scenario：`33`（P0 `15`，P1 `18`，P2 `0`）
 - Complex E2E：`11`（implemented `0`，partially_implemented `11`，designed `0`）
 - 剩余自动化缺口：`24`
 - PR slice：implemented `11`，partially_implemented `0`，missing `0`
