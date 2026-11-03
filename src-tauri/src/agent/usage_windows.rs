@@ -174,7 +174,7 @@ pub fn wait_notice(label: &str, next_available_ms: Option<i64>) -> String {
 /// 等待只有在"时间会让它变好"时才成立——时段会到点、额度会重置；缺凭据不会
 /// 自己好，它需要用户动作，所以它是一条**原因**，不是一条等待理由。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum WaitCauseKind { UsageWindow, QuotaCap, DailySpendCap, MissingCredential }
+pub enum WaitCauseKind { UsageWindow, QuotaCap, DailySpendCap, MissingCredential, Transient }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WaitCause {
@@ -202,6 +202,7 @@ impl WaitCause {
             (WaitCauseKind::DailySpendCap, Some(clock)) => format!("{} 今日预算已用完，{clock} 后继续", self.label),
             (WaitCauseKind::DailySpendCap, None) => format!("{} 今日预算已用完", self.label),
             (WaitCauseKind::MissingCredential, _) => format!("{} 尚未配置凭据", self.label),
+            (WaitCauseKind::Transient, _) => format!("{} 连接出错，1 分钟后重试", self.label),
         }
     }
 }
@@ -367,12 +368,61 @@ pub(crate) mod model_wait {
         load(db, session).await?.ok_or(sqlx::Error::RowNotFound)
     }
 
+    /// M220：按会话和端点持久记账，重启不重置退避；恢复成功时统一清除。
+    pub(crate) async fn bound_transient(
+        db: &SqlitePool, session: &str, error: &str,
+        mut unavailable: crate::agent::failover::ModelUnavailable,
+    ) -> sqlx::Result<(crate::agent::failover::ModelUnavailable, bool)> {
+        let payload = error.split_once("MODEL_UNAVAILABLE:").and_then(|(_, data)|
+            serde_json::Deserializer::from_str(data).into_iter::<serde_json::Value>().next()?.ok());
+        let endpoints = payload.as_ref().and_then(|value| value["transient_endpoints"].as_array());
+        let Some(endpoints) = endpoints else { return Ok((unavailable, false)); };
+        sqlx::query("CREATE TABLE IF NOT EXISTS model_transient_retries (session_id TEXT NOT NULL, endpoint TEXT NOT NULL, attempts INTEGER NOT NULL, PRIMARY KEY(session_id,endpoint))")
+            .execute(db).await?;
+        let now = chrono::Utc::now().timestamp_millis();
+        let restriction = payload.as_ref().and_then(|value| value["restriction_resume_at_ms"].as_i64());
+        let mut earliest = restriction;
+        let mut retries = Vec::new();
+        let mut exhausted = Vec::new();
+        for endpoint in endpoints.iter().filter_map(|value| value.as_str()) {
+            let attempts: i64 = sqlx::query_scalar("INSERT INTO model_transient_retries(session_id,endpoint,attempts) VALUES (?,?,1) ON CONFLICT(session_id,endpoint) DO UPDATE SET attempts=attempts+1 RETURNING attempts")
+                .bind(session).bind(endpoint).fetch_one(db).await?;
+            let label = crate::agent::failover::endpoint_label(endpoint);
+            if attempts > 12 {
+                exhausted.push(format!("{label} 已连续重试 12 次仍连接失败（含响应读取、网络及 5xx 故障）"));
+                continue;
+            }
+            let minutes = [1, 2, 5, 10, 30][((attempts - 1) as usize).min(4)];
+            let at = now + minutes * 60_000 + 250;
+            earliest = Some(earliest.map_or(at, |old| old.min(at)));
+            retries.push(format!("{label} 连接出错，{minutes} 分钟后重试（第 {attempts} 次）"));
+        }
+        unavailable.resume_at_ms = earliest;
+        let terminal = !exhausted.is_empty() && retries.is_empty() && restriction.is_none();
+        unavailable.notice = format!("{}；{}", unavailable.notice.replace("，1 分钟后重试", ""), retries.into_iter().chain(exhausted).collect::<Vec<_>>().join("；"));
+        if terminal {
+            unavailable.notice = format!("已结束：连续瞬时故障已超过重试上限。{}。目标与失败证据已保留。", unavailable.notice
+                .replace("系统自动重试/自愈，届时自动继续。", "")
+                .replace("系统自动重试/自愈", "")
+                .replace("系统将按退避策略重新观测可用路由。", ""));
+        }
+        Ok((unavailable, terminal))
+    }
+
+    pub(crate) async fn clear_transient_endpoint(db: &SqlitePool, session: &str, endpoint: &str) -> sqlx::Result<()> {
+        sqlx::query("CREATE TABLE IF NOT EXISTS model_transient_retries (session_id TEXT NOT NULL, endpoint TEXT NOT NULL, attempts INTEGER NOT NULL, PRIMARY KEY(session_id,endpoint))").execute(db).await?;
+        sqlx::query("DELETE FROM model_transient_retries WHERE session_id=? AND endpoint=?").bind(session).bind(endpoint).execute(db).await?;
+        Ok(())
+    }
+
     /// 真正的模型回合跑出来了（拿到了回答）——等待结束。
     ///
     /// 同时退休还挂着的模型唤醒：模型已经可用，再叫醒它一次就是把会话从已完成的
     /// 回合里拽回等待状态。
     pub(crate) async fn clear(db: &SqlitePool, session: &str) -> sqlx::Result<()> {
         ensure(db).await?;
+        sqlx::query("CREATE TABLE IF NOT EXISTS model_transient_retries (session_id TEXT NOT NULL, endpoint TEXT NOT NULL, attempts INTEGER NOT NULL, PRIMARY KEY(session_id,endpoint))").execute(db).await?;
+        sqlx::query("DELETE FROM model_transient_retries WHERE session_id=?").bind(session).execute(db).await?;
         sqlx::query("DELETE FROM model_availability_waits WHERE session_id=?")
             .bind(session)
             .execute(db)

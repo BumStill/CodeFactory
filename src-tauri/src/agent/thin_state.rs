@@ -355,6 +355,14 @@ pub async fn settle_error(db: &SqlitePool, session_id: &str, root_turn_id: &str,
     let state = if error_text == "agent loop stopped: Cancelled" {
         ThinState::ended("cancelled：回合已取消", "本会话记录")
     } else if let Some(unavailable) = super::failover::ModelUnavailable::parse(error_text) {
+        let (unavailable, terminal) = super::usage_windows::model_wait::bound_transient(db, session_id, error_text, unavailable).await?;
+        if terminal {
+            super::usage_windows::model_wait::clear(db, session_id).await?;
+            let state = ThinState::ended(&unavailable.notice, "本会话路由失败与重试记录");
+            save(db, session_id, &state).await?;
+            project_turn(db, root_turn_id, &state).await?;
+            return Ok(state);
+        }
         let at = unavailable.resume_at_ms.unwrap_or_else(|| now().saturating_add(60_000));
         let wake = super::background_tasks::persist_model_wakeup(db, session_id, root_turn_id, at, &unavailable.notice).await?;
         // M210/R1：模型可用性等待是一等事实，与「自动重试次数」分开记账——
@@ -849,6 +857,67 @@ mod m210_tests {
     }
 
     /// M210：模型真正跑出回合后等待结束，不再重挂唤醒。
+    #[tokio::test]
+    async fn m220_transient_backoff_is_durable_bounded_and_endpoint_scoped() {
+        let db = db().await;
+        let error = format!("MODEL_UNAVAILABLE:{}", serde_json::json!({
+            "resume_at_ms": now() + 60_250,
+            "notice": "当前没有可用模型：DeepSeek 连接出错，1 分钟后重试；系统自动重试/自愈",
+            "transient_endpoints": ["deepseek"]
+        }));
+        for (attempt, minutes) in [1, 2, 5, 10, 30, 30, 30, 30, 30, 30, 30, 30].into_iter().enumerate() {
+            let before = now();
+            let state = settle_error(&db, "m210", "m210-root", &error).await.unwrap();
+            assert_eq!(state.state, SessionState::WaitingWake, "attempt {}: {state:?}", attempt + 1);
+            let wait = super::super::usage_windows::model_wait::load(&db, "m210").await.unwrap().unwrap();
+            assert!(wait.resume_at_ms.unwrap() >= before + minutes * 60_000, "{wait:?}");
+            assert!(wait.reason.contains(&format!("{minutes} 分钟后重试")), "{wait:?}");
+            assert_eq!(state.consecutive_failures, 0);
+        }
+        let state = settle_error(&db, "m210", "m210-root", &error).await.unwrap();
+        assert_eq!(state.state, SessionState::Ended, "{state:?}");
+        assert!(state.reason.as_deref().unwrap().contains("12 次"));
+        assert!(super::super::usage_windows::model_wait::load(&db, "m210").await.unwrap().is_none());
+        let pending: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM wakeup_schedules WHERE session_id='m210' AND status='pending'").fetch_one(&db).await.unwrap();
+        assert_eq!(pending, 0);
+        // A successful response resets only that endpoint; another endpoint keeps its budget.
+        let unavailable = super::super::failover::ModelUnavailable::parse(&error).unwrap();
+        super::super::usage_windows::model_wait::bound_transient(&db, "m210", &error, unavailable.clone()).await.unwrap();
+        let other = error.replace("deepseek\"", "other\"");
+        super::super::usage_windows::model_wait::bound_transient(&db, "m210", &other, unavailable).await.unwrap();
+        super::super::usage_windows::model_wait::clear_transient_endpoint(&db, "m210", "deepseek").await.unwrap();
+        let remaining: Vec<String> = sqlx::query_scalar("SELECT endpoint FROM model_transient_retries WHERE session_id='m210'").fetch_all(&db).await.unwrap();
+        assert_eq!(remaining, vec!["other"]);
+        // A quota reset can beat a later transient backoff, but not the first retry.
+        let mixed = format!("MODEL_UNAVAILABLE:{}", serde_json::json!({
+            "resume_at_ms": now() + 60_250, "notice": "ChatGPT 已达上限；DeepSeek 连接出错，1 分钟后重试",
+            "transient_endpoints": ["other"], "restriction_resume_at_ms": now() + 90_000
+        }));
+        let before = now();
+        let (wait, terminal) = super::super::usage_windows::model_wait::bound_transient(&db, "m210", &mixed, super::super::failover::ModelUnavailable::parse(&mixed).unwrap()).await.unwrap();
+        assert!(!terminal);
+        assert!((before + 89_000..=now() + 90_000).contains(&wait.resume_at_ms.unwrap()));
+    }
+
+    #[tokio::test]
+    async fn m220_transient_budget_survives_database_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let url = format!("sqlite://{}?mode=rwc", dir.path().join("retry.db").display());
+        let error = format!("MODEL_UNAVAILABLE:{}", serde_json::json!({
+            "resume_at_ms": now() + 60_250, "notice": "DeepSeek 连接出错，1 分钟后重试",
+            "transient_endpoints": ["deepseek"]
+        }));
+        for minutes in [1, 2, 5] {
+            let db = crate::storage::db::connect(&url).await.unwrap();
+            let before = now();
+            let (wait, terminal) = super::super::usage_windows::model_wait::bound_transient(&db, "restart", &error, super::super::failover::ModelUnavailable::parse(&error).unwrap()).await.unwrap();
+            assert!(!terminal);
+            assert!(wait.resume_at_ms.unwrap() >= before + minutes * 60_000);
+            assert!(wait.notice.contains(&format!("{minutes} 分钟后重试")));
+            db.close().await;
+        }
+    }
+
     #[tokio::test]
     async fn m210_successful_turn_clears_the_model_wait() {
         let db = db().await;
