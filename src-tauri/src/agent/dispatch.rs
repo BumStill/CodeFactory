@@ -412,24 +412,267 @@ const DELIVERY_CEILINGS: &[&str] = &[
 /// vetoes an authorization sentence in the same message. Anything in
 /// [`PLAN_ONLY_CJK`] that is merely a posture cue ("给个方案 / 分析一下") is
 /// deliberately absent: it changes how the turn talks, not what it may write.
-const HARD_READ_ONLY_CJK: &[&str] = &[
-    "只分析",
-    "只评估",
-    "只审视",
-    "只读",
-    "不要改",
-    "别改",
-    "不要修改",
-    "别修改",
-    "先别修改",
-    "不要执行",
-    "别执行",
-    "不要实现",
-    "别实现",
-    "先别动代码",
-    "不要动代码",
-    "别动代码",
+///
+/// Each entry is `(cue, action)`. `action` is the verb the cue forbids, and it
+/// must be a COMPLETE word (see [`action_ends_word`]) — the empty string marks a
+/// cue that carries no verb ("只分析" is complete on its own).
+const HARD_READ_ONLY_CJK: &[(&str, &str)] = &[
+    ("只分析", ""),
+    ("只评估", ""),
+    ("只审视", ""),
+    ("只读", ""),
+    ("不要改", "改"),
+    ("别改", "改"),
+    ("不要修改", "修改"),
+    ("别修改", "修改"),
+    ("先别修改", "修改"),
+    ("不要执行", "执行"),
+    ("别执行", "执行"),
+    ("不要实现", "实现"),
+    ("别实现", "实现"),
+    ("先别动代码", "动"),
+    ("不要动代码", "动"),
+    ("别动代码", "动"),
 ];
+
+/// The grammatical OBJECTS a forbidden verb may take. This is a noun
+/// inventory, not an exception list: `不要改代码` forbids the verb `改` with a
+/// real object, while `不要改写` is the single word `改写` — `写` is not an
+/// object of `改`, which is exactly why the field message of 2026-11-04
+/// (「请逐条、原样执行，不要改写、不要合并…」) must not demote the turn.
+const READ_ONLY_VERB_OBJECTS: &[&str] = &[
+    "代码",
+    "文件",
+    "仓库",
+    "项目",
+    "实现",
+    "命令",
+    "测试",
+    "源码",
+    "文档",
+    "脚本",
+    "配置",
+    "分支",
+    "提交",
+    "合并",
+    "它",
+    "这个",
+    "这项",
+    "这些",
+    "这里",
+    "当前",
+    "已有",
+    "现有",
+    "任何",
+    "其他",
+    "东西",
+    "内容",
+    "逻辑",
+    "功能",
+    "程序",
+    "改动",
+];
+
+/// Verbs that state a WRITE intent. Kept narrow and free of words that double
+/// as nouns (`实现` is checked separately) so a review brief that says
+/// 「当前分支的实现」 is not misread as a write order.
+const WRITE_INTENT_VERBS: &[&str] = &[
+    "追加",
+    "提交",
+    "修改",
+    "修复",
+    "写入",
+    "写进",
+    "写到",
+    "写回",
+    "创建",
+    "新增",
+    "重构",
+    "推送",
+    "发布",
+    "部署",
+    "生成",
+    "合并",
+    "删除",
+    "更新",
+    "实现",
+];
+
+const NEGATION_PREFIXES: &[&str] = &["不要", "不用", "不必", "不许", "不准", "禁止", "无需", "别", "勿", "不"];
+
+/// A restraint that is itself revoked ("别只审视了", "不要只分析") lifts the
+/// read-only posture instead of imposing it — that is how a user steers a
+/// review turn back into implementation mid-session.
+const CUE_REVOCATIONS: &[&str] = &["别", "不要", "不用", "不必", "无需", "不再", "停止"];
+
+fn is_cjk_ideograph(ch: char) -> bool {
+    matches!(ch as u32,
+        0x3400..=0x4DBF | 0x4E00..=0x9FFF | 0xF900..=0xFAFF | 0x20000..=0x2FA1F)
+}
+
+/// Does the forbidden verb end here, or does the next character make it the
+/// first syllable of a longer word (`改写`, `改名`, `执行顺序`)?
+fn action_ends_word(text: &str, end: usize) -> bool {
+    let after = &text[end..];
+    let Some(next) = after.chars().next() else {
+        return true; // message ends on the verb: `先别修改`
+    };
+    if !is_cjk_ideograph(next) {
+        return true; // punctuation / space / ASCII / digits all end a CJK word
+    }
+    READ_ONLY_VERB_OBJECTS
+        .iter()
+        .any(|object| after.starts_with(object))
+}
+
+/// Byte offset of the first cue occurrence that is a real directive: its verb
+/// must be a complete word, and the cue must not itself be revoked ("别只审视
+/// 了，继续做" revokes the restraint instead of imposing it).
+fn read_only_cue_offset(text: &str, cue: &str, action: &str) -> Option<usize> {
+    let mut from = 0;
+    while let Some(offset) = text[from..].find(cue) {
+        let start = from + offset;
+        let end = start + cue.len();
+        let before = text[..start].trim_end();
+        let revoked = CUE_REVOCATIONS
+            .iter()
+            .any(|revocation| before.ends_with(revocation));
+        if !revoked && (action.is_empty() || action_ends_word(text, end)) {
+            return Some(start);
+        }
+        from = end;
+    }
+    None
+}
+
+/// True when the message states a write predicate this turn must honour.
+///
+/// R2 of M222: an INFERRED read-only directive only constrains the scope it
+/// names, so a sentence that also asks for a write (「然后把结论写进
+/// docs/x.md」) keeps write capability. A negated predicate is not an intent
+/// (「只分析，不要提交代码」 stays review-only).
+fn has_write_intent(text: &str) -> bool {
+    WRITE_INTENT_VERBS.iter().any(|verb| {
+        let mut from = 0;
+        while let Some(offset) = text[from..].find(verb) {
+            let start = from + offset;
+            let before = &text[..start];
+            let negated = NEGATION_PREFIXES.iter().any(|negation| {
+                before.len() >= negation.len()
+                    && before[before.len() - negation.len()..].ends_with(negation)
+            });
+            // `实现` doubles as a noun after 的/个/该/此 (`当前分支的实现`).
+            let nominal = *verb == "实现"
+                && before
+                    .chars()
+                    .next_back()
+                    .is_some_and(|ch| matches!(ch, '的' | '个' | '该' | '此' | '一'));
+            if !negated && !nominal {
+                return true;
+            }
+            from = start + verb.len();
+        }
+        false
+    })
+}
+
+fn without_scoped_file_limits(lowercased: &str) -> String {
+    SCOPED_FILE_LIMITS
+        .iter()
+        .fold(lowercased.to_string(), |text, scope| {
+            text.replace(scope, "")
+        })
+}
+
+/// M175: pasted specifications, templates and logs are context, not the user's
+/// action directive. Use the first instruction paragraph; quoted/fenced/heading
+/// blocks end that paragraph even when the paste omitted a blank separator.
+fn instruction_paragraph(message: &str) -> &str {
+    let message = message.trim();
+    let mut end = 0;
+    for line in message.split_inclusive('\n') {
+        let text = line.trim();
+        if text.is_empty() || text.starts_with('>') || text.starts_with("```")
+            || text.starts_with('#') {
+            break;
+        }
+        end += line.len();
+    }
+    message[..end].trim()
+}
+
+/// The text the read-only scan reads: first instruction paragraph, lowercased,
+/// scoped file limits removed, and conditional branches dropped (a conditional
+/// constraint governs its branch, not the entire turn).
+fn read_only_scan_text(user_msg: &str) -> String {
+    let text = without_scoped_file_limits(&instruction_paragraph(user_msg).to_ascii_lowercase());
+    text.split(['。', '；', ';'])
+        .filter(|clause| {
+            let clause = clause.trim_start();
+            !clause.starts_with("如果") && !clause.starts_with("若") && !clause.starts_with("if ")
+        })
+        .collect::<Vec<_>>()
+        .join("。")
+}
+
+/// The clause a cue matched, for the refusal text (R4): the user must be able
+/// to see which of their own words locked the turn.
+fn clause_around(text: &str, offset: usize) -> String {
+    const BREAKS: &[char] = &['。', '；', ';', '，', ',', '\n'];
+    let start = text[..offset]
+        .char_indices()
+        .rev()
+        .find(|(_, ch)| BREAKS.contains(ch))
+        .map(|(index, ch)| index + ch.len_utf8())
+        .unwrap_or(0);
+    let end = text[offset..]
+        .char_indices()
+        .find(|(_, ch)| BREAKS.contains(ch))
+        .map(|(index, _)| offset + index)
+        .unwrap_or(text.len());
+    let clause = text[start..end].trim();
+    // Keep it quotable: a long clause would drown the denial.
+    let capped: String = clause.chars().take(48).collect();
+    if capped.is_empty() {
+        clause.to_string()
+    } else {
+        capped
+    }
+}
+
+/// The read-only directive this message actually enforces, if any.
+///
+/// `Some(clause)` means the turn is `ReviewOnly` and the clause is what locked
+/// it. Wording alone never demotes a message that asks for a write: see R2.
+pub fn read_only_trigger(user_msg: &str) -> Option<String> {
+    let text = read_only_scan_text(user_msg);
+    let offset = read_only_wording_offset(&text)?;
+    if has_write_intent(&text) {
+        return None;
+    }
+    Some(clause_around(&text, offset))
+}
+
+/// Wording only: where the first read-only cue with a complete action word sits.
+/// Callers that must not be swayed by a co-occurring write intent (the delivery
+/// authorization veto) use this directly.
+fn read_only_wording_offset(text: &str) -> Option<usize> {
+    HARD_READ_ONLY_CJK
+        .iter()
+        .filter_map(|(cue, action)| read_only_cue_offset(text, cue, action))
+        .min()
+        .or_else(|| {
+            HARD_READ_ONLY_EN_PHRASES
+                .iter()
+                .filter_map(|phrase| text.find(phrase))
+                .min()
+        })
+}
+
+fn has_hard_read_only_directive(user_msg: &str) -> bool {
+    read_only_trigger(user_msg).is_some()
+}
+
 const HARD_READ_ONLY_EN_PHRASES: &[&str] = &[
     "only analyze",
     "only analyse",
@@ -458,42 +701,6 @@ const SCOPED_FILE_LIMITS: &[&str] = &[
     "do not change other files",
     "don't change other files",
 ];
-
-fn without_scoped_file_limits(lowercased: &str) -> String {
-    SCOPED_FILE_LIMITS
-        .iter()
-        .fold(lowercased.to_string(), |text, scope| {
-            text.replace(scope, "")
-        })
-}
-
-/// M175: pasted specifications, templates and logs are context, not the user's
-/// action directive. Use the first instruction paragraph; quoted/fenced/heading
-/// blocks end that paragraph even when the paste omitted a blank separator.
-fn instruction_paragraph(message: &str) -> &str {
-    let message = message.trim();
-    let mut end = 0;
-    for line in message.split_inclusive('\n') {
-        let text = line.trim();
-        if text.is_empty() || text.starts_with('>') || text.starts_with("```")
-            || text.starts_with('#') {
-            break;
-        }
-        end += line.len();
-    }
-    message[..end].trim()
-}
-
-fn has_hard_read_only_directive(user_msg: &str) -> bool {
-    let text = without_scoped_file_limits(&instruction_paragraph(user_msg).to_ascii_lowercase());
-    // Conditional constraints govern their branch, not the entire turn.
-    let text = text.split([ '。', '；', ';' ]).filter(|clause| {
-        let clause = clause.trim_start();
-        !clause.starts_with("如果") && !clause.starts_with("若") && !clause.starts_with("if ")
-    }).collect::<Vec<_>>().join("。");
-    HARD_READ_ONLY_CJK.iter().chain(HARD_READ_ONLY_EN_PHRASES.iter())
-        .any(|cue| text.contains(cue) && !text.contains(&format!("别{cue}")))
-}
 
 fn ceiling_declaration(lowercased: &str) -> bool {
     tokens(lowercased)
@@ -584,10 +791,9 @@ pub fn is_explicit_delivery_authorization(user_msg: &str) -> bool {
         return false;
     }
     let scoped = without_scoped_file_limits(&m);
-    !(HARD_READ_ONLY_CJK.iter().any(|cue| scoped.contains(cue))
-        || HARD_READ_ONLY_EN_PHRASES
-            .iter()
-            .any(|cue| scoped.contains(cue)))
+    // Boundary-aware: an authorization is not vetoed by `不要改写` (which is the
+    // word 改写, not the verb 改) any more than a write task is demoted by it.
+    read_only_wording_offset(&scoped).is_none()
 }
 
 /// Tokenize on non-alphanumeric boundaries for whole-word English matching.
@@ -2251,5 +2457,94 @@ mod m200_receipt_tests {
             .await
             .unwrap()
             .is_none());
+    }
+
+    // ---- M222: 只读线索必须按词边界匹配 -------------------------------
+    //
+    // Field report (11-04 02:1x, v1.91.73): 「请逐条、原样执行，不要改写、不要
+    // 合并、不要省略开头的 cd」 turned the whole session read-only, because
+    // `不要改写` contains the substring `不要改`. The cue is a VERB directive;
+    // 改写 is a different word and 写 is not that verb's object.
+
+    const M222_FIELD_MESSAGE: &str = "在测试仓库里追加一行并在本地提交，用 git 完成。请逐条、原样执行，不要改写、不要合并、不要省略开头的 cd。";
+
+    #[test]
+    fn m222_field_message_keeps_write_capability() {
+        for message in [
+            M222_FIELD_MESSAGE,
+            // 同样的收尾指令换一个长词前缀，仍然不是只读。
+            "在测试仓库里追加一行并在本地提交。请逐条、原样执行，不要改名、不要合并、不要省略开头的 cd。",
+            "在测试仓库里追加一行并在本地提交。请按顺序执行，不要改动措辞、不要合并提交。",
+        ] {
+            let contract = decide_chat_contract(None, message);
+            assert!(
+                !contract.grants.explicit_read_only,
+                "an ordinary write task must not be demoted to read-only: {message}"
+            );
+            assert_eq!(contract.capability, TurnCapability::Implement, "{message}");
+        }
+    }
+
+    /// The prefix must not become the general escape hatch: a real directive is
+    /// still a directive when the verb stands on its own or takes an object.
+    #[test]
+    fn m222_genuine_read_only_directives_still_hold() {
+        for message in [
+            "只分析这段代码，不要改代码。",
+            "先别修改，给方案。",
+            "只读审查当前分支的实现，不要修改文件。",
+            "不要执行任何命令，先把方案说清楚。",
+            "先别动代码，我们先对齐设计。",
+            "only review, do not change anything.",
+        ] {
+            let contract = decide_chat_contract(None, message);
+            assert!(
+                contract.grants.explicit_read_only,
+                "explicit read-only directive must hold: {message}"
+            );
+            assert_eq!(contract.capability, TurnCapability::ReviewOnly, "{message}");
+        }
+    }
+
+    /// R2: an inferred read-only only constrains the scope it names. A message
+    /// that ALSO carries an unambiguous write predicate keeps write capability.
+    #[test]
+    fn m222_write_intent_in_the_same_message_outranks_a_posture_cue() {
+        for message in [
+            "只分析这段代码，然后把结论写进 docs/report.md。",
+            "只评估，然后修复这个 bug 并提交。",
+            "别客套，直接实现这个功能。",
+        ] {
+            let contract = decide_chat_contract(None, message);
+            assert!(
+                !contract.grants.explicit_read_only,
+                "a write predicate keeps write capability: {message}"
+            );
+            assert_eq!(contract.capability, TurnCapability::Implement, "{message}");
+        }
+        // …but a NEGATED write predicate is not a write intent.
+        let negated = decide_chat_contract(None, "只分析，不要提交代码。");
+        assert!(negated.grants.explicit_read_only);
+        assert_eq!(negated.capability, TurnCapability::ReviewOnly);
+        // …and a structured read-only turn is never overridden by wording.
+        let structured = decide_chat_contract_with_intent(
+            None,
+            "只分析，然后提交报告。",
+            TurnIntent {
+                structured_read_only: true,
+            },
+        );
+        assert_eq!(structured.capability, TurnCapability::ReviewOnly);
+    }
+
+    /// A trigger is reported only when the turn really is read-only, so the
+    /// runtime never attaches a quotation to a turn that kept write capability.
+    #[test]
+    fn m222_trigger_is_reported_only_for_an_enforced_read_only_turn() {
+        assert_eq!(
+            read_only_trigger("只分析这段代码，不要改代码，也不要提交。").as_deref(),
+            Some("只分析这段代码")
+        );
+        assert_eq!(read_only_trigger(M222_FIELD_MESSAGE), None);
     }
 }
