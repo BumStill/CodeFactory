@@ -166,11 +166,35 @@ fn heredoc_header_prefix<'a>(header: &'a str, root: Option<&Path>) -> Result<(Op
 }
 
 fn canonical(path: &Path) -> std::path::PathBuf {
-    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+    match path.canonicalize() {
+        Ok(real) => strip_verbatim_prefix(&real),
+        Err(_) => strip_verbatim_prefix(path),
+    }
+}
+
+/// M215 R1 (Windows): `canonicalize` hands back verbatim paths (`\\?\C:\a`,
+/// UNC as `\\?\UNC\srv\share`). They name the same directory as the plain form,
+/// so comparisons and `cd` targets are reduced to the plain form first — a
+/// workspace root compared against a verbatim temp directory otherwise looks
+/// like a different place and the proof fails closed on a legitimate command.
+fn plain_windows_text(text: &str) -> String {
+    if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+        return format!(r"\\{rest}");
+    }
+    match text.strip_prefix(r"\\?\") {
+        Some(rest) => rest.to_string(),
+        None => text.to_string(),
+    }
+}
+
+fn strip_verbatim_prefix(path: &Path) -> std::path::PathBuf {
+    std::path::PathBuf::from(plain_windows_text(&path.to_string_lossy()))
 }
 
 fn within(root: &Path, path: &Path) -> bool {
-    path == root || path.starts_with(root)
+    let root = strip_verbatim_prefix(root);
+    let path = strip_verbatim_prefix(path);
+    path == root || path.starts_with(&root)
 }
 
 /// Shell word -> physical path. Quotes and backslash escapes are undone, `~`
@@ -185,19 +209,25 @@ fn physical(base: &Path, raw: &str) -> Option<std::path::PathBuf> {
         home()?
     } else if let Some(rest) = text.strip_prefix("~/").or_else(|| text.strip_prefix("$HOME/")).or_else(|| text.strip_prefix("${HOME}/")) {
         home()?.join(rest)
-    } else if text.starts_with('/') || has_drive(&text) {
+    } else if text.starts_with('/') || windows_absolute(&text) {
         std::path::PathBuf::from(&text)
     } else {
         base.join(&text)
     };
-    if let Ok(real) = expanded.canonicalize() { return Some(real); }
+    if let Ok(real) = expanded.canonicalize() { return Some(strip_verbatim_prefix(&real)); }
     let parent = expanded.parent()?.canonicalize().ok()?;
-    Some(parent.join(expanded.file_name()?))
+    Some(strip_verbatim_prefix(&parent).join(expanded.file_name()?))
 }
 
 fn has_drive(text: &str) -> bool {
     let bytes = text.as_bytes();
     bytes.len() > 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && (bytes[2] == b'\\' || bytes[2] == b'/')
+}
+
+/// `C:\...` (drive) and `\\?\...` / `\\server\share` (verbatim, UNC) are
+/// absolute on Windows; they must not be joined onto a base directory.
+fn windows_absolute(text: &str) -> bool {
+    text.starts_with(r"\\") || has_drive(text)
 }
 
 /// Strip matching quotes and undo shell backslash escapes. `$(...)`, backticks
@@ -212,9 +242,15 @@ fn shell_text(raw: &str) -> Option<String> {
         raw
     };
     let mut out = String::with_capacity(inner.len());
-    let mut chars = inner.chars();
-    while let Some(c) = chars.next() {
-        if c == '\\' { out.push(chars.next()?); } else { out.push(c); }
+    // A Windows path uses `\` as its separator, so undoing escapes there would
+    // turn `\\?\C:\a\b` into `\?C:ab`. Such words keep their backslashes.
+    if windows_absolute(inner) {
+        out.push_str(inner);
+    } else {
+        let mut chars = inner.chars();
+        while let Some(c) = chars.next() {
+            if c == '\\' { out.push(chars.next()?); } else { out.push(c); }
+        }
     }
     let mut rest = out.clone();
     for token in ["${HOME}", "$HOME", "${PWD}", "$PWD"] { rest = rest.replace(token, ""); }
@@ -1637,6 +1673,41 @@ gh pr comment 933 --body 'CI 全绿，已打 merge-queue: armed'";
         // Read-only traffic alone is not an owned remote write: it needs no
         // allowance, and must not create one for a later segment.
         assert!(own_remote_actions("gh pr view 933 --json state").is_none());
+    }
+}
+
+/// M215 R1 (Windows): a canonicalised Windows path arrives verbatim
+/// (`\\?\C:\...`). The proof must read it as the same directory it names, and
+/// `\` inside such a word is a separator, not a shell escape.
+#[cfg(test)]
+mod m215_windows_path_forms {
+    use super::{plain_windows_text, shell_text};
+
+    #[test]
+    fn verbatim_prefixes_reduce_to_the_plain_form() {
+        assert_eq!(plain_windows_text(r"\\?\C:\Users\a\state"), r"C:\Users\a\state");
+        assert_eq!(plain_windows_text(r"\\?\UNC\server\share\ws"), r"\\server\share\ws");
+        assert_eq!(plain_windows_text("/Users/leo/ws"), "/Users/leo/ws");
+        assert_eq!(plain_windows_text(r"C:\Users\a\state"), r"C:\Users\a\state");
+    }
+
+    #[test]
+    fn windows_paths_keep_their_backslashes() {
+        assert_eq!(shell_text(r"\\?\C:\Users\a\state").as_deref(), Some(r"\\?\C:\Users\a\state"));
+        assert_eq!(shell_text(r"C:\Users\a\state").as_deref(), Some(r"C:\Users\a\state"));
+        assert_eq!(shell_text(r#""\\?\C:\Users\a\state""#).as_deref(), Some(r"\\?\C:\Users\a\state"));
+        // A plain POSIX word still undoes backslash escapes.
+        assert_eq!(shell_text(r"my\ dir").as_deref(), Some("my dir"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn verbatim_root_contains_its_plain_child() {
+        use super::within;
+        use std::path::Path;
+        assert!(within(Path::new(r"\\?\C:\ws"), Path::new(r"C:\ws\state")));
+        assert!(within(Path::new(r"C:\ws"), Path::new(r"\\?\C:\ws\state")));
+        assert!(!within(Path::new(r"\\?\C:\ws"), Path::new(r"C:\other")));
     }
 }
 
