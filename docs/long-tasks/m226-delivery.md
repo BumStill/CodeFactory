@@ -1,6 +1,6 @@
 # M226：续接任务与嵌套工作区救援
 
-Scenario-Test: HLT-001, HLT-004
+Scenario-Test: HLT-001, HLT-004, RTE-004
 README-Update: reviewed
 README-Update-Reason: 修复既有任务生命周期及清理安全，不改变公开功能承诺。
 

@@ -17,6 +17,11 @@
     { "pattern": "src-tauri/src/commands/settings.rs", "scenario_id": "HLT-001" },
     { "pattern": "src-tauri/src/commands/usage_acceptance_tests.rs", "scenario_id": "HLT-001" },
     { "pattern": "src/components/SubscriptionQuotaSection.tsx", "scenario_id": "HLT-001" },
-    { "pattern": "src/lib/tauri.ts", "scenario_id": "HLT-001" }
+    { "pattern": "src/lib/tauri.ts", "scenario_id": "HLT-001" },
+    { "pattern": "scripts/build-cache-budget.mjs", "scenario_id": "RTE-004" },
+    { "pattern": "scripts/worktree-closeout.mjs", "scenario_id": "RTE-004" },
+    { "pattern": "scripts/worktree-janitor.mjs", "scenario_id": "RTE-004" },
+    { "pattern": "scripts/worktree-rescue.mjs", "scenario_id": "RTE-004" },
+    { "pattern": "src-tauri/src/build_cache.rs", "scenario_id": "RTE-004" }
   ]
 }

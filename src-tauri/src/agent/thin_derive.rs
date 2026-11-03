@@ -2,6 +2,7 @@
 //! 四态由运行事实推导，thin_session_state 只作投影。
 use sqlx::SqlitePool;
 use super::thin_state::{SessionState, ThinState};
+use crate::util::no_window::NoWindow;
 
 async fn has_table(db: &SqlitePool, name: &str) -> sqlx::Result<bool> {
     Ok(sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?")
@@ -731,12 +732,8 @@ async fn stale_delivery_scope(db: &SqlitePool, session: &str) -> sqlx::Result<bo
 /// 另外磁盘上还存在未提交/未推送的工作时同样不得结束——那是在等继续，不是在等收尾。
 pub(crate) async fn delivery_closeout_may_end(db: &SqlitePool, session: &str) -> sqlx::Result<bool> {
     if crate::session_executor_alive(session) == Some(true) { return Ok(false); }
-    if has_table(db, "chat_turn_state").await? {
-        let running: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM chat_turn_state WHERE session_id=? AND completed_at IS NULL AND terminal_reason IS NULL",
-        ).bind(session).fetch_one(db).await?;
-        if running > 0 { return Ok(false); }
-    }
+    // Durable turn rows may outlive their executor (M188); only a live
+    // executor proves a running round. Restart reconciliation owns orphan rows.
     if unanswered_user(db, session).await? { return Ok(false); }
     if has_table(db, "wakeup_schedules").await? {
         // 收尾/修复唤醒本身不算排队中的工作，其它 pending 唤醒都算。
@@ -779,7 +776,7 @@ async fn delivery_fact_belongs_to_earlier_objective(db: &SqlitePool, session: &s
 }
 
 fn workspace_path_is_dirty(path: &std::path::Path) -> bool {
-    std::process::Command::new("git")
+    std::process::Command::new("git").no_window()
         .current_dir(path)
         .args(["status", "--porcelain=v1", "--untracked-files=all"])
         .output()
@@ -798,7 +795,7 @@ fn pending_work_in(paths: &[String]) -> bool {
         let Ok(canonical) = path.canonicalize() else { return true; };
         let path = canonical.as_path();
         if workspace_path_is_dirty(path) { return true; }
-        let Ok(output) = std::process::Command::new("git")
+        let Ok(output) = std::process::Command::new("git").no_window()
             .current_dir(path)
             .args(["worktree", "list", "--porcelain"])
             .output() else { continue };
@@ -1553,7 +1550,7 @@ mod tests {
         let repo = temp.path().join("repo");
         std::fs::create_dir_all(&repo).unwrap();
         let run = |cwd: &std::path::Path, args: &[&str]| {
-            let out = std::process::Command::new("git").current_dir(cwd).args(args).output().unwrap();
+            let out = std::process::Command::new("git").no_window().current_dir(cwd).args(args).output().unwrap();
             assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
             String::from_utf8(out.stdout).unwrap().trim().to_owned()
         };
@@ -1577,7 +1574,7 @@ mod tests {
         let refs = run(&repo, &["for-each-ref", "--format=%(refname)", "refs/codefactory/rescue/"]);
         std::fs::remove_dir_all(&outer).unwrap();
         let restored = refs.lines().any(|reference| {
-            let out = std::process::Command::new("git").current_dir(&repo)
+            let out = std::process::Command::new("git").no_window().current_dir(&repo)
                 .args(["show", &format!("{reference}:continuation.txt")]).output().unwrap();
             out.status.success() && out.stdout == b"synthetic continuation work"
         });
