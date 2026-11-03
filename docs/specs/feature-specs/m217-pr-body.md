@@ -17,7 +17,7 @@ R4/R5：重建后实际 admission 产生 daily_spend_cap skip 和可持久化模
 - Observation：金额、来源、余额、重置时间、路由 skip，不输出密钥。
 - Release：本 PR 只合并，不执行发版；Release-Urgency: immediate。
 - Viewport：复用既有布局；订阅控件过滤人民币预算行，防止错误百分比操作。`pnpm test:usage:headless` 通过 1366×768、800×600、375×812 的趋势、热力图、详情和预算键盘路径；截图位于系统临时目录 `codefactory-token-usage-headless/{wide-settings,wide-day-detail,minimum-window-settings,narrow-settings}.png`（深色）及 `/tmp/codefactory-m217-usage-light/`（浅色）。两种主题均通过相同布局/键盘断言，并经 view_image 确认宽屏截图无重叠、裁切。
-- AI Collaboration：context scope 为 M217、成本持久化、路由、余额与 dispatch；assumptions 为既有 Asia/Shanghai 用量日界；review point 为重启不能清零、凭据不出现在输出；validation result：M217 四项定向验收通过，路由构造守卫修复后通过，前端 163 个文件 / 1087 项测试通过，build、用量真浏览器、统一 local scenario gate、治理基线、README/scenario validator 通过；Rust workspace 全量仍在执行。按任务模板不调用 delegate_tasks，单执行流。
+- AI Collaboration：context scope 为 M217、成本持久化、路由、余额与 dispatch；assumptions 为既有 Asia/Shanghai 用量日界；review point 为重启不能清零、凭据不出现在输出；validation result：M217 四项定向验收通过，路由构造守卫修复后通过，前端 163 个文件 / 1087 项测试通过，build、用量真浏览器、统一 local scenario gate、治理基线、README/scenario validator 通过；Rust workspace 全量复跑已通过（CARGO_INCREMENTAL=0，专用目录与心跳保护）。按任务模板不调用 delegate_tasks，单执行流。
 
 ### 自验收
 - 已花按单价、缓存命中去重、幂等写入：定向测试通过。
@@ -25,7 +25,7 @@ R4/R5：重建后实际 admission 产生 daily_spend_cap skip 和可持久化模
 - 真机验收由编排方发版后完成（not live）：执行 codefactory --dispatch usage_status，核对当日金额误差 ≤5%；重启再查；在设置 endpoint_daily_spend_caps 临时降低 daily_cap_cny，触发 DeepSeek，核对 daily_spend_cap 与 waiting_wake；恢复 ¥10。能读取余额时核对余额差。
 - 无 Spec Amendment；未修改信任根。
 
-Scenario-Test: HLT-001
+Scenario-Test: HLT-001, CXD-002, DAT-001, RTE-003, RTE-004, SKL-002, SKL-003
 README-Update: reviewed
 README-Update-Reason: 修复既有预算功能的持久化与内部 dispatch 接线，不改变安装、隐私或平台承诺。
 
