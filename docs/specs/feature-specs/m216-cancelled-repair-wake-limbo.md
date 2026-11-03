@@ -33,7 +33,7 @@ Release-Urgency: immediate
 | R1 | 以上现场元数据 + 调度拒绝/派生/覆盖判定调用链 | 不复制真实对话的根因记录 |
 | R2 | 已触发订阅不再覆盖；取消操作同事务保护等待；技术投递失败不消耗工作区恢复预算 | SQLite 事务测试、瞬态准入失败后成功投递、停止不复活 |
 | R3 | 本地短周期巡检补 pending 修复计划与审计，独立于 ≥180s GH 观测 | 无来源遗留状态的幂等修复与审计断言 |
-| R4 | 合成 CI failure → blocked 双事件，失败准入后重试 | 真实持久调度器 → WakeSink 投递成功，fire_count 递增，不发人工消息 |
+| R4 | 合成 CI failure → blocked 双事件，失败准入后由系统自动重试/自愈 | 真实持久调度器 → WakeSink 投递成功，fire_count 递增，对话写入数量保持零 |
 
 ## Applicable Harnesses
 
