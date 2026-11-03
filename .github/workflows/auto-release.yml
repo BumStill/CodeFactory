@@ -467,9 +467,52 @@ jobs:
           EXPECTED_HEAD: ${{ steps.version_pr.outputs.head_sha }}
         run: |
           set -euo pipefail
-          for attempt in $(seq 1 180); do
-            DATA=$(gh pr view "$PR" --repo "$GITHUB_REPOSITORY" \
-              --json state,mergeStateStatus,mergeCommit,headRefOid,statusCheckRollup)
+          # The six required checks this gate waits for. Kept explicit in the
+          # workflow so the release gate and the repo ruleset can be compared by
+          # reading (tests/test_github_main_gate.py), and passed to the
+          # classifier so judgement lives in tested code rather than in shell.
+          REQUIRED_CHECKS="governance-baseline agent-bridge-linux check-frontend check-rust remote-real-app-gui scenario-gate-pr"
+          MAX_INFRA_RETRIES=2
+          INFRA_RETRIES=0
+          GRACE_ROUNDS=0
+
+          # Reading GitHub is an observation, not a verdict. On 2026-11-03 a
+          # `HTTP 502: Bad Gateway` while polling became "the version PR
+          # failed", and `set -e` killed the whole release (M223 R1). Retry a
+          # bounded number of times with backoff, and report every attempt.
+          gh_retry() {
+            local attempt
+            for attempt in 1 2 3 4 5; do
+              if "$@"; then
+                return 0
+              fi
+              echo "::warning::GitHub call failed (attempt $attempt/5): $*" >&2
+              sleep $((attempt * 10))
+            done
+            return 1
+          }
+
+          observe_pr() {
+            local out
+            for attempt in 1 2 3 4 5; do
+              if out=$(gh pr view "$PR" --repo "$GITHUB_REPOSITORY" \
+                         --json state,mergeStateStatus,mergeCommit,headRefOid,statusCheckRollup \
+                         2>/dev/null); then
+                printf '%s' "$out"
+                return 0
+              fi
+              echo "::warning::could not read version PR #$PR (attempt $attempt/5); retrying in 10s" >&2
+              sleep 10
+            done
+            return 1
+          }
+
+          for attempt in $(seq 1 360); do
+            if ! DATA=$(observe_pr); then
+              echo "::warning::version PR #$PR is unreadable right now ($attempt/360); keeping the release alive"
+              sleep 20
+              continue
+            fi
             ACTUAL_HEAD=$(jq -r '.headRefOid' <<< "$DATA")
             if [ "$ACTUAL_HEAD" != "$EXPECTED_HEAD" ]; then
               echo "::error::Version PR #$PR head changed from $EXPECTED_HEAD to $ACTUAL_HEAD"
@@ -491,21 +534,104 @@ jobs:
               exit 1
             fi
 
-            SUCCESSES=0
-            for CHECK in governance-baseline agent-bridge-linux check-frontend check-rust remote-real-app-gui scenario-gate-pr; do
-              CONCLUSIONS=$(jq -r --arg check "$CHECK" \
-                '.statusCheckRollup[]? | select(.name == $check) | .conclusion' <<< "$DATA")
-              if grep -Eq '^(FAILURE|CANCELLED|TIMED_OUT|ACTION_REQUIRED)$' \
-                   <<< "$CONCLUSIONS"; then
-                echo "::error::Version PR #$PR required check $CHECK failed"
-                exit 1
-              fi
-              if grep -qx 'SUCCESS' <<< "$CONCLUSIONS"; then
-                SUCCESSES=$((SUCCESSES + 1))
-              fi
-            done
+            # The rollup is passed through as-is; the classifier collapses it
+            # to the newest attempt per check name (a rerun appends a second
+            # check run for the same head SHA, and a superseded FAILURE must
+            # never outvote the attempt that replaced it) and owns every other
+            # judgement in this round (M223).
+            ROLLUP=$(jq -c '[.statusCheckRollup[]?
+                | {name: (.name // .context), conclusion: (.conclusion // ""),
+                   startedAt: (.startedAt // ""), id: (.id // "")}]' <<< "$DATA")
 
+            classify_round() {   # $1 = run/job evidence, $2 = rerunnable run ids, $3 = annotations
+              jq -n --argjson checks "$ROLLUP" --argjson runs "$1" --argjson retry "$2" \
+                    --argjson annotations "$3" \
+                    --argjson required "$(jq -Rc 'split(" ") | map(select(length > 0))' \
+                        <<< "$REQUIRED_CHECKS")" \
+                    --argjson used "$INFRA_RETRIES" --argjson max "$MAX_INFRA_RETRIES" \
+                '{checks: $checks, runs: $runs, retry_run_ids: $retry,
+                  annotations: $annotations, required: $required,
+                  infra_retries_used: $used, max_infra_retries: $max}' \
+                | python3 tools/release/classify_ci_infra.py
+            }
+
+            # "All six green" stays the merge trigger, in the exact shape the
+            # repo audit test pins (tests/test_release_workflow.py): the gate
+            # may not quietly require fewer checks. Counting uses the newest
+            # attempt per check name, so a stale duplicate cannot vote twice.
+            SUCCESSES=$(jq -r '[group_by(.name)[]
+                | {latest: max_by(.startedAt)}
+                | select(.latest.conclusion == "SUCCESS")] | length' <<< "$ROLLUP")
+
+            DECISION_JSON=$(classify_round '[]' '[]' '{}')
+            DECISION=$(jq -r '.decision' <<< "$DECISION_JSON")
+
+            if [ "$DECISION" != "merge" ] && [ "$DECISION" != "wait" ]; then
+              if [ "$GRACE_ROUNDS" -gt 0 ]; then
+                # A rerun was just requested; the rollup still carries the old
+                # attempt. Observe, do not spend another retry on stale
+                # evidence.
+                GRACE_ROUNDS=$((GRACE_ROUNDS - 1))
+                echo "Version PR #$PR is settling after an infrastructure rerun ($GRACE_ROUNDS grace round(s) left)"
+                sleep 20
+                continue
+              fi
+
+              # Something is red. Gather what actually failed so the classifier
+              # can separate a GitHub hiccup (runner setup, action download, a
+              # cancelled run) from a real red test. A failure to collect
+              # evidence never becomes a verdict: the classifier stays
+              # fail-closed and says so.
+              RUN_JOBS="[]"
+              RETRY_RUN_IDS="[]"
+              if ! FAILING_RUNS=$(gh_retry gh run list --repo "$GITHUB_REPOSITORY" \
+                     --commit "$EXPECTED_HEAD" --limit 50 \
+                     --json databaseId,event,conclusion \
+                     --jq '[.[] | select(.event == "pull_request")
+                             | select(.conclusion == "failure" or .conclusion == "cancelled"
+                                   or .conclusion == "timed_out" or .conclusion == "startup_failure")
+                             | .databaseId] | .[]?'); then
+                echo "::warning::could not list workflow runs for $EXPECTED_HEAD; red checks stay unclassified" >&2
+                FAILING_RUNS=""
+              fi
+              for RUN_ID in $FAILING_RUNS; do
+                RETRY_RUN_IDS=$(jq -c --argjson id "$RUN_ID" '. + [$id] | unique' <<< "$RETRY_RUN_IDS")
+                if ! JOBS=$(gh_retry gh run view "$RUN_ID" --repo "$GITHUB_REPOSITORY" --json jobs); then
+                  echo "::warning::could not read jobs of run $RUN_ID; its step evidence is missing" >&2
+                  continue
+                fi
+                RUN_JOBS=$(jq -c --argjson id "$RUN_ID" --argjson jobs "$JOBS" \
+                  '. + [{run_id: $id, jobs: $jobs}]' <<< "$RUN_JOBS")
+              done
+
+              # A job GitHub never placed has no failed step at all; its
+              # check-run annotation ("The job was not acquired by Runner ...")
+              # is the only evidence of why (M223 R2).
+              ANNOTATIONS="{}"
+              for CHECK in $(jq -r '.failed_checks[]' <<< "$DECISION_JSON"); do
+                CHECK_ID=$(jq -r --arg c "$CHECK" \
+                  '[.[] | select(.name == $c) | select(.startedAt | length > 0)]
+                   | max_by(.startedAt) | .id // empty' <<< "$ROLLUP")
+                if [ -z "$CHECK_ID" ]; then
+                  continue
+                fi
+                if ! MESSAGES=$(gh_retry gh api \
+                       "repos/$GITHUB_REPOSITORY/check-runs/$CHECK_ID/annotations" \
+                       --jq '[.[].message]'); then
+                  echo "::warning::could not read annotations of $CHECK ($CHECK_ID)" >&2
+                  continue
+                fi
+                ANNOTATIONS=$(jq -c --arg check "$CHECK" --argjson messages "$MESSAGES" \
+                  '. + {($check): $messages}' <<< "$ANNOTATIONS")
+              done
+
+              DECISION_JSON=$(classify_round "$RUN_JOBS" "$RETRY_RUN_IDS" "$ANNOTATIONS")
+              DECISION=$(jq -r '.decision' <<< "$DECISION_JSON")
+            fi
+
+            REASON=$(jq -r '.reason' <<< "$DECISION_JSON")
             MERGE_STATE=$(jq -r '.mergeStateStatus' <<< "$DATA")
+
             if [ "$MERGE_STATE" = "DIRTY" ]; then
               echo "::error::Version PR #$PR has merge conflicts"
               exit 1
@@ -514,17 +640,42 @@ jobs:
               echo "::error::Version PR #$PR is behind main; refusing to expand an already planned release batch. Rerun Auto Release to replan from latest main."
               exit 1
             fi
+
+            case "$DECISION" in
+              merge|wait)
+                ;;
+              retry_infra)
+                INFRA_RETRIES=$((INFRA_RETRIES + 1))
+                echo "::warning::$REASON -- rerunning failed jobs instead of failing the release"
+                for RUN_ID in $(jq -r '.retry_run_ids[]' <<< "$DECISION_JSON"); do
+                  if ! gh run rerun "$RUN_ID" --repo "$GITHUB_REPOSITORY" --failed; then
+                    echo "::warning::rerun of $RUN_ID was rejected (already rerunning?); observing the next round" >&2
+                  fi
+                done
+                GRACE_ROUNDS=3
+                sleep 20
+                continue
+                ;;
+              *)
+                echo "::error::$REASON"
+                exit 1
+                ;;
+            esac
+
             if [ "$SUCCESSES" -eq 6 ]; then
-              gh pr merge "$PR" --repo "$GITHUB_REPOSITORY" --squash \
-                --auto --match-head-commit "$EXPECTED_HEAD"
-              echo "All required checks passed; submitted guarded merge for version PR #$PR"
+              if gh pr merge "$PR" --repo "$GITHUB_REPOSITORY" --squash \
+                   --auto --match-head-commit "$EXPECTED_HEAD"; then
+                echo "All required checks passed; submitted guarded merge for version PR #$PR"
+              else
+                echo "::warning::guarded merge submission for version PR #$PR was rejected; the next round re-checks and retries"
+              fi
               sleep 5
               continue
             fi
-            echo "Version PR #$PR waiting ($attempt/180, state=$MERGE_STATE, required=$SUCCESSES/6)"
+            echo "Version PR #$PR waiting ($attempt/360, state=$MERGE_STATE, required=$SUCCESSES/6, infra-retries=$INFRA_RETRIES): $REASON"
             sleep 20
           done
-          echo "::error::Version PR #$PR did not merge within 60 minutes"
+          echo "::error::Version PR #$PR did not merge within 120 minutes"
           exit 1
 
       - name: Tag guarded merge and dispatch release build
