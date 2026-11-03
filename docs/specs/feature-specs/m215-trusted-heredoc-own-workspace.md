@@ -53,6 +53,10 @@ Release-Urgency: default
 
 ## 证据
 
-- `cargo test --test m198_trusted_heredoc`：28 passed（含 25 条既有 M198/trusted 用例）。
-- `cargo test --lib m198`：M198 真实解释器执行用例（含新增 M215 断言）。
+- `cargo test --test m198_trusted_heredoc`：35 passed（含 25 条既有 M198/trusted 用例）。
+- `cargo test --lib m215`：M215 真实解释器执行用例（含新增 M215 断言）3 passed。
+- `cargo test --test m159_trusted_git --test m177_trusted_local_git --test m180_readonly_still_prompts
+  --test m182_trusted_git_denylist --test m207_trusted_git_composition`：全部 ok。
 - 直接运行 `trusted_python_ast.py`：6 条放行样例 exit 0，7 条拦截样例 exit 1 且带行号。
+- `sensitive()` 不带工作区根（单元层）时同样成立：`cd "$(pwd)"` 前缀按"就是当前目录"放行，
+  因此 `m198_quoted_python_is_not_shell_syntax` 无需根也能证明，不再退化成 `trusted.heredoc.unproved`。
