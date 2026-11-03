@@ -42,15 +42,22 @@ pub(super) fn python_heredoc_proved(root: Option<&Path>, command: &str) -> bool 
 pub(super) fn python_heredoc_proof(root: Option<&Path>, command: &str) -> Result<(), String> {
     if command.len() > 256 * 1024 { return Err("脚本超过 256 KiB".into()); }
     let Some((header, rest)) = command.split_once('\n') else { return Err("heredoc 缺少换行".into()); };
-    // M215: `cd <this workspace> &&` is how a heredoc actually starts; the
-    // prefix is proved against the registered root, never ignored.
-    let header = heredoc_header_prefix(header.trim(), root)?;
-    let Some((runner, delimiter)) = header.split_once(" <<") else { return Err("缺少 `<<` heredoc 起始符".into()); };
-    let node = ["node", "node -"].contains(&runner);
-    if !node && !["python3 -", "python -"].contains(&runner) {
-        return Err(format!("不接受的解释器入口：{runner}"));
-    }
-    let Some(delimiter) = delimiter.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')) else {
+    // M215 R1: resolve the `cd` prefix to a physical path (relative, `..`, `~`,
+    // spaces, backslash escapes, macOS `/private` aliasing) and accept it when
+    // it lands *inside* this workspace, not only on the workspace root.
+    let (effective, header) = heredoc_header_prefix(header.trim(), root)?;
+    let base = effective.as_deref().or(root);
+    // M215 R1: read-only commands may run before the heredoc (`grep … | head;
+    // echo ===; python3 - <<'PY'`). Each earlier segment must be read-only —
+    // otherwise the whole command stays unproved. `2>&1` is a redirection, not a
+    // command separator, so it is folded away before splitting.
+    let header = header.replace("2>&1", " ").replace("2>&2", " ").replace(">&1", " ").replace(">&2", " ");
+    let mut segments = split_top_level(&header, &[';', '|', '&', '\n']);
+    let Some(heredoc_segment) = segments.pop() else { return Err("缺少 heredoc 命令".into()); };
+    for segment in segments { prefix_segment_is_read_only(base, segment)?; }
+    let Some((runner, delimiter)) = heredoc_segment.split_once(" <<") else { return Err("缺少 `<<` heredoc 起始符".into()); };
+    let runner = runner.trim();
+    let Some(delimiter) = delimiter.trim().strip_prefix('\'').and_then(|s| s.strip_suffix('\'')) else {
         return Err("heredoc 分隔符必须用单引号关闭展开".into());
     };
     if delimiter.is_empty() || !delimiter.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
@@ -69,9 +76,27 @@ pub(super) fn python_heredoc_proof(root: Option<&Path>, command: &str) -> Result
         body.push('\n');
     }
     if !closed { return Err("heredoc 分隔符未闭合".into()); }
+    // M215 R2: a body naming no outside path, no network, no subprocess and no
+    // delete call is workspace-contained. A `cat` body is data written into this
+    // workspace, so only the paths it mentions are judged.
+    if let Some(result) = cat_heredoc_runner(base, runner) {
+        result?;
+        if let Some(base) = base { heredoc_body_contained(base, &body, true)?; }
+        return Ok(());
+    }
+    let node = matches!(runner, "node" | "node -");
+    if !node && !matches!(runner, "python3 -" | "python -") {
+        return Err(format!("不接受的解释器入口：{runner}"));
+    }
+    // The static AST proof stays the strong path; containment is only the
+    // fallback for bodies that proof cannot model (e.g. `json.load`).
+    let contained = match base {
+        Some(base) => { heredoc_body_contained(base, &body, false)?; true }
+        None => false,
+    };
     let mut cmd = Command::new(if cfg!(windows) { "python" } else { "python3" });
     cmd.args(["-I", "-c", include_str!("trusted_python_ast.py")]);
-    if let Some(root) = root { cmd.arg(root); } else { cmd.arg(""); }
+    if let Some(root) = base { cmd.arg(root); } else { cmd.arg(""); }
     if node { cmd.arg("node"); }
     let Ok(mut child) = cmd.no_window().stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::piped()).spawn() else {
         return Err(format!("无法启动{}证明进程", if node { " node " } else { " python " }));
@@ -81,6 +106,8 @@ pub(super) fn python_heredoc_proof(root: Option<&Path>, command: &str) -> Result
     drop(input);
     let Ok(output) = child.wait_with_output() else { return Err("证明进程异常退出".into()); };
     if output.status.success() { return Ok(()); }
+    // M215 R2: strict AST proof could not model this body, but containment held.
+    if contained { return Ok(()); }
     let reason = decode_prover_escapes(String::from_utf8_lossy(&output.stderr).trim());
     Err(if reason.is_empty() { "脚本包含无法静态证明的结构".into() } else { reason })
 }
@@ -112,26 +139,302 @@ pub(crate) fn decode_prover_escapes(text: &str) -> String {
     out
 }
 
-/// M215: strip an optional `cd <path>` prefix that only re-enters this
-/// workspace. Anything else (subdirectory, other root, unparsable) stays
-/// unproved.
-fn heredoc_header_prefix<'a>(header: &'a str, root: Option<&Path>) -> Result<&'a str, String> {
-    let Some(rest) = header.strip_prefix("cd ") else { return Ok(header) };
+/// M215 R1: resolve the `cd` prefix of a heredoc header to a physical directory
+/// and accept it when it is the workspace root or any directory inside it.
+/// `~`, `$HOME`, relative paths, `..`, quotes and backslash escapes are
+/// resolved; anything unresolvable or escaping the workspace stays unproved.
+fn heredoc_header_prefix<'a>(header: &'a str, root: Option<&Path>) -> Result<(Option<std::path::PathBuf>, &'a str), String> {
+    let root = root.map(canonical);
+    let Some(rest) = header.strip_prefix("cd ") else { return Ok((root, header)) };
     let mut split = None;
-    for separator in [" && ", "; "] {
+    for separator in [" && ", "; ", "\n"] {
         if let Some(parts) = rest.split_once(separator) { split = Some(parts); break; }
     }
     let Some((target, tail)) = split else { return Err("heredoc 头部的 cd 没有可证明的分隔符".into()); };
-    let target = target.trim().trim_matches('"').trim_matches('\'');
-    let identity = matches!(target, "$(pwd)" | "${PWD}" | "$PWD" | "`pwd`");
-    // Compare physical paths: a macOS temp root is reached through a symlink, so
-    // the literal root text and its canonical form differ.
-    let same_root = root.is_some_and(|root| {
-        let Ok(target) = root.join(target).canonicalize() else { return false };
-        target == root.canonicalize().unwrap_or_else(|_| root.to_path_buf())
-    });
-    if !identity && !same_root { return Err(format!("heredoc 头部 cd 目标不是本工作区：{target}")); }
-    Ok(tail.trim())
+    let target = target.trim();
+    // `cd "$(pwd)"` re-enters the directory this session already runs in, so it
+    // needs no root to prove: whatever the root is, it stays inside it.
+    if matches!(target.trim_matches('"').trim_matches('\''), "$(pwd)" | "${PWD}" | "$PWD" | "`pwd`") {
+        return Ok((root, tail.trim()));
+    }
+    let Some(root) = root else { return Err("没有工作区根目录，无法证明 heredoc 头部的 cd".into()); };
+    let Some(resolved) = physical(&root, target) else {
+        return Err(format!("无法解析 heredoc 头部 cd 目标：{target}"));
+    };
+    if !within(&root, &resolved) { return Err(format!("heredoc 头部 cd 目标不是本工作区：{target}")); }
+    Ok((Some(resolved), tail.trim()))
+}
+
+fn canonical(path: &Path) -> std::path::PathBuf {
+    match path.canonicalize() {
+        Ok(real) => strip_verbatim_prefix(&real),
+        Err(_) => strip_verbatim_prefix(path),
+    }
+}
+
+/// M215 R1 (Windows): `canonicalize` hands back verbatim paths (`\\?\C:\a`,
+/// UNC as `\\?\UNC\srv\share`). They name the same directory as the plain form,
+/// so comparisons and `cd` targets are reduced to the plain form first — a
+/// workspace root compared against a verbatim temp directory otherwise looks
+/// like a different place and the proof fails closed on a legitimate command.
+fn plain_windows_text(text: &str) -> String {
+    if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+        return format!(r"\\{rest}");
+    }
+    match text.strip_prefix(r"\\?\") {
+        Some(rest) => rest.to_string(),
+        None => text.to_string(),
+    }
+}
+
+fn strip_verbatim_prefix(path: &Path) -> std::path::PathBuf {
+    std::path::PathBuf::from(plain_windows_text(&path.to_string_lossy()))
+}
+
+fn within(root: &Path, path: &Path) -> bool {
+    let root = strip_verbatim_prefix(root);
+    let path = strip_verbatim_prefix(path);
+    path == root || path.starts_with(&root)
+}
+
+/// Shell word -> physical path. Quotes and backslash escapes are undone, `~`
+/// and `$HOME` expand, and a path that does not exist yet keeps its canonical
+/// parent (a heredoc may create the file). Anything dynamic is refused.
+fn physical(base: &Path, raw: &str) -> Option<std::path::PathBuf> {
+    let quoted = raw.trim().trim_matches('"').trim_matches('\'');
+    if matches!(quoted, "$(pwd)" | "${PWD}" | "$PWD" | "`pwd`") { return Some(base.to_path_buf()); }
+    let text = shell_text(raw)?;
+    let home = || std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")).ok().map(std::path::PathBuf::from);
+    let expanded = if text == "~" || text == "$HOME" || text == "${HOME}" {
+        home()?
+    } else if let Some(rest) = text.strip_prefix("~/").or_else(|| text.strip_prefix("$HOME/")).or_else(|| text.strip_prefix("${HOME}/")) {
+        home()?.join(rest)
+    } else if text.starts_with('/') || windows_absolute(&text) {
+        std::path::PathBuf::from(&text)
+    } else {
+        base.join(&text)
+    };
+    if let Ok(real) = expanded.canonicalize() { return Some(strip_verbatim_prefix(&real)); }
+    let parent = expanded.parent()?.canonicalize().ok()?;
+    Some(strip_verbatim_prefix(&parent).join(expanded.file_name()?))
+}
+
+fn has_drive(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    bytes.len() > 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && (bytes[2] == b'\\' || bytes[2] == b'/')
+}
+
+/// `C:\...` (drive) and `\\?\...` / `\\server\share` (verbatim, UNC) are
+/// absolute on Windows; they must not be joined onto a base directory.
+fn windows_absolute(text: &str) -> bool {
+    text.starts_with(r"\\") || has_drive(text)
+}
+
+/// Strip matching quotes and undo shell backslash escapes. `$(...)`, backticks
+/// and environment references other than `$HOME`/`$PWD` are dynamic: refused.
+fn shell_text(raw: &str) -> Option<String> {
+    let raw = raw.trim();
+    let inner = if raw.len() >= 2
+        && ((raw.starts_with('"') && raw.ends_with('"')) || (raw.starts_with('\'') && raw.ends_with('\'')))
+    {
+        &raw[1..raw.len() - 1]
+    } else {
+        raw
+    };
+    let mut out = String::with_capacity(inner.len());
+    // A Windows path uses `\` as its separator, so undoing escapes there would
+    // turn `\\?\C:\a\b` into `\?C:ab`. Such words keep their backslashes.
+    if windows_absolute(inner) {
+        out.push_str(inner);
+    } else {
+        let mut chars = inner.chars();
+        while let Some(c) = chars.next() {
+            if c == '\\' { out.push(chars.next()?); } else { out.push(c); }
+        }
+    }
+    let mut rest = out.clone();
+    for token in ["${HOME}", "$HOME", "${PWD}", "$PWD"] { rest = rest.replace(token, ""); }
+    if rest.contains('$') || rest.contains('`') { return None; }
+    Some(out)
+}
+
+const PROTECTED_PARTS: &[&str] = &[".git", ".ssh", ".aws", ".gnupg", ".netrc", "credentials", "id_rsa", "id_ed25519"];
+
+fn protected_path(path: &Path) -> bool {
+    path.components().any(|component| match component {
+        Component::Normal(part) => {
+            let part = part.to_string_lossy();
+            PROTECTED_PARTS.contains(&part.as_ref())
+                || part.starts_with(".env")
+                || part.ends_with(".pem")
+                || part.ends_with(".key")
+        }
+        _ => false,
+    })
+}
+
+/// M215 R1: `cat >> <workspace file> <<'EOF'` is a data write, not a program.
+/// Only the redirect target is judged; flags or extra arguments are refused so
+/// the shape stays exactly what it looks like.
+fn cat_heredoc_runner(base: Option<&Path>, runner: &str) -> Option<Result<(), String>> {
+    let words: Vec<&str> = runner.split_whitespace().collect();
+    let name = words.first()?.rsplit(['/', '\\']).next()?.trim_end_matches(".exe");
+    if name != "cat" { return None; }
+    match &words[1..] {
+        [] => Some(Ok(())),
+        [op, path] if matches!(*op, ">" | ">>") => {
+            let Some(base) = base else { return Some(Err("没有工作区根目录，无法证明 cat heredoc 目标".into())); };
+            match physical(base, path) {
+                Some(target) if within(base, &target) && !protected_path(&target) => Some(Ok(())),
+                _ => Some(Err(format!("cat heredoc 目标不在本工作区：{path}"))),
+            }
+        }
+        _ => Some(Err(format!("不接受的 cat heredoc 形式：{runner}"))),
+    }
+}
+
+/// Capabilities a heredoc program may not hold: network, subprocess, deletion,
+/// dynamic environment or reflection.
+const HEREDOC_DANGER: &[&str] = &[
+    "subprocess", "os.system", "os.popen", "os.exec", "os.spawn", "socket", "urllib",
+    "requests", "httpx", "ftplib", "http://", "https://", "shutil", "rmtree", "os.remove",
+    "os.unlink", "unlink(", "remove(", "child_process", "execsync", "spawnsync", "system(",
+    "eval(", "exec(", "__import__", "ctypes", "environ", "getenv", "sys.argv", "globals(",
+    "locals(", "rm -rf", "rm -fr", "git push", "git reset", "import os", "import sys",
+];
+
+/// M215 R2: a body that names no path outside the workspace and holds no
+/// network, subprocess or delete capability is treated as workspace-contained.
+/// Every path-looking token is resolved; when it cannot be proved the command
+/// still asks for approval.
+fn heredoc_body_contained(base: &Path, body: &str, data_only: bool) -> Result<(), String> {
+    let lower = body.to_ascii_lowercase();
+    let line_of = |needle: &str| body.to_ascii_lowercase().lines().position(|l| l.contains(needle)).map_or(1, |i| i + 1);
+    if !data_only {
+        if let Some(needle) = HEREDOC_DANGER.iter().find(|needle| lower.contains(**needle)) {
+            return Err(format!("heredoc 正文第 {} 行无法证明：包含越界能力 {needle}", line_of(*needle)));
+        }
+    }
+    for token in path_tokens(body) {
+        let token = token.trim_matches('"').trim_matches('\'').to_string();
+        if token.is_empty() || token.contains("://") { continue; }
+        // `//`, `..` and punctuation runs are prose, not paths.
+        if !token.chars().any(|c| c.is_ascii_alphanumeric()) { continue; }
+        if !(token.contains('/') || token.contains('\\') || token.starts_with('~')) { continue; }
+        let line = line_of(&token);
+        match physical(base, &token) {
+            Some(resolved) => {
+                if protected_path(&resolved) { return Err(format!("heredoc 正文第 {line} 行无法证明：涉及受保护路径 {token}")); }
+                if !within(base, &resolved) { return Err(format!("heredoc 正文第 {line} 行无法证明：路径在工作区外 {token}")); }
+            }
+            /* A relative path that does not exist yet cannot escape; anything
+               absolute, expanding or climbing (`..`) must resolve or it stays
+               unproved. */
+            None if token.starts_with('/') || token.starts_with('~') || token.contains("..") || has_drive(&token) => {
+                return Err(format!("heredoc 正文第 {line} 行无法证明：路径无法解析 {token}"));
+            }
+            None => {}
+        }
+    }
+    Ok(())
+}
+
+/// M215 R1: split a header on top-level `;`/`|`/`&`/newline. Quotes keep their
+/// content together, so a separator inside `'PY'` or `"a;b"` does not split.
+fn split_top_level<'a>(input: &'a str, separators: &[char]) -> Vec<&'a str> {
+    let mut parts = Vec::new();
+    let mut quote: Option<char> = None;
+    let mut start = 0usize;
+    for (offset, ch) in input.char_indices() {
+        if let Some(opening) = quote {
+            if ch == opening { quote = None; }
+            continue;
+        }
+        if ch == '\'' || ch == '"' { quote = Some(ch); continue; }
+        if separators.contains(&ch) {
+            let part = input[start..offset].trim();
+            if !part.is_empty() { parts.push(part); }
+            start = offset + ch.len_utf8();
+        }
+    }
+    let tail = input[start..].trim();
+    if !tail.is_empty() { parts.push(tail); }
+    parts
+}
+
+/// Commands that may run before a heredoc without changing the proof: they only
+/// read. Anything else keeps the whole command unproved.
+const READ_ONLY_PREFIX: &[&str] = &[
+    "echo", "printf", "pwd", "ls", "cat", "head", "tail", "wc", "grep", "egrep", "fgrep",
+    "sed", "cut", "sort", "uniq", "tr", "nl", "basename", "dirname", "realpath", "stat",
+    "file", "du", "df", "date", "diff", "comm", "test", "[", "true", "false", "column", "jq",
+];
+
+/// M215 R1: one command placed before the heredoc. It may read files, query Git
+/// or re-enter this workspace; anything that writes, deletes or leaves the
+/// workspace keeps the approval gate.
+fn prefix_segment_is_read_only(base: Option<&Path>, segment: &str) -> Result<(), String> {
+    let words: Vec<&str> = segment.split_whitespace().collect();
+    let mut index = 0;
+    while index < words.len() {
+        let (name, _) = words[index].split_once('=').unwrap_or((words[index], ""));
+        if words[index].contains('=') && !name.is_empty()
+            && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        {
+            index += 1;
+        } else {
+            break;
+        }
+    }
+    let Some(binary) = words.get(index) else { return Ok(()) };
+    let name = binary
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(binary)
+        .trim_end_matches(".exe")
+        .to_ascii_lowercase();
+    let args = &words[index + 1..];
+    if args.iter().any(|arg| arg.starts_with('>')) {
+        return Err(format!("heredoc 之前的命令带有输出重定向：{segment}"));
+    }
+    if name == "cd" {
+        let Some(target) = args.first() else { return Err(format!("heredoc 之前的 cd 没有目标：{segment}")); };
+        let inside = match base {
+            Some(base) => physical(base, target).is_some_and(|resolved| within(base, &resolved)),
+            None => matches!(*target, "$(pwd)" | "${PWD}" | "$PWD" | "`pwd`"),
+        };
+        return inside.then_some(()).ok_or_else(|| format!("heredoc 之前的 cd 目标不可证明：{segment}"));
+    }
+    if name == "git" {
+        let subcommand = args.iter().position(|arg| !arg.starts_with('-'));
+        let read_only = subcommand.is_some_and(|at| {
+            let rest: Vec<String> = args[at + 1..].iter().map(|arg| arg.to_string()).collect();
+            read_only_git_verb(&args[at].to_ascii_lowercase(), &rest)
+        });
+        return read_only.then_some(()).ok_or_else(|| format!("heredoc 之前的 Git 不是只读：{segment}"));
+    }
+    if name == "sed" && args.iter().any(|arg| arg.starts_with("-i") || arg.starts_with("--in-place")) {
+        return Err(format!("heredoc 之前的 sed 会写文件：{segment}"));
+    }
+    if READ_ONLY_PREFIX.contains(&name.as_str()) { return Ok(()); }
+    Err(format!("heredoc 之前不是只读命令：{segment}"))
+}
+
+/// Path-looking words of a body. Quotes and shell punctuation are separators,
+/// so `/Users/leo/.ssh` and `"../x"` both survive as single tokens.
+fn path_tokens(body: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    for ch in body.chars() {
+        let keep = ch.is_ascii_alphanumeric() || matches!(ch, '/' | '\\' | '.' | '-' | '_' | '~' | '$' | '{' | '}' | ':' | '"' | '\'' | '@' | '+' | '%');
+        if keep {
+            current.push(ch);
+        } else if !current.is_empty() {
+            tokens.push(std::mem::take(&mut current));
+        }
+    }
+    if !current.is_empty() { tokens.push(current); }
+    tokens
 }
 
 /// Git subcommands that move the working tree, the index or a local branch.
@@ -284,6 +587,13 @@ fn git_segment_is_sensitive(args: &[String]) -> bool {
     }
     let Some(subcommand) = subcommand else { return false };
     let lower = subcommand.to_ascii_lowercase();
+    // M215 R3: a query verb that can execute a program or write a file is a
+    // write, not a read.
+    if git_runs_program(&args[index + 1..]) { return true; }
+    // M215 R3: a pure read-only Git invocation needs no workspace-root proof,
+    // no registration and no snapshot — wherever it runs. A write verb in the
+    // same segment still falls through to the original rules below.
+    if read_only_git_verb(&lower, &args[index + 1..]) { return false; }
     // M180: `worktree list` reads registrations; it does not move or discard
     // work. Only the listing verb is exempt: remove/prune/add/move/lock still
     // require the session-owned proof and snapshot.
@@ -308,6 +618,60 @@ fn git_segment_is_sensitive(args: &[String]) -> bool {
         });
     }
     false
+}
+
+/// M215 R3: options that turn a Git query into program execution or a file
+/// write. These keep the workspace-root proof and the snapshot.
+fn git_runs_program(rest: &[String]) -> bool {
+    rest.iter().any(|arg| {
+        let option = arg.split('=').next().unwrap_or(arg);
+        ["--ext-diff", "--textconv", "--upload-pack", "--receive-pack", "--exec", "--exec-path"]
+            .contains(&option)
+    })
+}
+
+/// M215 R3: Git verbs that only read local state or a remote. Anything that can
+/// execute a program, write a file or rewrite config is excluded here even when
+/// the verb is normally a query (`--ext-diff`, `--textconv`, `--output`).
+fn read_only_git_verb(subcommand: &str, rest: &[String]) -> bool {
+    let lower: Vec<String> = rest.iter().map(|arg| arg.to_ascii_lowercase()).collect();
+    if lower.iter().any(|arg| {
+        let option = arg.split('=').next().unwrap_or(arg);
+        ["--ext-diff", "--textconv", "--output", "--output-directory", "--upload-pack", "--receive-pack", "--exec", "--exec-path"]
+            .contains(&option)
+    }) {
+        return false;
+    }
+    match subcommand {
+        "status" | "log" | "show" | "diff" | "rev-parse" | "describe" | "ls-files" | "grep"
+        | "cat-file" | "merge-base" | "ls-remote" | "blame" | "shortlog" | "for-each-ref"
+        | "show-ref" | "rev-list" | "check-ignore" | "count-objects" | "var" | "version"
+        | "help" | "name-rev" | "diff-tree" | "diff-index" | "diff-files" | "symbolic-ref"
+        | "whatchanged" | "cherry" | "merge-tree" => true,
+        "fetch" => fetch_args(&rest.iter().map(String::as_str).collect::<Vec<_>>()),
+        "branch" => branch_is_read_only(&lower),
+        "remote" => lower.iter().all(|arg| matches!(arg.as_str(), "-v" | "--verbose" | "show")),
+        "stash" => matches!(lower.first().map(String::as_str), Some("list" | "show")),
+        "worktree" => matches!(lower.first().map(String::as_str), Some("list")),
+        "reflog" => matches!(lower.first().map(String::as_str), Some("show" | "list" | "exists")),
+        "config" => {
+            lower.iter().any(|arg| arg == "core.hookspath")
+                && lower.iter().filter(|arg| !arg.starts_with('-')).count() == 1
+        }
+        _ => false,
+    }
+}
+
+/// `git branch` is a listing only with a query flag or no arguments at all;
+/// a bare positional argument names a branch to create, which is a write.
+fn branch_is_read_only(args: &[String]) -> bool {
+    const WRITE_FLAGS: &[&str] = &[
+        "-d", "-D", "-m", "-M", "-c", "-C", "-f", "--force", "-u", "--set-upstream-to",
+        "--unset-upstream", "--edit-description", "--delete", "--move", "--copy", "--create",
+        "--track", "--no-track",
+    ];
+    if args.iter().any(|arg| WRITE_FLAGS.contains(&arg.as_str())) { return false; }
+    args.is_empty() || args.iter().any(|arg| arg.starts_with('-'))
 }
 
 fn inline_payload(args: &[String], flags: &[&str]) -> Option<String> {
@@ -1309,5 +1673,142 @@ gh pr comment 933 --body 'CI 全绿，已打 merge-queue: armed'";
         // Read-only traffic alone is not an owned remote write: it needs no
         // allowance, and must not create one for a later segment.
         assert!(own_remote_actions("gh pr view 933 --json state").is_none());
+    }
+}
+
+/// M215 R1 (Windows): a canonicalised Windows path arrives verbatim
+/// (`\\?\C:\...`). The proof must read it as the same directory it names, and
+/// `\` inside such a word is a separator, not a shell escape.
+#[cfg(test)]
+mod m215_windows_path_forms {
+    use super::{plain_windows_text, shell_text};
+
+    #[test]
+    fn verbatim_prefixes_reduce_to_the_plain_form() {
+        assert_eq!(plain_windows_text(r"\\?\C:\Users\a\state"), r"C:\Users\a\state");
+        assert_eq!(plain_windows_text(r"\\?\UNC\server\share\ws"), r"\\server\share\ws");
+        assert_eq!(plain_windows_text("/Users/leo/ws"), "/Users/leo/ws");
+        assert_eq!(plain_windows_text(r"C:\Users\a\state"), r"C:\Users\a\state");
+    }
+
+    #[test]
+    fn windows_paths_keep_their_backslashes() {
+        assert_eq!(shell_text(r"\\?\C:\Users\a\state").as_deref(), Some(r"\\?\C:\Users\a\state"));
+        assert_eq!(shell_text(r"C:\Users\a\state").as_deref(), Some(r"C:\Users\a\state"));
+        assert_eq!(shell_text(r#""\\?\C:\Users\a\state""#).as_deref(), Some(r"\\?\C:\Users\a\state"));
+        // A plain POSIX word still undoes backslash escapes.
+        assert_eq!(shell_text(r"my\ dir").as_deref(), Some("my dir"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn verbatim_root_contains_its_plain_child() {
+        use super::within;
+        use std::path::Path;
+        assert!(within(Path::new(r"\\?\C:\ws"), Path::new(r"C:\ws\state")));
+        assert!(within(Path::new(r"C:\ws"), Path::new(r"\\?\C:\ws\state")));
+        assert!(!within(Path::new(r"\\?\C:\ws"), Path::new(r"C:\other")));
+    }
+}
+
+#[cfg(test)]
+mod m215_trusted_heredoc_and_read_only_git {
+    use super::{python_heredoc_proof, sensitive};
+
+    fn workspace() -> (tempfile::TempDir, std::path::PathBuf) {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("src-tauri/src/agent")).unwrap();
+        std::fs::create_dir_all(root.join("state")).unwrap();
+        std::fs::write(root.join("src-tauri/src/agent/trusted_git.rs"), "// existing\n").unwrap();
+        std::fs::write(root.join("src-tauri/Cargo.toml"), "[package]\nname = \"synthetic\"\n").unwrap();
+        std::fs::write(root.join("state/session.json"), "{\"state\":\"active\"}\n").unwrap();
+        (temp, root)
+    }
+
+    /// R4: the five shapes the field log recorded as false positives.
+    #[test]
+    fn field_shapes_are_proved() {
+        let (_temp, root) = workspace();
+        let shapes = [
+            "cd src-tauri && cat >> src/agent/trusted_git.rs <<'EOF'\n// appended by the agent\nfn synthetic() {}\nEOF".to_string(),
+            "cd src-tauri && python3 - <<'PY'\nimport json\np = 'Cargo.toml'\nprint(json.load(open(p)))\nPY".to_string(),
+            format!("cd {}/state && python3 - <<'PY'\nimport json\nprint(json.load(open('{}/state/session.json')))\nPY", root.display(), root.display()),
+            "cd \"src-tauri\" && python3 - <<'PY'\nimport re\nprint(re.sub('a', 'b', 'aaa'))\nPY".to_string(),
+            "cd src-tauri/.. && cat >> src-tauri/src/agent/trusted_git.rs <<'EOF'\n// parent-relative cd\nEOF".to_string(),
+        ];
+        for shape in shapes {
+            assert!(python_heredoc_proof(Some(&root), &shape).is_ok(), "{shape}\n{:?}", python_heredoc_proof(Some(&root), &shape));
+        }
+    }
+
+    /// R4: the boundary did not move — outside destinations, outside paths in a
+    /// body, protected files and unproved `cd` still ask for approval.
+    #[test]
+    fn boundaries_still_ask() {
+        let (_temp, root) = workspace();
+        for shape in [
+            "cd /etc && cat > hosts <<'EOF'\ndata\nEOF".to_string(),
+            "cd .. && python3 - <<'PY'\nprint('escape')\nPY".to_string(),
+            format!("cat >> {}/state/new.txt <<'EOF'\nsee /Users/leo/.ssh/id_rsa\nEOF", root.display()),
+            "python3 - <<'PY'\nopen('/Users/leo/.ssh/id_rsa').read()\nPY".to_string(),
+            "python3 - <<'PY'\nimport subprocess\nsubprocess.run(['git', 'push'])\nPY".to_string(),
+            "python3 - <<'PY'\nopen('../outside.txt', 'w').write('bad')\nPY".to_string(),
+        ] {
+            assert!(python_heredoc_proof(Some(&root), &shape).is_err(), "{shape}");
+        }
+    }
+
+    /// R1/R2: read-only commands may run before the heredoc; the proof judges
+    /// the prefix with the same "read-only only" rule and then the body.
+    #[test]
+    fn read_only_prefix_before_heredoc_is_proved() {
+        let (_temp, root) = workspace();
+        let shapes = [
+            format!(
+                "cd {} && grep -rl trusted . | head; echo ===; python3 - <<'PY'\nimport json\nprint(json.load(open('state/session.json')))\nPY",
+                root.display()
+            ),
+            "grep -rl trusted . | head; echo ===; python3 - <<'PY'\nprint('ok')\nPY".to_string(),
+            "echo start; wc -l src-tauri/Cargo.toml; cat src-tauri/Cargo.toml | head -1; cat >> src-tauri/src/agent/trusted_git.rs <<'EOF'\n// appended after read-only commands\nEOF".to_string(),
+            "ls -1 | head -3 && git status --short; python3 - <<'PY'\nprint('ok')\nPY".to_string(),
+            "git log --oneline 2>&1 | head -3; python3 - <<'PY'\nprint('ok')\nPY".to_string(),
+        ];
+        for shape in shapes {
+            assert!(python_heredoc_proof(Some(&root), &shape).is_ok(), "{shape}\n{:?}", python_heredoc_proof(Some(&root), &shape));
+        }
+        for shape in [
+            "rm -rf src; python3 - <<'PY'\nprint('ok')\nPY".to_string(),
+            "git reset --hard HEAD~1; python3 - <<'PY'\nprint('ok')\nPY".to_string(),
+            "cd /etc && grep -rl root . | head; python3 - <<'PY'\nprint('ok')\nPY".to_string(),
+        ] {
+            assert!(python_heredoc_proof(Some(&root), &shape).is_err(), "{shape}");
+        }
+    }
+
+    /// R3: read-only Git is allowed anywhere; any write verb in the same
+    /// compound command still follows the original rule.
+    #[test]
+    fn read_only_git_needs_no_approval_but_writes_still_do() {
+        for command in [
+            "cd /tmp && git branch -r --contains origin/main",
+            "git show origin/main:src-tauri/Cargo.toml | grep -c 'version'",
+            "git status --short",
+            "git log --oneline -3 && git diff --stat",
+            "git rev-parse HEAD && git ls-files | wc -l",
+        ] {
+            assert!(!sensitive(command), "{command}");
+        }
+        for command in [
+            "git status --short && git reset --hard HEAD~1",
+            "git log --oneline && git clean -fd",
+            "git branch -D feature",
+            "git config core.hooksPath .githooks",
+            "git show --ext-diff HEAD",
+        ] {
+            assert!(sensitive(command), "{command}");
+        }
+        let mixed = "git status --short; git push origin main";
+        assert!(sensitive(mixed) || codefactory_agent_loop::policy::is_delivery_command(mixed), "{mixed}");
     }
 }
