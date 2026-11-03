@@ -41,7 +41,17 @@ pub(super) fn python_heredoc_proved(root: Option<&Path>, command: &str) -> bool 
 /// only saying "unproved".
 pub(super) fn python_heredoc_proof(root: Option<&Path>, command: &str) -> Result<(), String> {
     if command.len() > 256 * 1024 { return Err("脚本超过 256 KiB".into()); }
-    let Some((header, rest)) = command.split_once('\n') else { return Err("heredoc 缺少换行".into()); };
+    // M221: the heredoc may start on a later line (`git add -A` then
+    // `git commit -F - <<'MSG'`), so the header is every line up to and
+    // including the first one that opens a heredoc.
+    let mut header_end = None;
+    let mut scanned = 0;
+    for line in command.split_inclusive('\n') {
+        scanned += line.len();
+        if line.contains("<<") { header_end = Some(scanned); break; }
+    }
+    let Some(header_end) = header_end else { return Err("heredoc 缺少换行".into()); };
+    let (header, rest) = command.split_at(header_end);
     // M215 R1: resolve the `cd` prefix to a physical path (relative, `..`, `~`,
     // spaces, backslash escapes, macOS `/private` aliasing) and accept it when
     // it lands *inside* this workspace, not only on the workspace root.
@@ -52,10 +62,12 @@ pub(super) fn python_heredoc_proof(root: Option<&Path>, command: &str) -> Result
     // otherwise the whole command stays unproved. `2>&1` is a redirection, not a
     // command separator, so it is folded away before splitting.
     let header = header.replace("2>&1", " ").replace("2>&2", " ").replace(">&1", " ").replace(">&2", " ");
-    let mut segments = split_top_level(&header, &[';', '|', '&', '\n']);
-    let Some(heredoc_segment) = segments.pop() else { return Err("缺少 heredoc 命令".into()); };
-    for segment in segments { prefix_segment_is_read_only(base, segment)?; }
-    let Some((runner, delimiter)) = heredoc_segment.split_once(" <<") else { return Err("缺少 `<<` heredoc 起始符".into()); };
+    let segments = split_top_level(&header, &[';', '|', '&', '\n']);
+    let Some(heredoc_at) = segments.iter().position(|segment| segment.contains(" <<")) else {
+        return Err("缺少 `<<` heredoc 起始符".into());
+    };
+    let (prefix, consumers) = (&segments[..heredoc_at], &segments[heredoc_at + 1..]);
+    let Some((runner, delimiter)) = segments[heredoc_at].split_once(" <<") else { return Err("缺少 `<<` heredoc 起始符".into()); };
     let runner = runner.trim();
     let Some(delimiter) = delimiter.trim().strip_prefix('\'').and_then(|s| s.strip_suffix('\'')) else {
         return Err("heredoc 分隔符必须用单引号关闭展开".into());
@@ -64,18 +76,43 @@ pub(super) fn python_heredoc_proof(root: Option<&Path>, command: &str) -> Result
         return Err("heredoc 分隔符不合法".into());
     }
     let mut body = String::new();
+    let mut trailer = Vec::new();
     let mut lines = rest.lines();
     let mut closed = false;
     while let Some(line) = lines.next() {
         if line == delimiter {
             closed = true;
-            if lines.any(|l| !l.trim().is_empty()) { return Err("heredoc 之后仍有 shell 内容".into()); }
+            trailer.extend(lines.by_ref());
             break;
         }
         body.push_str(line);
         body.push('\n');
     }
     if !closed { return Err("heredoc 分隔符未闭合".into()); }
+    // M221: the lines after the closing delimiter are ordinary shell, so they
+    // must stay read-only. The field command ended with `git log --oneline -1`,
+    // which used to be refused as "still shell content after the heredoc".
+    let trailer = trailer.join("\n");
+    for segment in split_top_level(&trailer, &[';', '|', '&', '\n']) {
+        trailer_segment_is_allowed(base, segment)?;
+    }
+    // M221: `git commit -F -` / `git tag -F -` read their message from standard
+    // input, so such a heredoc carries data — it is neither executed nor
+    // resolved as a path. The pipeline spelling (`cat <<'MSG' | git commit -F -`)
+    // is the same statement, so both are judged the same way.
+    let pipeline_consumer = match consumers {
+        [] => None,
+        [only] => Some(*only),
+        _ => return Err(format!("heredoc 之后不是可证明的单一消费者：{}", consumers.join(" | "))),
+    };
+    if let Some(verb) = git_data_heredoc_consumer(base, runner, pipeline_consumer)? {
+        if base.is_none() {
+            return Err(format!("没有工作区根目录，无法证明 {verb} 的数据 heredoc"));
+        }
+        for segment in prefix { prefix_segment_is_local(base, segment)?; }
+        return Ok(());
+    }
+    for segment in prefix { prefix_segment_is_read_only(base, segment)?; }
     // M215 R2: a body naming no outside path, no network, no subprocess and no
     // delete call is workspace-contained. A `cat` body is data written into this
     // workspace, so only the paths it mentions are judged.
@@ -374,26 +411,8 @@ const READ_ONLY_PREFIX: &[&str] = &[
 /// or re-enter this workspace; anything that writes, deletes or leaves the
 /// workspace keeps the approval gate.
 fn prefix_segment_is_read_only(base: Option<&Path>, segment: &str) -> Result<(), String> {
-    let words: Vec<&str> = segment.split_whitespace().collect();
-    let mut index = 0;
-    while index < words.len() {
-        let (name, _) = words[index].split_once('=').unwrap_or((words[index], ""));
-        if words[index].contains('=') && !name.is_empty()
-            && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-        {
-            index += 1;
-        } else {
-            break;
-        }
-    }
-    let Some(binary) = words.get(index) else { return Ok(()) };
-    let name = binary
-        .rsplit(['/', '\\'])
-        .next()
-        .unwrap_or(binary)
-        .trim_end_matches(".exe")
-        .to_ascii_lowercase();
-    let args = &words[index + 1..];
+    let Some((name, args)) = segment_command(segment) else { return Ok(()) };
+    let args = args.as_slice();
     if args.iter().any(|arg| arg.starts_with('>')) {
         return Err(format!("heredoc 之前的命令带有输出重定向：{segment}"));
     }
@@ -418,6 +437,148 @@ fn prefix_segment_is_read_only(base: Option<&Path>, segment: &str) -> Result<(),
     }
     if READ_ONLY_PREFIX.contains(&name.as_str()) { return Ok(()); }
     Err(format!("heredoc 之前不是只读命令：{segment}"))
+}
+
+/// M221: a segment's binary name and its arguments, skipping the leading
+/// `NAME=value` environment assignments the read-only rule already allowed.
+fn segment_command(segment: &str) -> Option<(String, Vec<&str>)> {
+    let words: Vec<&str> = segment.split_whitespace().collect();
+    let mut index = 0;
+    while index < words.len() {
+        let (name, _) = words[index].split_once('=').unwrap_or((words[index], ""));
+        if words[index].contains('=') && !name.is_empty()
+            && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        {
+            index += 1;
+        } else {
+            break;
+        }
+    }
+    let binary = *words.get(index)?;
+    let name = binary
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(binary)
+        .trim_end_matches(".exe")
+        .to_ascii_lowercase();
+    Some((name, words[index + 1..].to_vec()))
+}
+
+/// M221: parse Git's global arguments down to the subcommand. A `-C` target has
+/// to stay inside this workspace; `--git-dir` / `--work-tree` / `--namespace` /
+/// `--exec-path` can point the command at another repository and stay unproved.
+fn git_subcommand<'a>(base: Option<&Path>, args: &[&'a str]) -> Result<(&'a str, Vec<&'a str>), String> {
+    let mut index = 0;
+    while index < args.len() {
+        let arg = args[index];
+        match arg {
+            "-C" => {
+                let Some(target) = args.get(index + 1) else { return Err("Git -C 缺少目录".into()); };
+                let Some(base) = base else { return Err("没有工作区根目录，无法证明 Git -C 目标".into()); };
+                match physical(base, target) {
+                    Some(resolved) if within(base, &resolved) => {}
+                    _ => return Err(format!("Git -C 目标不在本工作区：{target}")),
+                }
+                index += 2;
+            }
+            "-c" => {
+                if args.get(index + 1).is_none() { return Err("Git -c 缺少配置项".into()); }
+                index += 2;
+            }
+            _ if arg.starts_with("--git-dir") || arg.starts_with("--work-tree")
+                || arg.starts_with("--namespace") || arg.starts_with("--exec-path") =>
+            {
+                return Err(format!("不允许的 Git 全局参数：{arg}"));
+            }
+            _ if arg.starts_with('-') => index += 1,
+            _ => return Ok((arg, args[index + 1..].to_vec())),
+        }
+    }
+    Err("Git 命令缺少子命令".into())
+}
+
+/// M221: verbs that only write this workspace's own history, so the session's
+/// write permission already covers them once the target is proven local.
+const LOCAL_GIT_WRITE: &[&str] = &["add", "commit", "tag"];
+
+/// M221: does this Git segment read its message text from standard input?
+fn reads_message_from_stdin(args: &[&str]) -> bool {
+    let mut index = 0;
+    while index < args.len() {
+        match args[index] {
+            "-F" | "--file" => return args.get(index + 1) == Some(&"-"),
+            "--file=-" | "-F-" => return true,
+            _ => {}
+        }
+        index += 1;
+    }
+    false
+}
+
+fn data_heredoc_verb(base: Option<&Path>, segment: &str) -> Result<Option<String>, String> {
+    let Some((name, args)) = segment_command(segment) else { return Ok(None) };
+    if name != "git" { return Ok(None); }
+    let (verb, rest) = git_subcommand(base, &args)?;
+    let verb = verb.to_ascii_lowercase();
+    if !matches!(verb.as_str(), "commit" | "tag") || !reads_message_from_stdin(&rest) {
+        return Ok(None);
+    }
+    Ok(Some(verb))
+}
+
+/// M221: `git commit -F -` / `git tag -F -` turn a heredoc into message data.
+/// `cat <<'MSG' | git commit -F -` is the same statement written as a pipeline,
+/// so both spellings are accepted — and nothing else is.
+fn git_data_heredoc_consumer(
+    base: Option<&Path>,
+    runner: &str,
+    pipeline: Option<&str>,
+) -> Result<Option<String>, String> {
+    match (data_heredoc_verb(base, runner)?, pipeline) {
+        (Some(verb), None) => Ok(Some(verb)),
+        (Some(_), Some(_)) => Err("heredoc 前后各有一个数据消费者".into()),
+        (None, Some(segment)) => match cat_heredoc_runner(base, runner) {
+            Some(Ok(())) => data_heredoc_verb(base, segment)?
+                .map(Some)
+                .ok_or_else(|| format!("heredoc 之后的命令不是可证明的数据消费者：{segment}")),
+            _ => Err(format!("不接受的 heredoc 生产者：{runner}")),
+        },
+        (None, None) => Ok(None),
+    }
+}
+
+/// M221: what may follow the closing delimiter. Read-only commands and local Git
+/// writes are covered by this proof itself; a recognised remote write is handed
+/// to its own authority (delivery + ownership, M208/M130), so a plain
+/// `&& git push origin HEAD` after the message needs no second proof here.
+/// Destructive remote shapes (force, mirror, `--tags`, a `src:dst` refspec to
+/// main) are not recognised by `own_remote_actions`, so they still ask.
+fn trailer_segment_is_allowed(base: Option<&Path>, segment: &str) -> Result<(), String> {
+    if segment.trim().is_empty() { return Ok(()); }
+    if own_remote_actions(segment).is_some() { return Ok(()); }
+    prefix_segment_is_local(base, segment).map_err(|reason| format!("heredoc 之后：{reason}"))
+}
+
+/// M221: the segments in front of a data heredoc may also be local Git writes
+/// (`git add -A && git commit -F - <<'MSG'`). Reading a message from standard
+/// input there is refused: only the heredoc owns that input.
+fn prefix_segment_is_local(base: Option<&Path>, segment: &str) -> Result<(), String> {
+    let Some((name, args)) = segment_command(segment) else { return Ok(()) };
+    if name == "git" {
+        if let Ok((verb, rest)) = git_subcommand(base, &args) {
+            let verb = verb.to_ascii_lowercase();
+            if LOCAL_GIT_WRITE.contains(&verb.as_str()) {
+                if rest.iter().any(|arg| matches!(*arg, "-F" | "-F-" | "--file" | "--file=-")) {
+                    return Err(format!("heredoc 之前的 Git 也从标准输入读取说明：{segment}"));
+                }
+                if base.is_none() {
+                    return Err(format!("没有工作区根目录，无法证明本地 Git 写入：{segment}"));
+                }
+                return Ok(());
+            }
+        }
+    }
+    prefix_segment_is_read_only(base, segment)
 }
 
 /// Path-looking words of a body. Quotes and shell punctuation are separators,
@@ -1810,5 +1971,71 @@ mod m215_trusted_heredoc_and_read_only_git {
         }
         let mixed = "git status --short; git push origin main";
         assert!(sensitive(mixed) || codefactory_agent_loop::policy::is_delivery_command(mixed), "{mixed}");
+    }
+}
+
+/// M221: `git commit -F -` / `git tag -F -` read the heredoc body as message
+/// data. The body is never executed, so the interpreter proof does not apply;
+/// the command is judged segment by segment instead (local Git writes inside
+/// this workspace yes, remote actions and outside repositories still ask).
+#[cfg(test)]
+mod m221_git_data_heredoc {
+    use super::{python_heredoc_proof, sensitive};
+
+    fn workspace() -> (tempfile::TempDir, std::path::PathBuf) {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("src-tauri/src/agent")).unwrap();
+        std::fs::write(root.join("tracked.txt"), "base\n").unwrap();
+        (temp, root)
+    }
+
+    /// R1/R2: the commit message heredoc is data, in both shapes the field log
+    /// recorded (`git commit -F - <<'MSG'` and `cat <<'MSG' | git commit -F -`).
+    #[test]
+    fn local_commit_message_heredoc_is_proved() {
+        let (_temp, root) = workspace();
+        let shapes = [
+            "git add -A && git commit -q -F - <<'MSG'\nM221: local commit message\nMSG".to_string(),
+            "git add -A\ngit commit -q -F - <<'MSG'\nM221: message after a newline separator\nMSG".to_string(),
+            "git add -A && git commit -q -F - <<'MSG'\nM221: message\nMSG\ngit log --oneline -1".to_string(),
+            "cat <<'MSG' | git commit -F -\nM221: piped message\nMSG".to_string(),
+            "git commit --file=- <<'MSG'\nM221: long option\nMSG".to_string(),
+            "git add -A && git tag -a v9 -F - <<'MSG'\nM221: tag message\nMSG".to_string(),
+            format!("cd {} && git add -A && git commit -F - <<'MSG'\nM221: absolute workspace cd\nMSG", root.display()),
+            // A message naming an outside path is still just text: it is never
+            // resolved as a path and never executed.
+            "git commit -F - <<'MSG'\nsee /Users/leo/.ssh/id_rsa for the incident\nMSG".to_string(),
+        ];
+        for shape in shapes {
+            assert!(python_heredoc_proof(Some(&root), &shape).is_ok(), "{shape}\n{:?}", python_heredoc_proof(Some(&root), &shape));
+        }
+        // R3: the original command no longer needs a local-rewrite snapshot.
+        // The proof itself stays fail-closed without a workspace premise: the
+        // gateway passes the registered root, a bare predicate does not.
+        assert!(python_heredoc_proof(None, "git add -A && git commit -F - <<'MSG'\nM221: message\nMSG").is_err());
+        assert!(sensitive("git add -A && git commit -q -F - <<'MSG'\nM221: message\nMSG"));
+    }
+
+    /// R3: the boundary did not move. Another repository, a rewriting prefix,
+    /// a script body, an unquoted delimiter and trailing shell content still ask.
+    #[test]
+    fn git_data_heredoc_boundaries_still_ask() {
+        let (_temp, root) = workspace();
+        let shapes = [
+            "git -C /tmp/other-repo commit -F - <<'MSG'\nmessage\nMSG".to_string(),
+            "git --git-dir=/tmp/other/.git commit -F - <<'MSG'\nmessage\nMSG".to_string(),
+            "git reset --hard HEAD~1 && git commit -F - <<'MSG'\nmessage\nMSG".to_string(),
+            "git clean -fd && git add -A && git commit -F - <<'MSG'\nmessage\nMSG".to_string(),
+            "git add -A && git commit -F - <<'MSG'\nmessage\nMSG\nrm -rf src".to_string(),
+            "git add -A && git commit -F - <<MSG\nmessage\nMSG".to_string(),
+            "git add -A && python3 - <<'PY'\nprint('script, not a message')\nPY".to_string(),
+            "git add -A && git commit -F - <<'MSG'\nmessage\nMSG\npython3 - <<'PY'\nprint('extra')\nPY".to_string(),
+            "cat <<'MSG' | git commit -F - | tee log.txt\nmessage\nMSG".to_string(),
+            "cat <<'MSG' | sh\nmessage\nMSG".to_string(),
+        ];
+        for shape in shapes {
+            assert!(python_heredoc_proof(Some(&root), &shape).is_err(), "{shape}");
+        }
     }
 }
