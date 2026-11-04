@@ -22,6 +22,8 @@
     { "pattern": "scripts/worktree-closeout.mjs", "scenario_id": "RTE-004" },
     { "pattern": "scripts/worktree-janitor.mjs", "scenario_id": "RTE-004" },
     { "pattern": "scripts/worktree-rescue.mjs", "scenario_id": "RTE-004" },
-    { "pattern": "src-tauri/src/build_cache.rs", "scenario_id": "RTE-004" }
+    { "pattern": "src-tauri/src/build_cache.rs", "scenario_id": "RTE-004" },
+    { "pattern": "src-tauri/src/startup_recovery.rs", "scenario_id": "HLT-001" },
+    { "pattern": "src-tauri/src/startup_recovery.rs", "scenario_id": "HLT-004" }
   ]
 }

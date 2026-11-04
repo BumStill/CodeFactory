@@ -225,6 +225,14 @@ struct ExtractedChunk {
 }
 
 pub async fn ensure_schema(pool: &SqlitePool) -> crate::errors::Result<()> {
+    ensure_schema_inner(pool, true).await
+}
+
+pub async fn ensure_schema_for_startup(pool: &SqlitePool) -> crate::errors::Result<()> {
+    ensure_schema_inner(pool, false).await
+}
+
+async fn ensure_schema_inner(pool: &SqlitePool, backfill: bool) -> crate::errors::Result<()> {
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS knowledge_libraries (
             id            TEXT PRIMARY KEY,
@@ -298,7 +306,7 @@ pub async fn ensure_schema(pool: &SqlitePool) -> crate::errors::Result<()> {
     ] {
         sqlx::query(index).execute(pool).await?;
     }
-    ensure_search_index(pool).await?;
+    if backfill { ensure_search_index(pool).await?; }
     Ok(())
 }
 
@@ -478,15 +486,24 @@ async fn scan_library_once(
     let mut summary = KnowledgeScanSummary::new(library_id);
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
 
-    for entry in WalkDir::new(&library.root_path)
-        .follow_links(false)
-        .into_iter()
-        .filter_map(|entry| entry.ok())
-    {
-        if !entry.file_type().is_file() {
-            continue;
-        }
-        let path = entry.path();
+    let root = library.root_path.clone();
+    static WALK_LANES: std::sync::OnceLock<std::sync::Arc<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
+    let lanes = WALK_LANES.get_or_init(|| std::sync::Arc::new(tokio::sync::Semaphore::new(2))).clone();
+    let permit = tokio::time::timeout(std::time::Duration::from_secs(10), lanes.acquire_owned()).await
+        .map_err(|_| crate::errors::AppError::Other("knowledge traversal capacity timeout".into()))?
+        .map_err(|_| crate::errors::AppError::Other("knowledge traversal unavailable".into()))?;
+    let walk = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        WalkDir::new(root).follow_links(false).into_iter()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.file_type().is_file())
+            .map(|entry| entry.into_path()).collect::<Vec<_>>()
+    });
+    let paths = tokio::time::timeout(std::time::Duration::from_secs(30), walk).await
+        .map_err(|_| crate::errors::AppError::Other("knowledge traversal timeout; system will retry".into()))?
+        .map_err(|error| crate::errors::AppError::Other(format!("knowledge traversal failed: {error}")))?;
+    for path in paths {
+        let path = path.as_path();
         let Some(kind) = supported_kind(path) else {
             continue;
         };
@@ -635,6 +652,10 @@ pub async fn search(
     query: KnowledgeSearchQuery,
 ) -> crate::errors::Result<Vec<KnowledgeSearchResult>> {
     let started = std::time::Instant::now();
+    // A user can open search before background upgrade completes. Serialize
+    // through SQLite's transaction and build on demand rather than exposing
+    // "no such table" during this short window.
+    ensure_search_index(pool).await?;
     let terms = query_terms(&query.query);
     if terms.is_empty() {
         return Ok(Vec::new());

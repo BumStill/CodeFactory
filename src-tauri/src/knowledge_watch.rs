@@ -153,6 +153,22 @@ pub fn spawn_scan(pool: SqlitePool, library_id: String) {
 /// Rebuild watcher registrations from the current library list: enabled
 /// libraries get a watcher, disabled or deleted ones lose theirs.
 pub async fn refresh(pool: &SqlitePool) {
+    let pool = pool.clone();
+    // notify registration can block in the OS on UNC/mapped drives. Keep the
+    // complete refresh on one dedicated blocking lane, including its mutex.
+    static LANE: OnceLock<std::sync::Arc<tokio::sync::Semaphore>> = OnceLock::new();
+    let lane = LANE.get_or_init(|| std::sync::Arc::new(tokio::sync::Semaphore::new(1))).clone();
+    let Ok(permit) = lane.try_acquire_owned() else { return; };
+    let worker = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        tauri::async_runtime::block_on(refresh_inner(&pool));
+    });
+    if tokio::time::timeout(Duration::from_secs(10), worker).await.is_err() {
+        tracing::warn!("knowledge watcher registration timed out; system will retry without blocking startup");
+    }
+}
+
+async fn refresh_inner(pool: &SqlitePool) {
     let libraries = match crate::knowledge::list_libraries(pool).await {
         Ok(libraries) => libraries,
         Err(e) => {
