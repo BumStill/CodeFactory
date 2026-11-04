@@ -31,6 +31,7 @@
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
+import { rescueBeforeRemoval } from "./worktree-rescue.mjs";
 
 const args = process.argv.slice(2);
 const APPLY = args.includes("--apply");
@@ -170,6 +171,7 @@ for (const r of rows) {
   if (r.isCurrent || r.isMain || !r.merged || r.dirty) continue;
   process.stdout.write(`removing ${path.basename(r.dir)} … `);
   try {
+    rescueBeforeRemoval(r.dir);
     git(repoRoot, "worktree", "remove", "--force", r.dir);
     // The branch is merged, so its ref carries nothing the remote lacks.
     tryGit(repoRoot, "branch", "-D", r.branch);
@@ -185,6 +187,7 @@ if (STALE_DAYS > 0) {
     const target = path.join(r.dir, "src-tauri", "target");
     if (!fs.existsSync(target)) continue;
     process.stdout.write(`cleaning build output in ${path.basename(r.dir)} … `);
+    rescueBeforeRemoval(target);
     fs.rmSync(target, { recursive: true, force: true });
     console.log("ok");
   }

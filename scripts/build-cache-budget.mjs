@@ -16,6 +16,7 @@
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
+import { rescueBeforeRemoval } from "./worktree-rescue.mjs";
 
 /** 60 GiB, matching `DEFAULT_BUDGET_BYTES` in src-tauri/src/build_cache.rs. */
 export const DEFAULT_BUDGET_BYTES = 60 * 1024 * 1024 * 1024;
@@ -165,6 +166,7 @@ function removePlanned(plan, trigger, logFile) {
   for (const entry of plan.evict) {
     try {
       const stat = dirStats(entry.path);
+      rescueBeforeRemoval(entry.path);
       fs.rmSync(entry.path, { recursive: true, force: true });
       freed += stat.bytes;
       if (logFile) {

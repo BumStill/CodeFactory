@@ -271,6 +271,8 @@ pub fn scan_root(
 /// Remove a cache directory. Returns the bytes freed.
 pub fn remove_entry(entry: &CacheEntry) -> std::io::Result<u64> {
     if entry.path.exists() {
+        crate::agent::execution_workspace::rescue_removal_subtree(&entry.path)
+            .map_err(|error| std::io::Error::other(format!("cleanup rescue failed; preserving cache: {error}")))?;
         std::fs::remove_dir_all(&entry.path)?;
     }
     Ok(entry.bytes)
