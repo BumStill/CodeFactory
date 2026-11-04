@@ -744,6 +744,111 @@ fn branch_exists(root: &Path, branch: &str) -> bool {
     .is_ok()
 }
 
+/// M226/R2: freeze one worktree (tracked + untracked content) into a permanent
+/// `refs/codefactory/rescue/...` ref. The snapshot commit's parent is the current
+/// HEAD, so unpushed commits stay reachable through the ref's ancestry and the
+/// working tree is not touched.
+fn snapshot_tree(path: &Path, label: &str) -> Result<String> {
+    let safe: String = label
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '-' })
+        .collect();
+    let reference = format!(
+        "refs/codefactory/rescue/cleanup-{safe}/{}-{}",
+        Utc::now().timestamp_millis(),
+        uuid::Uuid::new_v4().simple()
+    );
+    let index = tempfile::tempdir()?;
+    let index_path = index.path().join("index");
+    let index_file = index_path.to_string_lossy().to_string();
+    let with_index = |args: &[&str]| -> Result<String> {
+        let output = Command::new("git")
+            .no_window()
+            .current_dir(path)
+            .env("GIT_INDEX_FILE", &index_file)
+            .env("GIT_AUTHOR_NAME", "CodeFactory Rescue")
+            .env("GIT_AUTHOR_EMAIL", "rescue@codefactory.invalid")
+            .env("GIT_COMMITTER_NAME", "CodeFactory Rescue")
+            .env("GIT_COMMITTER_EMAIL", "rescue@codefactory.invalid")
+            .args(args)
+            .output()?;
+        if !output.status.success() {
+            bail!(
+                "git {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    };
+    let head = git(path, &["rev-parse", "--verify", "HEAD"])?;
+    with_index(&["read-tree", &head])?;
+    with_index(&["add", "-A"])?;
+    let tree = with_index(&["write-tree"])?;
+    let message = format!("codefactory cleanup rescue: {label}");
+    let commit_args = ["commit-tree", tree.as_str(), "-m", message.as_str(), "-p", head.as_str()];
+    let commit = with_index(&commit_args)?;
+    git(path, &["update-ref", &reference, &commit])?;
+    git(path, &["rev-parse", "--verify", &reference])?;
+    let _ = std::fs::remove_file(&index_path);
+    Ok(reference)
+}
+
+/// M226/R2: snapshot the managed workspace plus every registered Git worktree
+/// nested inside it, and return the permanent refs that now hold that content.
+fn snapshot_before_removal(
+    repo_root: &Path,
+    workspace_path: &Path,
+    id: &str,
+) -> Result<Vec<String>> {
+    // Git prints canonical paths; macOS temp dirs are symlinked through /private,
+    // so compare canonical forms or every nested worktree looks "outside" the
+    // workspace (M226: that miss is exactly what deleted the nested work).
+    let workspace_path = workspace_path
+        .canonicalize()
+        .unwrap_or_else(|_| workspace_path.to_path_buf());
+    let workspace_path = workspace_path.as_path();
+    let mut targets = vec![("workspace".to_string(), workspace_path.to_path_buf())];
+    let porcelain = git(repo_root, &["worktree", "list", "--porcelain", "-z"])?;
+    let mut nested_index = 0usize;
+    for field in porcelain.split('\0') {
+        let Some(nested) = field.strip_prefix("worktree ") else { continue; };
+        let nested = PathBuf::from(nested);
+        if !nested.exists() { continue; }
+        // Windows canonicalize adds the verbatim prefix; Git porcelain does not.
+        // Canonicalize both operands before containment checks, never just parent.
+        let nested = nested.canonicalize()?;
+        if nested == workspace_path || !nested.starts_with(workspace_path) {
+            continue;
+        }
+        nested_index += 1;
+        targets.push((format!("nested-{nested_index}"), nested));
+    }
+    let mut refs = Vec::new();
+    for (label, path) in targets {
+        refs.push(snapshot_tree(&path, &format!("{id}-{label}"))?);
+    }
+    Ok(refs)
+}
+
+/// M226/R2: rescue any Git worktrees inside a deletion subtree, including
+/// independently initialized nested repositories. Inspection failures stop deletion.
+pub(crate) fn rescue_removal_subtree(path: &Path) -> Result<()> {
+    let removal = path.canonicalize()?;
+    for entry in walkdir::WalkDir::new(path).follow_links(false).into_iter()
+        .filter_entry(|entry| entry.file_name() != ".git") {
+        let entry = entry?;
+        if entry.file_type().is_dir() && entry.path().join(".git").exists() {
+            let common = git(entry.path(), &["rev-parse", "--path-format=absolute", "--git-common-dir"])?;
+            if Path::new(&common).canonicalize()?.starts_with(&removal) {
+                bail!("Git object database is inside removal subtree; preserving repository and rescue refs");
+            }
+            snapshot_before_removal(entry.path(), entry.path(), "subtree")?;
+        }
+    }
+    Ok(())
+}
+
 /// M161 R1/R2: preserve Git's complete stash object (index + worktree +
 /// untracked parent) under a permanent ref before restoring the registered branch.
 /// The journal also makes an interrupted repair discoverable on the next attach.
@@ -1670,6 +1775,15 @@ fn inspect_and_remove_candidate(
             return Ok(CandidateDisposition::Incident(
                 "managed workspace repo, gitdir, branch, or HEAD changed before cleanup".into(),
             ));
+        }
+        // M226/R2: snapshot even when the parent itself is dirty and deletion
+        // will be refused below. Never let a failed rescue reach removal.
+        if let Err(error) = snapshot_before_removal(&canonical_repo_root, &workspace_path, &candidate.id)
+            .and_then(|_| rescue_removal_subtree(&workspace_path)) {
+            return Ok(CandidateDisposition::Preserved {
+                code: "workspace_cleanup_snapshot_failed",
+                detail: format!("清理前无法保存工作区快照，因此先保留整个工作区：{error}"),
+            });
         }
         let status = match git(
             &workspace_path,
@@ -4196,6 +4310,7 @@ pub(crate) async fn settle_missing_terminal_workspace(pool: &SqlitePool, session
             .bind(session).bind(session).fetch_one(pool).await?;
         if newer > 0 { return Ok(false); }
     }
+    if !super::thin_derive::delivery_closeout_may_end(pool, session).await? { return Ok(false); }
     let reason = format!("{reason}；登记工作区已删除，收尾已无需工作区，系统完成会话结算（不代表重新执行了 §8 文件清理）。");
     sqlx::query("INSERT INTO workspace_recovery_budget(session_id,settled_reason) VALUES (?,?) ON CONFLICT(session_id) DO UPDATE SET settled_reason=excluded.settled_reason")
         .bind(session).bind(&reason).execute(pool).await?;
@@ -4328,6 +4443,58 @@ mod tests {
     use sqlx::SqlitePool;
     use std::path::{Path, PathBuf};
     use std::process::Command;
+
+    fn git_at(root: &Path, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .no_window()
+            .current_dir(root)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    /// M226/R2：真实现场是「父工作区干净、新工作留在嵌套 worktree 里」。
+    /// 清理前必须把嵌套 worktree 的未提交文件也快照进永久 ref。
+    #[test]
+    fn m226_cleanup_snapshot_preserves_nested_worktree_work() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        git_at(&repo, &["init", "--initial-branch=main"]);
+        git_at(&repo, &["config", "user.name", "CodeFactory"]);
+        git_at(&repo, &["config", "user.email", "codefactory@example.invalid"]);
+        std::fs::write(repo.join("base.txt"), "base\n").unwrap();
+        // `.claude/` 被忽略，所以嵌套 worktree 在父工作区里不会显示成未跟踪目录。
+        std::fs::write(repo.join(".gitignore"), ".claude/\n").unwrap();
+        git_at(&repo, &["add", "base.txt", ".gitignore"]);
+        git_at(&repo, &["commit", "-m", "base"]);
+        let workspace = temp.path().join("task");
+        git_at(&repo, &["worktree", "add", "-b", "feat/m191", workspace.to_str().unwrap()]);
+        let nested = workspace.join(".claude/worktrees/fix-m192");
+        std::fs::create_dir_all(nested.parent().unwrap()).unwrap();
+        git_at(&workspace, &["worktree", "add", "-b", "feat/m192", nested.to_str().unwrap()]);
+        std::fs::write(nested.join("m192-notes.md"), "M192 未提交的工作\n").unwrap();
+
+        // 这正是导致数据丢失的假象：父工作区看起来完全干净。
+        assert_eq!(
+            git_at(&workspace, &["status", "--porcelain=v1", "--untracked-files=all"]),
+            ""
+        );
+
+        let refs = super::snapshot_before_removal(&repo, &workspace, "objective-m226").unwrap();
+        assert_eq!(refs.len(), 2, "工作区本身 + 嵌套 worktree：{refs:?}");
+        let nested_ref = refs.last().unwrap();
+        let rescued = git_at(&repo, &["show", &format!("{nested_ref}:m192-notes.md")]);
+        assert_eq!(rescued, "M192 未提交的工作");
+        // 快照不改动工作树：文件仍在原处，内容不变。
+        assert!(nested.join("m192-notes.md").exists());
+    }
 
     #[tokio::test]
     async fn failed_cache_ownership_resets_on_each_persisted_activity_source() {

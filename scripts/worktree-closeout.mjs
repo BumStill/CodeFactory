@@ -4,6 +4,7 @@
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
+import { rescueBeforeRemoval } from "./worktree-rescue.mjs";
 
 const args = process.argv.slice(2);
 const APPLY = args.includes("--apply");
@@ -49,6 +50,7 @@ if (!APPLY) {
   console.log("Report only. Re-run with --apply to remove the worktree and local branch.");
   process.exit(0);
 }
+rescueBeforeRemoval(target);
 git(repoRoot, "worktree", "remove", "--force", target);
 git(repoRoot, "branch", "-D", worktree.branch);
 git(repoRoot, "worktree", "prune");
