@@ -178,6 +178,9 @@ pub async fn ensure(db: &SqlitePool) -> sqlx::Result<()> {
 
 pub async fn save(db: &SqlitePool, session_id: &str, state: &ThinState) -> sqlx::Result<()> {
     ensure(db).await?;
+    super::background_tasks::ensure_wake_schema(db).await?;
+    sqlx::query("CREATE TRIGGER IF NOT EXISTS thin_ended_cancel_wakes AFTER UPDATE OF state ON thin_session_state WHEN NEW.state='ended' BEGIN UPDATE wakeup_schedules SET status='cancelled' WHERE session_id=NEW.session_id AND status='pending'; END").execute(db).await?;
+    sqlx::query("CREATE TRIGGER IF NOT EXISTS thin_ended_insert_cancel_wakes AFTER INSERT ON thin_session_state WHEN NEW.state='ended' BEGIN UPDATE wakeup_schedules SET status='cancelled' WHERE session_id=NEW.session_id AND status='pending'; END").execute(db).await?;
     let guarded;
     let state = if state.state == SessionState::Ended
         && super::thin_derive::unanswered_user(db, session_id).await?

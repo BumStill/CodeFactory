@@ -2943,6 +2943,22 @@ impl ObjectiveStore {
                        AND NOT EXISTS (SELECT 1 FROM chat_session_cancel_intents stop WHERE stop.session_id=user.session_id AND stop.requested_at>=user.created_at)
                      ORDER BY user.created_at DESC,user.id DESC LIMIT 1")
                     .bind(session_id).bind(root_turn_id).fetch_optional(&mut **tx).await?;
+                if recovery_objective.is_none() {
+                    // M228: an assistant wait notice is not task completion. A
+                    // durable model wake names the exact settled task to resume.
+                    let has_wakes: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='wakeup_schedules'").fetch_one(&mut **tx).await?;
+                    if has_wakes > 0 {
+                        recovery_objective = sqlx::query_scalar(
+                            "SELECT objective.id FROM wakeup_schedules wake
+                             JOIN chat_turn_state turn ON turn.root_turn_id=wake.root_turn_id AND turn.session_id=wake.session_id
+                             JOIN objectives objective ON objective.id=turn.objective_id AND objective.session_id=wake.session_id
+                             WHERE wake.session_id=? AND wake.status='pending' AND wake.id LIKE 'model-availability-%'
+                               AND objective.status IN ('completed','legacy_orphan')
+                               AND EXISTS (SELECT 1 FROM thin_session_state thin WHERE thin.session_id=wake.session_id AND thin.state='waiting_wake')
+                             ORDER BY wake.next_at,wake.id LIMIT 1")
+                            .bind(session_id).fetch_optional(&mut **tx).await?;
+                    }
+                }
                 if let Some(previous) = &recovery_objective {
                     candidates.push(previous.clone());
                 } else {
