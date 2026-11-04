@@ -839,13 +839,13 @@ async fn delivery_fact_belongs_to_earlier_objective(db: &SqlitePool, session: &s
 }
 
 fn workspace_path_is_dirty(path: &std::path::Path) -> bool {
-    std::process::Command::new("git").no_window()
-        .current_dir(path)
-        .args(["status", "--porcelain=v1", "--untracked-files=all"])
-        .output()
-        .ok()
-        .filter(|output| output.status.success())
-        .is_some_and(|output| !String::from_utf8_lossy(&output.stdout).trim().is_empty())
+    let mut command = std::process::Command::new("git").no_window();
+    command.current_dir(path)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .args(["status", "--porcelain=v1", "--untracked-files=all"]);
+    // An unreadable or timed-out worktree is not evidence of cleanliness.
+    crate::agent::delivery::bounded_delivery_output(&mut command)
+        .map(|output| !output.is_empty()).unwrap_or(true)
 }
 
 /// M226/R1/R2：工作区本身或它内部嵌套的 worktree 里还有未提交内容。
@@ -858,12 +858,12 @@ fn pending_work_in(paths: &[String]) -> bool {
         let Ok(canonical) = path.canonicalize() else { return true; };
         let path = canonical.as_path();
         if workspace_path_is_dirty(path) { return true; }
-        let Ok(output) = std::process::Command::new("git").no_window()
-            .current_dir(path)
-            .args(["worktree", "list", "--porcelain"])
-            .output() else { continue };
-        if !output.status.success() { continue; }
-        for block in String::from_utf8_lossy(&output.stdout).split("\n\n") {
+        let mut command = std::process::Command::new("git").no_window();
+        command.current_dir(path)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .args(["worktree", "list", "--porcelain"]);
+        let Ok(output) = crate::agent::delivery::bounded_delivery_output(&mut command) else { return true; };
+        for block in output.split("\n\n") {
             let Some(nested) = block.lines().find_map(|line| line.strip_prefix("worktree ")) else { continue };
             let nested = std::path::Path::new(nested.trim());
             if !nested.exists() { continue; }
@@ -882,7 +882,17 @@ async fn unfinished_workspace_work(db: &SqlitePool, session: &str) -> sqlx::Resu
         "SELECT worktree_path FROM execution_workspaces WHERE session_id=? ORDER BY updated_at DESC LIMIT 8",
     ).bind(session).fetch_all(db).await?;
     if paths.is_empty() { return Ok(false); }
-    Ok(tokio::task::spawn_blocking(move || pending_work_in(&paths)).await.unwrap_or(true))
+    static PROBES: std::sync::OnceLock<std::sync::Arc<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
+    let lane = PROBES.get_or_init(|| std::sync::Arc::new(tokio::sync::Semaphore::new(2))).clone();
+    let Ok(permit) = lane.try_acquire_owned() else { return Ok(true); };
+    let probe = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        pending_work_in(&paths)
+    });
+    Ok(match tokio::time::timeout(std::time::Duration::from_secs(35), probe).await {
+        Ok(Ok(pending)) => pending,
+        _ => true, // Unknown filesystem state must retain work, never clean it.
+    })
 }
 
 /// M211/R2：助手回合自己声明「还没做完」时，结束前必须先有真实续接唤醒。
@@ -3576,13 +3586,35 @@ pub(crate) mod merged_settlement {
                 continue;
             }
             let workspaces = terminal_workspaces(pool, &session).await?;
-            match closeout_all(&workspaces) {
+            static CLOSEOUT_LANE: std::sync::OnceLock<std::sync::Arc<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
+            let lane = CLOSEOUT_LANE.get_or_init(|| std::sync::Arc::new(tokio::sync::Semaphore::new(1))).clone();
+            let Ok(Ok(permit)) = tokio::time::timeout(std::time::Duration::from_secs(2), lane.acquire_owned()).await else {
+                summary.skipped += 1;
+                continue;
+            };
+            let closeout = tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                closeout_all(&workspaces)
+            });
+            // Never detach a mutating closeout and then launch another one for
+            // the same workspace. The single lane stays owned by the worker.
+            let result = match tokio::time::timeout(std::time::Duration::from_secs(120), closeout).await {
+                Ok(result) => result.unwrap_or_else(|error| Err(format!("closeout worker failed: {error}"))),
+                Err(_) => Err("timeout: closeout remains owned by its bounded worker".into()),
+            };
+            match result {
                 Ok(note) => {
                     let text = format!("{reason}。系统已自动完成收尾：{note}。任务已结束。");
                     settle_ended_and_cancel(pool, &session, &text, &note).await?;
                     close_workspace_rows(pool, &session).await?;
                     tracing::info!(session, %note, "merged/closed session settled after restart");
                     summary.settled += 1;
+                }
+                Err(failure) if failure.contains("timeout") || failure.contains("worker failed") => {
+                    // A technical probe failure is not a product decision.
+                    // Retain state and workspaces; a later safety tick retries.
+                    tracing::warn!(session, %failure, "closeout probe deferred; system will retry");
+                    summary.skipped += 1;
                 }
                 Err(failure) => {
                     let question = format!(
@@ -3811,30 +3843,19 @@ pub(crate) mod merged_settlement {
     }
 
     fn remote_branch_state(repo: &Path, branch: &str) -> Option<bool> {
-        let output = Command::new("git")
-            .no_window()
-            .current_dir(repo)
-            .args(["ls-remote", "--heads", "origin", branch])
-            .output()
-            .ok()?;
-        if !output.status.success() {
-            return None;
-        }
-        Some(!String::from_utf8_lossy(&output.stdout).trim().is_empty())
+        let mut command = Command::new("git").no_window();
+        command.current_dir(repo)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .args(["ls-remote", "--heads", "origin", branch]);
+        crate::agent::delivery::bounded_delivery_output(&mut command).ok()
+            .map(|output| !output.is_empty())
     }
 
     fn git(cwd: &Path, args: &[&str]) -> Result<String, String> {
-        let output = Command::new("git")
-            .no_window()
-            .current_dir(cwd)
-            .args(args)
-            .output()
-            .map_err(|error| error.to_string())?;
-        if output.status.success() {
-            Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
-        } else {
-            Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
-        }
+        let mut command = Command::new("git").no_window();
+        command.current_dir(cwd)
+            .env("GIT_TERMINAL_PROMPT", "0").args(args);
+        crate::agent::delivery::bounded_delivery_output(&mut command)
     }
 
 

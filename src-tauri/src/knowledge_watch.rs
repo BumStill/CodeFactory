@@ -95,6 +95,14 @@ pub fn start(pool: SqlitePool) {
     if EVENT_TX.set(tx).is_err() {
         return; // already running in this process
     }
+    // M233: a large library indexes behind the UI and resumes after a restart.
+    let index_pool = pool.clone();
+    tauri::async_runtime::spawn(async move {
+        match crate::knowledge::sync_search_index(&index_pool, None).await {
+            Ok(count) => tracing::info!("knowledge search index caught up {count} chunk(s)"),
+            Err(e) => tracing::warn!("knowledge search index sync deferred: {e}"),
+        }
+    });
     tauri::async_runtime::spawn(async move {
         match crate::knowledge::reconcile_all_libraries(&pool).await {
             Ok(ids) => tracing::info!("knowledge startup reconcile covered {} librar(ies)", ids.len()),
@@ -153,6 +161,22 @@ pub fn spawn_scan(pool: SqlitePool, library_id: String) {
 /// Rebuild watcher registrations from the current library list: enabled
 /// libraries get a watcher, disabled or deleted ones lose theirs.
 pub async fn refresh(pool: &SqlitePool) {
+    let pool = pool.clone();
+    // notify registration can block in the OS on UNC/mapped drives. Keep the
+    // complete refresh on one dedicated blocking lane, including its mutex.
+    static LANE: OnceLock<std::sync::Arc<tokio::sync::Semaphore>> = OnceLock::new();
+    let lane = LANE.get_or_init(|| std::sync::Arc::new(tokio::sync::Semaphore::new(1))).clone();
+    let Ok(permit) = lane.try_acquire_owned() else { return; };
+    let worker = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        tauri::async_runtime::block_on(refresh_inner(&pool));
+    });
+    if tokio::time::timeout(Duration::from_secs(10), worker).await.is_err() {
+        tracing::warn!("knowledge watcher registration timed out; system will retry without blocking startup");
+    }
+}
+
+async fn refresh_inner(pool: &SqlitePool) {
     let libraries = match crate::knowledge::list_libraries(pool).await {
         Ok(libraries) => libraries,
         Err(e) => {
