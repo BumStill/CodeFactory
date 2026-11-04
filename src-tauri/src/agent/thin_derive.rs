@@ -811,7 +811,7 @@ pub(crate) async fn delivery_closeout_may_end(db: &SqlitePool, session: &str) ->
         let status: Option<String> = sqlx::query_scalar(
             "SELECT status FROM objectives WHERE session_id=? ORDER BY created_at DESC, rowid DESC LIMIT 1",
         ).bind(session).fetch_optional(db).await?;
-        if status.is_some_and(|status| !matches!(status.as_str(), "completed" | "cancelled" | "failed")) {
+        if status.is_some_and(|status| !matches!(status.as_str(), "completed" | "cancelled" | "failed" | "legacy_orphan")) {
             return Ok(false);
         }
     }
@@ -833,7 +833,7 @@ async fn delivery_fact_belongs_to_earlier_objective(db: &SqlitePool, session: &s
     ).bind(session).fetch_one(db).await?;
     let Some(merged_at) = merged_at else { return Ok(false); };
     let newer: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM objectives WHERE session_id=? AND created_at > ?",
+        "SELECT COUNT(*) FROM objectives WHERE session_id=? AND created_at > ? AND status NOT IN ('completed','cancelled','failed','legacy_orphan')",
     ).bind(session).bind(merged_at).fetch_one(db).await?;
     Ok(newer > 0)
 }
@@ -1168,6 +1168,30 @@ pub async fn derive_state(db: &SqlitePool, session: &str) -> sqlx::Result<ThinSt
 }
 
 async fn derive_candidate(db: &SqlitePool, session: &str) -> sqlx::Result<ThinState> {
+    // M230/R3: re-reading historical delivery receipts is not new input. Preserve
+    // the entire ended projection until a newer message/objective/observation or
+    // an explicitly admitted executor/wake exists. observed_at is only a poll time.
+    if let Some(previous) = super::thin_state::load(db, session).await?
+        .filter(|state| state.state == SessionState::Ended
+            && !state.reason.as_deref().is_some_and(|reason| reason.starts_with("cancelled"))) {
+        let mut fresh = crate::session_executor_alive(session) == Some(true);
+        for (table, query) in [
+            ("messages", "SELECT COUNT(*) FROM messages WHERE session_id=? AND created_at>?"),
+            ("objectives", "SELECT COUNT(*) FROM objectives WHERE session_id=? AND created_at>? AND status NOT IN ('completed','cancelled','failed','legacy_orphan')"),
+            ("thin_external_observations", "SELECT COUNT(*) FROM thin_external_observations WHERE session_id=? AND merged_at>?"),
+            ("wakeup_schedules", "SELECT COUNT(*) FROM wakeup_schedules WHERE session_id=? AND status='pending' AND created_at*1000>?"),
+        ] {
+            if has_table(db, table).await? {
+                let count: i64 = sqlx::query_scalar(query).bind(session).bind(previous.updated_at).fetch_one(db).await?;
+                fresh |= count > 0;
+            }
+        }
+        // Preserve M211's narrowly scoped recovery of a proven mis-ended
+        // continuation, not a generic reopening based on an old PR receipt.
+        let interrupted_continuation = stale_delivery_scope(db, session).await?
+            && assistant_declared_unfinished(db, session).await?.is_some();
+        if !fresh && !interrupted_continuation { return Ok(previous); }
+    }
     clear_text_pr_association(db, session).await?;
     super::workspace_recovery_budget::ensure(db).await?;
     // M211/R1：上一单 objective 的 PR 与收尾结算不代表本单做完。
@@ -1644,6 +1668,87 @@ mod tests {
             out.status.success() && out.stdout == b"synthetic continuation work"
         });
         assert!(restored, "nested untracked work must remain recoverable after cleanup");
+    }
+
+    async fn m230_legacy_fixture() -> SqlitePool {
+        let db = m211_fixture().await;
+        super::super::background_tasks::ensure_wake_schema(&db).await.unwrap();
+        m211_workspace(&db, "history", "feat/history", "closed", false).await;
+        sqlx::query("UPDATE objectives SET status='legacy_orphan' WHERE session_id='derive'").execute(&db).await.unwrap();
+        sqlx::query("INSERT INTO thin_delivery_refs VALUES ('derive','feat/history',42,'ThroughMerge')").execute(&db).await.unwrap();
+        sqlx::query("INSERT INTO thin_external_observations(session_id,pr_number,ceiling,observed_at,completed_reason,closeout_queued,merged_at) VALUES ('derive',42,'ThroughMerge',100,'PR #42 已合并',1,100)").execute(&db).await.unwrap();
+        db
+    }
+
+    #[tokio::test]
+    async fn m230_legacy_orphan_is_not_current_work_even_when_newer_than_merge() {
+        let db = m230_legacy_fixture().await;
+        for created_at in [1, 200] {
+            sqlx::query("UPDATE objectives SET created_at=?").bind(created_at).execute(&db).await.unwrap();
+            assert!(delivery_closeout_may_end(&db, "derive").await.unwrap(), "legacy_orphan at {created_at} must not revive work");
+            let state = refresh(&db, "derive").await.unwrap();
+            assert_eq!(state.state, SessionState::Ended, "{state:?}");
+            assert!(!state.reason.unwrap_or_default().contains("用户已停止"));
+            let pending: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM wakeup_schedules WHERE status='pending'").fetch_one(&db).await.unwrap();
+            assert_eq!(pending, 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn m230_ended_batch_restart_is_a_noop_but_new_input_resumes() {
+        let db = m230_legacy_fixture().await;
+        for i in 0..8 {
+            let session = format!("history-{i}");
+            sqlx::query("INSERT INTO sessions(id,title,cwd,model_id,created_at,updated_at,delivery_mode) VALUES (?,'synthetic','/synthetic','model',1,1,'thin')").bind(&session).execute(&db).await.unwrap();
+            sqlx::query("INSERT INTO thin_delivery_refs VALUES (?,'feat/history',42,'ThroughMerge')").bind(&session).execute(&db).await.unwrap();
+            sqlx::query("INSERT INTO thin_external_observations(session_id,pr_number,ceiling,observed_at,completed_reason,closeout_queued,merged_at) VALUES (?,42,'ThroughMerge',100,'PR #42 已合并',1,100)").bind(&session).execute(&db).await.unwrap();
+            sqlx::query("INSERT INTO thin_session_state(session_id,state,reason,outcome_location,updated_at) VALUES (?,'ended','交付收尾完成','本会话记录',200)").bind(&session).execute(&db).await.unwrap();
+        }
+        let before: Vec<(String, String, String, i64)> = sqlx::query_as("SELECT session_id,state,reason,updated_at FROM thin_session_state ORDER BY session_id").fetch_all(&db).await.unwrap();
+        reconcile_running_liveness(&db).await.unwrap();
+        for (session, _, _, _) in &before { assert_eq!(refresh(&db, session).await.unwrap().state, SessionState::Ended); }
+        let after: Vec<(String, String, String, i64)> = sqlx::query_as("SELECT session_id,state,reason,updated_at FROM thin_session_state ORDER BY session_id").fetch_all(&db).await.unwrap();
+        assert_eq!(before, after, "historical facts must not mutate ended projections");
+        let wakes: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM wakeup_schedules").fetch_one(&db).await.unwrap();
+        assert_eq!(wakes, 0);
+        sqlx::query("INSERT INTO messages(id,session_id,role,content,created_at) VALUES ('new-input','history-0','user','new synthetic task',300)").execute(&db).await.unwrap();
+        assert_ne!(refresh(&db, "history-0").await.unwrap().state, SessionState::Ended);
+    }
+
+    #[tokio::test]
+    async fn m230_startup_repairs_unloaded_history_without_erasing_records() {
+        let db = m230_legacy_fixture().await;
+        // No in-memory/front-end session registration: repair must use durable IDs.
+        sqlx::query("INSERT INTO messages(id,session_id,role,content,created_at) VALUES ('history-answer','derive','assistant','交付完成',110)").execute(&db).await.unwrap();
+        sqlx::query("INSERT INTO thin_session_state(session_id,state,reason,updated_at) VALUES ('derive','waiting_wake','PR #42 已合并；继续当前任务',200)").execute(&db).await.unwrap();
+        sqlx::query("INSERT INTO wakeup_schedules(id,session_id,prompt,source,next_at,status,created_at) VALUES ('thin-closeout-derive-42','derive','PR #42 已合并。系统自动重试/自愈：请继续当前任务，不要收尾、不要结束会话。','agent_decided',9999999999,'pending',200)").execute(&db).await.unwrap();
+        let before: (i64, i64, i64) = sqlx::query_as("SELECT (SELECT COUNT(*) FROM messages),(SELECT COUNT(*) FROM objectives),(SELECT COUNT(*) FROM execution_workspaces)").fetch_one(&db).await.unwrap();
+        merged_settlement::settle_merged_sessions(&db).await.unwrap();
+        let state = super::super::thin_state::load(&db, "derive").await.unwrap().unwrap();
+        assert_eq!(state.state, SessionState::Ended, "{state:?}");
+        assert!(state.reason.as_deref().unwrap().contains("PR #42 已合并"));
+        assert!(!state.reason.as_deref().unwrap().contains("用户已停止"));
+        assert_eq!(refresh(&db, "derive").await.unwrap().state, SessionState::Ended);
+        merged_settlement::settle_merged_sessions(&db).await.unwrap();
+        let pending: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM wakeup_schedules WHERE status='pending'").fetch_one(&db).await.unwrap();
+        assert_eq!(pending, 0);
+        let after: (i64, i64, i64) = sqlx::query_as("SELECT (SELECT COUNT(*) FROM messages),(SELECT COUNT(*) FROM objectives),(SELECT COUNT(*) FROM execution_workspaces)").fetch_one(&db).await.unwrap();
+        assert_eq!(before, after);
+        let turns: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM chat_turn_state").fetch_one(&db).await.unwrap();
+        assert_eq!(turns, 0);
+    }
+
+    #[tokio::test]
+    async fn m230_completed_newer_objective_is_not_active_but_queued_input_is() {
+        let db = m230_legacy_fixture().await;
+        sqlx::query("UPDATE objectives SET status='cancelled',decision_type='cancelled',cancellation_provenance='explicit_cancel',completed_at=200,created_at=200").execute(&db).await.unwrap();
+        assert!(delivery_closeout_may_end(&db, "derive").await.unwrap());
+        sqlx::query("UPDATE objectives SET status='active'").execute(&db).await.unwrap();
+        assert!(!delivery_closeout_may_end(&db, "derive").await.unwrap());
+        sqlx::query("UPDATE objectives SET status='legacy_orphan'").execute(&db).await.unwrap();
+        sqlx::query("INSERT INTO messages(id,session_id,role,content,created_at) VALUES ('queued','derive','user','synthetic continuation',300)").execute(&db).await.unwrap();
+        assert!(!delivery_closeout_may_end(&db, "derive").await.unwrap());
+        assert_ne!(refresh(&db, "derive").await.unwrap().state, SessionState::Ended);
     }
 
     #[tokio::test]
@@ -3462,6 +3567,14 @@ pub(crate) mod merged_settlement {
                 summary.skipped += 1;
                 continue;
             };
+            // M230/R2/R4: gate before touching workspace rows or the filesystem.
+            // Scan durable IDs, including history outside dispatch's 200-row list.
+            if super::has_column(pool, "objectives", "session_id").await?
+                && (!super::delivery_closeout_may_end(pool, &session).await?
+                    || super::stale_delivery_scope(pool, &session).await?) {
+                summary.skipped += 1;
+                continue;
+            }
             let workspaces = terminal_workspaces(pool, &session).await?;
             match closeout_all(&workspaces) {
                 Ok(note) => {
