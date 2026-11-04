@@ -209,7 +209,20 @@ impl PermissionGateway for DesktopPermissionGateway {
             }
             if let (Some(root), Some(command)) = (self.managed_workspace_root().await, bash_command) {
                 if let Some(roots) = registered_git_roots(&self.db, &self.session_id).await {
-                    if super::trusted_git::registered_rewrite(&roots, &root, command) {
+                    // M224/R5：沙箱生效时，本地命令的访问范围由内核保证，不再因为
+                    // 「无法用命令文字证明范围」(trusted.git.unproved) 进入审批。
+                    // 破坏性改写与远端动作不受此豁免；沙箱不可用时 is_enforced 为
+                    // false，整条路径完全退回原有的文字证明 + 审批（R7）。
+                    let rewrite = super::trusted_git::registered_rewrite(&roots, &root, command);
+                    if super::trusted_sandbox::covers_local_command(
+                        super::trusted_sandbox::is_enforced(&root, None),
+                        rewrite,
+                        remote,
+                        super::trusted_git::outside_write_sandbox_scope(command),
+                    ) {
+                        return PermissionOutcome::Allow;
+                    }
+                    if rewrite {
                         if super::trusted_git::backup_registered(&roots, &root, command).is_some() {
                             return PermissionOutcome::Allow;
                         }

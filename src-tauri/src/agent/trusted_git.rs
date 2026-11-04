@@ -192,6 +192,39 @@ pub(super) fn python_heredoc_proof(root: Option<&Path>, command: &str) -> Result
 /// M215: prover diagnostics travel through the host console, and a Windows code
 /// page that cannot encode CJK escapes them as `\uXXXX`. Decode those escapes so
 /// the approval text names the line in readable Chinese on every platform.
+/// M224/R5：沙箱约束的是文件写入，不是凭据读取，也不是远端动作，更不替用户
+/// 决定"要不要动别的 checkout"。这些类别即便在沙箱里也必须继续走审批，
+/// 否则沙箱会变成"凭据外带/远端改写"的白名单。
+pub(crate) fn outside_write_sandbox_scope(command: &str) -> bool {
+    let lowered = command.to_ascii_lowercase();
+    let words = lowered
+        .split(|c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '-')
+        .filter(|w| !w.is_empty());
+    for word in words {
+        if matches!(word, "gh" | "curl" | "wget" | "ssh" | "scp" | "netrc" | "token") {
+            return true;
+        }
+    }
+    for needle in [
+        "git push",
+        "git config --global",
+        "git config --system",
+        "config --global",
+        "config --system",
+        "~/.ssh",
+        ".aws/",
+    ] {
+        if lowered.contains(needle) {
+            return true;
+        }
+    }
+    // `..` 段可能指向另一个 checkout：沙箱会拒绝写入，但"要不要动别人的目录"
+    // 是用户决定，不是沙箱能替代的裁决。
+    command
+        .split(|c: char| c.is_whitespace() || c == ';' || c == '\'' || c == '"')
+        .any(|token| token == ".." || token.starts_with("../") || token.contains("/../"))
+}
+
 pub(crate) fn decode_prover_escapes(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut chars = text.chars().peekable();

@@ -63,13 +63,21 @@ pub fn writable_paths(workspace: &Path) -> Vec<WritablePath> {
             extras.push(home.join(relative));
         }
     }
-    // 共享编译缓存可能落在工作区之外（worktree 场景），存在才加入。
+    // 编译缓存：任务专属缓存目录与 .codefactory-cache 容器（沙箱化构建必须能写，
+    // 否则 R10 矩阵里的 cargo/pnpm 会因缓存只读而失败）。
+    let task_cache = crate::build_cache::task_cache_root(workspace);
+    if let Some(container) = task_cache.parent() {
+        extras.push(container.to_path_buf());
+    }
+    extras.push(task_cache);
     if let Some(cache) = env_path("CODEFACTORY_BUILD_CACHE_ROOT") {
         extras.push(cache);
     }
 
+    // 只登记真实存在的目录：不存在的路径无法规范化，而 fail-closed 会让整个
+    // 沙箱构建失败（构建缓存目录由构建层在需要时创建）。
     for path in extras {
-        if path.is_absolute() {
+        if path.is_absolute() && path.exists() && !paths.iter().any(|p| p.path() == path.as_path()) {
             paths.push(WritablePath::tree(path));
         }
     }
@@ -105,6 +113,32 @@ pub fn resolve(workspace: &Path, settings: Option<&Settings>) -> SandboxGate {
 /// R5：权限网关用的廉价判定——沙箱此刻是否真的会约束命令。
 pub fn is_enforced(workspace: &Path, settings: Option<&Settings>) -> bool {
     matches!(resolve(workspace, settings), SandboxGate::Enforced(_))
+}
+
+/// R5：沙箱生效时，本地普通命令不再因为「无法用命令文字证明访问范围」
+/// 进入审批——范围由内核保证。破坏性改写与远端动作不在豁免范围内。
+pub fn covers_local_command(
+    enforced: bool,
+    destructive_rewrite: bool,
+    remote: bool,
+    outside_scope: bool,
+) -> bool {
+    enforced && !destructive_rewrite && !remote && !outside_scope
+}
+
+/// R7：沙箱不可用时，命令仍按既有审批路径执行，但结果里必须写明这次没有沙箱，
+/// 不能静默降级。用户主动关闭时同样只提示一次，不阻断执行。
+pub fn fallback_notice(workspace: &Path, settings: Option<&Settings>) -> Option<String> {
+    match resolve(workspace, settings) {
+        SandboxGate::Enforced(_) => None,
+        SandboxGate::FallbackApproval(reason) => Some(if enabled(settings) {
+            format!(
+                "M224：系统沙箱不可用（{reason}）；本命令按既有审批路径在本机执行，没有系统沙箱约束。"
+            )
+        } else {
+            "M224：可信模式沙箱已按设置关闭（trusted_command_sandbox=false），本命令在本机无沙箱执行。".to_string()
+        }),
+    }
 }
 
 /// 供诊断/账本使用的状态文本。
@@ -279,47 +313,224 @@ mod tests {
         assert!(!outside_file.exists());
     }
 
-    /// 每次真实启动都有可观察的进程证据：spawn 前 0 个匹配，运行中至少 1 个。
+    /// R5：只有"沙箱生效 + 非破坏性改写 + 非远端"的本地命令才免审批。
+    #[test]
+    fn local_command_exemption_requires_a_live_sandbox_and_no_destructive_intent() {
+        assert!(covers_local_command(true, false, false, false));
+        assert!(
+            !covers_local_command(false, false, false, false),
+            "无沙箱必须退回审批"
+        );
+        assert!(
+            !covers_local_command(true, true, false, false),
+            "破坏性改写仍要审批"
+        );
+        assert!(
+            !covers_local_command(true, false, true, false),
+            "远端动作仍走交付裁决"
+        );
+        assert!(
+            !covers_local_command(true, false, false, true),
+            "凭据/远端写/跨 checkout 不在沙箱覆盖范围内"
+        );
+    }
+
+    /// 沙箱覆盖不到的风险必须仍然被识别出来（否则 R5 会变成凭据外带的白名单）。
+    #[test]
+    fn credential_remote_and_cross_checkout_commands_stay_out_of_scope() {
+        for command in [
+            "gh auth token",
+            "gh pr merge 7 --squash",
+            "git push --force origin main",
+            "git push origin :main",
+            "git config --global core.hooksPath /tmp/hooks",
+            "git checkout -- ../other",
+            "git reset --hard HEAD && rm -rf ../other",
+            "curl -s https://example.com",
+        ] {
+            assert!(
+                crate::agent::trusted_git::outside_write_sandbox_scope(command),
+                "{command} must stay inside approval"
+            );
+        }
+        for command in [
+            "git status --porcelain",
+            "git add -A && git commit -m 'x'",
+            "git fetch --prune origin main && git merge origin/main --no-edit",
+            "python3 - <<'PY'\nopen('tracked.txt','w').write('x')\nPY",
+        ] {
+            assert!(
+                !crate::agent::trusted_git::outside_write_sandbox_scope(command),
+                "{command} is local-write scope"
+            );
+        }
+    }
+
+    /// R7：沙箱不可用时必须有明确、非静默的说明；生效时不产生噪音。
+    #[test]
+    fn fallback_notice_is_explicit_and_absent_when_enforced() {
+        let workspace = temp_dir("notice");
+        assert!(
+            fallback_notice(&workspace, None).is_none(),
+            "沙箱生效时不应提示降级"
+        );
+        let relative = Path::new("relative/workspace");
+        let notice = fallback_notice(relative, None).expect("相对路径必须 fail-closed");
+        assert!(notice.contains("系统沙箱不可用"), "{notice}");
+        assert!(notice.contains("没有系统沙箱约束"), "{notice}");
+    }
+
+    /// R8：失败提示必须同时给出"被拒路径"和"登记工作区"，模型才能自我修复。
+    #[test]
+    fn failure_hint_names_the_path_and_the_registered_workspace() {
+        let workspace = temp_dir("hint");
+        let sandbox = sandbox(&workspace);
+        let hint = sandbox.failure_hint(
+            "/bin/sh: /Users/someone/outside.txt: Operation not permitted",
+        );
+        assert!(hint.contains("/Users/someone/outside.txt"), "{hint}");
+        let canonical = workspace.canonicalize().unwrap_or(workspace.clone());
+        assert!(
+            hint.contains(&canonical.display().to_string()),
+            "hint must name the registered workspace: {hint}"
+        );
+    }
+
+    /// R10：把本仓库工作区的 profile 落盘，供兼容矩阵（`tools/verify/m224-r10-matrix.mjs`）
+    /// 用与产品完全相同的策略执行真实工作流。
+    #[test]
+    fn emits_repo_profile_for_the_r10_matrix() {
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("repo root")
+            .to_path_buf();
+        let sandbox = sandbox(&repo);
+        let dir = repo.join("target").join("m224");
+        std::fs::create_dir_all(&dir).expect("target/m224");
+        let path = dir.join("repo.sb");
+        std::fs::write(&path, sandbox.profile()).expect("write repo profile");
+        let written = std::fs::read_to_string(&path).expect("read back");
+        assert!(written.contains("(deny file-write*)"), "{written}");
+        assert!(
+            written.contains(&repo.canonicalize().unwrap_or(repo.clone()).display().to_string()),
+            "profile must whitelist the repository workspace"
+        );
+        println!("m224 profile: {}", path.display());
+    }
+
+    /// 沙箱内的信号不能越界：对沙箱外（同一用户）的进程发信号必须失败，
+    /// 且那个进程要活着。这是 R3/R4 之外最容易漏的一条边界。
+    #[test]
+    fn signals_cannot_escape_the_sandbox() {
+        let workspace = temp_dir("signal-outside");
+        let sandbox = sandbox(&workspace);
+
+        let mut outsider = Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn outsider");
+        let outsider_pid = outsider.id();
+
+        let launch = sandbox.wrap(
+            "/bin/sh",
+            &[
+                "-c".into(),
+                format!("kill -TERM {outsider_pid}; echo outside=$?"),
+            ],
+        );
+        let output = Command::new(&launch.program)
+            .args(&launch.args)
+            .output()
+            .expect("run kill");
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        assert!(
+            stdout.contains("outside=1"),
+            "kill of an out-of-sandbox process must fail: {stdout}{stderr}"
+        );
+
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(
+            outsider.try_wait().expect("try_wait").is_none(),
+            "the out-of-sandbox process must still be alive"
+        );
+        let _ = outsider.kill();
+        let _ = outsider.wait();
+    }
+
+    /// 同一沙箱内的子进程必须还能被结束，否则构建/测试工具会挂死。
+    #[test]
+    fn signals_reach_processes_inside_the_same_sandbox() {
+        let workspace = temp_dir("signal-inside");
+        let sandbox = sandbox(&workspace);
+        let launch = sandbox.wrap(
+            "/bin/sh",
+            &[
+                "-c".into(),
+                "sleep 30 & child=$!; kill -TERM $child; echo inside=$?".into(),
+            ],
+        );
+        let output = Command::new(&launch.program)
+            .args(&launch.args)
+            .output()
+            .expect("run kill inside");
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        assert!(
+            stdout.contains("inside=0"),
+            "same-sandbox kill must succeed: {stdout}{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// 每次真实启动都有可观察的进程证据。macOS 沙箱拒绝 `ps` 读进程表
+    /// （seatbelt 不授予该能力），所以可观察性由"运行中写下的心跳 + 退出后的完成标记"
+    /// 证明：两者都出现，说明确实有一个进程带着这份 profile 跑过。
     #[test]
     fn spawn_is_observable_before_and_after() {
         let workspace = temp_dir("spawncount");
         let sandbox = sandbox(&workspace);
+        let started = workspace.join("started.txt");
+        let done = workspace.join("done.txt");
         let token = format!("m224spawnprobe{}", std::process::id());
         let launch = sandbox.wrap(
             "/bin/sh",
-            &["-c".into(), format!("sleep 0.6; printf 'done {token}'")],
+            &[
+                "-c".into(),
+                format!(
+                    "printf '{token}' > '{}'; sleep 0.6; printf '{token}' > '{}'",
+                    started.display(),
+                    done.display()
+                ),
+            ],
         );
 
-        fn matching(token: &str) -> usize {
-            let out = Command::new("ps")
-                .args(["-Ao", "command"])
-                .output()
-                .expect("ps");
-            String::from_utf8_lossy(&out.stdout)
-                .lines()
-                .filter(|line| line.contains(token))
-                .count()
-        }
-
-        assert_eq!(matching(&token), 0, "no process should match before spawn");
+        assert!(!started.exists(), "nothing should have run before the spawn");
         let mut child = Command::new(&launch.program)
             .args(&launch.args)
             .current_dir(&workspace)
-            .stdout(std::process::Stdio::piped())
             .spawn()
             .expect("spawn");
-        let mut observed = 0usize;
-        let deadline = Instant::now() + Duration::from_secs(5);
+
+        let mut observed_while_running = false;
+        let deadline = Instant::now() + Duration::from_secs(10);
         while Instant::now() < deadline {
-            observed = observed.max(matching(&token));
+            if std::fs::read_to_string(&started).map(|s| s == token).unwrap_or(false) {
+                observed_while_running = true;
+            }
             if child.try_wait().expect("try_wait").is_some() {
                 break;
             }
             std::thread::sleep(Duration::from_millis(50));
         }
-        let output = child.wait_with_output().expect("wait");
-        assert!(observed >= 1, "sandboxed process must be observable while running");
-        assert!(output.status.success());
-        assert!(String::from_utf8_lossy(&output.stdout).contains(&token));
+        let status = child.wait().expect("wait");
+        assert!(
+            observed_while_running,
+            "the sandboxed process must be observable while it is running"
+        );
+        assert!(status.success(), "sandboxed spawn must exit cleanly");
+        assert_eq!(
+            std::fs::read_to_string(&done).expect("completion marker"),
+            token
+        );
     }
 }

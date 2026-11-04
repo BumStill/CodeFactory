@@ -261,6 +261,13 @@ fn build_profile(workspace: &Path, writable: &[WritablePath], network: NetworkPo
     profile.push_str("(allow process*)\n");
     profile.push_str("(allow sysctl-read)\n");
     profile.push_str("(allow mach-lookup)\n");
+    // 构建/测试工具会结束自己的子进程（vitest worker、cargo 子任务），也会用
+    // POSIX 信号量做 worker 协调。信号只放行到**同一沙箱内**的目标：子进程继承
+    // 沙箱，所以够用；而同一用户下沙箱外的进程（编辑器、其它会话、系统服务）
+    // 仍然发不到——实测 `(allow signal)` 过宽、`(target pgrp self)` 能杀掉沙箱
+    // 外进程，两者都不可接受。
+    profile.push_str("(allow signal (target same-sandbox))\n");
+    profile.push_str("(allow ipc-posix-sem)\n");
     profile.push_str("(allow file-read*)\n");
     profile.push_str("(deny file-write*)\n");
     // R3：白名单先写"登记工作区"，再写调用方显式登记的支撑路径；写在 deny 之后才生效。
@@ -312,6 +319,15 @@ mod tests {
         assert!(profile.contains("(deny file-write*)"));
         assert!(profile.contains("(allow file-write* (subpath \"/private/var/ws\"))"));
         assert!(profile.contains("(allow network*)"));
+        assert!(
+            profile.contains("(allow signal (target same-sandbox))"),
+            "{profile}"
+        );
+        assert!(
+            !profile.contains("(allow signal)\n"),
+            "signal 不得无目标放行（会给同用户任意进程发信号）: {profile}"
+        );
+        assert!(profile.contains("(allow ipc-posix-sem)"), "{profile}");
     }
 
     #[test]

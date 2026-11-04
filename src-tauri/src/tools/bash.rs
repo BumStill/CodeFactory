@@ -383,6 +383,8 @@ async fn execute_inner(
     let launched_program;
     // M224：`Some` 表示这次启动真的被系统沙箱约束，失败输出要带修复提示（R8）。
     let mut trusted_sandbox: Option<crate::command_sandbox::CommandSandbox> = None;
+    // R7：沙箱不可用/被关闭时写入结果的说明，保证降级不是静默的。
+    let mut sandbox_notice: Option<String> = None;
     let sandboxed = matches!(sandbox_mode, crate::config::settings::SandboxMode::Docker);
     let cmd = match sandbox_mode {
         crate::config::settings::SandboxMode::Docker => {
@@ -423,6 +425,12 @@ async fn execute_inner(
                 &shell.args,
             );
             trusted_sandbox = sandbox;
+            if trusted_sandbox.is_none() {
+                sandbox_notice = crate::agent::trusted_sandbox::fallback_notice(
+                    &ctx.cwd,
+                    ctx.settings.as_ref(),
+                );
+            }
             launched_program = program.clone();
             let mut cmd = Command::new(program).no_window();
             cmd.args(program_args)
@@ -540,6 +548,10 @@ async fn execute_inner(
                 combined.push_str(&format!("\n[m147b] {}\n", guarded.note));
             }
 
+            if let Some(notice) = sandbox_notice.as_ref() {
+                combined.push('\n');
+                combined.push_str(notice);
+            }
             let is_error = !output.status.success();
             if is_error {
                 let return_code = output.status.code();
