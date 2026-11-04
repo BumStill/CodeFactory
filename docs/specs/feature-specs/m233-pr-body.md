@@ -32,6 +32,7 @@ Spec：原文规格及 Req 映射；Compatibility：旧 schema、ended、在途�
 真机验收由编排方发版后完成：Windows 保留本地数据安装新版，几秒内看到真正主界面、打开历史会话并输入；核对 ended 不复活、在途工作区不删除；断外网/不可达路径下仍可交互；Mac 同步检查。Windows 日志：%APPDATA%\com.codefactory.app\startup.log，panic：同目录 crash\panic-*.log。
 本任务仅授权合并，不发版（not live）。CI 绿后标记 merge-queue: armed，由队列合并，不手工 merge。合并后核对 API merged=true、squash SHA、Release-Urgency trailer；检查远端分支、干净状态、清理本任务构建及临时进程，不删除 managed workspace。
 
+Scenario-Test: DAT-001, HLT-001, HLT-004, KB-001, RTE-003, RTE-004
 README-Update: reviewed
 README-Update-Reason: 修复现有启动实现与诊断日志，不改变 README 的公开功能、平台或隐私承诺。
 

@@ -494,14 +494,17 @@ async fn scan_library_once(
         .map_err(|_| crate::errors::AppError::Other("knowledge traversal unavailable".into()))?;
     let walk = tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        WalkDir::new(root).follow_links(false).into_iter()
-            .filter_map(|entry| entry.ok())
-            .filter(|entry| entry.file_type().is_file())
-            .map(|entry| entry.into_path()).collect::<Vec<_>>()
+        let mut paths = Vec::new();
+        for entry in WalkDir::new(root).follow_links(false) {
+            let entry = entry.map_err(|error| error.to_string())?;
+            if entry.file_type().is_file() { paths.push(entry.into_path()); }
+        }
+        Ok::<_, String>(paths)
     });
     let paths = tokio::time::timeout(std::time::Duration::from_secs(30), walk).await
         .map_err(|_| crate::errors::AppError::Other("knowledge traversal timeout; system will retry".into()))?
-        .map_err(|error| crate::errors::AppError::Other(format!("knowledge traversal failed: {error}")))?;
+        .map_err(|error| crate::errors::AppError::Other(format!("knowledge traversal failed: {error}")))?
+        .map_err(|error| crate::errors::AppError::Other(format!("knowledge traversal incomplete; existing index retained: {error}")))?;
     for path in paths {
         let path = path.as_path();
         let Some(kind) = supported_kind(path) else {

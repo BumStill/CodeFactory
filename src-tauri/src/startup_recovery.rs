@@ -161,6 +161,18 @@ mod tests {
         crate::knowledge::ensure_schema(&pool).await.unwrap();
         let exists: i64 = sqlx::query_scalar("SELECT count(*) FROM sqlite_master WHERE name='knowledge_fts'")
             .fetch_one(&pool).await.unwrap();
+        let library = crate::knowledge::KnowledgeLibrary {
+            id: "m233-unreachable".into(), name: "synthetic".into(),
+            root_path: dir.path().join("unreachable").to_string_lossy().into(),
+            enabled: true, created_at: "synthetic".into(), last_scan_at: None, scan_status: "idle".into(),
+        };
+        sqlx::query("INSERT INTO knowledge_libraries(id,name,root_path,created_at) VALUES (?,?,?,?)")
+            .bind(&library.id).bind(&library.name).bind(&library.root_path).bind(&library.created_at).execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO knowledge_documents(id,library_id,path,kind,hash,mtime,size,status,updated_at) VALUES ('m233-document',?,'synthetic.docx','docx','h',1,1,'indexed','synthetic')")
+            .bind(&library.id).execute(&pool).await.unwrap();
+        assert!(crate::knowledge::scan_library(&pool, &library.id).await.is_err());
+        let retained: i64 = sqlx::query_scalar("SELECT count(*) FROM knowledge_documents WHERE id='m233-document'").fetch_one(&pool).await.unwrap();
+        assert_eq!(retained, 1, "an unreachable root must not erase the existing index");
         assert_eq!(exists, 1);
     }
 }
