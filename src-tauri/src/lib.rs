@@ -52,6 +52,7 @@ mod menu_spec;
 mod notify;
 mod openrouter;
 mod panic_log;
+mod startup_recovery;
 mod secrets;
 mod session_title;
 mod storage;
@@ -1625,8 +1626,10 @@ pub fn run() {
             crate::menu::handle_menu_event(app, event.id().as_ref());
         })
         .setup(|app| {
+            let setup_started = std::time::Instant::now();
             let data_dir = app.path().app_data_dir().expect("app data dir unavailable");
             std::fs::create_dir_all(&data_dir)?;
+            startup_recovery::record(&data_dir, "setup", "started", std::time::Duration::ZERO);
             crate::window_state::restore_and_track_main_window(app)?;
 
             // Before anything else can panic: a stripped release binary with
@@ -1658,22 +1661,26 @@ pub fn run() {
             // Rolling daily DB backup — one snapshot per day, 7-day retention.
             // Best-effort: failures are logged and never block startup.
             let db_path = data_dir.join("codefactory.db");
-            if let Err(e) = backup_db_daily(&data_dir, &db_path) {
-                tracing::warn!("db backup skipped: {e}");
-            }
+            // Copying a large database (or an unavailable roaming profile) is
+            // blocking I/O, despite being best-effort. Keep it off setup.
+            let backup_dir = data_dir.clone();
+            let backup_path = db_path.clone();
+            tauri::async_runtime::spawn_blocking(move || {
+                let started = std::time::Instant::now();
+                let status = if backup_db_daily(&backup_dir, &backup_path).is_ok() { "completed" } else { "failed" };
+                startup_recovery::record(&backup_dir, "daily-backup", status, started.elapsed());
+            });
 
             let db_url = format!("sqlite:{}", db_path.display());
             let settings = config::settings::load();
             // CF-WINDOW-R6：把持久化的会话豁免读回内存，重启后依然有效。
             agent::usage_windows::hydrate_session_overrides();
 
-            let pool = tauri::async_runtime::block_on(storage::db::connect(&db_url))?;
+            let db_started = std::time::Instant::now();
+            startup_recovery::record(&data_dir, "database", "started", std::time::Duration::ZERO);
+            let pool = tauri::async_runtime::block_on(storage::db::connect_startup(&db_url))?;
+            startup_recovery::record(&data_dir, "database", "completed", db_started.elapsed());
             agent::daily_spend_live::install_database(pool.clone());
-            tauri::async_runtime::block_on(agent::daily_spend_live::rebuild(
-                &pool, &settings, agent::quota_cap::daily_spend::ledger(), chrono::Utc::now().timestamp_millis(),
-            ))?;
-            let spend_settings = settings.clone();
-            tauri::async_runtime::spawn(async move { agent::daily_spend_live::refresh(&spend_settings, true).await; });
 
             // Continuously claim expired identity-complete delivery runs, then
             // resume only already-authorized work. This also recovers a lost
@@ -1734,10 +1741,34 @@ pub fn run() {
             let scheduler_handles: commands::tasks::SchedulerHandles =
                 Arc::new(Mutex::new(HashMap::new()));
             app.manage(scheduler_handles);
-            // CF-BG：启动后台任务对账 + 唤醒投递循环（重启后继续监视/补发唤醒）。
-            crate::agent::background_tasks::start_runtime(app.handle().clone());
+            app.manage(commands::terminal::TerminalState::new());
+            let app = app.handle().clone();
+            let recovery_log_dir = data_dir.clone();
+            startup_recovery::spawn(data_dir.clone(), move || {
+            let stage_started = std::time::Instant::now();
+            startup_recovery::record(&data_dir, "spend-rebuild", "started", std::time::Duration::ZERO);
+            // Preserve quota restoration before any automatic recovery admission.
+            tauri::async_runtime::block_on(agent::daily_spend_live::rebuild(
+                &objective_pool, &delivery_settings, agent::quota_cap::daily_spend::ledger(), chrono::Utc::now().timestamp_millis(),
+            ))?;
+            startup_recovery::record(&data_dir, "spend-rebuild", "completed", stage_started.elapsed());
+            let spend_settings = delivery_settings.clone();
+            tauri::async_runtime::spawn(async move { agent::daily_spend_live::refresh(&spend_settings, true).await; });
+            // Recovery may run long after window readiness. Only publish the
+            // background wake runtime once settlement has closed admission.
             // M191: 启动知识库自动更新（崩溃修复 + 全库对账 + 文件监听 + 定时兜底）。
+            // M192 FTS upgrade may scan every chunk. Never run it on the
+            // native setup thread; failed transactions remain retryable.
+            let index_pool = knowledge_pool.clone();
+            tauri::async_runtime::spawn(async move {
+                if let Err(error) = crate::knowledge::ensure_schema(&index_pool).await {
+                    tracing::warn!(%error, "knowledge search index upgrade deferred");
+                }
+            });
             crate::knowledge_watch::start(knowledge_pool);
+            tauri::async_runtime::block_on(agent::journal::recover_orphaned_tasks(
+                &objective_pool, agent::journal::OrphanScope::All,
+            ))?;
             let objective_store = agent::objective::ObjectiveStore::new(objective_pool.clone());
             let cancelled_sessions = tauri::async_runtime::block_on(
                 objective_store.consume_pending_chat_session_cancellations(),
@@ -1772,7 +1803,11 @@ pub fn run() {
             // M188: retire orphan transports and settle merged sessions before
             // admitting restart recovery, which could otherwise revive old PRs.
             tauri::async_runtime::block_on(agent::thin_derive::reconcile_orphan_turns(&objective_pool))?;
+            let stage_started = std::time::Instant::now();
+            startup_recovery::record(&data_dir, "merged-settlement", "started", std::time::Duration::ZERO);
             tauri::async_runtime::block_on(agent::thin_derive::settle_merged_sessions(&objective_pool))?;
+            startup_recovery::record(&data_dir, "merged-settlement", "completed", stage_started.elapsed());
+            crate::agent::background_tasks::start_runtime(app.clone());
             // 阶段 2 P0/R2: thin sessions are heartbeat-only, so a row left
             // `running` by a prior process (install restart) has no executor
             // and no other owner. Resume it now instead of leaving it running
@@ -1780,7 +1815,7 @@ pub fn run() {
             // phase-1 R3 "you were interrupted" prompt.
             let resumed_thin_sessions = tauri::async_runtime::block_on(
                 agent::thin_restart::resume_running_without_executor(
-                    app.handle().clone(),
+                    app.clone(),
                     &objective_pool,
                     agent::thin_restart::ResumeOrigin::Startup,
                 ),
@@ -1898,7 +1933,7 @@ pub fn run() {
                 process_identity,
             );
             agent::objective_supervisor::spawn_objective_recovery_supervisor(
-                app.handle().clone(),
+                app.clone(),
                 objective_pool.clone(),
             );
             agent::execution_workspace::spawn_cleanup_supervisor(
@@ -1914,8 +1949,7 @@ pub fn run() {
             // session itself, directory deleted) while the app is closed. Heal
             // those once on startup instead of letting the session sit parked.
             agent::execution_workspace::spawn_incident_healer(objective_pool.clone());
-            agent::quota_live::spawn_refresh(app.handle().clone());
-            app.manage(commands::terminal::TerminalState::new());
+            agent::quota_live::spawn_refresh(app.clone());
 
             let browser_reclaim_pool = objective_pool.clone();
             tauri::async_runtime::spawn(async move {
@@ -1983,6 +2017,9 @@ pub fn run() {
                 }
             });
 
+            Ok(())
+            });
+            startup_recovery::record(&recovery_log_dir, "setup", "completed", setup_started.elapsed());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

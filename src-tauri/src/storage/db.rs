@@ -272,6 +272,14 @@ async fn connection_open_transaction(connection: &mut sqlx::SqliteConnection) ->
 }
 
 pub async fn connect(db_path: &str) -> crate::errors::Result<SqlitePool> {
+    connect_inner(db_path, false).await
+}
+
+pub async fn connect_startup(db_path: &str) -> crate::errors::Result<SqlitePool> {
+    connect_inner(db_path, true).await
+}
+
+async fn connect_inner(db_path: &str, startup: bool) -> crate::errors::Result<SqlitePool> {
     if !sqlx::Sqlite::database_exists(db_path)
         .await
         .unwrap_or(false)
@@ -287,17 +295,22 @@ pub async fn connect(db_path: &str) -> crate::errors::Result<SqlitePool> {
         .connect_with(pool_connect_options(db_path)?)
         .await?;
 
+    initialize(&pool, startup).await?;
+    Ok(pool)
+}
+
+async fn initialize(pool: &SqlitePool, startup: bool) -> crate::errors::Result<()> {
     // sqlx file-based migrations first — they handle the cases where a
     // version slot is unclaimed in the user's `_sqlx_migrations` table.
     // We ignore the result on a checksum/version mismatch so that the
     // ensure_schema pass below can still run; the row-level damage from
     // a half-applied migration is what we're working around here.
-    if let Err(e) = sqlx::migrate!("./migrations").run(&pool).await {
+    if let Err(e) = sqlx::migrate!("./migrations").run(pool).await {
         tracing::warn!("sqlx::migrate reported {e}; falling back to idempotent ensure_schema");
     }
 
     // Idempotent schema sync — see ensure_schema doc-comment for the why.
-    ensure_schema(&pool).await.map_err(|error| crate::errors::AppError::Other(
+    ensure_schema_inner(pool, startup).await.map_err(|error| crate::errors::AppError::Other(
         format!("Database startup schema repair failed (MEM-A/legacy upgrade): {error}")
     ))?;
     // Fail at startup, never after a user starts a turn. Preparing these
@@ -307,7 +320,7 @@ pub async fn connect(db_path: &str) -> crate::errors::Result<SqlitePool> {
         "SELECT name, enabled, updated_at FROM feature_flags LIMIT 0",
         "SELECT id, session_id, created_at, flag_enabled, source_count, excluded_count, wire_fingerprint, payload_json FROM assembly_manifests LIMIT 0",
     ] {
-        sqlx::query(statement).execute(&pool).await.map_err(|error|
+        sqlx::query(statement).execute(pool).await.map_err(|error|
             crate::errors::AppError::Other(format!("Database startup schema verification failed (MEM-A): {error}"))
         )?;
     }
@@ -316,7 +329,7 @@ pub async fn connect(db_path: &str) -> crate::errors::Result<SqlitePool> {
     // `pool_connect_options` turns them on for every connection in the pool,
     // including the four the previous single-shot `PRAGMA foreign_keys = ON`
     // could never reach.
-    Ok(pool)
+    Ok(())
 }
 
 /// Make sure every column the application code expects actually exists on
@@ -348,6 +361,10 @@ async fn table_exists(pool: &SqlitePool, table: &str) -> crate::errors::Result<b
 }
 
 async fn ensure_schema(pool: &SqlitePool) -> crate::errors::Result<()> {
+    ensure_schema_inner(pool, false).await
+}
+
+async fn ensure_schema_inner(pool: &SqlitePool, startup: bool) -> crate::errors::Result<()> {
     ensure_column(pool, "sessions", "delivery_mode", "TEXT NOT NULL DEFAULT 'legacy' CHECK (delivery_mode IN ('thin', 'legacy'))").await?;
     sqlx::query("CREATE TABLE IF NOT EXISTS thin_delivery_refs (session_id TEXT PRIMARY KEY, branch TEXT NOT NULL, pr_number INTEGER NOT NULL, ceiling TEXT NOT NULL)")
         .execute(pool).await?;
@@ -529,6 +546,9 @@ async fn ensure_schema(pool: &SqlitePool) -> crate::errors::Result<()> {
         .await?;
     }
 
+    let migration_needed: i64 = sqlx::query_scalar("SELECT count(*) FROM usage_migration_receipts WHERE version='usage-v1'")
+        .fetch_one(pool).await?;
+    if !startup || migration_needed == 0 {
     let mut migration_scanned = 0_i64;
     let mut migration_inserted = 0_i64;
     let mut migration_skipped = 0_i64;
@@ -670,6 +690,7 @@ async fn ensure_schema(pool: &SqlitePool) -> crate::errors::Result<()> {
     .bind(Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
     .execute(pool)
     .await?;
+    }
 
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS task_runs (
@@ -1648,11 +1669,12 @@ async fn ensure_schema(pool: &SqlitePool) -> crate::errors::Result<()> {
     // into 'completed' (worktree merge that already applied) or 'pending', before
     // any scheduler runs. Session-agnostic; mirrors the evolution_jobs recovery
     // above. Best-effort: a recovery hiccup must never block app startup.
-    if let Err(e) =
-        crate::agent::journal::recover_orphaned_tasks(pool, crate::agent::journal::OrphanScope::All)
-            .await
-    {
-        tracing::warn!("task orphan recovery at boot failed (non-fatal): {e}");
+    if !startup {
+        if let Err(e) = crate::agent::journal::recover_orphaned_tasks(
+            pool, crate::agent::journal::OrphanScope::All,
+        ).await {
+            tracing::warn!("task orphan recovery at boot failed (non-fatal): {e}");
+        }
     }
 
     // Delivery recovery has its own durable identity and lease model. Schema
@@ -1669,7 +1691,11 @@ async fn ensure_schema(pool: &SqlitePool) -> crate::errors::Result<()> {
         Err(e) => tracing::warn!("session activity backfill failed (non-fatal): {e}"),
     }
 
-    crate::knowledge::ensure_schema(pool).await?;
+    if startup {
+        crate::knowledge::ensure_schema_for_startup(pool).await?;
+    } else {
+        crate::knowledge::ensure_schema(pool).await?;
+    }
     crate::benchmark::ensure_schema(pool).await?;
 
     Ok(())

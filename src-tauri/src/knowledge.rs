@@ -225,6 +225,14 @@ struct ExtractedChunk {
 }
 
 pub async fn ensure_schema(pool: &SqlitePool) -> crate::errors::Result<()> {
+    ensure_schema_inner(pool, true).await
+}
+
+pub async fn ensure_schema_for_startup(pool: &SqlitePool) -> crate::errors::Result<()> {
+    ensure_schema_inner(pool, false).await
+}
+
+async fn ensure_schema_inner(pool: &SqlitePool, backfill: bool) -> crate::errors::Result<()> {
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS knowledge_libraries (
             id            TEXT PRIMARY KEY,
@@ -298,47 +306,125 @@ pub async fn ensure_schema(pool: &SqlitePool) -> crate::errors::Result<()> {
     ] {
         sqlx::query(index).execute(pool).await?;
     }
-    ensure_search_index(pool).await?;
+    if backfill { ensure_search_index(pool).await?; }
     Ok(())
 }
 
-/// Tokenize inside SQLite so direct writes, cascades and rollback maintain the
-/// same index as the scanner. No per-connection extension/UDF is required.
-fn fts_tokens_sql(value: &str) -> String {
-    format!(r#"(WITH RECURSIVE chars(rest, word, prev, tokens) AS (
-        SELECT coalesce({value}, '') || ' ', '', '', ''
-        UNION ALL
-        SELECT substr(rest, 2),
-          CASE WHEN substr(rest,1,1) GLOB '[a-zA-Z0-9_]' THEN word || lower(substr(rest,1,1)) ELSE '' END,
-          CASE WHEN (substr(rest,1,1) BETWEEN '一' AND '鿿' OR substr(rest,1,1) BETWEEN '㐀' AND '䶿' OR substr(rest,1,1) BETWEEN 'ぁ' AND 'ヿ' OR substr(rest,1,1) BETWEEN '가' AND '힣') THEN substr(rest,1,1) ELSE '' END,
-          tokens || CASE WHEN substr(rest,1,1) GLOB '[a-zA-Z0-9_]' THEN '' ELSE word || ' ' END ||
-          CASE WHEN (substr(rest,1,1) BETWEEN '一' AND '鿿' OR substr(rest,1,1) BETWEEN '㐀' AND '䶿' OR substr(rest,1,1) BETWEEN 'ぁ' AND 'ヿ' OR substr(rest,1,1) BETWEEN '가' AND '힣')
-            THEN substr(rest,1,1) || ' ' || CASE WHEN prev != '' THEN prev || substr(rest,1,1) || ' ' ELSE '' END ELSE '' END
-        FROM chars WHERE rest != ''
-    ) SELECT tokens FROM chars WHERE rest = '')"#)
+const FTS_BATCH: i64 = 100;
+
+/// Linear tokenizer: ASCII words lowercased, CJK unigrams plus adjacent bigrams.
+/// M233: this replaced a per-character recursive SQL CTE whose cost grew with
+/// the square of the text length and ran inside one write transaction.
+fn fts_tokens(value: &str) -> String {
+    let mut tokens = String::with_capacity(value.len() * 3);
+    let mut word = String::new();
+    let mut prev: Option<char> = None;
+    for c in value.chars().chain(std::iter::once(' ')) {
+        if c.is_ascii_alphanumeric() || c == '_' {
+            word.push(c.to_ascii_lowercase());
+            prev = None;
+            continue;
+        }
+        if !word.is_empty() {
+            tokens.push_str(&word);
+            tokens.push(' ');
+            word.clear();
+        }
+        if is_cjk(c) {
+            tokens.push(c);
+            tokens.push(' ');
+            if let Some(previous) = prev {
+                tokens.push(previous);
+                tokens.push(c);
+                tokens.push(' ');
+            }
+            prev = Some(c);
+        } else {
+            prev = None;
+        }
+    }
+    tokens
 }
 
+fn fts_filename(path: &str) -> &str {
+    path.rsplit(['/', '\\']).next().unwrap_or(path)
+}
+
+/// Creates the index objects only: triggers record which chunks changed, so
+/// direct writes, cascades and rollback stay correct without tokenizing in SQL.
+/// `sync_search_index` does the tokenizing, in short resumable batches.
 async fn ensure_search_index(pool: &SqlitePool) -> crate::errors::Result<()> {
-    let mut tx = pool.begin().await?;
+    let ready: i64 = sqlx::query_scalar(
+        "SELECT (SELECT count(*) FROM sqlite_master WHERE name IN ('knowledge_fts','knowledge_fts_pending','knowledge_fts_q_insert'))
+              - (SELECT count(*) FROM sqlite_master WHERE type='trigger' AND name='knowledge_fts_insert')",
+    ).fetch_one(pool).await?;
+    if ready == 3 { return Ok(()); }
+    let mut tx = crate::storage::db::begin_write(pool).await?;
     let exists: i64 = sqlx::query_scalar("SELECT count(*) FROM sqlite_master WHERE name='knowledge_fts' AND type='table'")
         .fetch_one(&mut *tx).await?;
-    sqlx::query("CREATE VIRTUAL TABLE IF NOT EXISTS knowledge_fts USING fts5(body, title, filename, tokenize='unicode61 remove_diacritics 0')").execute(&mut *tx).await?;
-    // Index only the final component, not unrelated parent directory names.
-    let filename = "(WITH RECURSIVE p(s) AS (SELECT replace(d.path, char(92), '/') UNION ALL SELECT substr(s,instr(s,'/')+1) FROM p WHERE instr(s,'/')>0) SELECT s FROM p WHERE instr(s,'/')=0)";
-    let select = format!("SELECT c.rowid, {}, {}, {} FROM knowledge_chunks c JOIN knowledge_documents d ON d.id=c.document_id",
-        fts_tokens_sql("c.text"), fts_tokens_sql("coalesce(d.title,'') || ' ' || coalesce(c.heading,'')"),
-        fts_tokens_sql(filename));
     for statement in [
-        format!("CREATE TRIGGER IF NOT EXISTS knowledge_fts_insert AFTER INSERT ON knowledge_chunks BEGIN INSERT INTO knowledge_fts(rowid,body,title,filename) {select} WHERE c.rowid=NEW.rowid; END"),
-        "CREATE TRIGGER IF NOT EXISTS knowledge_fts_delete AFTER DELETE ON knowledge_chunks BEGIN DELETE FROM knowledge_fts WHERE rowid=OLD.rowid; END".into(),
-        format!("CREATE TRIGGER IF NOT EXISTS knowledge_fts_update AFTER UPDATE ON knowledge_chunks BEGIN DELETE FROM knowledge_fts WHERE rowid=OLD.rowid; INSERT INTO knowledge_fts(rowid,body,title,filename) {select} WHERE c.rowid=NEW.rowid; END"),
-        format!("CREATE TRIGGER IF NOT EXISTS knowledge_fts_document AFTER UPDATE OF title,path ON knowledge_documents BEGIN DELETE FROM knowledge_fts WHERE rowid IN (SELECT rowid FROM knowledge_chunks WHERE document_id=NEW.id); INSERT INTO knowledge_fts(rowid,body,title,filename) {select} WHERE d.id=NEW.id; END"),
-    ] { sqlx::query(&statement).execute(&mut *tx).await?; }
+        "CREATE VIRTUAL TABLE IF NOT EXISTS knowledge_fts USING fts5(body, title, filename, tokenize='unicode61 remove_diacritics 0')",
+        "CREATE TABLE IF NOT EXISTS knowledge_fts_pending (chunk_rowid INTEGER PRIMARY KEY)",
+        "DROP TRIGGER IF EXISTS knowledge_fts_insert",
+        "DROP TRIGGER IF EXISTS knowledge_fts_delete",
+        "DROP TRIGGER IF EXISTS knowledge_fts_update",
+        "DROP TRIGGER IF EXISTS knowledge_fts_document",
+        "CREATE TRIGGER IF NOT EXISTS knowledge_fts_q_insert AFTER INSERT ON knowledge_chunks BEGIN INSERT OR IGNORE INTO knowledge_fts_pending VALUES (NEW.rowid); END",
+        "CREATE TRIGGER IF NOT EXISTS knowledge_fts_q_update AFTER UPDATE ON knowledge_chunks BEGIN DELETE FROM knowledge_fts WHERE rowid=OLD.rowid; INSERT OR IGNORE INTO knowledge_fts_pending VALUES (NEW.rowid); END",
+        "CREATE TRIGGER IF NOT EXISTS knowledge_fts_q_delete AFTER DELETE ON knowledge_chunks BEGIN DELETE FROM knowledge_fts WHERE rowid=OLD.rowid; DELETE FROM knowledge_fts_pending WHERE chunk_rowid=OLD.rowid; END",
+        "CREATE TRIGGER IF NOT EXISTS knowledge_fts_q_document AFTER UPDATE OF title,path ON knowledge_documents BEGIN DELETE FROM knowledge_fts WHERE rowid IN (SELECT rowid FROM knowledge_chunks WHERE document_id=NEW.id); INSERT OR IGNORE INTO knowledge_fts_pending SELECT rowid FROM knowledge_chunks WHERE document_id=NEW.id; END",
+    ] { sqlx::query(statement).execute(&mut *tx).await?; }
     if exists == 0 {
-        sqlx::query(&format!("INSERT INTO knowledge_fts(rowid,body,title,filename) {select}")).execute(&mut *tx).await?;
+        // Row ids only; the expensive work stays in the batches below.
+        sqlx::query("INSERT OR IGNORE INTO knowledge_fts_pending SELECT rowid FROM knowledge_chunks").execute(&mut *tx).await?;
     }
     tx.commit().await?;
     Ok(())
+}
+
+/// Indexes pending chunks in short write transactions. The queue is durable, so
+/// a closed app resumes where it stopped. `max_batches: None` drains the queue.
+pub async fn sync_search_index(pool: &SqlitePool, max_batches: Option<usize>) -> crate::errors::Result<usize> {
+    ensure_search_index(pool).await?;
+    let mut indexed = 0;
+    let mut batches = 0;
+    while max_batches.is_none_or(|max| batches < max) {
+        let mut tx = crate::storage::db::begin_write(pool).await?;
+        let rows = sqlx::query(
+            "SELECT p.chunk_rowid, c.text, c.heading, d.title, d.path
+             FROM knowledge_fts_pending p
+             JOIN knowledge_chunks c ON c.rowid = p.chunk_rowid
+             JOIN knowledge_documents d ON d.id = c.document_id
+             ORDER BY p.chunk_rowid LIMIT ?",
+        ).bind(FTS_BATCH).fetch_all(&mut *tx).await?;
+        if rows.is_empty() {
+            sqlx::query("DELETE FROM knowledge_fts_pending WHERE chunk_rowid NOT IN (SELECT rowid FROM knowledge_chunks)")
+                .execute(&mut *tx).await?;
+            tx.commit().await?;
+            break;
+        }
+        for row in &rows {
+            let rowid: i64 = row.try_get(0)?;
+            let text: String = row.try_get(1)?;
+            let heading: Option<String> = row.try_get(2)?;
+            let title: Option<String> = row.try_get(3)?;
+            let path: String = row.try_get(4)?;
+            let label = format!("{} {}", title.unwrap_or_default(), heading.unwrap_or_default());
+            sqlx::query("DELETE FROM knowledge_fts WHERE rowid=?").bind(rowid).execute(&mut *tx).await?;
+            sqlx::query("INSERT INTO knowledge_fts(rowid,body,title,filename) VALUES (?,?,?,?)")
+                .bind(rowid).bind(fts_tokens(&text)).bind(fts_tokens(&label)).bind(fts_tokens(fts_filename(&path)))
+                .execute(&mut *tx).await?;
+            sqlx::query("DELETE FROM knowledge_fts_pending WHERE chunk_rowid=?").bind(rowid).execute(&mut *tx).await?;
+        }
+        tx.commit().await?;
+        indexed += rows.len();
+        batches += 1;
+        if max_batches.is_none() {
+            // Hand the write lock to chat and settings between batches.
+            tokio::time::sleep(std::time::Duration::from_millis(15)).await;
+        }
+    }
+    Ok(indexed)
 }
 
 pub async fn add_library(
@@ -461,6 +547,13 @@ pub async fn scan_library(
     while lease.take_rerun() {
         summary = scan_library_once(pool, library_id).await?;
     }
+    drop(lease);
+    let index_pool = pool.clone();
+    tauri::async_runtime::spawn(async move {
+        if let Err(error) = sync_search_index(&index_pool, None).await {
+            tracing::warn!(%error, "knowledge search index sync deferred");
+        }
+    });
     Ok(summary)
 }
 
@@ -478,15 +571,27 @@ async fn scan_library_once(
     let mut summary = KnowledgeScanSummary::new(library_id);
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
 
-    for entry in WalkDir::new(&library.root_path)
-        .follow_links(false)
-        .into_iter()
-        .filter_map(|entry| entry.ok())
-    {
-        if !entry.file_type().is_file() {
-            continue;
+    let root = library.root_path.clone();
+    static WALK_LANES: std::sync::OnceLock<std::sync::Arc<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
+    let lanes = WALK_LANES.get_or_init(|| std::sync::Arc::new(tokio::sync::Semaphore::new(2))).clone();
+    let permit = tokio::time::timeout(std::time::Duration::from_secs(10), lanes.acquire_owned()).await
+        .map_err(|_| crate::errors::AppError::Other("knowledge traversal capacity timeout".into()))?
+        .map_err(|_| crate::errors::AppError::Other("knowledge traversal unavailable".into()))?;
+    let walk = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        let mut paths = Vec::new();
+        for entry in WalkDir::new(root).follow_links(false) {
+            let entry = entry.map_err(|error| error.to_string())?;
+            if entry.file_type().is_file() { paths.push(entry.into_path()); }
         }
-        let path = entry.path();
+        Ok::<_, String>(paths)
+    });
+    let paths = tokio::time::timeout(std::time::Duration::from_secs(30), walk).await
+        .map_err(|_| crate::errors::AppError::Other("knowledge traversal timeout; system will retry".into()))?
+        .map_err(|error| crate::errors::AppError::Other(format!("knowledge traversal failed: {error}")))?
+        .map_err(|error| crate::errors::AppError::Other(format!("knowledge traversal incomplete; existing index retained: {error}")))?;
+    for path in paths {
+        let path = path.as_path();
         let Some(kind) = supported_kind(path) else {
             continue;
         };
@@ -635,6 +740,11 @@ pub async fn search(
     query: KnowledgeSearchQuery,
 ) -> crate::errors::Result<Vec<KnowledgeSearchResult>> {
     let started = std::time::Instant::now();
+    // Bounded: until the background queue drains, results cover indexed chunks
+    // only. Search never waits for a whole library to be tokenized.
+    if let Err(error) = sync_search_index(pool, Some(1)).await {
+        tracing::warn!(%error, "knowledge search index catch-up deferred");
+    }
     let terms = query_terms(&query.query);
     if terms.is_empty() {
         return Ok(Vec::new());
@@ -1399,6 +1509,50 @@ mod tests {
             .bind(id).bind(id).bind(text).execute(pool).await.unwrap();
     }
 
+    #[test]
+    fn m233_tokens_are_linear_and_match_the_index_format() {
+        assert_eq!(super::fts_tokens("Atlas产品 路线_x图").split_whitespace().collect::<Vec<_>>(),
+            ["atlas", "产", "品", "产品", "路", "线", "路线", "_x", "图"]);
+        assert_eq!(super::fts_filename(r"C:\docs\路线图.pdf"), "路线图.pdf");
+        assert_eq!(super::fts_filename("/docs/roadmap.pdf"), "roadmap.pdf");
+        let start = std::time::Instant::now();
+        let tokens = super::fts_tokens(&"产品路线图".repeat(200_000));
+        assert!(tokens.len() > 1_000_000);
+        assert!(start.elapsed().as_secs() < 2, "1M chars took {:?}", start.elapsed());
+    }
+
+    #[tokio::test]
+    async fn m233_upgrade_backfill_is_batched_resumable_and_keeps_writes_moving() {
+        let pool = memory_pool().await;
+        m192_fixture(&pool, "big", "大库", "种子").await;
+        let text = "历史方案描述产品路线图".repeat(400);
+        let mut tx = pool.begin().await.unwrap();
+        for i in 0..1_000 {
+            sqlx::query("INSERT INTO knowledge_chunks (id,document_id,chunk_index,content_type,text,token_estimate) VALUES (?,'big',?,'page',?,10)")
+                .bind(format!("big-{i}")).bind(i + 1).bind(&text).execute(&mut *tx).await.unwrap();
+        }
+        tx.commit().await.unwrap();
+        // Simulate an install that never finished the old all-or-nothing rebuild.
+        for name in ["knowledge_fts_q_insert", "knowledge_fts_q_update", "knowledge_fts_q_delete", "knowledge_fts_q_document"] {
+            sqlx::query(&format!("DROP TRIGGER {name}")).execute(&pool).await.unwrap();
+        }
+        sqlx::query("DROP TABLE knowledge_fts").execute(&pool).await.unwrap();
+        sqlx::query("DROP TABLE knowledge_fts_pending").execute(&pool).await.unwrap();
+        let start = std::time::Instant::now();
+        super::ensure_schema(&pool).await.unwrap();
+        assert!(start.elapsed().as_secs() < 2, "upgrade must not tokenize: {:?}", start.elapsed());
+        let pending = || async { sqlx::query_scalar::<_, i64>("SELECT count(*) FROM knowledge_fts_pending").fetch_one(&pool).await.unwrap() };
+        assert_eq!(pending().await, 1_001);
+        let start = std::time::Instant::now();
+        assert_eq!(super::sync_search_index(&pool, Some(1)).await.unwrap(), 100);
+        assert!(start.elapsed().as_secs() < 2, "one batch held the write lock for {:?}", start.elapsed());
+        // A restart here keeps the durable queue: nothing starts over.
+        assert_eq!(pending().await, 901);
+        assert_eq!(super::sync_search_index(&pool, None).await.unwrap(), 901);
+        assert_eq!(pending().await, 0);
+        assert!(!search_hits(&pool, "m192", "路线图").await.is_empty());
+    }
+
     #[tokio::test]
     async fn m192_cjk_mixed_highlight_and_lifecycle() {
         let pool = memory_pool().await;
@@ -1457,6 +1611,7 @@ mod tests {
                 .execute(&mut *tx).await.unwrap();
         }
         tx.commit().await.unwrap();
+        super::sync_search_index(&pool, None).await.unwrap();
         let mut timings = Vec::new();
         for i in 0..40 {
             let start = std::time::Instant::now();
