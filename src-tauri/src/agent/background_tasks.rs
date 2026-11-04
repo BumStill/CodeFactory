@@ -808,6 +808,10 @@ pub type WakeFuture = Pin<Box<dyn std::future::Future<Output = bool> + Send>>;
 /// 唤醒入队通道。生产实现走与用户输入相同的会话入队；测试用记录型实现。
 pub trait WakeSink: Send + Sync {
     fn enqueue(&self, session_id: String, text: String) -> WakeFuture;
+    fn enqueue_detailed(&self, session_id: String, text: String) -> Pin<Box<dyn std::future::Future<Output = Result<bool, String>> + Send>> {
+        let future = self.enqueue(session_id, text);
+        Box::pin(async move { if future.await { Ok(true) } else { Err("唤醒通道拒绝准入".into()) } })
+    }
 }
 
 /// D2：把待投递的唤醒交给会话入队，投递成功才标记 `enqueued`，因此重启后不会重复补发。
@@ -1018,14 +1022,19 @@ pub(crate) async fn persist_model_wakeup(
     pool: &SqlitePool, session: &str, root: &str, at_ms: i64, notice: &str,
 ) -> sqlx::Result<String> {
     ensure_wakeup_schema(pool).await?;
+    super::thin_state::ensure(pool).await?;
     let base = format!("model-availability-{session}");
+    let mut tx = crate::storage::db::begin_write(pool).await?;
+    let ended: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM thin_session_state WHERE session_id=? AND state='ended'")
+        .bind(session).fetch_one(&mut *tx).await?;
+    if ended > 0 { return Ok(base); }
     let pending: Option<String> = sqlx::query_scalar(
         "SELECT id FROM wakeup_schedules
           WHERE session_id=? AND status='pending' AND id LIKE 'model-availability-%'
           ORDER BY next_at ASC, created_at ASC LIMIT 1",
     )
     .bind(session)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *tx)
     .await?;
     let id = match pending {
         Some(id) => id,
@@ -1034,7 +1043,7 @@ pub(crate) async fn persist_model_wakeup(
                 "SELECT COUNT(*) FROM wakeup_schedules WHERE session_id=? AND id LIKE 'model-availability-%'",
             )
             .bind(session)
-            .fetch_one(pool)
+            .fetch_one(&mut *tx)
             .await?;
             if seen == 0 { base } else { format!("{base}-re{seen}") }
         }
@@ -1049,7 +1058,8 @@ pub(crate) async fn persist_model_wakeup(
     .bind(session).bind(root)
     .bind(format!("{notice}。系统自动重试/自愈：模型可用时间已到，重新检查凭据、使用时段和用户额度硬上限，继续原任务。"))
     .bind(at_ms.saturating_add(999).div_euclid(1000)).bind(now_secs())
-    .execute(pool).await?;
+    .execute(&mut *tx).await?;
+    tx.commit().await?;
     Ok(id)
 }
 
@@ -1304,6 +1314,29 @@ async fn reject_exhausted_wakes(pool: &SqlitePool, session: &str, wakes: &[Wakeu
     Ok(true)
 }
 
+async fn record_wake_rejection(pool: &SqlitePool, session: &str, error: &str, now: i64) -> sqlx::Result<()> {
+    let error = crate::trajectory::redact_text(error, 1000);
+    super::thin_state::ensure(pool).await?;
+    sqlx::query("CREATE TABLE IF NOT EXISTS session_audit_events(id TEXT PRIMARY KEY,session_id TEXT NOT NULL,kind TEXT NOT NULL,actor TEXT NOT NULL,detail_json TEXT NOT NULL,created_at INTEGER NOT NULL)").execute(pool).await?;
+    let mut tx = crate::storage::db::begin_write(pool).await?;
+    let attempts: i64 = sqlx::query_scalar("INSERT INTO workspace_recovery_budget(session_id,attempts,next_at,last_error) VALUES (?,1,?,?) ON CONFLICT(session_id) DO UPDATE SET attempts=attempts+1,next_at=excluded.next_at,last_error=excluded.last_error RETURNING attempts")
+        .bind(format!("wake-delivery:{session}")).bind(now + 60).bind(&error).fetch_one(&mut *tx).await?;
+    let detail = serde_json::json!({"error":error,"attempts":attempts,"next_at":now+60}).to_string();
+    sqlx::query("INSERT INTO session_audit_events(id,session_id,kind,actor,detail_json,created_at) VALUES (?,?,'wakeup_admission_failed','system',?,?)")
+        .bind(uuid::Uuid::new_v4().to_string()).bind(session).bind(detail).bind(now*1000).execute(&mut *tx).await?;
+    if attempts >= 30 {
+        let reason = format!("自动继续失败：{error}。系统已每分钟重试唤醒准入，共 {attempts} 次，自动恢复已结束；任务未完成，详情见本会话审计记录。");
+        sqlx::query("UPDATE thin_session_state SET state='ended',reason=?,waiting_for=NULL,wake_source=NULL,question=NULL,updated_at=? WHERE session_id=?")
+            .bind(reason).bind(now*1000).bind(session).execute(&mut *tx).await?;
+        sqlx::query("UPDATE wakeup_schedules SET status='cancelled' WHERE session_id=? AND status='pending'").bind(session).execute(&mut *tx).await?;
+    } else if attempts >= 5 {
+        let notice = format!("自动继续失败：{error}；系统自动重试/自愈，将在 1 分钟后重试（已尝试 {attempts} 次）");
+        sqlx::query("UPDATE thin_session_state SET waiting_for=?,reason=?,updated_at=? WHERE session_id=? AND state='waiting_wake'")
+            .bind(&notice).bind(&notice).bind(now*1000).bind(session).execute(&mut *tx).await?;
+    }
+    tx.commit().await
+}
+
 pub async fn drain_due_wakeups_at(pool: &SqlitePool, sink: &dyn WakeSink, now: i64) -> usize {
     use futures_util::{stream::FuturesUnordered, StreamExt};
     // 同一进程只有一个扫描器可推进计划；先锁再读，不能依赖入队后的 CAS 去重。
@@ -1333,6 +1366,12 @@ pub async fn drain_due_wakeups_at(pool: &SqlitePool, sink: &dyn WakeSink, now: i
     let mut pending = FuturesUnordered::new();
     for (session, wakes) in sessions {
         pending.push(async move {
+            if let Ok(Some(state)) = super::thin_state::load(pool, &session).await {
+                if state.state == super::thin_state::SessionState::Ended {
+                    cancel_session_wakeups(pool, &session).await;
+                    return 0;
+                }
+            }
             // M216：旧版本把准入失败记到了工作区预算，迁移时仅清除这类未结算技术记录。
             if let Err(error) = sqlx::query("DELETE FROM workspace_recovery_budget WHERE session_id=? AND settled_reason IS NULL AND last_error='唤醒投递失败；系统自动重试/自愈'")
                 .bind(&session).execute(pool).await {
@@ -1377,13 +1416,17 @@ pub async fn drain_due_wakeups_at(pool: &SqlitePool, sink: &dyn WakeSink, now: i
             let text = wakes.iter().map(|wake| {
                 wakeup_text(wake, wake.fire_count + 1, now.saturating_sub(wake.next_at) >= wake.every_sec.unwrap_or(1).max(1) as i64)
             }).collect::<Vec<_>>().join("\n\n");
-            if !deliver_wake(sink, session.clone(), text, due).await {
-                // 每分钟至多一次准入失败；持续 pending，不以技术失败把任务终态化。
-                let result = sqlx::query("INSERT INTO workspace_recovery_budget(session_id,attempts,next_at,last_error) VALUES (?,1,?,'唤醒准入失败；系统自动重试/自愈') ON CONFLICT(session_id) DO UPDATE SET attempts=attempts+1,next_at=excluded.next_at,last_error=excluded.last_error")
-                    .bind(&delivery_key).bind(now + 60).execute(pool).await;
-                if let Err(error) = result { tracing::warn!(%error, session, "wake retry persistence failed; automatic retry next tick"); }
+            let delivery = tokio::time::timeout(Duration::from_secs(5), sink.enqueue_detailed(session.clone(), text)).await
+                .unwrap_or_else(|_| Err("唤醒准入超时（5 秒）".into()));
+            if let Err(error) = delivery {
+                if let Err(error) = record_wake_rejection(pool, &session, &error, now).await {
+                    tracing::warn!(%error, session, "wake retry persistence failed; automatic retry next tick");
+                }
                 return 0;
             }
+            // Ok(false) means the active executor owns the session: defer without
+            // charging a failed-admission attempt or ending that live turn.
+            if delivery == Ok(false) { return 0; }
             let _ = super::workspace_recovery_budget::clear(pool, &session).await;
             let _ = super::workspace_recovery_budget::clear(pool, &format!("wake-delivery:{session}")).await;
             for wake in &wakes {
@@ -1612,18 +1655,17 @@ struct ChatWakeSink {
 #[cfg(not(test))]
 impl WakeSink for ChatWakeSink {
     fn enqueue(&self, session_id: String, text: String) -> WakeFuture {
+        let future = self.enqueue_detailed(session_id, text);
+        Box::pin(async move { future.await == Ok(true) })
+    }
+
+    fn enqueue_detailed(&self, session_id: String, text: String) -> Pin<Box<dyn std::future::Future<Output = Result<bool, String>> + Send>> {
         let app = self.app.clone();
         Box::pin(async move {
-            // M148/R2：系统接续走同一条入队通道，但来源是 SystemWake——只接续当前
-            // 任务，不把上一回合结算成「被用户重新发起」（那会让等 PR/CI 的会话
-            // 被判 ended，之后 PR 监视再也不唤醒它）。
-            match crate::commands::chat::send_system_wake(app.clone(), session_id, text).await
-            {
-                Ok(()) => true,
-                Err(error) => {
-                    tracing::debug!(%error, "background task wake deferred");
-                    false
-                }
+            match crate::commands::chat::send_system_wake(app, session_id, text).await {
+                Ok(()) => Ok(true),
+                Err(error) if error.to_string().contains("CHAT_RUN_BUSY") => Ok(false),
+                Err(error) => Err(crate::trajectory::redact_text(&error.to_string(), 1000)),
             }
         })
     }
@@ -2463,6 +2505,63 @@ mod tests {
             sqlx::query("INSERT OR REPLACE INTO thin_external_observations VALUES ('fixture',?)").bind(reason).execute(&pool).await.unwrap();
             assert_eq!(wake_source_cover(&pool, "fixture").await.is_covered(), reason.is_none(), "triggered observation: {reason:?}");
         }
+    }
+
+    #[tokio::test]
+    async fn m228_busy_is_not_rejection_and_errors_are_redacted() {
+        let pool = memory_pool().await;
+        super::super::workspace_recovery_budget::ensure(&pool).await.unwrap();
+        persist_model_wakeup(&pool,"m228-busy","root",1000,"wait").await.unwrap();
+        struct Busy;
+        impl WakeSink for Busy {
+            fn enqueue(&self, _: String, _: String) -> WakeFuture { Box::pin(async { false }) }
+            fn enqueue_detailed(&self, _: String, _: String) -> Pin<Box<dyn std::future::Future<Output=Result<bool,String>> + Send>> { Box::pin(async { Ok(false) }) }
+        }
+        for n in 0..35 { assert_eq!(drain_due_wakeups_at(&pool,&Busy,100+n*60).await,0); }
+        let attempts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM workspace_recovery_budget WHERE session_id='wake-delivery:m228-busy'").fetch_one(&pool).await.unwrap();
+        assert_eq!(attempts,0);
+        record_wake_rejection(&pool,"m228-busy","database locked token=syntheticsecret123",3000).await.unwrap();
+        let error: String = sqlx::query_scalar("SELECT last_error FROM workspace_recovery_budget WHERE session_id='wake-delivery:m228-busy'").fetch_one(&pool).await.unwrap();
+        assert!(error.contains("database locked") && !error.contains("syntheticsecret123"));
+        let detail: String = sqlx::query_scalar("SELECT detail_json FROM session_audit_events WHERE session_id='m228-busy'").fetch_one(&pool).await.unwrap();
+        assert!(detail.contains("database locked") && !detail.contains("syntheticsecret123"));
+    }
+
+    #[tokio::test]
+    async fn m228_ended_session_does_not_rearm_startup_interruption() {
+        let pool = memory_pool().await;
+        super::super::thin_state::ensure(&pool).await.unwrap();
+        persist_model_wakeup(&pool, "m228-ended", "root", 1000, "model wait").await.unwrap();
+        super::super::thin_state::save(&pool, "m228-ended", &super::super::thin_state::ThinState::ended("PR #42 已合并", "synthetic")).await.unwrap();
+        let pending: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM wakeup_schedules WHERE status='pending'").fetch_one(&pool).await.unwrap();
+        assert_eq!(pending, 0, "ended must cancel pending wakes");
+        persist_model_wakeup(&pool, "m228-ended", "root", 2000, "启动阶段中断").await.unwrap();
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM wakeup_schedules").fetch_one(&pool).await.unwrap();
+        assert_eq!(count, 1, "startup recovery must not create another row after settlement");
+    }
+
+    #[tokio::test]
+    async fn m228_rejected_wakes_explain_and_terminate_after_thirty_attempts() {
+        let pool = memory_pool().await;
+        super::super::thin_state::ensure(&pool).await.unwrap();
+        super::super::thin_state::save(&pool,"m228-reject", &super::super::thin_state::after_final(super::super::thin_state::WaitNeed::External { what: "model reset".into(), covered: true }, "")).await.unwrap();
+        persist_model_wakeup(&pool,"m228-reject","root",1000,"model reset").await.unwrap();
+        struct Reject;
+        impl WakeSink for Reject {
+            fn enqueue(&self, _: String, _: String) -> WakeFuture { Box::pin(async { false }) }
+        }
+        for n in 0..30 {
+            assert_eq!(drain_due_wakeups_at(&pool,&Reject,100 + n*60).await,0);
+            if n == 4 {
+                let state = super::super::thin_state::load(&pool,"m228-reject").await.unwrap().unwrap();
+                assert!(state.waiting_for.unwrap_or_default().contains("自动继续失败"));
+            }
+        }
+        let state = super::super::thin_state::load(&pool,"m228-reject").await.unwrap().unwrap();
+        assert_eq!(state.state,super::super::thin_state::SessionState::Ended);
+        assert!(state.reason.unwrap().contains("30"));
+        let audits: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM session_audit_events WHERE session_id='m228-reject' AND kind='wakeup_admission_failed'").fetch_one(&pool).await.unwrap();
+        assert_eq!(audits,30);
     }
 
     #[tokio::test]

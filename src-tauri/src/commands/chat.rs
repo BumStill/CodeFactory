@@ -6303,6 +6303,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn m228_model_wait_wake_continues_answered_settled_objective() {
+        use crate::agent::objective::TurnOrigin;
+        let pool = crate::storage::db::connect("sqlite::memory:").await.unwrap();
+        sqlx::query("INSERT INTO sessions(id,title,cwd,model_id,created_at,updated_at,delivery_mode) VALUES ('m228','fixture','/synthetic','chatgpt',1,1,'thin')").execute(&pool).await.unwrap();
+        let first = admit_persisted_chat_turn_with_origin(&pool, &crate::ChatRunControl::pending(), "m228", Some("m228-root"), "original task", TurnOrigin::User).await.unwrap();
+        sqlx::query("UPDATE chat_turn_state SET status='completed',terminal_reason='completed',completed_at=1 WHERE root_turn_id=?").bind(&first.root_turn_id).execute(&pool).await.unwrap();
+        sqlx::query("UPDATE objectives SET status='completed',decision_type='complete',evidence_ref='synthetic',reached_acceptance=requested_acceptance,completed_at=1,recovery_owner=NULL,remediation_id=NULL,lease_owner=NULL,lease_expires_at=NULL WHERE id=?").bind(&first.objective.id).execute(&pool).await.unwrap();
+        sqlx::query("UPDATE chat_run_controls SET status='completed',settled_at=1,updated_at=1 WHERE session_id='m228'").execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO messages(id,session_id,role,content,created_at) VALUES ('m228-answer','m228','assistant','waiting for model reset',9999999999999)").execute(&pool).await.unwrap();
+        crate::agent::thin_state::save(&pool,"m228", &crate::agent::thin_state::after_final(crate::agent::thin_state::WaitNeed::External { what: "model reset".into(), covered: true }, "")).await.unwrap();
+        crate::agent::background_tasks::persist_model_wakeup(&pool,"m228", &first.root_turn_id, 1000,"ChatGPT reset; DeepSeek daily limit").await.unwrap();
+        let resumed = admit_persisted_chat_turn_with_origin(&pool, &crate::ChatRunControl::pending(), "m228", None, "model reset wake", TurnOrigin::SystemWake).await.unwrap();
+        assert_eq!(resumed.objective.id, first.objective.id);
+        assert!(!resumed.already_settled);
+    }
+
+    #[tokio::test]
+    async fn m228_due_wake_starts_chatgpt_after_reset_with_daily_fallback_capped() {
+        use crate::agent::{background_tasks::{WakeSink, WakeFuture}, quota_cap::{shared_quota_ledger, EndpointQuota, UsageSource, WindowUsage, daily_spend}};
+        let pool = crate::storage::db::connect("sqlite::memory:").await.unwrap();
+        sqlx::query("INSERT INTO sessions(id,title,cwd,model_id,created_at,updated_at,delivery_mode) VALUES ('m228-combo','fixture','/synthetic','gpt-5.5',1,1,'thin')").execute(&pool).await.unwrap();
+        let first = admit_persisted_chat_turn_with_origin(&pool,&crate::ChatRunControl::pending(),"m228-combo",Some("m228-combo-root"),"original task",crate::agent::objective::TurnOrigin::User).await.unwrap();
+        sqlx::query("UPDATE chat_run_controls SET status='completed',settled_at=1 WHERE session_id='m228-combo'").execute(&pool).await.unwrap();
+        crate::agent::thin_state::save(&pool,"m228-combo", &crate::agent::thin_state::after_final(crate::agent::thin_state::WaitNeed::External { what: "ChatGPT reset".into(), covered: true }, "")).await.unwrap();
+        let now = chrono::Utc::now().timestamp_millis();
+        crate::agent::background_tasks::persist_model_wakeup(&pool,"m228-combo", &first.root_turn_id,now,"ChatGPT reset; DeepSeek daily limit").await.unwrap();
+        let mut settings = crate::config::settings::Settings::default();
+        settings.endpoints.clear();
+        settings.default_endpoint="m228-chatgpt".into();
+        settings.endpoints.insert("m228-chatgpt".into(),Endpoint { base_url:"https://synthetic.example/m228-chatgpt".into(),key_ref:None,api_style:ApiStyle::Chatgpt,custom_models:vec![],active_model:Some("gpt-5.5".into()) });
+        settings.endpoints.insert("m228-deepseek".into(),Endpoint { base_url:"https://synthetic.example/m228-deepseek".into(),key_ref:Some("synthetic".into()),api_style:ApiStyle::Openai,custom_models:vec![],active_model:Some("deepseek-v4-pro".into()) });
+        settings.endpoint_daily_spend_caps.insert("m228-deepseek".into(),daily_spend::default_config());
+        daily_spend::ledger().record_estimated("m228-deepseek",20.0,now);
+        shared_quota_ledger().record_server_usage("https://synthetic.example/m228-chatgpt",EndpointQuota { source:UsageSource::ServerReported,five_hour:WindowUsage { used_ratio:1.0,resets_at_ms:Some(now-1000) },weekly:WindowUsage { used_ratio:0.0,resets_at_ms:None },observed_at_ms:now-2000 });
+        // Production resolve_route_plan refreshes quota_live before planning.
+        // Simulate that confirmed provider reading, not a clock-only bypass.
+        shared_quota_ledger().record_server_usage("https://synthetic.example/m228-chatgpt",EndpointQuota { source:UsageSource::LiveQuery,five_hour:WindowUsage { used_ratio:0.0,resets_at_ms:Some(now+18_000_000) },weekly:WindowUsage { used_ratio:0.0,resets_at_ms:Some(now+86_400_000) },observed_at_ms:now });
+        struct AdmissionSink { pool: sqlx::SqlitePool, settings: crate::config::settings::Settings }
+        impl WakeSink for AdmissionSink {
+            fn enqueue(&self, session: String, text: String) -> WakeFuture {
+                let pool=self.pool.clone(); let settings=self.settings.clone();
+                Box::pin(async move {
+                    let receipt=admit_persisted_chat_turn_with_origin(&pool,&crate::ChatRunControl::pending(),&session,None,&text,crate::agent::objective::TurnOrigin::SystemWake).await.unwrap();
+                    let route=resolve_turn_route(&settings,None,"gpt-5.5","prefer",false).await.unwrap();
+                    let active=ActiveRouteState::from_plan_with_health(route.plan,EndpointHealthRegistry::new(Duration::from_secs(120)));
+                    active.attach_usage_settings(Arc::new(tokio::sync::RwLock::new(settings)));
+                    active.admit_model_availability(None,false,None).await.unwrap();
+                    assert_eq!(active.current().endpoint_name,"m228-chatgpt");
+                    active.record_current_failure("synthetic transport probe");
+                    crate::agent::persistence::persist_model_route_attempts(&pool,&session,&receipt.root_turn_id,"prefer",&active.attempt_snapshots(false),false,false).await.unwrap();
+                    true
+                })
+            }
+        }
+        let at=(now+999)/1000;
+        assert_eq!(crate::agent::background_tasks::drain_due_wakeups_at(&pool,&AdmissionSink {pool:pool.clone(),settings},at+1).await,1);
+        let attempts:i64=sqlx::query_scalar("SELECT COUNT(*) FROM model_route_attempts WHERE session_id='m228-combo' AND endpoint='m228-chatgpt'").fetch_one(&pool).await.unwrap();
+        assert_eq!(attempts,1);
+        let pending:i64=sqlx::query_scalar("SELECT COUNT(*) FROM wakeup_schedules WHERE session_id='m228-combo' AND status='pending'").fetch_one(&pool).await.unwrap();
+        assert_eq!(pending,0);
+        shared_quota_ledger().clear("https://synthetic.example/m228-chatgpt");
+    }
+
+    #[tokio::test]
     async fn m209_system_wake_admits_a_fresh_turn_after_settlement() {
         use crate::agent::objective::TurnOrigin;
         let pool = crate::storage::db::connect("sqlite::memory:").await.unwrap();
