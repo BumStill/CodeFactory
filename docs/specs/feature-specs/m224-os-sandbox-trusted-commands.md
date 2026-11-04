@@ -26,7 +26,7 @@
 ## 需求
 - R1 接口：抽出跨平台的 `CommandSandbox`：输入 cwd、可写路径集合、网络策略，输出受限的启动方式。bash 工具的所有启动路径（前台、后台任务）都要经过它，不得留旁路。
 - R2 macOS 实现：用 Seatbelt 启动命令，策略为全盘可读、写入只允许 R3 的路径。子进程继承限制。
-- R3 可写范围：本会话已登记的工作区、该工作区 git 需要写的路径（含 `git_common_dir` 下的 worktree 元数据、refs、objects）、系统临时目录、`.codefactory-cache` 编译缓存、工具链缓存（如 `~/.cargo`、pnpm store）。清单写成数据，放一处。主 checkout 的工作树文件不可写。凭据目录（`~/.ssh`、钥匙串、应用数据目录、`settings.json`）不可写；读取限制在 Implementation Notes 里写明能否做到，做不到要说清楚。
+- R3 可写范围（编排方裁决）：写入默认全部拒绝，只放行集中定义的白名单。本会话工作区白名单里只有经身份验证、已登记的那一个工作区；不迁移 execution-workspaces，不写针对应用数据目录的整体 deny。应用数据目录根、settings.json、数据库、日志、其他会话工作区不在白名单内，必须断言不可写。保留正常工作流需要的精确 Git 元数据、系统临时目录、`.codefactory-cache` 和工具链缓存支撑路径，绝不开放主 checkout 的工作树；尽量不把 `git_common_dir/config`、`hooks/` 放进白名单，影响正常 Git 流程时在 Implementation Notes 报告。策略生成必须规范化路径（`/var` → `/private/var`）。凭据目录不可写；读取限制在 Implementation Notes 中说明。
 - R4 网络：阶段 1 保持可联网（git fetch、cargo、pnpm 都需要），只记录这一点是已知边界，不声称已隔离网络。
 - R5 审批改动：沙箱生效时，本地命令不再因 `trusted.git.unproved` 进入审批。上面的样本全部免审批执行。远端动作继续按 M130 的两层权限判定（会话级允许交付）。
 - R6 门禁绕过：`--no-verify`、`CODEFACTORY_SKIP_SYNC_GATE`、修改 `core.hooksPath` 指向 `.githooks` 以外等，由网关直接拒绝，并在工具结果里给修复指引（如先合并最新 main）。不进审批。
@@ -51,3 +51,18 @@ Spec、AI Collaboration、Compatibility（权限行为变化）；治理改动�
 - 新版信任模式真实会话：跑完一单（改代码、测试、提交、同步 main、开 PR），全程 `trusted.git.unproved` 审批为 0。
 - 同一会话让它尝试写工作区外文件：被系统拦下，模型能看懂原因。
 - 关掉沙箱开关后回到旧行为，再打开恢复。
+
+## Implementation Notes（阶段 1，2026-11-05）
+
+- R3 已裁决（见 `m224-os-sandbox-trusted-commands-review.md`「裁决结果」）：写入默认全部拒绝 + 集中白名单，
+  不写针对应用数据目录的整体 `deny`。白名单当前只包含本会话登记工作区，因此应用数据目录根、`settings.json`、
+  数据库、日志、其他会话工作区天然不可写；策略生成前用 `canonicalize` 规范化（`/var` → `/private/var`）。
+- 已提交实现：`src-tauri/src/command_sandbox.rs`（`CommandSandbox::new/wrap/profile`、`probe_program`、
+  `gate_bypass`、`failure_hint`）与验收测试 `src-tauri/tests/m224_command_sandbox.rs`。
+- 本地验证：`cargo test --test m224_command_sandbox` 6/6 通过（真实 Seatbelt：工作区可写、应用数据与工作区外不可写、
+  子进程同样受限、动态拼接路径被拦、绕过命令被拒并给修复指引、运行时缺失 fail-closed）。
+- 未完成 / 已知边界：尚未接入 bash 工具前台与后台启动点（R1）、未改动权限网关（R5）、无回退开关（R9）、
+  未跑 R10 兼容矩阵；阶段 1 保持联网（R4）。这些未完成前，产品行为与旧路径一致，不得宣称沙箱已生效。
+- 后续接入注意：Git 元数据（`.git` 目录、worktree 的 `commondir`、`objects`、`refs`）与系统临时目录、
+  `.codefactory-cache` 需要作为显式白名单条目登记，否则 `git commit`/`cargo test` 会在沙箱内失败；
+  `git_common_dir/config`、`hooks/` 尽量不加入白名单，若影响正常 Git 流程在此记录。
