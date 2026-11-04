@@ -36,6 +36,7 @@ fn m224_real_seatbelt_default_deny_and_children() {
     let sandbox = CommandSandbox::new(
         &ws,
         vec![WritablePath::tree(ws.clone())],
+        vec![],
         NetworkPolicy::Enabled,
     )
     .unwrap();
@@ -91,7 +92,13 @@ fn m224_real_seatbelt_default_deny_and_children() {
 #[test]
 fn m224_invalid_roots_and_unavailable_runtime_fail_closed() {
     assert!(
-        CommandSandbox::new(&PathBuf::from("relative"), vec![], NetworkPolicy::Enabled).is_err()
+        CommandSandbox::new(
+            &PathBuf::from("relative"),
+            vec![],
+            vec![],
+            NetworkPolicy::Enabled
+        )
+        .is_err()
     );
     assert!(command_sandbox::probe_program("/m224-missing-sandbox-exec").is_err());
 }
@@ -110,6 +117,7 @@ fn m224_policy_variants_and_accessors_are_observable() {
     let sandbox = CommandSandbox::new(
         &ws,
         vec![WritablePath::literal(other.clone())],
+        vec![],
         NetworkPolicy::Disabled,
     )
     .unwrap();

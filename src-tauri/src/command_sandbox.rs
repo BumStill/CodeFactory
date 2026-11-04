@@ -75,6 +75,9 @@ pub struct CommandLaunch {
 pub struct CommandSandbox {
     workspace: PathBuf,
     writable: Vec<WritablePath>,
+    /// 在允许之后显式写下的拒绝项（后置规则覆盖前序 allow）。
+    /// 用来锁住「工作区在本目录内、但绝不能写」的子路径，例如 git 的 config 与 hooks/。
+    blocked: Vec<WritablePath>,
     network: NetworkPolicy,
     runtime: PathBuf,
     profile: String,
@@ -85,6 +88,7 @@ impl CommandSandbox {
     pub fn new(
         workspace: &Path,
         writable: Vec<WritablePath>,
+        blocked: Vec<WritablePath>,
         network: NetworkPolicy,
     ) -> Result<Self, String> {
         if !workspace.is_absolute() {
@@ -97,15 +101,22 @@ impl CommandSandbox {
         let runtime = probe_program(MACOS_SANDBOX_EXEC)?;
         let mut canonical_writable = Vec::with_capacity(writable.len());
         for entry in writable {
-            canonical_writable.push(WritablePath {
-                path: canonical(&entry.path)?,
-                recursive: entry.recursive,
-            });
+            canonical_writable.push(canonical_entry(&entry.path, entry.recursive)?);
         }
-        let profile = build_profile(&canonical_workspace, &canonical_writable, network);
+        let mut canonical_blocked = Vec::with_capacity(blocked.len());
+        for entry in blocked {
+            canonical_blocked.push(canonical_entry(&entry.path, entry.recursive)?);
+        }
+        let profile = build_profile(
+            &canonical_workspace,
+            &canonical_writable,
+            &canonical_blocked,
+            network,
+        );
         Ok(Self {
             workspace: canonical_workspace,
             writable: canonical_writable,
+            blocked: canonical_blocked,
             network,
             runtime,
             profile,
@@ -130,6 +141,11 @@ impl CommandSandbox {
     /// 已规范化的显式写入白名单（不含工作区本身；工作区恒在白名单首项）。
     pub fn writable(&self) -> &[WritablePath] {
         &self.writable
+    }
+
+    /// 允许之后显式拒绝的条目（如 git config、hooks/）。
+    pub fn blocked(&self) -> &[WritablePath] {
+        &self.blocked
     }
 
     pub fn network_policy(&self) -> NetworkPolicy {
@@ -242,6 +258,34 @@ fn canonical(path: &Path) -> Result<PathBuf, String> {
     })
 }
 
+/// 白名单条目规范化：叶子文件可以还不存在（例如 `packed-refs.lock`、
+/// `FETCH_HEAD` 首次创建），这时规范化父目录再拼回文件名——仍然只放行这一个
+/// 确切名字，不会把父目录整棵放开。
+fn canonical_entry(path: &Path, recursive: bool) -> Result<WritablePath, String> {
+    if path.exists() {
+        return Ok(WritablePath {
+            path: canonical(path)?,
+            recursive,
+        });
+    }
+    let parent = path.parent().ok_or_else(|| {
+        format!(
+            "M224：路径缺少父目录（{}）；策略生成失败即 fail-closed",
+            path.display()
+        )
+    })?;
+    let name = path.file_name().ok_or_else(|| {
+        format!(
+            "M224：路径缺少文件名（{}）；策略生成失败即 fail-closed",
+            path.display()
+        )
+    })?;
+    Ok(WritablePath {
+        path: canonical(parent)?.join(name),
+        recursive,
+    })
+}
+
 fn escape(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     for ch in value.chars() {
@@ -254,7 +298,12 @@ fn escape(value: &str) -> String {
     out
 }
 
-fn build_profile(workspace: &Path, writable: &[WritablePath], network: NetworkPolicy) -> String {
+fn build_profile(
+    workspace: &Path,
+    writable: &[WritablePath],
+    blocked: &[WritablePath],
+    network: NetworkPolicy,
+) -> String {
     let mut profile = String::new();
     profile.push_str("(version 1)\n");
     profile.push_str("(deny default)\n");
@@ -281,6 +330,14 @@ fn build_profile(workspace: &Path, writable: &[WritablePath], network: NetworkPo
         }
     }
     profile.push_str("(allow file-write* (literal \"/dev/null\"))\n");
+    // 后置拒绝覆盖前序允许：白名单条目覆盖到的子路径也可以是禁区（git config / hooks）。
+    for entry in blocked {
+        let literal = escape(&entry.path.to_string_lossy());
+        profile.push_str(&format!("(deny file-write* (literal \"{literal}\"))\n"));
+        if entry.recursive {
+            profile.push_str(&format!("(deny file-write* (subpath \"{literal}\"))\n"));
+        }
+    }
     if network == NetworkPolicy::Enabled {
         profile.push_str("(allow network*)\n");
     }
@@ -315,7 +372,7 @@ mod tests {
 
     #[test]
     fn profile_keeps_writes_denied_by_default() {
-        let profile = build_profile(Path::new("/private/var/ws"), &[], NetworkPolicy::Enabled);
+        let profile = build_profile(Path::new("/private/var/ws"), &[], &[], NetworkPolicy::Enabled);
         assert!(profile.contains("(deny file-write*)"));
         assert!(profile.contains("(allow file-write* (subpath \"/private/var/ws\"))"));
         assert!(profile.contains("(allow network*)"));

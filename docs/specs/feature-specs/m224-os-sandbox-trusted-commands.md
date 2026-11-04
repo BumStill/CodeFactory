@@ -55,14 +55,27 @@ Spec、AI Collaboration、Compatibility（权限行为变化）；治理改动�
 ## Implementation Notes（阶段 1，2026-11-05）
 
 - R3 已裁决（见 `m224-os-sandbox-trusted-commands-review.md`「裁决结果」）：写入默认全部拒绝 + 集中白名单，
-  不写针对应用数据目录的整体 `deny`。白名单当前只包含本会话登记工作区，因此应用数据目录根、`settings.json`、
-  数据库、日志、其他会话工作区天然不可写；策略生成前用 `canonicalize` 规范化（`/var` → `/private/var`）。
-- 已提交实现：`src-tauri/src/command_sandbox.rs`（`CommandSandbox::new/wrap/profile`、`probe_program`、
-  `gate_bypass`、`failure_hint`）与验收测试 `src-tauri/tests/m224_command_sandbox.rs`。
-- 本地验证：`cargo test --test m224_command_sandbox` 6/6 通过（真实 Seatbelt：工作区可写、应用数据与工作区外不可写、
-  子进程同样受限、动态拼接路径被拦、绕过命令被拒并给修复指引、运行时缺失 fail-closed）。
-- 未完成 / 已知边界：尚未接入 bash 工具前台与后台启动点（R1）、未改动权限网关（R5）、无回退开关（R9）、
-  未跑 R10 兼容矩阵；阶段 1 保持联网（R4）。这些未完成前，产品行为与旧路径一致，不得宣称沙箱已生效。
-- 后续接入注意：Git 元数据（`.git` 目录、worktree 的 `commondir`、`objects`、`refs`）与系统临时目录、
-  `.codefactory-cache` 需要作为显式白名单条目登记，否则 `git commit`/`cargo test` 会在沙箱内失败；
-  `git_common_dir/config`、`hooks/` 尽量不加入白名单，若影响正常 Git 流程在此记录。
+  不写针对应用数据目录的整体 `deny`。应用数据目录根、`settings.json`、数据库、日志、其他会话工作区天然不可写；
+  策略生成前用 `canonicalize` 规范化（`/var` → `/private/var`）。
+- 已接入产品路径：`lib.rs` 声明模块，`tools/bash.rs` 前台与 `agent/background_tasks.rs` 后台共用
+  `agent::trusted_sandbox::wrap_command`，`agent/permission_gateway.rs` 用 `covers_local_command` 做准入。
+- **Git 元数据（本轮登记）**：真实工作区是 linked worktree 时 `.git` 是文件，index/objects/refs/logs 都在
+  工作区外。`git_paths()` 用 `git rev-parse --git-dir --git-common-dir` 取路径并规范化后登记：
+  整棵放行 `worktrees/<id>`；common dir 只放行 `objects`、`refs`、`logs`、`worktrees`、`branches`、`modules`
+  与 `packed-refs`、`packed-refs.lock`、`FETCH_HEAD`、`ORIG_HEAD`、`MERGE_HEAD`、`CHERRY_PICK_HEAD`、
+  `REVERT_HEAD`、`shallow`、`gc.log` 单文件（叶子可以尚不存在，仍只放行该名字）。
+  普通仓库（git dir 就是 common dir）整棵放行 common 后用后置 `deny` 锁死 `config`、`config.worktree`、`hooks/`。
+- **config / hooks 是否被 git 流程需要**：不需要。linked worktree 内的 `git add`+`commit`（pre-commit 钩子真执行）、
+  `git merge`、`git worktree add` 全部只写 objects/refs/logs/index/HEAD，在 `config` 与 `hooks/` 只读时通过
+  （矩阵 git-commit / git-merge / git-worktree / git-config-readonly / git-hooks-readonly）。
+  因此 sandbox 内 `git config` 会失败——有意为之，写 config 等于允许进程把 `core.hooksPath`、`core.fsmonitor`
+  或别名指向沙箱外可执行文件。已知边界：需要写 `packed-refs`（`git gc` / `git pack-refs`）或 common 根上
+  其它新文件的操作会失败；`packed-refs` 已按单文件放行，首次由 gc 创建时失败，遇到再单独处理。
+- **工具链缓存收窄**：`~/.cargo` 只放行 `registry`、`git` 与包缓存锁文件 `.package-cache`；
+  `~/.cargo/bin`、`~/.cargo/config.toml` 不在白名单（否则沙箱内进程能植入下次在沙箱外运行的程序）。
+  `~/.rustup` 完全不放行：构建只读 toolchain，可写等于允许替换编译器；矩阵 cargo-test 在收窄后的策略内仍通过。
+- **信号**：`(allow signal (target same-sandbox))`。实测 `(allow signal)` 过宽、`(target pgrp self)` 能杀掉沙箱外进程。
+- **嵌套沙箱**：macOS 不允许沙箱内再调 `sandbox-exec`，所以沙箱自身用例在宿主侧跑（`cargo test --lib -- trusted_sandbox`），
+  沙箱内跑项目测试与真实工作流；两层都要绿，矩阵报告保留每项耗时。
+- 本地验证（最后一次修改之后）：`trusted_sandbox` 16/16、`m224_command_sandbox` 7/7、`permission_gateway` 23/23、
+  R10 矩阵 13/13（真实 linked worktree）。逐条证据见 `docs/acceptance/m224.md`。

@@ -49,39 +49,153 @@ fn env_path(var: &str) -> Option<PathBuf> {
 /// 这里刻意**不**包含 `$HOME`：读可以放开，写只放开工作区与构建缓存，
 /// 这样 `echo > ~/outside.txt` 会被系统拒绝而不是靠解析命令文字判断。
 pub fn writable_paths(workspace: &Path) -> Vec<WritablePath> {
-    let mut paths = vec![WritablePath::tree(workspace)];
+    sandbox_paths(workspace).0
+}
 
-    let mut extras: Vec<PathBuf> = Vec::new();
-    extras.push(std::env::temp_dir());
-    for var in ["CARGO_HOME", "RUSTUP_HOME", "TMPDIR"] {
-        if let Some(path) = env_path(var) {
-            extras.push(path);
+/// 允许之后仍需显式拒绝的路径（当前只有 git 的 config 与 hooks/）。
+pub fn blocked_paths(workspace: &Path) -> Vec<WritablePath> {
+    sandbox_paths(workspace).1
+}
+
+/// 一次算清允许与拒绝两套路径，避免 `resolve` 里重复读 git 元数据。
+pub fn sandbox_paths(workspace: &Path) -> (Vec<WritablePath>, Vec<WritablePath>) {
+    let mut paths: Vec<WritablePath> = vec![WritablePath::tree(workspace)];
+    let mut extras: Vec<WritablePath> = vec![WritablePath::tree(std::env::temp_dir())];
+
+    // 收窄 ~/.cargo：只放行 cargo 真正要写的 `registry` 与 `git` 两个子树，外加包缓存
+    // 锁文件。`~/.cargo/bin` 与 `~/.cargo/config.toml` 一旦可写，沙箱内进程就能植入
+    // 「下次在沙箱外运行」的可执行文件，或改掉 cargo 配置去加载外部命令。
+    let cargo_home = env_path("CARGO_HOME")
+        .or_else(|| env_path("HOME").map(|home| home.join(".cargo")));
+    if let Some(home) = cargo_home {
+        extras.push(WritablePath::tree(home.join("registry")));
+        extras.push(WritablePath::tree(home.join("git")));
+        extras.push(WritablePath::literal(home.join(".package-cache")));
+    }
+    // `~/.rustup` 刻意不放行：cargo 构建只**读** toolchain，让 toolchain 目录可写等于
+    // 允许替换编译器；实测缺省不需要写（R10 矩阵在沙箱内 cargo test 通过）。
+    if let Some(home) = env_path("HOME") {
+        for relative in [".npm", ".cache", "Library/Caches"] {
+            extras.push(WritablePath::tree(home.join(relative)));
         }
     }
-    if let Some(home) = env_path("HOME") {
-        for relative in [".cargo", ".rustup", ".npm", ".cache", "Library/Caches"] {
-            extras.push(home.join(relative));
-        }
+    if let Some(tmpdir) = env_path("TMPDIR") {
+        extras.push(WritablePath::tree(tmpdir));
     }
     // 编译缓存：任务专属缓存目录与 .codefactory-cache 容器（沙箱化构建必须能写，
     // 否则 R10 矩阵里的 cargo/pnpm 会因缓存只读而失败）。
     let task_cache = crate::build_cache::task_cache_root(workspace);
     if let Some(container) = task_cache.parent() {
-        extras.push(container.to_path_buf());
+        extras.push(WritablePath::tree(container.to_path_buf()));
     }
-    extras.push(task_cache);
+    extras.push(WritablePath::tree(task_cache));
     if let Some(cache) = env_path("CODEFACTORY_BUILD_CACHE_ROOT") {
-        extras.push(cache);
+        extras.push(WritablePath::tree(cache));
     }
 
+    let (git_allow, git_block) = git_paths(workspace);
+    extras.extend(git_allow);
+
     // 只登记真实存在的目录：不存在的路径无法规范化，而 fail-closed 会让整个
-    // 沙箱构建失败（构建缓存目录由构建层在需要时创建）。
-    for path in extras {
-        if path.is_absolute() && path.exists() && !paths.iter().any(|p| p.path() == path.as_path()) {
-            paths.push(WritablePath::tree(path));
+    // 沙箱构建失败（构建缓存目录由构建层在需要时创建）。单文件条目（literal）允许
+    // 尚不存在——`FETCH_HEAD`、`packed-refs.lock` 都是首次写入时才创建。
+    for entry in extras {
+        if !entry.path().is_absolute() {
+            continue;
+        }
+        if entry.is_recursive() && !entry.path().exists() {
+            // 父目录存在就保留规则：cargo 的 `registry`/`git` 子树是首次构建时才创建的，
+            // 规则本身是窄路径，提前登记不会放宽边界。父目录也不存在时才丢弃
+            // （构建缓存容器由构建层按需创建，缺了会让规范化失败）。
+            let parent_exists = entry
+                .path()
+                .parent()
+                .map(|parent| parent.exists())
+                .unwrap_or(false);
+            if !parent_exists {
+                continue;
+            }
+        }
+        if paths
+            .iter()
+            .any(|p| p.path() == entry.path() && p.is_recursive() == entry.is_recursive())
+        {
+            continue;
+        }
+        paths.push(entry);
+    }
+    (paths, git_block)
+}
+
+/// R3：git 元数据的写入面。
+///
+/// 真实工作区往往是 linked worktree：`.git` 是一个文件，内容指向
+/// `<common>/worktrees/<id>`，index、HEAD、logs 全在工作区之外。沙箱一旦生效，
+/// 不放行这些路径就会让会话里的 `git add` / `commit` / `merge` 全部失败。
+/// 反过来，config 与 hooks/ 必须永远不可写——那等于允许沙箱内进程植入"下次在
+/// 沙箱外执行"的钩子。
+fn git_paths(workspace: &Path) -> (Vec<WritablePath>, Vec<WritablePath>) {
+    let Some((git_dir, common)) = git_dirs(workspace) else {
+        return (Vec::new(), Vec::new());
+    };
+    let mut allow = Vec::new();
+    let mut block = vec![
+        WritablePath::literal(common.join("config")),
+        WritablePath::literal(common.join("config.worktree")),
+        WritablePath::tree(common.join("hooks")),
+    ];
+
+    if git_dir == common {
+        // 普通仓库：index/HEAD/index.lock 就在这个目录根上，必须整棵放行，
+        // 再由上面的后置 deny 把 config 与 hooks/ 锁死。
+        allow.push(WritablePath::tree(common));
+    } else {
+        // linked worktree：本工作区的元数据目录整棵放行（index、HEAD、logs/HEAD、
+        // COMMIT_EDITMSG、index.lock 都在里面）。
+        allow.push(WritablePath::tree(git_dir));
+        for relative in ["objects", "refs", "logs", "worktrees", "branches", "modules"] {
+            allow.push(WritablePath::tree(common.join(relative)));
+        }
+        for relative in [
+            "packed-refs",
+            "packed-refs.lock",
+            "FETCH_HEAD",
+            "ORIG_HEAD",
+            "MERGE_HEAD",
+            "CHERRY_PICK_HEAD",
+            "REVERT_HEAD",
+            "shallow",
+            "gc.log",
+        ] {
+            allow.push(WritablePath::literal(common.join(relative)));
         }
     }
-    paths
+    block.retain(|entry| entry.is_recursive() || entry.path().parent().is_some());
+    (allow, block)
+}
+
+/// `git rev-parse --git-dir --git-common-dir`，一次性拿到本工作区与公共仓库目录。
+fn git_dirs(workspace: &Path) -> Option<(PathBuf, PathBuf)> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(workspace)
+        .args([
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-dir",
+            "--git-common-dir",
+        ])
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8(output.stdout).ok()?;
+    let mut lines = text.lines().map(str::trim).filter(|line| !line.is_empty());
+    let git_dir = PathBuf::from(lines.next()?);
+    let common = PathBuf::from(lines.next()?);
+    Some((git_dir, common))
 }
 
 /// 解析沙箱。失败一律是 `FallbackApproval`，调用方据此退回审批。
@@ -100,11 +214,8 @@ pub fn resolve(workspace: &Path, settings: Option<&Settings>) -> SandboxGate {
             workspace.display()
         ));
     };
-    match CommandSandbox::new(
-        &absolute,
-        writable_paths(&absolute),
-        NetworkPolicy::Enabled,
-    ) {
+    let (writable, blocked) = sandbox_paths(&absolute);
+    match CommandSandbox::new(&absolute, writable, blocked, NetworkPolicy::Enabled) {
         Ok(sandbox) => SandboxGate::Enforced(sandbox),
         Err(reason) => SandboxGate::FallbackApproval(reason),
     }
@@ -198,12 +309,9 @@ mod tests {
     }
 
     fn sandbox(workspace: &Path) -> CommandSandbox {
-        CommandSandbox::new(
-            workspace,
-            writable_paths(workspace),
-            NetworkPolicy::Enabled,
-        )
-        .expect("sandbox builds on macOS")
+        let (writable, blocked) = sandbox_paths(workspace);
+        CommandSandbox::new(workspace, writable, blocked, NetworkPolicy::Enabled)
+            .expect("sandbox builds on macOS")
     }
 
     /// 生成的 profile 必须真的表达三条边界：写白名单、工作区写入、网络出站。
@@ -416,6 +524,276 @@ mod tests {
             "profile must whitelist the repository workspace"
         );
         println!("m224 profile: {}", path.display());
+    }
+
+    fn run_git(cwd: &Path, args: &[&str]) -> std::process::Output {
+        Command::new("/usr/bin/git")
+            .args(args)
+            .current_dir(cwd)
+            .output()
+            .expect("run git")
+    }
+
+    /// 夹具放在 HOME 下：主 checkout 与 linked worktree 都必须落在
+    /// 「工作区 + 临时目录」之外，否则"主 checkout 不可写"这条断言测不到东西。
+    fn fixture_dir(tag: &str) -> PathBuf {
+        let home = PathBuf::from(std::env::var("HOME").expect("HOME"));
+        let dir = home.join(format!(".m224-fixture-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create fixture dir");
+        dir
+    }
+
+    /// 普通仓库 + 一个 linked worktree（`.git` 是文件，元数据在工作区之外）。
+    fn linked_worktree(tag: &str) -> (PathBuf, PathBuf) {
+        let base = fixture_dir(tag);
+        assert!(run_git(&base, &["init", "-q", "-b", "main"]).status.success());
+        assert!(
+            run_git(&base, &["config", "user.email", "m224@example.com"])
+                .status
+                .success()
+        );
+        assert!(
+            run_git(&base, &["config", "user.name", "m224"])
+                .status
+                .success()
+        );
+        std::fs::write(base.join("a.txt"), "a\n").expect("seed file");
+        assert!(run_git(&base, &["add", "a.txt"]).status.success());
+        assert!(run_git(&base, &["commit", "-qm", "init"]).status.success());
+        let worktree = base.join("wt");
+        assert!(
+            run_git(&base, &["worktree", "add", "-q", "-b", "sandbox", "wt"])
+                .status
+                .success()
+        );
+        (base, worktree)
+    }
+
+    /// R3：真实工作区是 linked worktree 时，git 元数据（index、objects、refs、logs）
+    /// 都在工作区之外。沙箱必须放行它们，否则会话里的 add/commit/merge 全部失败。
+    #[test]
+    fn git_metadata_outside_the_workspace_stays_writable() {
+        let (base, worktree) = linked_worktree("git-worktree");
+        assert!(
+            worktree.join(".git").is_file(),
+            "linked worktree must keep .git as a file (otherwise this test proves nothing)"
+        );
+        assert!(
+            base.join(".git/worktrees").exists(),
+            "worktree metadata must live outside the workspace"
+        );
+
+        let sandbox = sandbox(&worktree);
+        let launch = sandbox.wrap(
+            "/bin/sh",
+            &[
+                "-c".into(),
+                "printf 'from sandbox\\n' > b.txt && git add b.txt \
+                 && git commit -qm sandboxed && git rev-parse --short HEAD"
+                    .into(),
+            ],
+        );
+        let output = Command::new(&launch.program)
+            .args(&launch.args)
+            .current_dir(&worktree)
+            .output()
+            .expect("run sandboxed git");
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        assert!(
+            output.status.success(),
+            "sandboxed git commit must succeed inside a linked worktree: {stdout}{stderr}"
+        );
+        let log = run_git(&worktree, &["log", "-1", "--pretty=%s"]);
+        assert_eq!(
+            String::from_utf8_lossy(&log.stdout).trim(),
+            "sandboxed",
+            "the commit must be real"
+        );
+
+        let mergeable = run_git(&worktree, &["rev-parse", "--verify", "HEAD"]);
+        assert!(mergeable.status.success());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// 普通仓库（主 checkout 形态）：git dir 就是 common dir，index/HEAD/index.lock
+    /// 都在工作区外。这里验证"整棵放行 + 后置拒绝 config/hooks"这条分支真的成立。
+    #[test]
+    fn git_operations_work_in_a_plain_repository_without_opening_config() {
+        let base = fixture_dir("git-plain");
+        assert!(run_git(&base, &["init", "-q", "-b", "main"]).status.success());
+        assert!(
+            run_git(&base, &["config", "user.email", "m224@example.com"])
+                .status
+                .success()
+        );
+        assert!(
+            run_git(&base, &["config", "user.name", "m224"])
+                .status
+                .success()
+        );
+        std::fs::write(base.join("a.txt"), "a\n").expect("seed");
+        assert!(run_git(&base, &["add", "a.txt"]).status.success());
+        assert!(run_git(&base, &["commit", "-qm", "init"]).status.success());
+
+        let config = base.join(".git/config");
+        let config_before = std::fs::read_to_string(&config).expect("read config");
+        let sandbox = sandbox(&base);
+        let launch = sandbox.wrap(
+            "/bin/sh",
+            &[
+                "-c".into(),
+                "printf 'plain\n' > b.txt && git add b.txt && git commit -qm plain \
+                 && git log -1 --pretty=%s \
+                 && (printf 'x' > .git/config 2>/dev/null && echo config=WRITTEN || echo config=BLOCKED)"
+                    .into(),
+            ],
+        );
+        let output = Command::new(&launch.program)
+            .args(&launch.args)
+            .current_dir(&base)
+            .output()
+            .expect("run sandboxed git");
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        assert!(
+            output.status.success() && stdout.contains("plain"),
+            "sandboxed commit in a plain repository must succeed: {stdout}{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            stdout.contains("config=BLOCKED"),
+            "git config must stay read-only even when the git dir is the workspace .git: {stdout}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&config).expect("config unchanged"),
+            config_before
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// config、hooks/ 与主 checkout 的工作树文件必须仍然不可写：
+    /// 放行 git 元数据不等于允许植入"下次在沙箱外执行"的钩子或改配置。
+    #[test]
+    fn git_config_hooks_and_main_checkout_stay_read_only() {
+        let (base, worktree) = linked_worktree("git-guard");
+        let config = base.join(".git/config");
+        let hook = base.join(".git/hooks/m224-probe");
+        let main_file = base.join("a.txt");
+        let config_before = std::fs::read_to_string(&config).expect("read config");
+        let main_before = std::fs::read_to_string(&main_file).expect("read main file");
+
+        let sandbox = sandbox(&worktree);
+        let script = format!(
+            "if printf 'x' > '{}' 2>/dev/null; then echo config=WRITTEN; else echo config=BLOCKED; fi; \
+             if printf 'x' > '{}' 2>/dev/null; then echo hook=WRITTEN; else echo hook=BLOCKED; fi; \
+             if printf 'x' > '{}' 2>/dev/null; then echo main=WRITTEN; else echo main=BLOCKED; fi",
+            config.display(),
+            hook.display(),
+            main_file.display()
+        );
+        let launch = sandbox.wrap("/bin/sh", &["-c".into(), script]);
+        let output = Command::new(&launch.program)
+            .args(&launch.args)
+            .current_dir(&worktree)
+            .output()
+            .expect("run guard probes");
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        assert!(
+            stdout.contains("config=BLOCKED")
+                && stdout.contains("hook=BLOCKED")
+                && stdout.contains("main=BLOCKED"),
+            "config / hooks / main checkout must stay read-only: {stdout}{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            std::fs::read_to_string(&config).expect("config unchanged"),
+            config_before
+        );
+        assert!(!hook.exists(), "hook file must not be created");
+        assert_eq!(
+            std::fs::read_to_string(&main_file).expect("main file unchanged"),
+            main_before
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// 收窄 ~/.cargo：registry 与 git 可写，`bin/` 与 `config.toml` 不可写——
+    /// 否则沙箱内进程能植入下次在沙箱外运行的程序。
+    #[test]
+    fn cargo_payload_paths_stay_read_only() {
+        let workspace = temp_dir("cargo-payload");
+        let sandbox = sandbox(&workspace);
+        let home = PathBuf::from(std::env::var("HOME").expect("HOME"));
+        let cargo_root = home.join(".cargo");
+        let probe = cargo_root.join("bin/m224-probe");
+        let _ = std::fs::remove_file(&probe);
+
+        assert!(
+            sandbox
+                .writable()
+                .iter()
+                .any(|entry| entry.path().ends_with(".cargo/registry")),
+            "cargo registry must stay writable: {:?}",
+            sandbox.writable()
+        );
+        assert!(
+            sandbox
+                .writable()
+                .iter()
+                .any(|entry| entry.path().ends_with(".cargo/git")),
+            "cargo git cache must stay writable"
+        );
+        let profile = sandbox.profile();
+        assert!(
+            !profile.contains(&format!(
+                "(allow file-write* (subpath \"{}\"))",
+                cargo_root.display()
+            )),
+            "the whole cargo home must never be writable: {profile}"
+        );
+        assert!(
+            !profile.contains(".cargo/config"),
+            "cargo config must never be writable: {profile}"
+        );
+        assert!(
+            !profile.contains(".cargo/bin"),
+            "cargo bin must never be writable: {profile}"
+        );
+
+        let launch = sandbox.wrap(
+            "/bin/sh",
+            &[
+                "-c".into(),
+                format!(
+                    "if printf '#!/bin/sh' > '{}' 2>/dev/null; then echo bin=WRITTEN; else echo bin=BLOCKED; fi",
+                    probe.display()
+                ),
+            ],
+        );
+        let output = Command::new(&launch.program)
+            .args(&launch.args)
+            .current_dir(&workspace)
+            .output()
+            .expect("run cargo probe");
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        assert!(
+            stdout.contains("bin=BLOCKED"),
+            "writing into ~/.cargo/bin must be denied: {stdout}{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!probe.exists(), "no executable may be planted in cargo bin");
+    }
+
+    /// 供 R10 矩阵按任意工作区（例如真实 linked worktree）生成 profile。
+    #[test]
+    fn emits_profile_for_workspace_from_env() {
+        let Ok(workspace) = std::env::var("M224_PROFILE_WORKSPACE") else {
+            return;
+        };
+        let out = std::env::var("M224_PROFILE_OUT").expect("M224_PROFILE_OUT");
+        let sandbox = sandbox(&PathBuf::from(workspace));
+        std::fs::write(&out, sandbox.profile()).expect("write profile");
     }
 
     /// 沙箱内的信号不能越界：对沙箱外（同一用户）的进程发信号必须失败，

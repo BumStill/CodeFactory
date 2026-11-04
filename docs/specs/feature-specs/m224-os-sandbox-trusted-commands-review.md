@@ -1,8 +1,8 @@
 # M224 安全边界审查与 Spec Amendment（已裁决）
 
 实施已完成并接入产品路径：`lib.rs` 声明模块，前台 `bash`、后台任务启动点与权限网关都经
-`agent::trusted_sandbox` 决策，进程实际带 Seatbelt 策略启动。模块用例 11/11、网关套件 23/23、
-模块级真实 Seatbelt 用例 7/7 通过；R10 兼容矩阵在**产品同一份 profile** 内 9/9 通过
+`agent::trusted_sandbox` 决策，进程实际带 Seatbelt 策略启动。模块用例 16/16、网关套件 23/23、
+模块级真实 Seatbelt 用例 7/7 通过；R10 兼容矩阵在**产品同一份 profile** 内 13/13 通过（git 用例跑在真实 linked worktree 里）
 （`tools/verify/m224-r10-matrix.mjs`，报告 `target/m224/r10-matrix.json`）。验收状态见
 `docs/acceptance/m224.md`，本记录不复述逐条证据。
 
