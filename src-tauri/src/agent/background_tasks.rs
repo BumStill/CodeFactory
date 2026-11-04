@@ -2548,8 +2548,8 @@ mod tests {
     async fn m228_rejected_wakes_explain_and_terminate_after_thirty_attempts() {
         let pool = memory_pool().await;
         super::super::thin_state::ensure(&pool).await.unwrap();
-        super::super::thin_state::save(&pool,"m228-reject", &super::super::thin_state::after_final(super::super::thin_state::WaitNeed::External { what: "model reset".into(), covered: true }, "")).await.unwrap();
         persist_model_wakeup(&pool,"m228-reject","root",1000,"model reset").await.unwrap();
+        super::super::thin_state::save(&pool,"m228-reject", &super::super::thin_state::after_final(super::super::thin_state::WaitNeed::External { what: "model reset".into(), covered: true }, "")).await.unwrap();
         struct Reject;
         impl WakeSink for Reject {
             fn enqueue(&self, _: String, _: String) -> WakeFuture { Box::pin(async { false }) }
@@ -2572,9 +2572,9 @@ mod tests {
     async fn m216_cancelling_last_wake_preserves_wait_atomically() {
         let pool = memory_pool().await;
         super::super::thin_state::ensure(&pool).await.unwrap();
+        let wake = schedule_wakeup_at(&pool, wakeup_request("fixture", "PR #42 检查失败", Some(60)), 100).await.unwrap();
         super::super::thin_state::save(&pool, "fixture", &super::super::thin_state::after_final(
             super::super::thin_state::WaitNeed::External { what: "PR #42 修复".into(), covered: true }, "")).await.unwrap();
-        let wake = schedule_wakeup_at(&pool, wakeup_request("fixture", "PR #42 检查失败", Some(60)), 100).await.unwrap();
         cancel_wakeup(&pool, "fixture", &wake.id).await.unwrap();
         assert!(wake_source_cover(&pool, "fixture").await.is_covered(), "cancellation must commit a replacement with waiting state");
         let recorder = Arc::new(Recorder::default());
@@ -2586,9 +2586,9 @@ mod tests {
     async fn m216_stopping_wait_cancels_without_replacement() {
         let pool = memory_pool().await;
         super::super::thin_state::ensure(&pool).await.unwrap();
+        schedule_wakeup_at(&pool, wakeup_request("fixture", "PR #42 检查失败", Some(60)), 100).await.unwrap();
         super::super::thin_state::save(&pool, "fixture", &super::super::thin_state::after_final(
             super::super::thin_state::WaitNeed::External { what: "PR #42 修复".into(), covered: true }, "")).await.unwrap();
-        schedule_wakeup_at(&pool, wakeup_request("fixture", "PR #42 检查失败", Some(60)), 100).await.unwrap();
         assert_eq!(cancel_session_wakeups(&pool, "fixture").await, 1);
         assert_eq!(super::super::thin_state::load(&pool, "fixture").await.unwrap().unwrap().state, super::super::thin_state::SessionState::Ended);
         assert!(!wake_source_cover(&pool, "fixture").await.is_covered());
@@ -2659,8 +2659,9 @@ mod tests {
             let session = format!("synthetic-backlog-{index}");
             sqlx::query("INSERT INTO sessions VALUES (?,'thin')").bind(&session).execute(&pool).await.unwrap();
             sqlx::query("INSERT INTO thin_external_observations VALUES (?,'PR #42 已合并')").bind(&session).execute(&pool).await.unwrap();
-            super::super::thin_state::save(&pool, &session, &super::super::thin_state::after_final(
-                super::super::thin_state::WaitNeed::External { what: "PR #42 收尾".into(), covered: true }, "")).await.unwrap();
+            // M231: legacy restart fixture deliberately bypasses new-wait admission.
+            sqlx::query("INSERT INTO thin_session_state(session_id,state,waiting_for,updated_at) VALUES (?,'waiting_wake','PR #42 收尾',0)")
+                .bind(&session).execute(&pool).await.unwrap();
             sqlx::query("INSERT INTO workspace_recovery_budget(session_id,attempts,next_at,settled_reason) VALUES (?,?,0,?)")
                 .bind(&session).bind(if index == 0 { 0 } else { 3 })
                 .bind(if index == 4 { Some("登记工作区已删除") } else { None }).execute(&pool).await.unwrap();

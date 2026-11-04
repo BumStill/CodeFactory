@@ -153,6 +153,7 @@ pub(crate) async fn record_tool_call_started(
     arguments: &Value,
 ) -> Result<(), AppError> {
     let id = trace_record_id(session_id, provider_tool_call_id);
+    let mut tx = crate::storage::db::begin_write(pool).await?;
     sqlx::query(
         "INSERT OR IGNORE INTO tool_calls \
          (id, message_id, tool_name, arguments, status, created_at) \
@@ -163,8 +164,9 @@ pub(crate) async fn record_tool_call_started(
     .bind(tool_name)
     .bind(redacted_arguments(arguments))
     .bind(Utc::now().timestamp_millis())
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(())
 }
 
@@ -227,7 +229,7 @@ pub(crate) async fn record_terminal_tool_outcome(
         )));
     }
 
-    let mut transaction = pool.begin().await?;
+    let mut transaction = crate::storage::db::begin_write(pool).await?;
     let trace_id = trace_record_id(session_id, provider_tool_call_id);
     let redacted_result = result.map(|text| redact_text(text, MAX_RESULT_CHARS));
     let redacted_error = error.map(|text| redact_text(text, MAX_ERROR_CHARS));
@@ -310,7 +312,7 @@ pub(crate) async fn record_tool_call_metadata(
         compact.insert("truncated".into(), Value::Bool(true));
         Value::Object(compact).to_string()
     };
-    let mut transaction = pool.begin().await?;
+    let mut transaction = crate::storage::db::begin_write(pool).await?;
     let updated = sqlx::query("UPDATE tool_calls SET metadata = CASE \
         WHEN json_extract(metadata, '$.execution_started_at_ms') IS NOT NULL \
         THEN json_set(?, '$.execution_started_at_ms', json_extract(metadata, '$.execution_started_at_ms')) \
@@ -384,6 +386,33 @@ mod tests {
         .await
         .unwrap();
         pool
+    }
+
+    #[tokio::test]
+    async fn m231_real_tool_receipt_waits_for_writer_without_replaying_effect() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::storage::db::connect(&format!("sqlite://{}?mode=rwc", dir.path().join("receipts.db").display())).await.unwrap();
+        sqlx::query("INSERT INTO sessions(id,title,cwd,model_id,created_at,updated_at) VALUES ('m231','synthetic','/synthetic','model',1,1)").execute(&db).await.unwrap();
+        sqlx::query("INSERT INTO messages(id,session_id,role,content,created_at) VALUES ('m231-message','m231','assistant','',1)").execute(&db).await.unwrap();
+        record_tool_call_started(&db, "m231", "m231-message", "call", "bash", &json!({"command":"synthetic effect"})).await.unwrap();
+        let effects = std::sync::atomic::AtomicUsize::new(0);
+        effects.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let holder = db.begin_with("BEGIN IMMEDIATE").await.unwrap();
+        let writer = db.clone();
+        let task = tokio::spawn(async move {
+            record_terminal_tool_outcome(&writer, "m231", "call", "done", Some("synthetic effect committed"), None, 10).await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+        assert!(!task.is_finished(), "result persistence must wait for the external writer");
+        holder.commit().await.unwrap();
+        task.await.unwrap().unwrap();
+        assert_eq!(effects.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let row: (String, String) = sqlx::query_as("SELECT status,result FROM tool_calls WHERE id='m231:call'").fetch_one(&db).await.unwrap();
+        assert_eq!(row, ("done".into(), "synthetic effect committed".into()));
+        let replay: String = sqlx::query_scalar("SELECT content FROM messages WHERE id='m231:call:result'").fetch_one(&db).await.unwrap();
+        assert_eq!(serde_json::from_str::<Value>(&replay).unwrap()["content"], "synthetic effect committed");
+        assert!(!replay.contains("database is locked"));
+        db.close().await;
     }
 
     #[test]

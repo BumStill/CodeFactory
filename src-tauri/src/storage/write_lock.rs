@@ -46,7 +46,7 @@ pub fn is_lock_contention(error: &sqlx::Error) -> bool {
     if let sqlx::Error::Database(db) = error {
         // sqlx surfaces the SQLite extended result code as the driver code.
         if let Some(code) = db.code().and_then(|code| code.parse::<i32>().ok()) {
-            if code == SQLITE_BUSY || code == SQLITE_BUSY_SNAPSHOT {
+            if matches!(code & 0xff, 5 | 6) {
                 return true;
             }
         }
@@ -60,9 +60,15 @@ pub fn is_lock_contention(error: &sqlx::Error) -> bool {
 /// recognised as local contention rather than an agent failure.
 pub fn is_lock_contention_message(message: &str) -> bool {
     let lower = message.to_ascii_lowercase();
-    if lower.contains("database is locked")
+    if lower.contains(LOCAL_STORE_CONTENDED)
+        || lower.contains("database is locked")
         || lower.contains("database table is locked")
         || lower.contains("sqlite_busy")
+        || lower.contains("sqlite_locked")
+        || lower.split("(code: ").skip(1).any(|part| {
+            part.split(')').next().and_then(|value| value.parse::<i32>().ok())
+                .is_some_and(|code| matches!(code & 0xff, 5 | 6))
+        })
     {
         return true;
     }
