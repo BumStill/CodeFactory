@@ -451,6 +451,18 @@ async fn repair_waiting_wake_source(db: &SqlitePool, session: &str) -> sqlx::Res
         if monitor > 0 { return Ok(()); }
     }
     let what = state.waiting_for.clone().unwrap_or_default().trim().to_string();
+    if what.contains("本地数据库") {
+        let fires: i64 = sqlx::query_scalar("SELECT COALESCE(SUM(fire_count),0) FROM wakeup_schedules WHERE session_id=? AND id LIKE 'local-store-retry-%'")
+            .bind(session).fetch_one(db).await?;
+        if fires >= super::thin_state::FAILURE_LIMIT {
+            super::thin_state::save(db, session, &ThinState::ended("本地数据库忙，系统自动恢复 3 次后仍未推进，任务明确失败；执行记录保留", "本会话记录")).await?;
+            audit_wait_guard(db, session, "store_retry_exhausted", &what, fires).await;
+        } else {
+            arm_durable_wake(db, session, "local-store-retry", "本地数据库忙，系统自动重试/自愈：先核对工具收据，勿重复执行已发生的副作用，继续原任务。").await?;
+            audit_wait_guard(db, session, "store_retry_repaired", &what, fires).await;
+        }
+        return Ok(());
+    }
     // M210/R1/R5：模型可用性等待是系统自愈，不计入自动重试次数、也不升级成提问。
     // 唤醒已经触发过而模型仍不可用（10-30 12:00 现场）时，在这里重挂下一个恢复时间。
     if let Some(wait) = super::usage_windows::model_wait::load(db, session).await? {
@@ -514,10 +526,15 @@ const MAX_SELF_CONTINUE: i64 = 2;
 async fn arm_durable_wake(db: &SqlitePool, session: &str, prefix: &str, prompt: &str) -> sqlx::Result<()> {
     let at = chrono::Utc::now().timestamp();
     let mut tx = crate::storage::db::begin_write(db).await?;
+    let ended: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM thin_session_state WHERE session_id=? AND state='ended'")
+        .bind(session).fetch_one(&mut *tx).await?;
+    if ended > 0 { return Ok(()); }
     sqlx::query("INSERT INTO wakeup_schedules(id,session_id,prompt,source,next_at,status,created_at) SELECT ?,?,?,'agent_decided',?,'pending',? WHERE NOT EXISTS (SELECT 1 FROM wakeup_schedules WHERE session_id=? AND status='pending')")
         .bind(format!("{prefix}-{session}-{}", uuid::Uuid::new_v4())).bind(session)
         .bind(prompt).bind(at).bind(at).bind(session)
         .execute(&mut *tx).await?;
+    sqlx::query("UPDATE thin_session_state SET reason=?,wake_source='持久自动恢复唤醒',updated_at=? WHERE session_id=? AND state='waiting_wake'")
+        .bind(prompt).bind(chrono::Utc::now().timestamp_millis()).bind(session).execute(&mut *tx).await?;
     tx.commit().await?;
     Ok(())
 }
@@ -2040,12 +2057,11 @@ mod tests {
 
     // ── M197：`waiting_wake` 必须有具体唤醒源 ──────────────────────────────────
     async fn m197_wait(session: &str, db: &SqlitePool, what: &str) {
-        super::super::thin_state::save(db, session, &ThinState {
-            state: SessionState::WaitingWake,
-            waiting_for: Some(what.to_string()),
-            wake_source: Some(format!("已登记的唤醒源：{what}")),
-            ..ThinState::running()
-        }).await.unwrap();
+        // M231/R5: inject a legacy corrupt row, not an admitted new wait.
+        // Production save must reject this exact fixture under R4.
+        super::super::thin_state::ensure(db).await.unwrap();
+        sqlx::query("INSERT INTO thin_session_state(session_id,state,waiting_for,wake_source,updated_at) VALUES (?,'waiting_wake',?,'legacy missing source',0) ON CONFLICT(session_id) DO UPDATE SET state='waiting_wake',waiting_for=excluded.waiting_for,wake_source=excluded.wake_source")
+            .bind(session).bind(what).execute(db).await.unwrap();
     }
 
     async fn m197_fired_repair(db: &SqlitePool, session: &str, fire_count: i64) {
@@ -2115,6 +2131,24 @@ mod tests {
         let state = refresh(&db, "derive").await.unwrap();
         assert_eq!(state.state, SessionState::WaitingWake, "unanswered delivery must retain an automatic continuation: {state:?}");
         assert!(super::super::background_tasks::wake_source_cover(&db, "derive").await.pending_wakeups > 0);
+    }
+
+    #[tokio::test]
+    async fn m231_patrol_replaces_expired_reason_without_reviving_terminal_sessions() {
+        let db = fixture().await;
+        super::super::background_tasks::ensure_wake_schema(&db).await.unwrap();
+        m197_wait("derive", &db, "本地数据库写锁释放").await;
+        sqlx::query("UPDATE thin_session_state SET reason='订阅额度 10:52 重置（已过期）' WHERE session_id='derive'").execute(&db).await.unwrap();
+        patrol_waiting_wake_sources(&db).await.unwrap();
+        let state = super::super::thin_state::load(&db, "derive").await.unwrap().unwrap();
+        assert_eq!(state.state, SessionState::WaitingWake);
+        assert!(!state.reason.as_deref().unwrap_or_default().contains("10:52"));
+        assert!(super::super::background_tasks::wake_source_cover(&db, "derive").await.pending_wakeups > 0);
+        super::super::thin_state::save(&db, "derive", &ThinState::ended("cancelled：用户停止", "本会话记录")).await.unwrap();
+        patrol_waiting_wake_sources(&db).await.unwrap();
+        assert_eq!(super::super::thin_state::load(&db, "derive").await.unwrap().unwrap().state, SessionState::Ended);
+        let pending: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM wakeup_schedules WHERE session_id='derive' AND status='pending'").fetch_one(&db).await.unwrap();
+        assert_eq!(pending, 0);
     }
 
     #[tokio::test]
@@ -2240,12 +2274,7 @@ mod tests {
         let db = fixture().await;
         // M197/R1 之后，「系统自己盯着」的等待才允许自动补来源；要人决定的等待转人话提问
         // （见 m197_self_continue_is_bounded_then_asks_user）。这里仍验证补来源路径。
-        super::super::thin_state::save(&db, "derive", &ThinState {
-            state: SessionState::WaitingWake,
-            waiting_for: Some("等待后台任务完成".into()),
-            wake_source: Some("持久收尾投递器：系统自动重试/自愈".into()),
-            ..ThinState::running()
-        }).await.unwrap();
+        m197_wait("derive", &db, "等待后台任务完成").await;
         reconcile_waiting_on_startup(&db).await.unwrap();
         let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM wakeup_schedules WHERE session_id='derive' AND status='pending'")
             .fetch_one(&db).await.unwrap();
@@ -2333,7 +2362,7 @@ mod tests {
                     .bind(&session).execute(&db).await.unwrap();
                 let mut waiting = ThinState::running();
                 waiting.state = SessionState::WaitingWake;
-                super::super::thin_state::save(&db, &session, &waiting).await.unwrap();
+                m197_wait(&session, &db, "").await;
                 sqlx::query("INSERT INTO thin_external_observations(session_id,pr_number,ceiling,completed_reason) VALUES (?,187,'ThroughMerge','PR #187 已合并')")
                     .bind(&session).execute(&db).await.unwrap();
             }
@@ -2367,7 +2396,7 @@ mod tests {
             // A new delivery must never be settled by an older PR receipt.
             let mut waiting = ThinState::running();
             waiting.state = SessionState::WaitingWake;
-            super::super::thin_state::save(&db, "new-delivery", &waiting).await.unwrap();
+            m197_wait("new-delivery", &db, "").await;
             merged_settlement::settle_merged_sessions(&db).await.unwrap();
             let state = super::super::thin_state::load(&db, "new-delivery").await.unwrap().unwrap();
             assert_ne!(state.state, SessionState::Ended, "M187 stale PR settled new delivery");
@@ -2384,7 +2413,7 @@ mod tests {
                 .bind(session).bind(session).execute(&db).await.unwrap();
             let mut waiting = ThinState::running();
             waiting.state = SessionState::WaitingWake;
-            super::super::thin_state::save(&db, session, &waiting).await.unwrap();
+            m197_wait(session, &db, "").await;
             sqlx::query("INSERT INTO thin_external_observations(session_id,pr_number,ceiling,completed_reason) VALUES (?,187,'ThroughMerge','PR #187 已合并')")
                 .bind(session).execute(&db).await.unwrap();
         }
@@ -2449,8 +2478,7 @@ mod tests {
         for (session, branch, number) in [("derive", "own-branch", 174), ("adopted", "another-delivered-branch", 175)] {
             sqlx::query("INSERT INTO sessions(id,title,cwd,model_id,created_at,updated_at,delivery_mode) VALUES (?, 'synthetic','/synthetic','model',1,1,'thin')")
                 .bind(session).execute(&db).await.unwrap();
-            super::super::thin_state::save(&db, session, &super::super::thin_state::after_final(
-                super::super::thin_state::WaitNeed::External { what: "PR / CI".into(), covered: false }, "")).await.unwrap();
+            m197_wait(session, &db, "PR / CI").await;
             sqlx::query("INSERT INTO thin_delivery_refs VALUES (?,?,?,'ThroughMerge')")
                 .bind(session).bind(branch).bind(number).execute(&db).await.unwrap();
             ensure_pr_monitor(&db, session).await.unwrap();
@@ -2593,8 +2621,7 @@ mod tests {
         let db = crate::storage::db::connect(&url).await.unwrap();
         sqlx::query("INSERT INTO sessions(id,title,cwd,model_id,created_at,updated_at,delivery_mode) VALUES ('derive','synthetic','/synthetic','model',1,1,'thin')")
             .execute(&db).await.unwrap();
-        super::super::thin_state::save(&db, "derive", &super::super::thin_state::after_final(
-            super::super::thin_state::WaitNeed::External { what: "PR / CI".into(), covered: false }, "")).await.unwrap();
+        m197_wait("derive", &db, "PR / CI").await;
         sqlx::query("INSERT INTO thin_delivery_refs VALUES ('derive','synthetic',73,'ThroughMerge')").execute(&db).await.unwrap();
         ensure_pr_monitor(&db, "derive").await.unwrap();
         let reason = failure_reason(&serde_json::json!({"state":"OPEN", "statusCheckRollup":[{"name":"synthetic-ci","conclusion":"FAILURE"}]}), 73).unwrap();
@@ -2723,8 +2750,7 @@ mod tests {
     #[tokio::test]
     async fn m142_failed_check_wakes_for_repair_once_and_resumes_system_watch() {
         let db = fixture().await;
-        super::super::thin_state::save(&db, "derive", &super::super::thin_state::after_final(
-            super::super::thin_state::WaitNeed::External { what: "PR / CI".into(), covered: false }, "")).await.unwrap();
+        m197_wait("derive", &db, "PR / CI").await;
         sqlx::query("INSERT INTO thin_delivery_refs VALUES ('derive','synthetic',73,'ThroughMerge')").execute(&db).await.unwrap();
         ensure_external(&db).await.unwrap();
         sqlx::query("INSERT INTO thin_external_observations(session_id,pr_number,ceiling,observed_at,completed_reason) VALUES ('derive',73,'ThroughMerge',?,'PR #73 检查失败：unit-tests')")
@@ -2829,8 +2855,7 @@ mod tests {
     async fn m158_system_placeholder_wait_never_becomes_a_user_question() {
         for what in ["后台任务或未来定时唤醒", "定时唤醒（十分钟后）", "PR / CI 监视"] {
             let db = fixture().await;
-            super::super::thin_state::save(&db, "derive", &super::super::thin_state::after_final(
-                super::super::thin_state::WaitNeed::External { what: what.into(), covered: false }, "")).await.unwrap();
+            m197_wait("derive", &db, what).await;
             let state = refresh(&db, "derive").await.unwrap();
             assert_eq!(state.state, SessionState::WaitingWake, "{what}: {state:?}");
             assert!(state.question.is_none(), "{what}: {:?}", state.question);
@@ -2855,7 +2880,7 @@ mod tests {
         let db = fixture().await;
         let waiting = super::super::thin_state::after_final(
             super::super::thin_state::WaitNeed::External { what: "交付 PR / CI".into(), covered: false }, "");
-        super::super::thin_state::save(&db, "derive", &waiting).await.unwrap();
+        m197_wait("derive", &db, "交付 PR / CI").await;
         sqlx::query("INSERT INTO thin_delivery_refs VALUES ('derive','synthetic',42,'ThroughMerge')").execute(&db).await.unwrap();
         ensure_external(&db).await.unwrap();
         sqlx::query("INSERT INTO thin_external_observations(session_id,pr_number,ceiling,observed_at,completed_reason) VALUES ('derive',42,'ThroughMerge',1,'PR #42 已合并')")
@@ -3088,8 +3113,7 @@ mod tests {
     async fn m146_historical_closed_out_session_is_marked_without_a_turn() {
         let db = fixture().await;
         ensure_wake_table(&db).await;
-        super::super::thin_state::save(&db, "derive", &super::super::thin_state::after_final(
-            super::super::thin_state::WaitNeed::External { what: "PR / CI".into(), covered: true }, "")).await.unwrap();
+        m197_wait("derive", &db, "PR / CI").await;
         sqlx::query("INSERT INTO thin_delivery_refs VALUES ('derive','synthetic',776,'ThroughMerge')").execute(&db).await.unwrap();
         sqlx::query("INSERT INTO messages(id,session_id,role,content,created_at) VALUES ('closeout','derive','assistant','§8 收尾完成：分支已清理',2000)")
             .execute(&db).await.unwrap();
@@ -3281,9 +3305,7 @@ mod tests {
     async fn m146_conflicting_pr_queues_one_repair_wake_with_reason() {
         let db = fixture().await;
         ensure_wake_table(&db).await;
-        super::super::thin_state::save(&db, "derive", &super::super::thin_state::after_final(
-            super::super::thin_state::WaitNeed::External { what: "PR / CI".into(), covered: true }, ""))
-            .await.unwrap();
+        m197_wait("derive", &db, "PR / CI").await;
         sqlx::query("INSERT INTO thin_delivery_refs VALUES ('derive','synthetic',776,'ThroughMerge')").execute(&db).await.unwrap();
         ensure_external(&db).await.unwrap();
         sqlx::query("INSERT INTO thin_external_observations(session_id,pr_number,ceiling,observed_at,completed_reason) VALUES ('derive',776,'ThroughMerge',1,'PR #776 存在合并冲突（mergeable=CONFLICTING），需要解决冲突后重新交付')")
@@ -3333,9 +3355,7 @@ mod tests {
     #[tokio::test]
     async fn m158_opened_pr_registers_system_monitor_instead_of_asking_the_user() {
         let db = fixture().await;
-        super::super::thin_state::save(&db, "derive", &super::super::thin_state::after_final(
-            super::super::thin_state::WaitNeed::External { what: "PR / CI".into(), covered: false }, ""))
-            .await.unwrap();
+        m197_wait("derive", &db, "PR / CI").await;
         sqlx::query("INSERT INTO messages(id,session_id,role,content,created_at) VALUES ('created','derive','assistant','已开 PR：https://github.com/BumStill/CodeFactory/pull/846',100)")
             .execute(&db).await.unwrap();
         sqlx::query("INSERT INTO tool_calls(id,message_id,tool_name,arguments,result,status,created_at) VALUES ('m158-delivery','created','deliver_changes','{}',?,'done',101)")
@@ -3993,7 +4013,9 @@ pub(crate) mod merged_settlement {
                     state.state = crate::agent::thin_state::SessionState::WaitingWake;
                     state.waiting_for = Some("PR #186 合并".into());
                     state.wake_source = Some("已登记的唤醒源：PR #186 合并".into());
-                    thin_state::save(&pool, session, &state).await.unwrap();
+                    // Legacy restart signature includes a cancelled wake, not a new wait.
+                    sqlx::query("INSERT INTO thin_session_state(session_id,state,waiting_for,wake_source,updated_at) VALUES (?,'waiting_wake','PR #186 合并','legacy cancelled wake',0)")
+                        .bind(session).execute(&pool).await.unwrap();
                     sqlx::query(
                         "INSERT INTO thin_external_observations(session_id, completed_reason, observed_at)
                          VALUES (?, 'PR #186 已合并', 1)",
@@ -4119,17 +4141,8 @@ pub(crate) mod merged_settlement {
             let (repo, _branch_a, alive, branch_b) = build_fixture(&dir);
             std::fs::write(alive.join("scratch.txt"), "uncommitted").unwrap();
             let pool = seed_state(&dir).await;
-            thin_state::save(
-                &pool,
-                "sess-b",
-                &thin_state::ThinState {
-                    state: crate::agent::thin_state::SessionState::WaitingWake,
-                    waiting_for: Some("PR #186 合并".into()),
-                    ..thin_state::ThinState::running()
-                },
-            )
-            .await
-            .unwrap();
+            sqlx::query("INSERT INTO thin_session_state(session_id,state,waiting_for,updated_at) VALUES ('sess-b','waiting_wake','PR #186 合并',0)")
+                .execute(&pool).await.unwrap();
             sqlx::query("INSERT INTO thin_external_observations(session_id, completed_reason, observed_at) VALUES ('sess-b','PR #186 已合并',1)")
                 .execute(&pool).await.unwrap();
             sqlx::query("INSERT INTO wakeup_schedules(id, session_id, prompt, source, next_at, status, created_at) VALUES ('w-sess-b','sess-b','p','agent_decided',1,'pending',1)")
@@ -4213,17 +4226,10 @@ pub(crate) mod merged_settlement {
         async fn invariant_probe_reports_waiting_wake_without_source() {
             let dir = scratch_dir("probe");
             let pool = seed_state(&dir).await;
-            thin_state::save(
-                &pool,
-                "sess-d",
-                &thin_state::ThinState {
-                    state: crate::agent::thin_state::SessionState::WaitingWake,
-                    waiting_for: Some("PR #1".into()),
-                    ..thin_state::ThinState::running()
-                },
-            )
-            .await
-            .unwrap();
+            // The probe must inspect legacy corruption, not create a newly admitted wait.
+            thin_state::ensure(&pool).await.unwrap();
+            sqlx::query("INSERT INTO thin_session_state(session_id,state,waiting_for,updated_at) VALUES ('sess-d','waiting_wake','PR #1',0) ON CONFLICT(session_id) DO UPDATE SET state='waiting_wake',waiting_for='PR #1'")
+                .execute(&pool).await.unwrap();
             assert_eq!(
                 waiting_wake_without_wake_source(&pool).await,
                 vec!["sess-d".to_string()]
@@ -4251,12 +4257,10 @@ mod m210_tests {
     }
 
     async fn save_wait(db: &SqlitePool, what: &str) {
-        super::super::thin_state::save(db, "m210", &ThinState {
-            state: SessionState::WaitingWake,
-            waiting_for: Some(what.to_string()),
-            wake_source: Some("已登记的唤醒源：模型可用性".into()),
-            ..ThinState::running()
-        }).await.unwrap();
+        // Legacy consumed-model-wake fixture: new writes must pass R4 instead.
+        super::super::thin_state::ensure(db).await.unwrap();
+        sqlx::query("INSERT INTO thin_session_state(session_id,state,waiting_for,wake_source,updated_at) VALUES ('m210','waiting_wake',?,'legacy consumed model wake',0)")
+            .bind(what).execute(db).await.unwrap();
     }
 
     async fn seed_fired_model_wake(db: &SqlitePool) {

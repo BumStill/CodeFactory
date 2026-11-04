@@ -6312,8 +6312,8 @@ mod tests {
         sqlx::query("UPDATE objectives SET status='completed',decision_type='complete',evidence_ref='synthetic',reached_acceptance=requested_acceptance,completed_at=1,recovery_owner=NULL,remediation_id=NULL,lease_owner=NULL,lease_expires_at=NULL WHERE id=?").bind(&first.objective.id).execute(&pool).await.unwrap();
         sqlx::query("UPDATE chat_run_controls SET status='completed',settled_at=1,updated_at=1 WHERE session_id='m228'").execute(&pool).await.unwrap();
         sqlx::query("INSERT INTO messages(id,session_id,role,content,created_at) VALUES ('m228-answer','m228','assistant','waiting for model reset',9999999999999)").execute(&pool).await.unwrap();
-        crate::agent::thin_state::save(&pool,"m228", &crate::agent::thin_state::after_final(crate::agent::thin_state::WaitNeed::External { what: "model reset".into(), covered: true }, "")).await.unwrap();
         crate::agent::background_tasks::persist_model_wakeup(&pool,"m228", &first.root_turn_id, 1000,"ChatGPT reset; DeepSeek daily limit").await.unwrap();
+        crate::agent::thin_state::save(&pool,"m228", &crate::agent::thin_state::after_final(crate::agent::thin_state::WaitNeed::External { what: "model reset".into(), covered: true }, "")).await.unwrap();
         let resumed = admit_persisted_chat_turn_with_origin(&pool, &crate::ChatRunControl::pending(), "m228", None, "model reset wake", TurnOrigin::SystemWake).await.unwrap();
         assert_eq!(resumed.objective.id, first.objective.id);
         assert!(!resumed.already_settled);
@@ -6326,9 +6326,9 @@ mod tests {
         sqlx::query("INSERT INTO sessions(id,title,cwd,model_id,created_at,updated_at,delivery_mode) VALUES ('m228-combo','fixture','/synthetic','gpt-5.5',1,1,'thin')").execute(&pool).await.unwrap();
         let first = admit_persisted_chat_turn_with_origin(&pool,&crate::ChatRunControl::pending(),"m228-combo",Some("m228-combo-root"),"original task",crate::agent::objective::TurnOrigin::User).await.unwrap();
         sqlx::query("UPDATE chat_run_controls SET status='completed',settled_at=1 WHERE session_id='m228-combo'").execute(&pool).await.unwrap();
-        crate::agent::thin_state::save(&pool,"m228-combo", &crate::agent::thin_state::after_final(crate::agent::thin_state::WaitNeed::External { what: "ChatGPT reset".into(), covered: true }, "")).await.unwrap();
         let now = chrono::Utc::now().timestamp_millis();
         crate::agent::background_tasks::persist_model_wakeup(&pool,"m228-combo", &first.root_turn_id,now,"ChatGPT reset; DeepSeek daily limit").await.unwrap();
+        crate::agent::thin_state::save(&pool,"m228-combo", &crate::agent::thin_state::after_final(crate::agent::thin_state::WaitNeed::External { what: "ChatGPT reset".into(), covered: true }, "")).await.unwrap();
         let mut settings = crate::config::settings::Settings::default();
         settings.endpoints.clear();
         settings.default_endpoint="m228-chatgpt".into();

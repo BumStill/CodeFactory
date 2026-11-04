@@ -189,7 +189,7 @@ pub async fn execute(args: Value, ctx: &ExecCtx) -> Result<ToolOutput> {
         return Ok(ToolOutput::err(message));
     }
 
-    let mut tx = db.begin().await?;
+    let mut tx = crate::storage::db::begin_write(&db).await?;
     let previous: Option<(i64, String)> = sqlx::query_as(
         "SELECT revision, plan_json FROM chat_plan_events
          WHERE session_id = ? AND root_turn_id = ?
@@ -268,6 +268,30 @@ pub async fn execute(args: Value, ctx: &ExecCtx) -> Result<ToolOutput> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn m231_concurrent_plan_revisions_are_serialized() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::storage::db::connect(&format!("sqlite://{}?mode=rwc", dir.path().join("plans.db").display())).await.unwrap();
+        sqlx::query("INSERT INTO sessions(id,title,cwd,model_id,created_at,updated_at) VALUES ('m231-plan','synthetic','/synthetic','model',1,1)").execute(&db).await.unwrap();
+        let mut tasks = Vec::new();
+        for _ in 0..8 {
+            let db = db.clone();
+            tasks.push(tokio::spawn(async move {
+                let mut ctx = ExecCtx::new(std::path::PathBuf::from("/synthetic"), Some(db));
+                ctx.session_id = Some("m231-plan".into());
+                ctx.root_turn_id = Some("m231-root".into());
+                execute(json!({"steps": [
+                    {"id":"a","title":"a","kind":"analysis","status":"completed"},
+                    {"id":"b","title":"b","kind":"verification","status":"in_progress"}
+                ]}), &ctx).await
+            }));
+        }
+        for task in tasks { assert!(!task.await.unwrap().expect("concurrent plan must commit").is_error); }
+        let revisions: Vec<i64> = sqlx::query_scalar("SELECT revision FROM chat_plan_events WHERE session_id='m231-plan' ORDER BY revision").fetch_all(&db).await.unwrap();
+        assert_eq!(revisions, (1..=8).collect::<Vec<_>>());
+        db.close().await;
+    }
 
     fn step(id: &str, status: &str) -> PlanStep {
         PlanStep {

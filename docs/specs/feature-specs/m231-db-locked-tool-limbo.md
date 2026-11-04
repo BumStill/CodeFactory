@@ -37,4 +37,22 @@ Spec、AI Collaboration；影响回合恢复，追加 E2E-001 相关场景映射
 - 发版后一周查 `tool_calls`：不再有新的 `database is locked` 工具结果；`waiting_wake` 且无唤醒来源的会话为 0。
 
 ## Implementation Notes
-待实现期间补充路径追踪、重试预算及证据。真实安装版验收与发版后一周审计由编排方发版安装后完成；本任务负责文件 SQLite 并发集成测试、完整回归与合并后 §8 收尾，不自行发版。
+
+### R1 路径核查
+- 生产连接统一经过 `storage::db::pool_connect_options`，每条连接显式配置 WAL、FULL、foreign_keys 和 10 秒 busy_timeout，池获取上限 30 秒。
+- `update_plan`：工具执行中 `tools/update_plan.rs::execute` 使用 deferred `db.begin()`，先读最新 revision 再插入事件；并发工具会在读后写升级时直接返回 code 5，busy_timeout 无法保护这次升级。新增 8 个真实文件并发执行测试已先复现该错误；改用共享 `begin_write`（BEGIN IMMEDIATE）后通过。
+- `bash`：shell 进程本身不使用应用 SQLite；写库边界在执行前的 `DesktopToolBackend::mutation_preflight`（已有 BEGIN IMMEDIATE）、`SqlitePersistence::tool_execution_started_at_ms`，以及执行后的 `trajectory::record_terminal_tool_outcome` / metadata。后者此前绕过共享写锁重试，现统一进入 BEGIN IMMEDIATE；执行起始时钟和 started 轨迹也同样保护。历史样本只有工具结果，无法仅从 code 5 断定某次 bash 命中了哪个边界；上述结论来自生产调用链与并发回归，不虚构原始现场堆栈。
+
+### R2 预算与副作用边界
+- `begin_write`：最多 3 次获取，50/100ms 退避；生产 busy_timeout 每次 10 秒。若发现池中泄漏事务，仅回滚闲置连接，再给一次获取机会；最多 4 次，busy 等待 40 秒 + 150ms 退避 + 最多 800ms 闲置巡检，另受每次池获取 30 秒上限约束，保守总预算不超过 161 秒（不含已获得锁后的正常事务执行）。
+- 单条 `retry_write` 同样 3 次、50/100ms；生产 busy 等待总计 30.15 秒。测试连接使用 20ms 以快速验证耗尽。
+- 仅重试写锁获取或纯数据库操作，不包裹工具执行。真实工具轨迹测试在副作用计数递增后持有独立连接的写锁，断言落库等待、释放后成功、模型 replay 内容正确且计数为 1。已派发的 mutation 仍由现有持久收据与防重放机制保护。
+
+### R3–R6 状态与恢复
+- 内部锁错误在 desktop persistence 边界返回 `local_store_contended`，不生成原始 `database is locked` 工具消息。薄会话错误结算原子写入真实 5 秒唤醒与本地数据库忙理由；第三次明确失败，不沿用模型恢复时间。
+- `thin_state::save` 在 BEGIN IMMEDIATE 内核对 pending 唤醒、运行后台任务或活跃 PR 观测。无源且不可识别外部等待直接拒绝；外部等待在同事务补建系统恢复唤醒才允许写入。用户停止状态在补建前再次检查。
+- 启动与定期巡检复用现有入口；数据库孤儿等待补立即唤醒并写审计，补建时同事务替换旧理由；结束与停止会话不在巡检范围内。
+- 旧测试需要直接注入历史坏数据，而不能再通过生产 save 制造 R4 明确禁止的新状态；未改变这些测试的终态、来源、计数、恢复或防复活断言。
+
+### 验收分工
+真实安装版验收与发版后一周审计由编排方发版安装后完成；本任务负责文件 SQLite 并发集成测试、完整回归与合并后 §8 收尾，不自行发版。

@@ -582,6 +582,7 @@ impl Persistence for SqlitePersistence {
             return Ok(now_ms);
         }
         let id = crate::trajectory::trace_record_id(&self.session_id, &tool_call.id);
+        let mut tx = crate::storage::db::begin_write(&self.db).await.map_err(perr)?;
         let started: i64 = sqlx::query_scalar(
             "UPDATE tool_calls SET metadata = json_set(COALESCE(metadata, '{}'), \
              '$.execution_started_at_ms', COALESCE(json_extract(metadata, '$.execution_started_at_ms'), ?)) \
@@ -589,9 +590,10 @@ impl Persistence for SqlitePersistence {
         )
         .bind(now_ms.min(i64::MAX as u64) as i64)
         .bind(id)
-        .fetch_one(&self.db)
+        .fetch_one(&mut *tx)
         .await
         .map_err(perr)?;
+        tx.commit().await.map_err(perr)?;
         Ok(started.max(0) as u64)
     }
 
@@ -605,6 +607,11 @@ impl Persistence for SqlitePersistence {
     ) -> PersistResult<()> {
         if self.anonymous {
             return Ok(());
+        }
+        // M231: dispatch/preflight storage errors abort into internal recovery;
+        // never turn them into a tool message in the provider's replay history.
+        if error.is_some_and(crate::storage::db::is_lock_contention_message) {
+            return Err(perr(crate::storage::db::LOCAL_STORE_CONTENDED));
         }
         crate::trajectory::record_terminal_tool_outcome(
             &self.db,
@@ -686,6 +693,19 @@ mod tests {
     //! delegators depend on: a written gate row, and the anonymous no-op path.
     use super::*;
     use sqlx::sqlite::SqlitePoolOptions;
+
+    #[tokio::test]
+    async fn m231_internal_contention_never_enters_model_tool_history() {
+        let db = pool().await;
+        let tool: ToolCall = serde_json::from_value(serde_json::json!({
+            "id":"m231", "type":"function", "function":{"name":"bash","arguments":"{}"}
+        })).unwrap();
+        let p = SqlitePersistence { db: db.clone(), session_id: "synthetic".into(), anonymous: false };
+        p.record_tool_call_started("synthetic-message", &tool).await.unwrap();
+        let error = p.record_tool_call_outcome(&tool, "error", None, Some("Database error (code: 5) database is locked"), 1).await.unwrap_err();
+        assert_eq!(error.message, "local_store_contended");
+        assert_eq!(sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM messages WHERE role='tool'").fetch_one(&db).await.unwrap(), 0);
+    }
 
     #[tokio::test]
     async fn m90_execution_origin_survives_persistence_recreation() {
