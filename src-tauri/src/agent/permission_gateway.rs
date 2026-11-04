@@ -115,7 +115,7 @@ impl PermissionGateway for DesktopPermissionGateway {
     ) -> PermissionOutcome {
         // M130: never infer remote authority from model/user wording or the
         // loop's cached capability. Shell and structured delivery share this gate.
-        let remote = tool_call.function.name == "deliver_changes"
+        let remote = (tool_call.function.name == "deliver_changes" && args["ceiling"] != "off")
             || bash_command.is_some_and(codefactory_agent_loop::policy::is_delivery_command);
         if let Some(outcome) = self
             .authorize_permission_recovery(tool_call, args, bash_command)
@@ -1820,6 +1820,22 @@ mod tests {
     /// commits; a remote segment in the same command still follows delivery
     /// authority, and another repository still asks.
     #[tokio::test]
+    async fn m227_off_does_not_request_remote_delivery_authorization() {
+        let gateway = durable_test_gateway().await;
+        sqlx::query("UPDATE sessions SET permission_mode='trusted'").execute(&gateway.db).await.unwrap();
+        sqlx::query("ALTER TABLE sessions ADD COLUMN delivery_authorized INTEGER NOT NULL DEFAULT 0").execute(&gateway.db).await.unwrap();
+        let args = serde_json::json!({"ceiling":"off"});
+        let call = ToolCall { id:"m227-local".into(), r#type:"function".into(), function:FunctionCall {name:"deliver_changes".into(), arguments:args.to_string()} };
+        assert_eq!(gateway.authorize(&call, &args, None).await, PermissionOutcome::Allow);
+        let prompts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM permission_intents").fetch_one(&gateway.db).await.unwrap();
+        assert_eq!(prompts, 0);
+        let remote = serde_json::json!({"ceiling":"pr_only"});
+        assert_ne!(gateway.authorize(&call, &remote, None).await, PermissionOutcome::Allow);
+        let prompts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM permission_intents").fetch_one(&gateway.db).await.unwrap();
+        assert_eq!(prompts, 1);
+    }
+
+    #[tokio::test]
     async fn m221_local_commit_message_heredoc_is_allowed() {
         let gateway = durable_test_gateway().await;
         sqlx::query("UPDATE sessions SET permission_mode='trusted'").execute(&gateway.db).await.unwrap();
@@ -1860,11 +1876,16 @@ mod tests {
             exec.ancestors().map(|p| p.join("bin/bash.exe")).find(|p| p.is_file()).expect("Git Bash")
         } else { std::path::PathBuf::from("sh") };
         // R1/R2: the field shape, judgement plus a real commit.
+        let head_before = m159_git(&root, &["rev-parse", "HEAD"]);
+        let remote_before = m159_git(&root, &["ls-remote", "origin"]);
         let commit = "git add -A && git commit -q -F - <<'MSG'\nM221: local commit message heredoc\nMSG\ngit log --oneline -1";
         assert_eq!(authorize(commit).await, PermissionOutcome::Allow, "{commit}");
         let output = std::process::Command::new(&shell).no_window().current_dir(&root).args(["-c", commit]).output().unwrap();
         assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
         assert!(m159_git(&root, &["log", "--oneline", "-1"]).contains("M221: local commit message heredoc"));
+        assert_ne!(m159_git(&root, &["rev-parse", "HEAD"]), head_before, "M227: local commit must change HEAD");
+        assert_eq!(m159_git(&root, &["show", "HEAD:tracked.txt"]), "m221 change");
+        assert_eq!(m159_git(&root, &["ls-remote", "origin"]), remote_before, "M227: no push occurred");
         // R2: the pipeline spelling of the same statement.
         let piped = "cat <<'MSG' | git commit -q --allow-empty -F -\nM221: piped commit message\nMSG";
         assert_eq!(authorize(piped).await, PermissionOutcome::Allow, "{piped}");
