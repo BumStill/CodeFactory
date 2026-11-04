@@ -95,3 +95,59 @@ fn m224_invalid_roots_and_unavailable_runtime_fail_closed() {
     );
     assert!(command_sandbox::probe_program("/m224-missing-sandbox-exec").is_err());
 }
+
+#[cfg(target_os = "macos")]
+#[test]
+fn m224_policy_variants_and_accessors_are_observable() {
+    let root = std::env::temp_dir().join(format!("m224-api-{}", std::process::id()));
+    let ws = root.join("ws");
+    std::fs::create_dir_all(&ws).unwrap();
+    let extra = root.join("extra-file");
+    std::fs::write(&extra, b"x").unwrap();
+    let other = root.join("other-file");
+    std::fs::write(&other, b"x").unwrap();
+
+    let sandbox = CommandSandbox::new(
+        &ws,
+        vec![WritablePath::literal(other.clone())],
+        NetworkPolicy::Disabled,
+    )
+    .unwrap();
+
+    let canonical_ws = ws.canonicalize().unwrap();
+    let canonical_other = other.canonicalize().unwrap();
+    assert_eq!(sandbox.workspace(), canonical_ws.as_path());
+    assert_eq!(
+        sandbox.runtime(),
+        std::path::Path::new(command_sandbox::MACOS_SANDBOX_EXEC)
+    );
+    assert_eq!(sandbox.network_policy(), NetworkPolicy::Disabled);
+
+    let declared = sandbox.writable();
+    assert_eq!(declared.len(), 1);
+    assert_eq!(declared[0].path(), canonical_other.as_path());
+    assert!(!declared[0].is_recursive());
+
+    let profile = sandbox.profile();
+    assert!(!profile.contains("(allow network*)"));
+    assert!(profile.contains(&format!(
+        "(allow file-write* (literal \"{}\"))",
+        canonical_ws.display()
+    )));
+    assert!(profile.contains(&format!(
+        "(allow file-write* (literal \"{}\"))",
+        canonical_other.display()
+    )));
+    assert!(
+        !profile.contains(&format!("(subpath \"{}\")", canonical_other.display())),
+        "literal entries must not widen to a subtree"
+    );
+
+    let literal_entry = WritablePath::literal(other.clone());
+    assert!(!literal_entry.is_recursive());
+    assert_eq!(literal_entry.path(), other.as_path());
+    let tree_entry = WritablePath::tree(ws.clone());
+    assert!(tree_entry.is_recursive());
+
+    std::fs::remove_dir_all(root).unwrap();
+}

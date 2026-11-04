@@ -127,6 +127,11 @@ impl CommandSandbox {
         &self.runtime
     }
 
+    /// 已规范化的显式写入白名单（不含工作区本身；工作区恒在白名单首项）。
+    pub fn writable(&self) -> &[WritablePath] {
+        &self.writable
+    }
+
     pub fn network_policy(&self) -> NetworkPolicy {
         self.network
     }
