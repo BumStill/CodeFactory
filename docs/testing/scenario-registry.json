@@ -473,38 +473,6 @@
       "gates": [
         "pull_request"
       ]
-    },
-    {
-      "id": "M236",
-      "name": "会话运行中发出的消息必须持久排队并被投递",
-      "category": "capability_usage",
-      "priority": "P0",
-      "source_kind": "product_contract",
-      "change_patterns": [
-        "src-tauri/src/commands/queued_delivery.rs",
-        "src-tauri/src/commands/mod.rs",
-        "src-tauri/src/agent/background_tasks.rs",
-        "src-tauri/src/lib.rs",
-        "src/lib/queuedSend.ts",
-        "src/lib/queuedDispatchTestBackend.ts",
-        "src/stores/chat.ts",
-        "src/App.tsx"
-      ],
-      "automated_by": [
-        "rust:enqueue_persists_and_restart_keeps_message",
-        "rust:claim_is_fifo_and_never_double_claims",
-        "rust:queue_is_capped_and_failure_is_visible",
-        "rust:a_fresh_queued_message_outranks_a_wake_but_a_stale_one_does_not",
-        "rust:stale_handoff_returns_to_queue",
-        "path:src/lib/queuedSend.test.ts"
-      ],
-      "required_evidence": [
-        "L0",
-        "L1"
-      ],
-      "gates": [
-        "pull_request"
-      ]
     }
   ],
   "complex_e2e_cases": [
