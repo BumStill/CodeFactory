@@ -1,0 +1,104 @@
+name: Release Recovery
+
+# M223 R3: on 2026-11-03 release.yml run 41669986868 had build-macos cancelled
+# by runner capacity while every other job succeeded, leaving a Draft release
+# for a human to finish by hand.
+#
+# A run that reached "completed" with a red job now gets one honest question
+# asked about it: was every red job red for *infrastructure* reasons? If so the
+# failed jobs are rerun (at most twice per run) and the release finishes itself.
+# If anything red is a real result, this workflow stays quiet -- the Release run
+# is already the signal, and silently rerunning a broken build would hide it.
+#
+# `workflow_run` always executes this file from the default branch, so a pull
+# request cannot rewrite the recovery logic that judges it.
+
+env:
+  PYTHONUTF8: "1"
+  PYTHONIOENCODING: utf-8
+
+on:
+  workflow_run:
+    workflows: ["Release"]
+    types: [completed]
+
+concurrency:
+  group: release-recovery-${{ github.event.workflow_run.id }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  recover:
+    if: >-
+      github.event.workflow_run.conclusion == 'failure' ||
+      github.event.workflow_run.conclusion == 'cancelled'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Rerun failed jobs when every red job was infrastructure
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+          RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
+          HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          MAX_ATTEMPTS: "3"
+        run: |
+          set -euo pipefail
+          # The first attempt plus at most two automatic reruns.
+          if [ "$RUN_ATTEMPT" -ge "$MAX_ATTEMPTS" ]; then
+            echo "::error::Release run $RUN_ID exhausted its two infrastructure retries; recovery failed and the Draft remains unpublished. 系统自动重试/自愈预算已耗尽。"
+            exit 1
+          fi
+
+          JOBS=""
+          for attempt in 1 2 3 4 5; do
+            if JOBS=$(gh run view "$RUN_ID" --repo "$REPO" --json jobs,conclusion); then
+              break
+            fi
+            echo "::warning::could not read jobs of release run $RUN_ID (attempt $attempt/5); retrying in 10s" >&2
+            JOBS=""
+            sleep $((attempt * 10))
+          done
+          if [ -z "$JOBS" ]; then
+            echo "::error::could not read jobs of release run $RUN_ID; nothing is known about why it failed"
+            exit 1
+          fi
+
+          # Only the jobs that actually failed are under judgement: a job that
+          # was skipped because a needed job failed carries no verdict.
+          RED_JOBS=$(jq -c '[.jobs[]
+              | select(.conclusion == "failure" or .conclusion == "cancelled"
+                    or .conclusion == "timed_out" or .conclusion == "startup_failure")
+              | .name]' <<< "$JOBS")
+          CHECKS=$(jq -c '[.jobs[]
+              | {name: .name, conclusion: (.conclusion // ""),
+                 startedAt: (.startedAt // "")}]' <<< "$JOBS")
+          RUNS=$(jq -c --argjson id "$RUN_ID" '[{run_id: $id, jobs: {jobs: .jobs}}]' <<< "$JOBS")
+
+          payload=$(jq -n --argjson checks "$CHECKS" --argjson runs "$RUNS" \
+            --argjson retry "[$RUN_ID]" --argjson required "$RED_JOBS" \
+            '{checks: $checks, runs: $runs, retry_run_ids: $retry, required: $required,
+              infra_retries_used: 0, max_infra_retries: 1}')
+          DECISION=$(printf '%s' "$payload" | python3 tools/release/classify_ci_infra.py)
+          REASON=$(jq -r '.reason' <<< "$DECISION")
+
+          case "$(jq -r '.decision' <<< "$DECISION")" in
+            retry_infra)
+              if gh run rerun "$RUN_ID" --repo "$REPO" --failed; then
+                echo "::warning::$REASON -- reran the failed jobs of release run $RUN_ID (attempt $RUN_ATTEMPT of $MAX_ATTEMPTS)"
+              else
+                echo "::error::release run $RUN_ID failed for infrastructure reasons ($REASON) but the rerun request was rejected"
+                exit 1
+              fi
+              ;;
+            *)
+              echo "::warning::$REASON -- leaving release run $RUN_ID red; a real failure must not be rerun away"
+              exit 0
+              ;;
+          esac

@@ -40,11 +40,13 @@
 - `on-demand-embedded-browser-pane.md`: 当前会话按需创建的内置右侧浏览器分屏、控制权、安全隔离与自动回收规格。
 - `browser-access-zero-touch-provisioning.md`: 浏览器扩展零手工配对、受管浏览器下载在 Windows 权限受限时的自愈与回退规格。
 - `scenario-test-governance.md`: 统一场景注册表、PR 影响声明、证据等级，以及基于匿名历史形状的复杂真实端到端测试治理规格。
+- `unattended-smoke-shared-phase-budget.md`: PR #962 可信 driver 摘要拒绝的复现记录；预算实现已撤回，保留独立治理 follow-up。
 - `skill-lifecycle-system.md`: Skill package、安装事务、审核/激活、按需运行时与证据合同的领域主规格。
 - `skill-command-recovery.md`: 上述主规格的 P0 修复切片，限定 Skill payload 保留、稳定 skill root、命令错误/超时诊断、变化后重试与 system-owned 恢复。
 - `edit-line-stats-visibility.md`: 会话中文件编辑行的 `+X −Y` 行数展示、回合改动总和、颜色与溢出边界的可读性规格。
 - `m215-trusted-heredoc-own-workspace.md`: trusted 模式下只改本会话工作区的 `python`/`node` heredoc 与 `cd "$(pwd)" && git merge` 直接放行；不可证明时拒绝理由带脚本行号。
 - `m221-local-commit-heredoc.md`: `git commit -F -`/`git tag -F -` 的 heredoc 正文按「数据」而非「脚本」判定，本工作区内的本地 commit 直接放行；远端段与工作区外仓库仍按 M208/M130 审批。
+- `m223-release-retry-transient-infra.md`: 发版链路上的 GitHub 瞬时故障（502/限流、runner 排不到、检查被判 cancelled）按有限次数自动重跑，真实失败仍 fail-closed；含可测的判定脚本与真实 workflow shell 的验收测试。
 
 ## 模板
 - `requirements-traceability-template.md`

@@ -1965,7 +1965,23 @@ mod tests {
     /// half-written document behind.
     #[tokio::test]
     async fn aborted_scan_releases_the_library_and_leaves_no_partial_rows() {
-        let pool = memory_pool().await;
+        let database = tempfile::tempdir().expect("temporary database directory");
+        let options = sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(database.path().join("knowledge.sqlite"))
+            .create_if_missing(true);
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await
+            .expect("open cancellation-safe fixture database");
+        super::ensure_schema(&pool).await.expect("knowledge schema");
+        // Cancellation can discard a pooled connection. Exercise that path
+        // deterministically; unlike sqlite::memory:, the schema must survive.
+        pool.acquire().await.expect("acquire fixture connection")
+            .close().await.expect("replace fixture connection");
+        let libraries: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM knowledge_libraries")
+            .fetch_one(&pool).await.expect("schema survives connection replacement");
+        assert_eq!(libraries, 0);
         let root = fixture_root("abort");
         for index in 0..5 {
             write_docx(
@@ -2008,6 +2024,8 @@ mod tests {
         assert_eq!(summary.indexed_documents, 5, "summary: {summary:?}");
         assert_eq!(orphans, 0, "chunk rows must never outlive their document");
         assert_eq!(empty_documents, 0, "indexed documents must own chunks");
+        pool.close().await;
+        database.close().expect("remove fixture database after closing pool");
     }
 
     /// R5: exactly one pass per library; concurrent requests coalesce into a
