@@ -95,6 +95,14 @@ pub fn start(pool: SqlitePool) {
     if EVENT_TX.set(tx).is_err() {
         return; // already running in this process
     }
+    // M233: a large library indexes behind the UI and resumes after a restart.
+    let index_pool = pool.clone();
+    tauri::async_runtime::spawn(async move {
+        match crate::knowledge::sync_search_index(&index_pool, None).await {
+            Ok(count) => tracing::info!("knowledge search index caught up {count} chunk(s)"),
+            Err(e) => tracing::warn!("knowledge search index sync deferred: {e}"),
+        }
+    });
     tauri::async_runtime::spawn(async move {
         match crate::knowledge::reconcile_all_libraries(&pool).await {
             Ok(ids) => tracing::info!("knowledge startup reconcile covered {} librar(ies)", ids.len()),

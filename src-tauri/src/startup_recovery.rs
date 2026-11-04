@@ -89,67 +89,6 @@ mod tests {
         assert!(log.contains("step=recovery status=completed elapsed_ms="));
     }
 
-    #[cfg(windows)]
-    #[test]
-    fn m233_windows_webview_paints_and_invokes_while_history_is_slow() {
-        use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
-        use tauri::Manager;
-        let dir = tempfile::tempdir().unwrap();
-        let responsive = Arc::new(AtomicBool::new(false));
-        let finished = Arc::new(AtomicBool::new(false));
-        let probe = responsive.clone();
-        let recovery = finished.clone();
-        let mut context = tauri::generate_context!();
-        context.config_mut().app.windows.clear();
-        let started = Instant::now();
-        let app = tauri::Builder::default().any_thread()
-            .register_uri_scheme_protocol("m233", |_, _| {
-                tauri::http::Response::builder().header("Content-Type", "text/html")
-                    .body(b"<!doctype html><html><head></head><body></body></html>".to_vec()).unwrap()
-            })
-            .invoke_handler(move |invoke| {
-                if invoke.message.command() != "m233_window_ready" { return false; }
-                let painted = match invoke.message.payload() {
-                    tauri::ipc::InvokeBody::Json(value) => value.get("painted").and_then(|v| v.as_bool()) == Some(true),
-                    _ => false,
-                };
-                // A WebView IPC receipt after two animation frames, not a PID,
-                // open port, window handle or acknowledgement-only assertion.
-                if painted && !recovery.load(Ordering::SeqCst) && started.elapsed() < Duration::from_secs(2) {
-                    probe.store(true, Ordering::SeqCst);
-                }
-                invoke.resolver.resolve(true);
-                true
-            })
-            .setup(move |app| {
-                let done = finished.clone();
-                spawn_worker(dir.path().into(), move || {
-                    for _ in 0..320 { std::thread::sleep(Duration::from_millis(20)); }
-                    done.store(true, Ordering::SeqCst);
-                    Ok(())
-                });
-                tauri::WebviewWindowBuilder::new(app, "m233-startup", tauri::WebviewUrl::CustomProtocol("m233://localhost/".parse().unwrap()))
-                    .title("M233 synthetic startup acceptance")
-                    .initialization_script(r#"document.addEventListener('DOMContentLoaded', () => {
-                        document.body.innerHTML = '<main id="ready">CodeFactory startup acceptance</main>';
-                        requestAnimationFrame(() => requestAnimationFrame(() => {
-                            window.__TAURI_INTERNALS__.invoke('m233_window_ready', {
-                                painted: document.getElementById('ready').getBoundingClientRect().height > 0
-                            });
-                        }));
-                    });"#)
-                    .build()?;
-                let handle = app.handle().clone();
-                std::thread::spawn(move || {
-                    std::thread::sleep(Duration::from_secs(8));
-                    handle.exit(0);
-                });
-                Ok(())
-            }).build(context).unwrap();
-        app.run_return(|_, _| {});
-        assert!(responsive.load(Ordering::SeqCst), "window did not paint and complete IPC within 2s while recovery was pending");
-    }
-
     #[tokio::test]
     async fn m233_startup_schema_defers_fts_without_losing_upgrade_data() {
         let dir = tempfile::tempdir().unwrap();

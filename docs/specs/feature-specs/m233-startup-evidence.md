@@ -49,3 +49,17 @@ AI Collaboration：context scope 为指定版本范围、启动/结算/知识库
 5. Mac 安装版同样检查首屏、历史会话和启动日志。
 
 本任务交付上限为合并，不启动发版；真实安装版验收由编排方发版后完成（not live）。
+
+
+## R8 补充（编排方接手）
+
+`fts_tokens_sql` 的 SQL 递归切词耗时随文本长度平方增长（合成基准：每 chunk 4000 字 36.7ms），且全量回填在一个写事务里，被杀后回滚重来。现改为：
+
+- 触发器只把变动的 chunk 写入持久队列 `knowledge_fts_pending`，不切词；
+- `sync_search_index` 用 Rust 线性切词，每批 100 个 chunk，短写事务，批间释放写锁；队列持久，重启后继续；
+- 升级时只写入 rowid，不切词；已完整索引的 v1.91.80/81 不重建；
+- 搜索每次最多追赶一批，不再同步全量回填。回填完成前搜索只覆盖已索引部分。
+
+新增测试：`m233_tokens_are_linear_and_match_the_index_format`、`m233_upgrade_backfill_is_batched_resumable_and_keeps_writes_moving`。
+
+本 PR 撤回了新增的 Windows WebView 测试和 `src-tauri/build.rs` 改动：该测试让 Windows 测试程序因 Common Controls v6 无法加载，修复又造成链接失败并触发信任根门禁。窗口级证据因此缺失，由用户在 Windows 上验收，后续单独补回。这条取代上文 R5 中对该测试的描述。
