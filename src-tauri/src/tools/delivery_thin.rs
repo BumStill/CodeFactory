@@ -257,7 +257,7 @@ fn run(commands: &mut impl Commands, args: &Value, ceiling: DeliveryCeiling, exc
     let branch = commands.git(&["branch", "--show-current"])?;
     if branch.is_empty() { return Err("detached HEAD cannot be delivered".into()); }
     if args.get("expect_branch").and_then(Value::as_str).is_some_and(|expected| expected != branch) {
-        return Err(format!("expected branch does not match {branch}"));
+        return Err(format!("expect_branch 不匹配当前 objective 的交付分支 {branch}；未执行提交或推送。系统自动重试/自愈：在登记工作区核对 git status 和 git branch --show-current，使用 expect_branch={branch} 重试 deliver_changes；不得切回上一单已合并分支。"));
     }
     log.branch = branch.clone();
     // M132: resolve the title first — a delivery that cannot describe itself must
@@ -418,8 +418,53 @@ pub(super) async fn execute(args: &Value, ctx: &ExecCtx, ceiling: DeliveryCeilin
 }
 
 #[cfg(test)]
+pub(super) fn m232_deliver_fixture(cwd: &Path) -> Value {
+    tests::deliver_real_git_fixture(cwd)
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    pub(super) fn deliver_real_git_fixture(cwd: &Path) -> Value {
+        struct Fixture<'a> { cwd: &'a Path, forge: Forge }
+        impl Commands for Fixture<'_> {
+            fn git(&mut self, args: &[&str]) -> Result<String, String> {
+                delivery::git(self.cwd, args)
+            }
+            fn gh(&mut self, args: &[&str]) -> Result<String, String> {
+                self.forge.gh(args)
+            }
+            fn stage(&mut self, _: &[String]) -> Result<Vec<String>, String> {
+                delivery::git(self.cwd, &["add", "second.txt"])?;
+                Ok(vec!["second.txt".into()])
+            }
+        }
+        let mut fixture = Fixture { cwd, forge: Forge { number: Some(43),
+            branch: delivery::git(cwd, &["branch", "--show-current"]).unwrap(), ..Default::default() } };
+        let mut log = Log::default();
+        let result = run(&mut fixture, &json!({"title":"fix: deliver second task", "body":"Synthetic second task"}),
+            DeliveryCeiling::PrOnly, &[], &mut log).unwrap();
+        assert_eq!(fixture.forge.creates, 1);
+        assert!(fixture.forge.edited_body.is_none(), "old PR must not be edited");
+        assert_eq!(fixture.forge.merges, 0);
+        assert_eq!(result["branch"], delivery::git(cwd, &["branch", "--show-current"]).unwrap());
+        let sha = delivery::git(cwd, &["rev-parse", "HEAD"]).unwrap();
+        let remote = delivery::git(cwd, &["ls-remote", "--heads", "origin", &format!("refs/heads/{}", log.branch)]).unwrap();
+        assert_eq!(remote.split_whitespace().next(), Some(sha.as_str()));
+        result
+    }
+    #[test]
+    fn m232_wrong_branch_has_actionable_retry_before_side_effects() {
+        let mut forge = Forge::default();
+        let error = run(&mut forge, &json!({"expect_branch":"previous"}),
+            DeliveryCeiling::PrOnly, &[], &mut Log::default()).unwrap_err();
+        assert!(error.contains("expect_branch=feature") && error.contains("重试 deliver_changes"), "{error}");
+        assert_eq!(forge.pushes, 0);
+        assert_eq!(forge.creates, 0);
+        assert!(forge.events.is_empty());
+    }
+
     #[test]
     fn m137_session_policy_reaches_created_and_updated_pr_bodies() {
         for policy in ["immediate", "default", "hold"] {
@@ -444,6 +489,7 @@ mod tests {
 
     #[derive(Default)]
     struct Forge {
+        branch: String, number: Option<u64>,
         pushed: bool, pr: bool, armed: bool, fail_label: bool, merged: bool,
         pushes: usize, creates: usize, merges: usize, dispatched: bool,
         // CF-STAGE1-P1: proves the body contract runs between commit and push.
@@ -493,7 +539,11 @@ mod tests {
             })
         }
         fn gh(&mut self, a: &[&str]) -> Result<String,String> {
-            let pr = json!({"number":42,"url":"https://forge.invalid/pr/42",
+            if !self.branch.is_empty() && a.contains(&"--head") {
+                assert_eq!(a[a.iter().position(|arg| *arg == "--head").unwrap() + 1], self.branch);
+            }
+            let number = self.number.unwrap_or(42);
+            let pr = json!({"number":number,"url":format!("https://forge.invalid/pr/{number}"),
                 "title":self.pr_title.clone().unwrap_or_else(|| "fix: thin".to_string()),
                 "body":"synthetic","state":if self.merged {"MERGED"} else {"OPEN"},"headRefOid":"abc123"});
             match a[1] {
