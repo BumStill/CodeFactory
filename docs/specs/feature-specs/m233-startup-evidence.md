@@ -35,6 +35,10 @@ Spec、Compatibility、Release、Observation、Payload、AI Collaboration。未�
 
 AI Collaboration：context scope 为指定版本范围、启动/结算/知识库链路；假设为阻塞风险而非唯一已证实根因；review point 为 M188 顺序、M226/M230 在途保护与取消扫描兼容；validation result 记录于 PR。请求过独立只读审查，未将未返回的审查当通过。
 
+## Windows CI 加载期修复
+
+首轮 `check-rust` 在任何测试执行前退出 `0xc0000139 / STATUS_ENTRYPOINT_NOT_FOUND`。新增真实 WebView 测试令 lib test 链入 Tao/Wry 的 `SetWindowSubclass`、`DefSubclassProc` 等 comctl32 v6 导入；Tauri 默认 manifest 用于正式 exe，Cargo 测试 exe 未携带此依赖。`src-tauri/build.rs` 仅在 Windows MSVC 对 tests 添加 `/MANIFEST:EMBED` 及 Common-Controls 6.0 依赖，不取消 GUI 验收，不修改 workflow。实际 Windows 结果以同一 PR 新 head 的 CI 为准，不把 macOS 构建通过视为已证明该加载错误关闭。
+
 ## 真机验收交接（模板 §8）
 
 编排方发版后在 Windows 安装新版本，保留现有本地数据库和知识库：
