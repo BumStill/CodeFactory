@@ -15,6 +15,10 @@ import type { StreamEvent } from "../lib/tauri";
 // arriving for a specific session — including a BACKGROUND one.
 const streamHandlers: Record<string, (e: StreamEvent) => void> = {};
 const invokeMock = vi.hoisted(() => vi.fn());
+import {
+  installQueuedDispatch,
+  resetQueuedDispatch,
+} from "../lib/queuedDispatchTestBackend";
 vi.mock("../lib/tauri", () => ({
   invoke: invokeMock,
   onStream: vi.fn(async (sid: string, cb: (e: StreamEvent) => void) => {
@@ -66,8 +70,9 @@ function settle(id: string) {
 }
 
 beforeEach(() => {
+  resetQueuedDispatch();
   invokeMock.mockReset();
-  invokeMock.mockResolvedValue(undefined);
+  installQueuedDispatch(invokeMock);
   for (const k of Object.keys(streamHandlers)) delete streamHandlers[k];
   useChatStore.setState({
     sessions: [A, B] as never,
@@ -147,6 +152,8 @@ describe("per-session streaming concurrency", () => {
     expect(invokeMock).not.toHaveBeenCalledWith("mine_cross_session_patterns", expect.anything());
 
     settle("A");
+    // M236: the durable queue drain runs before post-mortem.
+    await new Promise((resolve) => setTimeout(resolve, 0));
 
     // Deterministic local mining (no model call) runs out of the box …
     expect(invokeMock).toHaveBeenCalledWith("mine_cross_session_patterns", { cwd: "/p/A" });
@@ -175,6 +182,7 @@ describe("per-session streaming concurrency", () => {
     expect(invokeMock).not.toHaveBeenCalledWith("run_postmortem", expect.anything());
 
     settle("B");
+    await new Promise((resolve) => setTimeout(resolve, 0));
 
     // With opt-in on, BOTH the local miner and the remote post-mortem fire.
     expect(invokeMock).toHaveBeenCalledWith("mine_cross_session_patterns", { cwd: "/p/B" });

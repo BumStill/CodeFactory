@@ -18,6 +18,7 @@ pub mod git;
 pub mod git_remote;
 pub mod hooks;
 pub mod interjections;
+pub mod queued_delivery;
 pub mod knowledge;
 pub mod learning;
 pub mod mcp;

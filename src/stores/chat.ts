@@ -15,6 +15,12 @@ import type {
 } from "../lib/tauri";
 import type { UnlistenFn } from "@tauri-apps/api/event";
 import { turnPlanFromEvent } from "../lib/chatPlan";
+import {
+  drainQueuedSends,
+  enqueueDurableQueuedSend,
+  tauriQueuedSendPort,
+  sessionsOwingDelivery,
+} from "../lib/queuedSend";
 import { currentTurnOwnership } from "../lib/turnOwnership";
 import {
   markPermissionResponse,
@@ -184,7 +190,7 @@ interface ChatStore {
   /** Send right now if idle, enqueue if streaming, or materialize an active draft. */
   sendOrQueue: (content: string) => Promise<"sent" | "queued" | "full" | "failed">;
   /** CF-HDE-R0/R8: queue a message for ONE named session (no UI switch). */
-  enqueueMessage: (sessionId: string, content: string) => "queued" | "full" | "unknown";
+  enqueueMessage: (sessionId: string, content: string) => Promise<"queued" | "full" | "unknown">;
   /** Remove a queued message (active session) before it fires. */
   removeFromQueue: (id: string) => void;
   /** Empty the active session's queue without sending. */
@@ -460,8 +466,13 @@ export const useChatStore = create<ChatStore>((set, get) => ({
         _streamingMsgId: streamingMsgIds,
       };
     });
+    // A hydrated session shows its durable backlog even when this renderer
+    // never saw the settlement that ended the previous turn.
+    void resumeQueuedDelivery(id).then((restored) => {
+      if (restored > 0 && !recoveredStaleStream) void drainNextQueuedMessage(id);
+    });
     if (recoveredStaleStream) {
-      drainNextQueuedMessage(id, set, get);
+      void drainNextQueuedMessage(id);
     }
   },
 
@@ -585,6 +596,13 @@ export const useChatStore = create<ChatStore>((set, get) => ({
   deleteSession: async (id) => {
     const deleted = findSession(get(), id);
     const wasActive = get().activeSession?.id === id;
+    // M236/R5/R6: a deleted session keeps no invisible backlog; every pending
+    // row gets a terminal reason instead of disappearing with the session.
+    try {
+      await tauriQueuedSendPort.failPending(id, "session was deleted before delivery");
+    } catch {
+      // The session is going away either way; the failure stays in the DB.
+    }
     await invoke("delete_session", { sessionId: id });
     get()._unlisten[id]?.();
     get()._unlistenSessionUpdated[id]?.();
@@ -896,28 +914,9 @@ export const useChatStore = create<ChatStore>((set, get) => ({
       await get().sendMessage(text, id, crypto.randomUUID());
       return "sent";
     }
-    if (rt.queue.length >= QUEUE_MAX) return "full";
-    set((s) => {
-      const prev = s.runtime[id] ?? freshRuntime();
-      return {
-        runtime: {
-          ...s.runtime,
-          [id]: {
-            ...prev,
-            queue: [
-              ...prev.queue,
-              {
-                id: crypto.randomUUID(),
-                content: text,
-                enqueuedAt: Date.now(),
-                rootTurnId: crypto.randomUUID(),
-              },
-            ],
-          },
-        },
-      };
-    });
-    return "queued";
+    // M236: the queue is durable, so `queued` is a promise we can keep.
+    const outcome = await persistQueuedSend(id, text);
+    return outcome === "unknown" ? "failed" : outcome;
   },
 
   /**
@@ -927,34 +926,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
    * 以前只能通过"界面当前显示的会话"到达——真机上就是发给 A 的消息被冲进了 B
    * （14:43:41 那次）。按 session_id 寻址之后，跨会话串台在结构上不可能发生。
    */
-  enqueueMessage: (sessionId, content) => {
-    const text = content.trim();
-    if (!text) return "unknown";
-    const session = findSession(get(), sessionId);
-    if (!session) return "unknown";
-    if ((get().runtime[sessionId]?.queue.length ?? 0) >= QUEUE_MAX) return "full";
-    set((s) => {
-      const prev = s.runtime[sessionId] ?? freshRuntime();
-      return {
-        runtime: {
-          ...s.runtime,
-          [sessionId]: {
-            ...prev,
-            queue: [
-              ...prev.queue,
-              {
-                id: crypto.randomUUID(),
-                content: text,
-                enqueuedAt: Date.now(),
-                rootTurnId: crypto.randomUUID(),
-              },
-            ],
-          },
-        },
-      };
-    });
-    return "queued";
-  },
+  enqueueMessage: (sessionId, content) => persistQueuedSend(sessionId, content),
 
   /**
    * CF-HDE-R0：改**指定会话**的权限模式。走的是界面权限选择器同一条命令
@@ -1168,6 +1140,8 @@ export const useChatStore = create<ChatStore>((set, get) => ({
           },
         };
       });
+      // M236: stopping is not itself a delivery boundary — the settlement event
+      // that follows is. Draining here would double-fire the queue.
       return true;
     } catch {
       const detail =
@@ -1470,32 +1444,168 @@ function recoverUndeliveredSteers(
   return true;
 }
 
-function drainNextQueuedMessage(
+/// M236: persist a queued send before acknowledging it. The in-memory
+/// `runtime[].queue` entry below is only the UI mirror of the durable row, and
+/// it carries the durable id so a cancelled/delivered row can be removed by id.
+async function persistQueuedSend(
   sessionId: string,
-  set: (fn: (s: ChatStore) => Partial<ChatStore>) => void,
-  get: () => ChatStore,
-): boolean {
-  const next = get().runtime[sessionId]?.queue[0];
-  if (!next) return false;
+  content: string,
+): Promise<"queued" | "full" | "unknown"> {
+  const text = content.trim();
+  if (!text) return "unknown";
+  const stored = useChatStore.getState();
+  if (!findSession(stored, sessionId)) return "unknown";
+  if ((stored.runtime[sessionId]?.queue.length ?? 0) >= QUEUE_MAX) return "full";
 
-  set((s) => {
-    const prev = s.runtime[sessionId];
-    if (!prev) return {};
+  // The root turn identity is minted here and persisted with the row, so a
+  // restart re-sends the *same* message identity instead of inventing a new one.
+  const outcome = await enqueueDurableQueuedSend(
+    tauriQueuedSendPort,
+    sessionId,
+    text,
+    crypto.randomUUID(),
+  );
+  if (!outcome.ok) return outcome.reason === "full" ? "full" : "unknown";
+  // Never report `queued` for a row a restart would forget: the mirror is
+  // filled from the committed record, not invented locally.
+  const record = outcome.record;
+  useChatStore.setState((s) => {
+    const prev = s.runtime[sessionId] ?? freshRuntime();
     return {
       runtime: {
         ...s.runtime,
-        [sessionId]: { ...prev, queue: prev.queue.filter((q) => q.id !== next.id) },
+        [sessionId]: {
+          ...prev,
+          queue: [
+            ...prev.queue,
+            {
+              id: record.id,
+              content: record.content,
+              enqueuedAt: record.createdAt,
+              rootTurnId: record.rootTurnId,
+            },
+          ],
+          revision: prev.revision + 1,
+        },
       },
     };
   });
-  setTimeout(() => {
-    void get().sendMessage(
-      next.content,
+  return "queued";
+}
+
+/// Drop a delivered/failed row from the UI mirror.
+function forgetQueuedMirror(sessionId: string, id: string) {
+  useChatStore.setState((s) => {
+    const prev = s.runtime[sessionId];
+    if (!prev || !prev.queue.some((item) => item.id === id)) return {};
+    return {
+      runtime: {
+        ...s.runtime,
+        [sessionId]: {
+          ...prev,
+          queue: prev.queue.filter((item) => item.id !== id),
+          revision: prev.revision + 1,
+        },
+      },
+    };
+  });
+}
+
+/// M236: delivery is a claim → send → confirm handshake against the durable
+/// queue, so it no longer depends on this renderer having seen `turn_settled`.
+/// Returns true when a message became the next turn.
+async function drainNextQueuedMessage(sessionId: string): Promise<boolean> {
+  if (!findSession(useChatStore.getState(), sessionId)) return false;
+  try {
+    const result = await drainQueuedSends(
+      tauriQueuedSendPort,
       sessionId,
-      next.rootTurnId,
+      async (content, rootTurnId) => {
+        await useChatStore.getState().sendMessage(content, sessionId, rootTurnId);
+      },
     );
-  }, 0);
-  return true;
+    for (const record of result.delivered) forgetQueuedMirror(sessionId, record.id);
+    if (result.failed) forgetQueuedMirror(sessionId, result.failed.record.id);
+    return result.delivered.length > 0;
+  } catch (error) {
+    // Every caller fires this from an event/startup path where a rejection
+    // would become an unhandled one. A failed claim leaves the durable rows
+    // untouched, so the next drain attempt still sees them.
+    reportQueuedRecoveryFailure(sessionId, error);
+    return false;
+  }
+}
+
+/// Recovery is best-effort by contract: it must never turn into a floating
+/// rejection that nobody awaits, and it must never be *silent* either — the
+/// message says which session kept its rows and why.
+function reportQueuedRecoveryFailure(sessionId: string, error: unknown) {
+  // eslint-disable-next-line no-console
+  console.warn(
+    `queued delivery recovery failed (non-fatal, rows kept): ${sessionId}`,
+    error,
+  );
+}
+
+/// App start / session open: restore the durable backlog into the UI and hand
+/// the first message over when the session is idle.
+async function resumeQueuedDelivery(sessionId: string): Promise<number> {
+  let rows: Awaited<ReturnType<typeof tauriQueuedSendPort.list>> = [];
+  try {
+    rows = await tauriQueuedSendPort.list(sessionId);
+  } catch {
+    return 0;
+  }
+  // A host that does not answer with rows (older backend, mocked bridge) means
+  // "nothing durable to restore", not a crash on the way into the session.
+  if (!Array.isArray(rows) || rows.length === 0) return 0;
+  useChatStore.setState((s) => {
+    const prev = s.runtime[sessionId] ?? freshRuntime();
+    const known = new Set(prev.queue.map((item) => item.id));
+    const restored = rows
+      .filter((row) => !known.has(row.id))
+      .map((row) => ({
+        id: row.id,
+        content: row.content,
+        enqueuedAt: row.createdAt,
+        rootTurnId: row.rootTurnId,
+      }));
+    if (restored.length === 0) return {};
+    return {
+      runtime: {
+        ...s.runtime,
+        [sessionId]: {
+          ...prev,
+          queue: [...restored, ...prev.queue],
+          revision: prev.revision + 1,
+        },
+      },
+    };
+  });
+  return rows.length;
+}
+
+/// Startup recovery (T3): sessions that still owe a delivery resume instead of
+/// forgetting, so a restart mid-queue loses nothing.
+export async function resumePendingQueuedDelivery(): Promise<void> {
+  let sessionIds: string[] = [];
+  try {
+    sessionIds = await sessionsOwingDelivery(tauriQueuedSendPort);
+  } catch {
+    return;
+  }
+  if (!Array.isArray(sessionIds) || sessionIds.length === 0) return;
+  for (const sessionId of sessionIds) {
+    if (!findSession(useChatStore.getState(), sessionId)) continue;
+    // One session that cannot restore must not stop the others from resuming.
+    try {
+      await resumeQueuedDelivery(sessionId);
+    } catch (error) {
+      reportQueuedRecoveryFailure(sessionId, error);
+      continue;
+    }
+    await drainNextQueuedMessage(sessionId);
+  }
 }
 
 /// Drop a trailing assistant bubble that never received anything. The steer
@@ -1595,7 +1705,11 @@ function handleStreamEvent(
     if (recoverUndeliveredSteers(sessionId, set, get)) {
       return; // it becomes the next turn — defer the queue drain and post-mortem
     }
-    if (drainNextQueuedMessage(sessionId, set, get)) {
+    // M236: the drain is a durable claim, so it is awaited instead of being
+    // decided from this renderer's in-memory queue. Post-mortem runs only when
+    // nothing was handed over.
+    void (async () => {
+    if (await drainNextQueuedMessage(sessionId)) {
       return; // more conversation coming — defer post-mortem
     }
 
@@ -1635,6 +1749,7 @@ function handleStreamEvent(
         }
       }
     }
+    })();
   }
 }
 

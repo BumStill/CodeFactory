@@ -13,6 +13,7 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 
 const invokeMock = vi.hoisted(() => vi.fn());
+import { queuedDispatchCommand, resetQueuedDispatch } from "./queuedDispatchTestBackend";
 
 vi.mock("./tauri", () => ({
   invoke: invokeMock,
@@ -105,8 +106,13 @@ function seed(input: {
 }
 
 beforeEach(() => {
+  resetQueuedDispatch();
   invokeMock.mockReset();
   invokeMock.mockImplementation(async (cmd: string, args?: Record<string, unknown>) => {
+    // M236: the pending queue is durable, so dispatch send reaches the queue
+    // commands before it answers `queued`.
+    const queued = queuedDispatchCommand(cmd, args);
+    if (queued.handled) return queued.value;
     if (cmd === "save_settings") return (args as { newSettings: Settings }).newSettings;
     if (cmd === "send_message" || cmd === "cancel_chat") return undefined;
     if (cmd === "update_session_model") {

@@ -13,7 +13,11 @@ import { UpdaterBanner } from "./components/UpdaterBanner";
 import { OnboardingWizard } from "./components/OnboardingWizard";
 import { useSettingsStore } from "./stores/settings";
 import { syncChatGptCatalog } from "./stores/chatgptCatalog";
-import { useChatStore, openSessionId } from "./stores/chat";
+import {
+  resumePendingQueuedDelivery,
+  useChatStore,
+  openSessionId,
+} from "./stores/chat";
 import { useAppNavigationStore } from "./stores/appNavigation";
 import { useAppDispatchBridge } from "./lib/useAppDispatchBridge";
 
@@ -53,6 +57,9 @@ export default function App() {
     let cancelled = false;
     void loadSessions()
       .then((sessions) => {
+        // M236/T3: a queue that survived a restart owes a delivery; resume it
+        // now instead of waiting for a settlement event that already happened.
+        void resumePendingQueuedDelivery().catch(() => {});
         if (cancelled) return;
         if (useChatStore.getState().draftSession || useChatStore.getState().activeSession) return;
         const latest = sessions[0];

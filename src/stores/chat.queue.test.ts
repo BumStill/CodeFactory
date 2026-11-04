@@ -11,7 +11,13 @@
 // auto-fire) — the IPC contract is covered separately in Rust tests.
 
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { useChatStore, QUEUE_MAX, freshRuntime, type SessionRuntime } from "./chat";
+import {
+  useChatStore,
+  QUEUE_MAX,
+  freshRuntime,
+  resumePendingQueuedDelivery,
+  type SessionRuntime,
+} from "./chat";
 import { reduceChatStreamEvent } from "./chatEvents";
 
 const streamMock = vi.hoisted(() => ({
@@ -19,6 +25,11 @@ const streamMock = vi.hoisted(() => ({
   onStream: vi.fn(),
 }));
 const invokeMock = vi.hoisted(() => vi.fn());
+import {
+  installQueuedDispatch,
+  resetQueuedDispatch,
+  queuedRows,
+} from "../lib/queuedDispatchTestBackend";
 vi.mock("../lib/tauri", () => ({
   invoke: invokeMock,
   onStream: streamMock.onStream,
@@ -78,8 +89,10 @@ function settle(
 describe("chat message queue (per-session)", () => {
   beforeEach(() => {
     resetStore();
+    resetQueuedDispatch();
     invokeMock.mockReset();
-    invokeMock.mockResolvedValue(undefined);
+    // M236: queueing is durable — route the queue commands at a real backend.
+    installQueuedDispatch(invokeMock);
     streamMock.handler = undefined;
     streamMock.onStream.mockReset();
     streamMock.onStream.mockImplementation(async (_sessionId, handler) => {
@@ -159,12 +172,55 @@ describe("chat message queue (per-session)", () => {
     expect(invokeMock).not.toHaveBeenCalledWith("send_message", expect.anything());
 
     settle("cancelled");
-    expect(q()).toHaveLength(0);
+    // M236: the drain is a durable claim + send handshake, so the mirror is
+    // updated on the next tick rather than synchronously.
     await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(q()).toHaveLength(0);
     expect(invokeMock).toHaveBeenCalledWith(
       "send_message",
       expect.objectContaining({ sessionId: SID, content: "queued after stop" }),
     );
+  });
+
+  // M236 recovery contract: restoration runs on paths nobody awaits (startup,
+  // session open, settlement), so a rejection there becomes an unhandled one
+  // and the user sees a broken app with no explanation. These two cases pin
+  // the "best effort, never silent, never lossy" behaviour of that path.
+  it("resumes on a bridge that answers nothing without rejecting", async () => {
+    invokeMock.mockImplementation(async () => undefined);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    await expect(resumePendingQueuedDelivery()).resolves.toBeUndefined();
+    expect(warn).not.toHaveBeenCalled();
+    expect(q()).toHaveLength(0);
+    warn.mockRestore();
+  });
+
+  it("keeps the durable row and reports when the claim bridge fails", async () => {
+    seed({ streaming: true });
+    await useChatStore.getState().sendOrQueue("survive a dead bridge");
+    expect(queuedRows()).toHaveLength(1);
+
+    const installed = invokeMock.getMockImplementation()!;
+    invokeMock.mockImplementation((async (command: string, args?: Record<string, unknown>) => {
+      if (command === "claim_next_queued_dispatch_message") {
+        throw new Error("bridge went away");
+      }
+      return (installed as (c: string, a?: Record<string, unknown>) => unknown)(command, args);
+    }) as never);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    seed({ streaming: false });
+    await expect(resumePendingQueuedDelivery()).resolves.toBeUndefined();
+
+    expect(warn).toHaveBeenCalledWith(
+      expect.stringContaining("rows kept"),
+      expect.any(Error),
+    );
+    // Neither lost nor duplicated: the message is still owed.
+    expect(queuedRows()).toHaveLength(1);
+    expect(queuedRows()[0].status).toBe("queued");
+    expect(q().map((item) => item.content)).toEqual(["survive a dead bridge"]);
+    warn.mockRestore();
   });
 
   it("only turn_settled flips streaming and clears a pending permission", () => {
@@ -284,6 +340,8 @@ describe("chat message queue (per-session)", () => {
     invokeMock.mockClear();
     streamMock.handler?.({ type: "done", input_tokens: 1, output_tokens: 2 });
     settle("completed");
+    // M236: the queue drain (claim → send → confirm) runs before post-mortem.
+    await new Promise((resolve) => setTimeout(resolve, 0));
 
     expect(invokeMock).toHaveBeenCalledWith("mine_cross_session_patterns", { cwd: "/proj" });
   });
