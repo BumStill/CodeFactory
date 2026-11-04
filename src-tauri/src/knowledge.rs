@@ -298,6 +298,46 @@ pub async fn ensure_schema(pool: &SqlitePool) -> crate::errors::Result<()> {
     ] {
         sqlx::query(index).execute(pool).await?;
     }
+    ensure_search_index(pool).await?;
+    Ok(())
+}
+
+/// Tokenize inside SQLite so direct writes, cascades and rollback maintain the
+/// same index as the scanner. No per-connection extension/UDF is required.
+fn fts_tokens_sql(value: &str) -> String {
+    format!(r#"(WITH RECURSIVE chars(rest, word, prev, tokens) AS (
+        SELECT coalesce({value}, '') || ' ', '', '', ''
+        UNION ALL
+        SELECT substr(rest, 2),
+          CASE WHEN substr(rest,1,1) GLOB '[a-zA-Z0-9_]' THEN word || lower(substr(rest,1,1)) ELSE '' END,
+          CASE WHEN (substr(rest,1,1) BETWEEN '一' AND '鿿' OR substr(rest,1,1) BETWEEN '㐀' AND '䶿' OR substr(rest,1,1) BETWEEN 'ぁ' AND 'ヿ' OR substr(rest,1,1) BETWEEN '가' AND '힣') THEN substr(rest,1,1) ELSE '' END,
+          tokens || CASE WHEN substr(rest,1,1) GLOB '[a-zA-Z0-9_]' THEN '' ELSE word || ' ' END ||
+          CASE WHEN (substr(rest,1,1) BETWEEN '一' AND '鿿' OR substr(rest,1,1) BETWEEN '㐀' AND '䶿' OR substr(rest,1,1) BETWEEN 'ぁ' AND 'ヿ' OR substr(rest,1,1) BETWEEN '가' AND '힣')
+            THEN substr(rest,1,1) || ' ' || CASE WHEN prev != '' THEN prev || substr(rest,1,1) || ' ' ELSE '' END ELSE '' END
+        FROM chars WHERE rest != ''
+    ) SELECT tokens FROM chars WHERE rest = '')"#)
+}
+
+async fn ensure_search_index(pool: &SqlitePool) -> crate::errors::Result<()> {
+    let mut tx = pool.begin().await?;
+    let exists: i64 = sqlx::query_scalar("SELECT count(*) FROM sqlite_master WHERE name='knowledge_fts' AND type='table'")
+        .fetch_one(&mut *tx).await?;
+    sqlx::query("CREATE VIRTUAL TABLE IF NOT EXISTS knowledge_fts USING fts5(body, title, filename, tokenize='unicode61 remove_diacritics 0')").execute(&mut *tx).await?;
+    // Index only the final component, not unrelated parent directory names.
+    let filename = "(WITH RECURSIVE p(s) AS (SELECT replace(d.path, char(92), '/') UNION ALL SELECT substr(s,instr(s,'/')+1) FROM p WHERE instr(s,'/')>0) SELECT s FROM p WHERE instr(s,'/')=0)";
+    let select = format!("SELECT c.rowid, {}, {}, {} FROM knowledge_chunks c JOIN knowledge_documents d ON d.id=c.document_id",
+        fts_tokens_sql("c.text"), fts_tokens_sql("coalesce(d.title,'') || ' ' || coalesce(c.heading,'')"),
+        fts_tokens_sql(filename));
+    for statement in [
+        format!("CREATE TRIGGER IF NOT EXISTS knowledge_fts_insert AFTER INSERT ON knowledge_chunks BEGIN INSERT INTO knowledge_fts(rowid,body,title,filename) {select} WHERE c.rowid=NEW.rowid; END"),
+        "CREATE TRIGGER IF NOT EXISTS knowledge_fts_delete AFTER DELETE ON knowledge_chunks BEGIN DELETE FROM knowledge_fts WHERE rowid=OLD.rowid; END".into(),
+        format!("CREATE TRIGGER IF NOT EXISTS knowledge_fts_update AFTER UPDATE ON knowledge_chunks BEGIN DELETE FROM knowledge_fts WHERE rowid=OLD.rowid; INSERT INTO knowledge_fts(rowid,body,title,filename) {select} WHERE c.rowid=NEW.rowid; END"),
+        format!("CREATE TRIGGER IF NOT EXISTS knowledge_fts_document AFTER UPDATE OF title,path ON knowledge_documents BEGIN DELETE FROM knowledge_fts WHERE rowid IN (SELECT rowid FROM knowledge_chunks WHERE document_id=NEW.id); INSERT INTO knowledge_fts(rowid,body,title,filename) {select} WHERE d.id=NEW.id; END"),
+    ] { sqlx::query(&statement).execute(&mut *tx).await?; }
+    if exists == 0 {
+        sqlx::query(&format!("INSERT INTO knowledge_fts(rowid,body,title,filename) {select}")).execute(&mut *tx).await?;
+    }
+    tx.commit().await?;
     Ok(())
 }
 
@@ -603,11 +643,12 @@ pub async fn search(
     let mut rows_query = String::from(
         "SELECT
             c.id AS chunk_id, c.document_id, c.chunk_index, c.text, c.page, c.slide, c.heading,
-            d.library_id, d.path, d.kind, d.title
-         FROM knowledge_chunks c
+            d.library_id, d.path, d.kind, d.title, bm25(knowledge_fts, 1.0, 8.0, 5.0) AS relevance
+         FROM knowledge_fts
+         JOIN knowledge_chunks c ON c.rowid = knowledge_fts.rowid
          JOIN knowledge_documents d ON d.id = c.document_id
          JOIN knowledge_libraries l ON l.id = d.library_id
-         WHERE d.status = 'indexed' AND l.enabled = 1",
+         WHERE knowledge_fts MATCH ? AND d.status = 'indexed' AND l.enabled = 1",
     );
     let library_ids = effective_library_ids(&query);
     if !library_ids.is_empty() {
@@ -619,7 +660,9 @@ pub async fn search(
         rows_query.push_str(" AND d.kind = ?");
     }
 
-    let mut q = sqlx::query(&rows_query);
+    rows_query.push_str(" ORDER BY relevance, d.path, c.chunk_index LIMIT ?");
+    let expression = terms.iter().map(|term| format!("\"{}\"", term.replace('"', "\"\""))).collect::<Vec<_>>().join(" OR ");
+    let mut q = sqlx::query(&rows_query).bind(expression);
     for library_id in &library_ids {
         q = q.bind(library_id);
     }
@@ -627,19 +670,14 @@ pub async fn search(
         q = q.bind(kind);
     }
 
+    q = q.bind(query.top_k.unwrap_or(8).clamp(1, 50) as i64);
     let rows = q.fetch_all(pool).await?;
     let mut results = Vec::new();
     for row in rows {
         let text: String = row.try_get("text")?;
         let path: String = row.try_get("path")?;
-        let haystack = format!("{} {}", text.to_lowercase(), path.to_lowercase());
-        let score = terms
-            .iter()
-            .map(|term| haystack.matches(term).count() as i64)
-            .sum::<i64>();
-        if score == 0 {
-            continue;
-        }
+        let relevance: f64 = row.try_get("relevance")?;
+        let score = (-relevance * 1_000_000_000.0).ceil().max(1.0) as i64;
         results.push(KnowledgeSearchResult {
             chunk_id: row.try_get("chunk_id")?,
             document_id: row.try_get("document_id")?,
@@ -655,14 +693,7 @@ pub async fn search(
             score,
         });
     }
-    results.sort_by(|a, b| {
-        b.score
-            .cmp(&a.score)
-            .then_with(|| a.path.cmp(&b.path))
-            .then_with(|| a.chunk_index.cmp(&b.chunk_index))
-    });
-    let top_k = query.top_k.unwrap_or(8).clamp(1, 50);
-    results.truncate(top_k);
+    // Keep SQLite's exact floating-point BM25 ordering; score is wire-compatible.
     record_retrieval_event(pool, &query, &results, started.elapsed().as_millis() as i64).await?;
     Ok(results)
 }
@@ -1229,15 +1260,29 @@ fn first_words(text: &str, max_words: usize) -> String {
         .join(" ")
 }
 
+fn is_cjk(ch: char) -> bool {
+    matches!(ch, '\u{3400}'..='\u{4dbf}' | '\u{4e00}'..='\u{9fff}' | '\u{3040}'..='\u{30ff}' | '\u{ac00}'..='\u{d7a3}')
+}
+
 fn query_terms(query: &str) -> Vec<String> {
-    query
-        .split_whitespace()
-        .map(|term| {
-            term.trim_matches(|c: char| !c.is_alphanumeric())
-                .to_lowercase()
-        })
-        .filter(|term| !term.is_empty())
-        .collect()
+    let chars: Vec<char> = query.chars().collect();
+    let mut terms = Vec::new();
+    let mut i = 0;
+    while i < chars.len() && terms.len() < 128 {
+        if is_cjk(chars[i]) {
+            let start = i;
+            while i < chars.len() && is_cjk(chars[i]) { i += 1; }
+            if i - start == 1 { terms.push(chars[start].to_string()); }
+            else { for pair in chars[start..i].windows(2).take(128 - terms.len()) { terms.push(pair.iter().collect()); } }
+        } else if chars[i].is_ascii_alphanumeric() || chars[i] == '_' {
+            let start = i;
+            while i < chars.len() && (chars[i].is_ascii_alphanumeric() || chars[i] == '_') { i += 1; }
+            terms.push(chars[start..i].iter().collect::<String>().to_ascii_lowercase());
+        } else { i += 1; }
+    }
+    terms.sort();
+    terms.dedup();
+    terms
 }
 
 fn effective_library_ids(query: &KnowledgeSearchQuery) -> Vec<String> {
@@ -1258,7 +1303,7 @@ fn effective_library_ids(query: &KnowledgeSearchQuery) -> Vec<String> {
 }
 
 fn make_snippet(text: &str, terms: &[String]) -> String {
-    let lower = text.to_lowercase();
+    let lower = text.to_ascii_lowercase();
     let first_match = terms
         .iter()
         .filter_map(|term| lower.find(term))
@@ -1274,7 +1319,30 @@ fn make_snippet(text: &str, terms: &[String]) -> String {
     while !text.is_char_boundary(safe_end) {
         safe_end -= 1;
     }
-    text[safe_start..safe_end].trim().to_string()
+    let fragment = text[safe_start..safe_end].trim();
+    // ASCII folding preserves UTF-8 byte offsets even beside non-ASCII text.
+    let folded = fragment.to_ascii_lowercase();
+    let mut ranges = Vec::new();
+    for term in terms {
+        for (start, _) in folded.match_indices(term) { ranges.push((start, start + term.len())); }
+    }
+    ranges.sort_unstable();
+    let mut merged: Vec<(usize, usize)> = Vec::new();
+    for (start, end) in ranges {
+        if let Some(last) = merged.last_mut() {
+            if start <= last.1 { last.1 = last.1.max(end); continue; }
+        }
+        merged.push((start, end));
+    }
+    let mut out = String::new();
+    let mut cursor = 0;
+    for (start, end) in merged {
+        out.push_str(&fragment[cursor..start]);
+        out.push('【'); out.push_str(&fragment[start..end]); out.push('】');
+        cursor = end;
+    }
+    out.push_str(&fragment[cursor..]);
+    out
 }
 
 async fn record_retrieval_event(
@@ -1322,6 +1390,87 @@ async fn record_retrieval_event(
 #[cfg(test)]
 mod tests {
     use std::io::Write;
+
+    async fn m192_fixture(pool: &sqlx::SqlitePool, id: &str, title: &str, text: &str) {
+        sqlx::query("INSERT OR IGNORE INTO knowledge_libraries (id,name,root_path,created_at) VALUES ('m192','synthetic','/synthetic/m192','now')").execute(pool).await.unwrap();
+        sqlx::query("INSERT INTO knowledge_documents (id,library_id,path,kind,hash,mtime,size,title,status,updated_at) VALUES (?,'m192',?,'pdf','hash',1,1,?,'indexed','now')")
+            .bind(id).bind(format!("/synthetic/m192/{id}.pdf")).bind(title).execute(pool).await.unwrap();
+        sqlx::query("INSERT INTO knowledge_chunks (id,document_id,chunk_index,content_type,text,page,heading,token_estimate) VALUES (?,?,0,'page',?,7,'来源标题',10)")
+            .bind(id).bind(id).bind(text).execute(pool).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn m192_cjk_mixed_highlight_and_lifecycle() {
+        let pool = memory_pool().await;
+        m192_fixture(&pool, "roadmap", "产品路线图", "历史方案描述产品路线图 Atlas RELEASE").await;
+        for query in ["历史方案里的产品路线图", "路线图 产品", "产品 不存在词", "atlas release", "ATLAS", "Atlas产品", "产"] {
+            let hits = search_hits(&pool, "m192", query).await;
+            assert_eq!(hits.len(), 1, "query: {query}");
+            assert_eq!(hits[0].page, Some(7));
+            assert_eq!(hits[0].heading.as_deref(), Some("来源标题"));
+            assert!(hits[0].snippet.contains('【'), "highlight: {:?}", hits[0]);
+            assert_eq!(hits[0].path, "/synthetic/m192/roadmap.pdf");
+        }
+        assert!(search_hits(&pool, "m192", "\" OR * : ()").await.is_empty());
+        let mut tx = pool.begin().await.unwrap();
+        sqlx::query("UPDATE knowledge_chunks SET text='替换词汇' WHERE id='roadmap'").execute(&mut *tx).await.unwrap();
+        tx.rollback().await.unwrap();
+        assert_eq!(search_hits(&pool, "m192", "Atlas").await.len(), 1);
+        sqlx::query("UPDATE knowledge_chunks SET text='替换词汇' WHERE id='roadmap'").execute(&pool).await.unwrap();
+        assert!(search_hits(&pool, "m192", "Atlas").await.is_empty());
+        assert_eq!(search_hits(&pool, "m192", "替换").await.len(), 1);
+        super::set_library_enabled(&pool, "m192", false).await.unwrap();
+        assert!(search_hits(&pool, "m192", "替换").await.is_empty());
+        super::set_library_enabled(&pool, "m192", true).await.unwrap();
+        sqlx::query("DELETE FROM knowledge_documents WHERE id='roadmap'").execute(&pool).await.unwrap();
+        assert!(search_hits(&pool, "m192", "替换").await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn m192_bm25_title_filename_and_length() {
+        let pool = memory_pool().await;
+        m192_fixture(&pool, "plain", "Other", &format!("roadmap {}", "unrelated ".repeat(300))).await;
+        m192_fixture(&pool, "short", "Other", "roadmap concise").await;
+        m192_fixture(&pool, "title", "roadmap", "concise content").await;
+        let hits = search_hits(&pool, "m192", "roadmap").await;
+        assert_eq!(hits[0].chunk_id, "title");
+        assert_eq!(hits[1].chunk_id, "short");
+        sqlx::query("UPDATE knowledge_documents SET title='Other', path='/synthetic/m192/roadmap.pdf' WHERE id='title'").execute(&pool).await.unwrap();
+        assert_eq!(search_hits(&pool, "m192", "roadmap").await[0].chunk_id, "title");
+    }
+
+    #[tokio::test]
+    async fn m192_migration_and_20k_p95() {
+        let pool = memory_pool().await;
+        m192_fixture(&pool, "legacy", "旧库", "产品路线图 migration").await;
+        // Simulate the pre-M192 schema without touching any production database.
+        let triggers: Vec<String> = sqlx::query_scalar("SELECT name FROM sqlite_master WHERE type='trigger' AND name LIKE 'knowledge_fts_%'").fetch_all(&pool).await.unwrap();
+        for name in triggers { sqlx::query(&format!("DROP TRIGGER {name}")).execute(&pool).await.unwrap(); }
+        sqlx::query("DROP TABLE IF EXISTS knowledge_fts").execute(&pool).await.unwrap();
+        super::ensure_schema(&pool).await.unwrap();
+        super::ensure_schema(&pool).await.unwrap();
+        assert_eq!(search_hits(&pool, "m192", "路线").await.len(), 1);
+        let mut tx = pool.begin().await.unwrap();
+        for i in 0..20_000 {
+            sqlx::query("INSERT INTO knowledge_chunks (id,document_id,chunk_index,content_type,text,token_estimate) VALUES (?,'legacy',?,'page',?,10)")
+                .bind(format!("bulk-{i}")).bind(i + 1).bind(format!("普通合成资料 reference number{i} {}", if i % 1000 == 0 { "目标检索" } else { "背景说明" }))
+                .execute(&mut *tx).await.unwrap();
+        }
+        tx.commit().await.unwrap();
+        let mut timings = Vec::new();
+        for i in 0..40 {
+            let start = std::time::Instant::now();
+            let hits = search_hits(&pool, "m192", if i % 2 == 0 { "目标检索" } else { "number17123" }).await;
+            assert!(!hits.is_empty());
+            timings.push(start.elapsed().as_millis());
+        }
+        timings.sort_unstable();
+        assert!(timings[37] < 200, "20k search p95={}ms", timings[37]);
+        let plan: Vec<sqlx::sqlite::SqliteRow> = sqlx::query("EXPLAIN QUERY PLAN SELECT rowid FROM knowledge_fts WHERE knowledge_fts MATCH '目标'").fetch_all(&pool).await.unwrap();
+        use sqlx::Row;
+        assert!(plan.iter().any(|r| r.get::<String,_>("detail").contains("VIRTUAL TABLE INDEX")));
+    }
+
 
     use sqlx::sqlite::SqlitePoolOptions;
     use uuid::Uuid;
