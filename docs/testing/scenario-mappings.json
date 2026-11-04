@@ -26,6 +26,11 @@
     { "pattern": "src-tauri/src/startup_recovery.rs", "scenario_id": "HLT-001" },
     { "pattern": "src-tauri/src/startup_recovery.rs", "scenario_id": "HLT-004" },
     { "pattern": "src-tauri/src/agent/thin.rs", "scenario_id": "HLT-001" },
-    { "pattern": "src-tauri/src/tools/update_plan.rs", "scenario_id": "HLT-001" }
+    { "pattern": "src-tauri/src/tools/update_plan.rs", "scenario_id": "HLT-001" },
+    { "pattern": "src-tauri/src/commands/queued_delivery.rs", "scenario_id": "CXD-002" },
+    { "pattern": "src-tauri/src/commands/mod.rs", "scenario_id": "CXD-002" },
+    { "pattern": "src/lib/queuedSend.ts", "scenario_id": "CXD-002" },
+    { "pattern": "src/lib/queuedDispatchTestBackend.ts", "scenario_id": "CXD-002" },
+    { "pattern": "src-tauri/src/agent/background_tasks.rs", "scenario_id": "RTE-005" }
   ]
 }

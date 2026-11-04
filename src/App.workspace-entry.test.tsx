@@ -75,6 +75,8 @@ vi.mock("./stores/chat", async () => {
   return {
     useChatStore,
     openSessionId: (s: FakeChatState) => s.draftSession?.id ?? s.activeSession?.id ?? null,
+    // M236: app start resumes a queue that survived a restart.
+    resumePendingQueuedDelivery: async () => {},
   };
 });
 vi.mock("./stores/chatgptCatalog", () => ({ syncChatGptCatalog: vi.fn() }));
