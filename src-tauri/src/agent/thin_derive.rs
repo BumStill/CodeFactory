@@ -22,6 +22,12 @@ async fn ensure_external(db: &SqlitePool) -> sqlx::Result<()> {
         sqlx::query("ALTER TABLE thin_external_observations ADD COLUMN next_check_at INTEGER NOT NULL DEFAULT 0")
             .execute(db).await?;
     }
+    if !has_column(db, "thin_external_observations", "failure_keys").await? {
+        sqlx::query("ALTER TABLE thin_external_observations ADD COLUMN failure_keys TEXT")
+            .execute(db).await?;
+    }
+    sqlx::query("CREATE TABLE IF NOT EXISTS thin_pr_failure_wakes(session_id TEXT NOT NULL,pr_number INTEGER NOT NULL,event_key TEXT NOT NULL,PRIMARY KEY(session_id,pr_number,event_key))")
+        .execute(db).await?;
     Ok(())
 }
 
@@ -205,25 +211,73 @@ fn completion_reason(pr: &serde_json::Value, ceiling: &str, released: bool, numb
     Some(format!("PR #{number} 已合并"))
 }
 
+fn failed_checks(pr: &serde_json::Value) -> Vec<&serde_json::Value> {
+    pr["statusCheckRollup"].as_array().into_iter().flatten().filter(|check| {
+        matches!(check["conclusion"].as_str(), Some("FAILURE" | "TIMED_OUT" | "CANCELLED" | "ACTION_REQUIRED" | "STARTUP_FAILURE" | "STALE"))
+            || matches!(check["state"].as_str(), Some("FAILURE" | "ERROR"))
+    }).collect()
+}
+
+fn blocked_comment(pr: &serde_json::Value) -> Option<&str> {
+    if completion_reason(pr, "ThroughMerge", false, 0).is_some() { return None; }
+    // Queue markers identify the head they rejected. Old comments must not
+    // make a repaired/new head fail again after the blocked label is lifted.
+    pr["comments"].as_array()?.iter().rev().filter_map(|c| c["body"].as_str()).find(|body| {
+        body.contains("<!-- merge-queue:blocked") && (!body.contains("head=")
+            || pr["headRefOid"].as_str().is_some_and(|head| body.contains(&format!("head={head}"))))
+    })
+}
+
 fn failure_reason(pr: &serde_json::Value, number: i64) -> Option<String> {
     if pr["state"] == "CLOSED" { return Some(format!("PR #{number} 已关闭但未合并")); }
     if pr["state"] != "OPEN" { return None; }
-    // M146/R4：冲突和被合并队列退回同样是「需要会话处理」的事实，必须带原因唤醒。
-    if matches!(pr["mergeable"].as_str(), Some("CONFLICTING"))
-        || matches!(pr["mergeStateStatus"].as_str(), Some("DIRTY")) {
-        return Some(format!("PR #{number} 存在合并冲突（mergeable=CONFLICTING），需要解决冲突后重新交付"));
+    let failed: Vec<String> = failed_checks(pr).iter().map(|check| {
+        let name = check["name"].as_str().or(check["context"].as_str()).unwrap_or("未知检查");
+        let detail = check["detailsUrl"].as_str().or(check["targetUrl"].as_str())
+            .filter(|s| !s.is_empty()).unwrap_or_else(|| check["conclusion"].as_str().or(check["state"].as_str()).unwrap_or("失败"));
+        format!("{name} ({detail})")
+    }).collect();
+    let comment = blocked_comment(pr);
+    let blocked = pr["labels"].as_array().is_some_and(|labels| labels.iter().any(|l| l["name"] == "merge-queue: blocked"));
+    let conflict = pr["mergeable"] == "CONFLICTING" || pr["mergeStateStatus"] == "DIRTY";
+    let mut parts = Vec::new();
+    if conflict { parts.push("存在合并冲突（mergeable=CONFLICTING）".to_string()); }
+    if blocked || comment.is_some() { parts.push("被合并队列退回（merge-queue: blocked）".to_string()); }
+    if !failed.is_empty() { parts.push(format!("检查失败：{}", failed.join("、"))); }
+    if let Some(body) = comment { parts.push(body.chars().take(2000).collect()); }
+    (!parts.is_empty()).then(|| format!("PR #{number} {}", parts.join("；")))
+}
+
+fn failure_event_keys(pr: &serde_json::Value) -> Vec<String> {
+    if !matches!(pr["state"].as_str(), Some("OPEN" | "CLOSED")) { return Vec::new(); }
+    let head = pr["headRefOid"].as_str().unwrap_or("unknown-head");
+    if pr["state"] == "CLOSED" { return vec![format!("{head}:closed")]; }
+    let mut keys: Vec<String> = failed_checks(pr).iter().map(|c| {
+        let name = c["name"].as_str().or(c["context"].as_str()).unwrap_or("未知检查");
+        format!("{head}:check:{name}")
+    }).collect();
+    if keys.is_empty() {
+        if pr["state"] == "CLOSED" { keys.push(format!("{head}:closed")); }
+        else if failure_reason(pr, 0).is_some() { keys.push(format!("{head}:queue-or-conflict")); }
     }
-    let labels: Vec<&str> = pr["labels"].as_array().map(|labels| {
-        labels.iter().filter_map(|label| label["name"].as_str()).collect()
-    }).unwrap_or_default();
-    if labels.iter().any(|name| *name == "merge-queue: blocked") {
-        return Some(format!("PR #{number} 被合并队列退回（merge-queue: blocked），需要按退回原因修复后重新排队"));
+    keys.sort();
+    keys.dedup();
+    keys
+}
+
+async fn apply_pr_observation(db: &SqlitePool, session: &str, number: i64, ceiling: &str, pr: &serde_json::Value, released: bool) -> sqlx::Result<()> {
+    let reason = failure_reason(pr, number).or_else(|| completion_reason(pr, ceiling, released, number));
+    let keys = failure_event_keys(pr);
+    let mut unseen = false;
+    for key in &keys {
+        let seen: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM thin_pr_failure_wakes WHERE session_id=? AND pr_number=? AND event_key=?")
+            .bind(session).bind(number).bind(key).fetch_one(db).await?;
+        unseen |= seen == 0;
     }
-    let failed: Vec<&str> = pr["statusCheckRollup"].as_array()?.iter().filter(|check| {
-        matches!(check["conclusion"].as_str(), Some("FAILURE" | "TIMED_OUT" | "CANCELLED" | "ACTION_REQUIRED" | "STARTUP_FAILURE" | "STALE"))
-            || matches!(check["state"].as_str(), Some("FAILURE" | "ERROR"))
-    }).map(|check| check["name"].as_str().or(check["context"].as_str()).unwrap_or("未知检查")).collect();
-    (!failed.is_empty()).then(|| format!("PR #{number} 检查失败：{}", failed.join("、")))
+    apply_observation(db, session, number, ceiling, reason.as_deref(), merged_at_millis(pr)).await?;
+    sqlx::query("UPDATE thin_external_observations SET failure_keys=?,closeout_queued=CASE WHEN ? THEN 0 WHEN ? THEN 1 ELSE closeout_queued END WHERE session_id=? AND pr_number=?")
+        .bind(serde_json::to_string(&keys).unwrap()).bind(unseen).bind(!keys.is_empty()).bind(session).bind(number).execute(db).await?;
+    Ok(())
 }
 
 fn is_external_failure(reason: &str) -> bool {
@@ -539,9 +593,8 @@ pub(crate) async fn heartbeat_external(db: &SqlitePool, session: &str) -> sqlx::
     if claimed {
         let observe_ceiling = ceiling.clone();
         let observed = tokio::task::spawn_blocking(move || {
-            let raw = observe_command(&cwd, &["pr", "view", &number.to_string(), "--json", "state,mergeCommit,mergedAt,mergeable,mergeStateStatus,labels,statusCheckRollup"])?;
+            let raw = observe_command(&cwd, &["pr", "view", &number.to_string(), "--json", "state,headRefOid,comments,mergeCommit,mergedAt,mergeable,mergeStateStatus,labels,statusCheckRollup"])?;
             let pr: serde_json::Value = serde_json::from_str(&raw).ok()?;
-            let merged_at = merged_at_millis(&pr);
             let released = if matches!(observe_ceiling.as_str(), "ThroughRelease" | "through_release") && pr["state"] == "MERGED" {
                 // 不把任意最新版本当作本 PR 的版本：必须确认 merge commit 被已发布 tag 包含。
                 let release = observe_command(&cwd, &["api", "repos/{owner}/{repo}/releases/latest"])?;
@@ -553,10 +606,10 @@ pub(crate) async fn heartbeat_external(db: &SqlitePool, session: &str) -> sqlx::
                 let comparison: serde_json::Value = serde_json::from_str(&comparison).ok()?;
                 matches!(comparison["status"].as_str(), Some("ahead" | "identical"))
             } else { false };
-            Some((failure_reason(&pr, number).or_else(|| completion_reason(&pr, &observe_ceiling, released, number)), merged_at))
+            Some((pr, released))
         }).await.ok().flatten();
-        if let Some((reason, merged_at)) = observed {
-            apply_observation(db, session, number, &ceiling, reason.as_deref(), merged_at).await?;
+        if let Some((pr, released)) = observed {
+            apply_pr_observation(db, session, number, &ceiling, &pr, released).await?;
         }
     }
     let pending: Option<(Option<String>, Option<i64>)> = sqlx::query_as(
@@ -581,6 +634,10 @@ pub(crate) async fn heartbeat_external(db: &SqlitePool, session: &str) -> sqlx::
             if !closeout_slot_free(db, at).await? { return Ok(()); }
         }
     }
+    queue_observed_wake(db, session, number, &reason, at).await
+}
+
+async fn queue_observed_wake(db: &SqlitePool, session: &str, number: i64, reason: &str, at: i64) -> sqlx::Result<()> {
     {
         super::background_tasks::wake_source_cover(db, session).await;
         // 同一事务写唤醒与去重事实，不留下“标记成功但没排唤醒”的崩溃窗口。
@@ -588,12 +645,18 @@ pub(crate) async fn heartbeat_external(db: &SqlitePool, session: &str) -> sqlx::
         let queued = sqlx::query("UPDATE thin_external_observations SET closeout_queued=1 WHERE session_id=? AND closeout_queued=0")
             .bind(session).execute(&mut *tx).await?.rows_affected() == 1;
         if queued {
+            let keys: Option<String> = sqlx::query_scalar("SELECT failure_keys FROM thin_external_observations WHERE session_id=?")
+                .bind(session).fetch_one(&mut *tx).await?;
+            for key in keys.as_deref().and_then(|raw| serde_json::from_str::<Vec<String>>(raw).ok()).unwrap_or_default() {
+                sqlx::query("INSERT OR IGNORE INTO thin_pr_failure_wakes(session_id,pr_number,event_key) VALUES (?,?,?)")
+                    .bind(session).bind(number).bind(key).execute(&mut *tx).await?;
+            }
             let failed = is_external_failure(&reason);
             let prefix = if failed { "thin-repair" } else { "thin-closeout" };
             let prompt = if reason.contains("检查已全绿") {
                 format!("{reason}。系统自动重试/自愈：核对必需检查与交付授权，满足条件后标记 merge-queue: armed，由合并队列合并并继续监视；不要手工合并。")
             } else if failed {
-                format!("{reason}。系统自动重试/自愈：诊断失败检查，修复后在同一分支重新交付并继续监视；PR 关闭时先核查原因再恢复交付。不向用户询问是否继续监视。")
+                format!("{reason}。系统自动重试/自愈：诊断失败检查，修复后在同一分支重新交付并继续监视；修到当前 head 必需检查全绿后移除 merge-queue: blocked，重新标记 merge-queue: armed，由队列合并，不得结束成已交付；PR 关闭时先核查原因再恢复交付。不向用户询问是否继续监视。")
             } else {
                 format!("{reason}，交付外部事项已完成。现在执行任务模板 §8 收尾：确认合并与 squash commit、检查并清理远端分支、检查本地未提交/未推送状态、清理本任务产物与后台进程，然后给出收尾回答。不要重复交付；若已无事可做直接报告完成。")
             };
@@ -3063,6 +3126,70 @@ mod tests {
             .execute(&db).await.unwrap();
         let state = refresh(&db, "derive").await.unwrap();
         assert_ne!(state.state, SessionState::Running, "没有回合在跑就不能显示 running（{:?}）", state.reason);
+    }
+
+    #[tokio::test]
+    async fn m229_pending_to_blocked_wakes_once_and_new_head_rearms() {
+        let db = fixture().await;
+        ensure_external(&db).await.unwrap();
+        super::super::background_tasks::ensure_wake_schema(&db).await.unwrap();
+        sqlx::query("INSERT INTO thin_delivery_refs VALUES ('derive','synthetic',91,'ThroughMerge')").execute(&db).await.unwrap();
+        sqlx::query("INSERT INTO thin_external_observations(session_id,pr_number,ceiling) VALUES ('derive',91,'ThroughMerge')").execute(&db).await.unwrap();
+        let mut pr = serde_json::json!({"state":"OPEN","headRefOid":"head-a","labels":[{"name":"merge-queue: armed"}],"statusCheckRollup":[{"name":"check-rust","status":"IN_PROGRESS"}]});
+        apply_pr_observation(&db, "derive", 91, "ThroughMerge", &pr, false).await.unwrap();
+        let reason: Option<String> = sqlx::query_scalar("SELECT completed_reason FROM thin_external_observations WHERE session_id='derive'").fetch_one(&db).await.unwrap();
+        assert!(reason.is_none());
+        pr["labels"] = serde_json::json!([{"name":"merge-queue: blocked"}]);
+        pr["statusCheckRollup"] = serde_json::json!([{"name":"check-rust","status":"COMPLETED","conclusion":"FAILURE","detailsUrl":"https://example.invalid/runs/19"}]);
+        for expected in [1_i64, 1] {
+            apply_pr_observation(&db, "derive", 91, "ThroughMerge", &pr, false).await.unwrap();
+            let reason = failure_reason(&pr, 91).unwrap();
+            queue_observed_wake(&db, "derive", 91, &reason, 180_000).await.unwrap();
+            let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM wakeup_schedules WHERE id LIKE 'thin-repair-%'").fetch_one(&db).await.unwrap();
+            assert_eq!(count, expected);
+        }
+        let prompt: String = sqlx::query_scalar("SELECT prompt FROM wakeup_schedules WHERE id LIKE 'thin-repair-%'").fetch_one(&db).await.unwrap();
+        assert!(prompt.contains("check-rust") && prompt.contains("https://example.invalid/runs/19"));
+        assert!(prompt.contains("全绿后移除 merge-queue: blocked") && prompt.contains("merge-queue: armed"));
+        assert_ne!(derive_state(&db, "derive").await.unwrap().state, SessionState::Ended);
+        // Even a changed queue summary/run URL must not repeat this check/head.
+        pr["statusCheckRollup"][0]["detailsUrl"] = serde_json::json!("https://example.invalid/runs/20");
+        apply_pr_observation(&db, "derive", 91, "ThroughMerge", &pr, false).await.unwrap();
+        let queued: i64 = sqlx::query_scalar("SELECT closeout_queued FROM thin_external_observations WHERE session_id='derive'").fetch_one(&db).await.unwrap();
+        assert_eq!(queued, 1);
+        pr["headRefOid"] = serde_json::json!("head-b");
+        apply_pr_observation(&db, "derive", 91, "ThroughMerge", &pr, false).await.unwrap();
+        queue_observed_wake(&db, "derive", 91, &failure_reason(&pr, 91).unwrap(), 360_000).await.unwrap();
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM wakeup_schedules WHERE id LIKE 'thin-repair-%'").fetch_one(&db).await.unwrap();
+        assert_eq!(count, 2, "a new head must get a fresh repair turn");
+        let keys: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM thin_pr_failure_wakes").fetch_one(&db).await.unwrap();
+        assert_eq!(keys, 2);
+    }
+
+    #[test]
+    fn m229_queue_drop_includes_failed_check_and_run() {
+        let pr = serde_json::json!({"state":"OPEN","headRefOid":"head-a","labels":[{"name":"merge-queue: blocked"}],"statusCheckRollup":[{"name":"check-rust","status":"COMPLETED","conclusion":"FAILURE","detailsUrl":"https://example.invalid/runs/17"}]});
+        let reason = failure_reason(&pr, 91).unwrap();
+        assert!(reason.contains("check-rust"), "{reason}");
+        assert!(reason.contains("https://example.invalid/runs/17"), "{reason}");
+    }
+
+    #[test]
+    fn m229_comment_and_cancelled_and_closed_are_repair_events() {
+        let comment = serde_json::json!({"state":"OPEN","comments":[{"body":"<!-- merge-queue:blocked --> required check scenario-gate-pr failed"}],"statusCheckRollup":[]});
+        let reason = failure_reason(&comment, 91).expect("queue comment must wake");
+        assert!(reason.contains("scenario-gate-pr"));
+        let cancelled = serde_json::json!({"state":"OPEN","statusCheckRollup":[{"name":"check-rust","conclusion":"CANCELLED","detailsUrl":"https://example.invalid/runs/18"}]});
+        assert!(failure_reason(&cancelled, 91).unwrap().contains("https://example.invalid/runs/18"));
+        assert!(failure_reason(&serde_json::json!({"state":"CLOSED"}), 91).unwrap().contains("未合并"));
+        let mut closed = cancelled.clone();
+        closed["state"] = serde_json::json!("CLOSED");
+        assert_ne!(failure_event_keys(&closed), failure_event_keys(&cancelled));
+        let repaired = serde_json::json!({"state":"OPEN","headRefOid":"head-new","labels":[],"comments":[{"body":"<!-- merge-queue:blocked head=head-old --> check-rust failed"}],"statusCheckRollup":[{"name":"check-rust","status":"COMPLETED","conclusion":"SUCCESS"}]});
+        assert!(failure_reason(&repaired, 91).is_none(), "old comments cannot block a green repaired head");
+        for empty in [serde_json::json!({}), serde_json::json!({"state":"OPEN","statusCheckRollup":[]})] {
+            assert!(completion_reason(&empty, "ThroughMerge", false, 91).is_none());
+        }
     }
 
     /// M146/R4：PR 冲突或被合并队列退回复活会话也要带原因唤醒。
