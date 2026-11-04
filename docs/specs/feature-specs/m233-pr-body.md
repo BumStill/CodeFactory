@@ -21,7 +21,9 @@
 - pnpm test：163 个文件、1089 项通过（含 lightModeAudit）。
 - pnpm build：通过。
 - pnpm test:startup-session:headless：通过；截图在系统临时目录 codefactory-startup-session-headless/with-history.png、history-continue.png、empty.png；未改 UI 布局。
-- Rust：CARGO_TARGET_DIR="$PWD/.codefactory-cache/cargo-target-m233" cargo test --manifest-path src-tauri/Cargo.toml --workspace --no-fail-fast；最终结果待追加。
+- Rust：CARGO_TARGET_DIR="$PWD/.codefactory-cache/cargo-target-m233" cargo test --manifest-path src-tauri/Cargo.toml --workspace --no-fail-fast；完整运行通过，包含防闪窗、历史恢复和知识库回归。
+- 320 会话/工作目录 + 真实慢 git 替身独立测量：setup_return_and_query_ms=0（毫秒精度），background_total_ms=10474；只证明共享后台启动器与查询响应，不冒充完整正常 setup 性能。
+- 实际应用 cargo build 成功后从 /tmp 执行 --history-session-smoke，机器断言 ok、same_objective、second_restart_stayed_cancelled 全为 true。
 - node --test scripts/startup-responsiveness.test.mjs：2/2 通过。
 - 治理基线通过；最终 PR body 将经 scenario --ci 和 README contract 双检查。
 
