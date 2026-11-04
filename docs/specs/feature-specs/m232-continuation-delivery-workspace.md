@@ -21,6 +21,6 @@ Release-Urgency: immediate
 ## Implementation Notes
 - 交付在任何 Git/远端副作用之前，根据本次 root turn/task 的 objective 登记解析并验证 cwd；不使用会话最新工作区猜测，不允许参数传入任意目录，不移动或接管未登记的嵌套 worktree。
 - thin 与 durable 共用入口路由；显式 off 和 release_only 保持原语义。
-- R1/R2：真实 Git 工作区 + synthetic forge 测试；R3：复跑 M226 快照/收尾隔离测试；R4：验证分支错误提示包含当前目标与重试动作。
+- R1/R2：真实 Git 工作区 + synthetic forge 测试；R3：复跑 M226 快照/收尾隔离测试；R4：验证错误提示包含当前目标及系统自动恢复步骤。
 - Harness：Spec、Compatibility、Observation、Release（仅合并交付，不发版）、AI Collaboration。
 - 真机验收由编排方发版后完成：安装新版本，上一单合并后通过 @spec: 发起第二单，确认工具 cwd/分支、新 PR 和旧 PR 无副作用，并确认上一单收尾不影响第二单。

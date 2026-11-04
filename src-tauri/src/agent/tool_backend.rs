@@ -1373,7 +1373,13 @@ impl DesktopToolBackend {
         // before any repository-local mutation reaches the receipt/dispatch
         // boundary. This second fence also covers a ReviewOnly turn that was
         // steered to Implement after the AgentLoop had already started.
-        if !is_task && requires_managed_git_workspace(&call.function.name) {
+        // M232: delivery resolves and verifies the current Objective's registered
+        // workspace itself before either engine can mutate Git. Checking the
+        // loop's stale cwd here would mark the valid new workspace incident
+        // before that routing runs. Other local mutations keep this fence.
+        if !is_task && requires_managed_git_workspace(&call.function.name)
+            && call.function.name != "deliver_changes"
+        {
             let objective_id = sqlx::query_scalar::<_, Option<String>>(
                 "SELECT objective_id FROM chat_turn_state WHERE root_turn_id=?",
             )
@@ -3284,6 +3290,34 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(receipts, 0);
+    }
+
+    #[tokio::test]
+    async fn m232_delivery_preflight_allows_objective_workspace_routing_from_stale_cwd() {
+        let backend = objective_backend(false).await;
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        std::fs::create_dir_all(&source).unwrap();
+        init_local_git_repo(&source);
+        let workspace = super::super::execution_workspace::allocate_or_attach(
+            &backend.db,
+            super::super::execution_workspace::ExecutionWorkspaceRequest {
+                objective_id: TEST_OBJECTIVE_ID.into(), session_id: Some(TEST_SESSION_ID.into()),
+                source_cwd: source.clone(), workspace_container: temp.path().join("managed"),
+                process_instance: "synthetic-m232".into(),
+            },
+        ).await.unwrap();
+        let args = serde_json::json!({"title":"fix: continue current task"});
+        let call = call_with_args("m232-routing", "deliver_changes", &args);
+        register_tool_call(&backend, &call, &args).await;
+        let (command, kind) = backend.classify(&call, &args);
+        let admission = backend.mutation_preflight(&call, &args, &objective_ctx(&source),
+            &command, kind, false).await.unwrap();
+        assert!(matches!(admission, MutationAdmission::Dispatch { .. }),
+            "delivery must reach its objective-aware routing before cwd verification");
+        super::super::execution_workspace::verify_objective_workspace(&backend.db,
+            TEST_OBJECTIVE_ID, &workspace.worktree_path).await.unwrap();
+        assert!(!source.join("second.txt").exists());
     }
 
     #[tokio::test]

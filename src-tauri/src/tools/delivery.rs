@@ -98,6 +98,39 @@ pub fn definition() -> ToolDefinition {
     }
 }
 
+pub(crate) async fn objective_delivery_cwd(ctx: &ExecCtx) -> Result<std::path::PathBuf> {
+    let Some(db) = &ctx.db else { return Ok(ctx.cwd.clone()); };
+    let (objective_id, _) = durable_objective_identity(db, ctx).await?;
+    crate::agent::execution_workspace::ensure_schema(db).await
+        .map_err(|error| crate::errors::AppError::Other(error.to_string()))?;
+    let path: Option<String> = sqlx::query_scalar(
+        "SELECT worktree_path FROM execution_workspaces WHERE objective_id=?",
+    ).bind(&objective_id).fetch_optional(db).await?;
+    let Some(path) = path else {
+        // Task-run workspaces have their own admission/identity checks. Never
+        // guess another Objective's workspace from session recency or a branch.
+        if ctx.task_id.is_some() { return Ok(ctx.cwd.clone()); }
+        return Err(crate::errors::AppError::ToolArgument(format!(
+            "当前 objective {objective_id} 尚未登记交付工作区；未执行 Git/PR 操作。系统自动重试/自愈：通过当前任务的执行入口重新分配工作区，在该工作区保留并验证改动后重试 deliver_changes；不要提交到上一单已合并分支，也不要询问用户选择技术身份。")));
+    };
+    let path = std::path::PathBuf::from(path);
+    let workspace = crate::agent::execution_workspace::verify_objective_workspace(db, &objective_id, &path)
+        .await.map_err(|error| crate::errors::AppError::ToolArgument(format!(
+            "当前 objective {objective_id} 的登记工作区 {} 无法验证：{error}。未执行 Git/PR 操作；系统自动重试/自愈：只读核对该目录的 git status 与 git branch --show-current，修复登记身份后在本任务工作区重试 deliver_changes，不得提交到上一单分支。", path.display())))?;
+    if let Some(session) = ctx.session_id.as_deref() {
+        if workspace.session_id.as_deref() != Some(session) {
+            return Err(crate::errors::AppError::ToolArgument(
+                "当前 objective 的工作区不属于本会话；未执行交付。系统自动重试/自愈：重新载入当前 root turn 的 objective/workspace 映射后重试，不得接管其他会话工作区。".into()));
+        }
+    }
+    Ok(workspace.worktree_path)
+}
+
+#[cfg(test)]
+pub(crate) fn m232_deliver_fixture(cwd: &std::path::Path) -> Value {
+    super::delivery_thin::m232_deliver_fixture(cwd)
+}
+
 pub async fn execute(args: Value, ctx: &ExecCtx) -> Result<ToolOutput> {
     match execute_inner(args, ctx).await {
         Err(crate::errors::AppError::ToolArgument(message)) => Ok(ToolOutput::err(message)),
@@ -214,6 +247,19 @@ async fn execute_inner(args: Value, ctx: &ExecCtx) -> Result<ToolOutput> {
         .await;
         return Ok(tool_output_for_outcome(&outcome));
     }
+
+    // M232: after argument/authorization checks and release-only handling,
+    // route both delivery engines to this turn's registered Objective workspace.
+    let routed = ExecCtx {
+        cwd: objective_delivery_cwd(ctx).await?,
+        #[cfg(not(test))]
+        app: ctx.app.clone(),
+        db: ctx.db.clone(), session_id: ctx.session_id.clone(),
+        root_turn_id: ctx.root_turn_id.clone(), task_id: ctx.task_id.clone(),
+        outer_receipt_id: ctx.outer_receipt_id.clone(), mutation_permit: ctx.mutation_permit.clone(),
+        knowledge_library_ids: ctx.knowledge_library_ids.clone(), settings: ctx.settings.clone(),
+    };
+    let ctx = &routed;
 
     if let (Some(db), Some(session_id)) = (&ctx.db, &ctx.session_id) {
         if crate::agent::thin::is_thin(db, session_id).await {
@@ -1192,7 +1238,7 @@ async fn prepare_durable_run(
         .map_err(crate::errors::AppError::ToolArgument)?;
     if expected_branch.is_some_and(|expected| expected != repo.branch) {
         return Err(crate::errors::AppError::ToolArgument(format!(
-            "expect_branch 不匹配当前交付分支 {}；未执行交付，请核对后重试。", repo.branch)));
+            "expect_branch 不匹配当前 objective 的交付分支 {}；未执行交付。系统自动重试/自愈：在登记工作区核对 git status 和 git branch --show-current，使用 expect_branch={} 重试 deliver_changes；不得切回上一单已合并分支。", repo.branch, repo.branch)));
     }
     let identity =
         delivery::capture_delivery_identity(&repo).map_err(crate::errors::AppError::Other)?;

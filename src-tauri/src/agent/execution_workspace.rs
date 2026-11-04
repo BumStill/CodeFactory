@@ -5908,6 +5908,64 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn m232_delivery_routes_current_objective_not_previous_merged_workspace() {
+        let (_temp, root, _remote, container) = init_repo();
+        let pool = pool_with_objectives(&["previous", "current"]).await;
+        let old = allocate_or_attach(&pool, request_for_session(&root, &container,
+            "previous", "same-session", "old-process")).await.unwrap();
+        record_terminal_merge_receipt(&pool, &old).await;
+        let old_head = git(&old.worktree_path, &["rev-parse", "HEAD"]);
+        let new = allocate_or_attach(&pool, request_for_session(&root, &container,
+            "current", "same-session", "new-process")).await.unwrap();
+        assert_ne!(old.worktree_path, new.worktree_path);
+        std::fs::write(new.worktree_path.join("second.txt"), "second task\n").unwrap();
+        sqlx::query("CREATE TABLE chat_turn_state(root_turn_id TEXT, objective_id TEXT, task_segment_id TEXT)")
+            .execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO chat_turn_state VALUES ('second-turn','current',NULL)")
+            .execute(&pool).await.unwrap();
+        let mut ctx = crate::tools::ExecCtx::new(old.worktree_path.clone(), Some(pool.clone()));
+        ctx.session_id = Some("same-session".into());
+        ctx.root_turn_id = Some("second-turn".into());
+        let cwd = crate::tools::delivery::objective_delivery_cwd(&ctx).await.unwrap();
+        assert_eq!(cwd.canonicalize().unwrap(), new.worktree_path.canonicalize().unwrap(),
+            "deliver_changes must route away from the already merged branch");
+        assert_eq!(git(&cwd, &["branch", "--show-current"]), new.branch_name);
+        assert!(cwd.join("second.txt").is_file());
+        let delivered = crate::tools::delivery::m232_deliver_fixture(&cwd);
+        assert_eq!(delivered["branch"], new.branch_name);
+        assert_eq!(delivered["pr_number"], 43);
+        assert_ne!(git(&cwd, &["rev-parse", "HEAD"]), old_head);
+        assert_eq!(git(&old.worktree_path, &["rev-parse", "HEAD"]), old_head);
+        let old_pr: i64 = sqlx::query_scalar("SELECT canonical_pr_number FROM delivery_runs WHERE objective_id='previous'")
+            .fetch_one(&pool).await.unwrap();
+        assert_eq!(old_pr, 42);
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM execution_workspaces WHERE objective_id='current' AND state='active'")
+            .fetch_one(&pool).await.unwrap();
+        assert_eq!(count, 1);
+        // R3: previous-task closeout cannot remove the second task's workspace.
+        let _ = run_cleanup_pass(&pool, &container, "previous-closeout").await.unwrap();
+        assert!(new.worktree_path.join("second.txt").is_file());
+        assert_eq!(workspace_state_of(&pool, "current").await.as_deref(), Some("active"));
+    }
+
+    #[tokio::test]
+    async fn m232_unregistered_workspace_returns_executable_recovery_without_old_branch_mutation() {
+        let (_temp, root, _remote, _container) = init_repo();
+        let pool = pool_with_objectives(&["unregistered"]).await;
+        sqlx::query("CREATE TABLE chat_turn_state(root_turn_id TEXT, objective_id TEXT, task_segment_id TEXT)")
+            .execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO chat_turn_state VALUES ('turn','unregistered',NULL)")
+            .execute(&pool).await.unwrap();
+        let before = git(&root, &["status", "--porcelain"]);
+        let mut ctx = crate::tools::ExecCtx::new(root.clone(), Some(pool));
+        ctx.root_turn_id = Some("turn".into());
+        let error = crate::tools::delivery::objective_delivery_cwd(&ctx).await.unwrap_err().to_string();
+        assert!(error.contains("系统自动重试/自愈") && error.contains("重试 deliver_changes"), "{error}");
+        assert!(error.contains("unregistered") && error.contains("不要提交到上一单"), "{error}");
+        assert_eq!(git(&root, &["status", "--porcelain"]), before);
+    }
+
     /// U24 (a): the user stops a task that has uncommitted work, then sends
     /// another message in the same session. The next Objective must continue in
     /// the same worktree/branch instead of starting over in an empty checkout.
