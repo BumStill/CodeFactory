@@ -352,7 +352,10 @@ Once the user approves the plan, execute in this exact order:\n\
 7. **Deliver (code changes in a git repo).** After the suite is green, call\n\
    the `deliver_changes` tool ONCE to carry the work through the user's\n\
    configured delivery ceiling (commit -> push -> PR -> CI -> merge ->\n\
-   release). Do NOT hand-run git in bash, and do NOT stop at a green build to\n\
+   release), only when remote delivery is requested. For local-only work,\n\
+   use bash `git add` / `git commit` in this session's workspace under normal\n\
+   write permission; no remote delivery authorization is needed. Do not push\n\
+   or open a PR for a local-only request. For requested remote delivery, do not stop at a green build to\n\
    describe a missing PR — invoking the tool IS how code work reaches done.\n\
    The tool stages only real source files (never local noise) and is\n\
    idempotent, so it is safe to call again to resume after any interruption.\n\
@@ -413,6 +416,10 @@ language, and never show internal gate vocabulary to the user.";
 
 const SYSTEM_PROMPT_AUTONOMOUS: &str = "\
 You are CodeFactory in AUTONOMOUS execution mode.\n\
+For local-only work, use bash `git add` / `git commit` in this session's\n\
+workspace under normal write permission, without remote delivery authorization.\n\
+Do not push or open a PR for a local-only request. Use deliver_changes only\n\
+for requested remote delivery (push, PR, merge or release).\n\
 \n\
 **CONTEXT YOU MUST INTERNALIZE:**\n\
 The user already approved a plan. They are NOT in this turn. Asking for\n\
@@ -555,9 +562,12 @@ implement, change, publish, deploy, or otherwise act now. Carry it out NOW.\n\
    happened (run it, read it back). Then summarize engineer-style: what you\n\
    did, the outcome the user sees, and a short list of files/deliverables.\n\
    Lead with the result, keep bookkeeping last.\n\
-6. **Deliver code work.** For a code change in a git repo, once verified, call\n\
+6. **Deliver code work.** For requested remote delivery in a git repo, once verified, call\n\
    the `deliver_changes` tool to carry it through the configured delivery\n\
-   ceiling (commit -> push -> PR -> CI -> merge -> release). A green build\n\
+   ceiling (commit -> push -> PR -> CI -> merge -> release). For local-only\n\
+   work, use bash `git add` / `git commit` in this session's workspace under\n\
+   normal write permission, without remote delivery authorization; do not push\n\
+   or create a PR. A green build\n\
    without delivery is not done; narrating the missing PR instead of opening\n\
    it is the exact failure this rule exists to prevent. The tool is idempotent\n\
    and commits only real source files.\n\
@@ -4718,6 +4728,18 @@ mod tests {
                 "Denied by shell safety policy: matches permanent deny 'shutdown'".into()
             )
         );
+    }
+
+    #[test]
+    fn m227_gpt_and_deepseek_prompts_allow_local_commits() {
+        // Both provider routes use the same mode-selected prompt builder.
+        for provider in ["gpt", "deepseek"] {
+            for mode in [AgentMode::Interactive, AgentMode::Autonomous, AgentMode::Execute] {
+                let prompt = base_system_prompt(mode, Path::new("/synthetic/project"));
+                assert!(prompt.contains("git add") && prompt.contains("git commit") && prompt.contains("local-only"), "{provider}: missing local commit route");
+                assert!(!prompt.contains("Do NOT hand-run git in bash"), "{provider}: contradictory blanket prohibition");
+            }
+        }
     }
 
     #[test]

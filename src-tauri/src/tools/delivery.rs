@@ -43,8 +43,11 @@ pub fn definition() -> ToolDefinition {
             description: "Deliver the current code changes through git: stage only the real \
                 changed source files (never local noise), commit, push, open (or reuse) a pull \
                 request, and — depending on the user's configured delivery ceiling — wait for CI, \
-                merge, and release. Call this after tests pass to carry code work to done; \
-                do NOT hand-run git in bash and do NOT stop at a green build to describe a missing \
+                merge, and release. Use this only when remote delivery is requested. For local-only \
+                work, use bash git add / git commit in this session's workspace under normal write \
+                permission; do not push or open a PR. ceiling: off returns that local guidance \
+                without remote authorization or side effects. After tests pass for remote delivery, \
+                call this instead of manually pushing; do NOT stop at a green build to describe a missing \
                 PR. It generates or repairs the PR README decision block. Idempotent: when a \
                 recoverable result supplies next_action, perform that action and call this again \
                 to resume the SAME PR; the agent loop bounds retries. Returns the steps taken, the \
@@ -112,6 +115,11 @@ async fn execute_inner(args: Value, ctx: &ExecCtx) -> Result<ToolOutput> {
         if args.get(field).is_some_and(|value| !value.is_null() && !value.is_string()) {
             return Ok(ToolOutput::err(format!("参数 {field} 必须是字符串，请修正后重试。")));
         }
+    }
+    // M227: explicit off is a local-only request, not remote delivery. Return
+    // guidance before settings, authorization, durable runs or repository IO.
+    if args["ceiling"] == "off" {
+        return Ok(ToolOutput::ok("只需本地提交时，请直接用 bash 在本会话工作区执行 git add <明确的改动文件> 和 git commit；这属于正常本地写操作，不需要远端交付授权。不要推送或创建 PR。deliver_changes 仅用于推送、PR、合并或发版；本次未执行任何 Git 或远端操作。"));
     }
     let Some(settings) = ctx.settings.clone() else {
         return Ok(ToolOutput::err("交付不可用:当前上下文没有可用的设置快照。"));
@@ -8185,6 +8193,20 @@ mod tests {
             Some(DeliveryCeiling::PrOnly)).await.unwrap();
         assert_eq!(new_ceiling, DeliveryCeiling::PrOnly);
         assert!(note.is_none());
+    }
+
+    #[tokio::test]
+    async fn m227_off_returns_local_commit_guidance_without_delivery_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let ctx = ExecCtx::new(temp.path().into(), None);
+        let output = execute(json!({"ceiling":"off"}), &ctx).await.unwrap();
+        assert!(!output.is_error, "off must not require delivery settings or authority");
+        let value = serde_json::to_value(output).unwrap().to_string();
+        assert!(value.contains("bash") && value.contains("git add") && value.contains("git commit"), "{value}");
+        assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 0);
+        let description = definition().function.description;
+        assert!(description.contains("local-only"));
+        assert!(!description.contains("do NOT hand-run git in bash"));
     }
 
     #[tokio::test]
