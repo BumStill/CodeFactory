@@ -803,7 +803,9 @@ fn pending_work_in(paths: &[String]) -> bool {
         for block in String::from_utf8_lossy(&output.stdout).split("\n\n") {
             let Some(nested) = block.lines().find_map(|line| line.strip_prefix("worktree ")) else { continue };
             let nested = std::path::Path::new(nested.trim());
-            if nested != path && nested.starts_with(path) && nested.exists() && workspace_path_is_dirty(nested) {
+            if !nested.exists() { continue; }
+            let Ok(nested) = nested.canonicalize() else { return true; };
+            if nested != path && nested.starts_with(path) && workspace_path_is_dirty(&nested) {
                 return true;
             }
         }

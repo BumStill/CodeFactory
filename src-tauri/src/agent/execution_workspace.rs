@@ -814,7 +814,11 @@ fn snapshot_before_removal(
     for field in porcelain.split('\0') {
         let Some(nested) = field.strip_prefix("worktree ") else { continue; };
         let nested = PathBuf::from(nested);
-        if nested == workspace_path || !nested.starts_with(workspace_path) || !nested.exists() {
+        if !nested.exists() { continue; }
+        // Windows canonicalize adds the verbatim prefix; Git porcelain does not.
+        // Canonicalize both operands before containment checks, never just parent.
+        let nested = nested.canonicalize()?;
+        if nested == workspace_path || !nested.starts_with(workspace_path) {
             continue;
         }
         nested_index += 1;
