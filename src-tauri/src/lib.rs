@@ -48,6 +48,7 @@ mod knowledge_watch;
 mod mcp;
 mod menu;
 mod clipboard_attachments;
+mod command_sandbox;
 mod menu_spec;
 mod notify;
 mod openrouter;

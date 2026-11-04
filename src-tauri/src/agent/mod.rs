@@ -57,6 +57,7 @@ mod tool_backend;
 pub(crate) mod tool_recovery;
 mod trusted_workspace;
 mod trusted_git;
+pub(crate) mod trusted_sandbox;
 pub(crate) mod update_recovery;
 pub mod user_context;
 pub mod verification;

@@ -181,6 +181,18 @@ impl PermissionGateway for DesktopPermissionGateway {
                 return self.request_permission(tool_call, args.clone(), bash_command).await;
             }
         }
+        // M224/R6：沙箱覆盖范围里被主动拒绝的命令不提供审批绕过——审批只决定
+        // "要不要跑"，不能决定"跑的时候要不要守约束"。放在所有 allow 分支之前。
+        if tool_call.function.name == "bash" {
+            if let Some(reason) = bash_command.and_then(crate::command_sandbox::gate_bypass) {
+                return self.request_permission_with_reason(
+                    tool_call,
+                    args.clone(),
+                    bash_command,
+                    Some(("trusted.sandbox.bypass", reason)),
+                ).await;
+            }
+        }
         // M159: delivery authority is not authority to force-push, delete a
         // remote ref, or discard local work. Prove and snapshot first.
         // M221: a proved heredoc already answered this for its read-only and

@@ -72,6 +72,10 @@ pub enum SandboxMode {
     Docker,
 }
 
+fn default_trusted_command_sandbox() -> bool {
+    true
+}
+
 fn default_sandbox_image() -> String {
     "ubuntu:24.04".to_string()
 }
@@ -159,6 +163,10 @@ pub struct Settings {
     /// Container image used when `sandbox_mode` is `Docker`.
     #[serde(default = "default_sandbox_image")]
     pub sandbox_image: String,
+    /// M224/R9：信任模式的系统沙箱（macOS Seatbelt）。默认开启，这是唯一的回退开关。
+    /// 关闭后信任模式回到 M224 之前的文字证明审批路径，不会变成"无边界直接执行"。
+    #[serde(default = "default_trusted_command_sandbox")]
+    pub trusted_command_sandbox: bool,
     /// True once the user explicitly saves a delivery ceiling from Settings or
     /// onboarding. Older settings files may contain `pr_only` only because it
     /// used to be the product default; without this marker, load-time migration
@@ -750,6 +758,7 @@ impl Default for Settings {
             im_webhook_format: ImWebhookFormat::Wecom,
             sandbox_mode: SandboxMode::Off,
             sandbox_image: default_sandbox_image(),
+            trusted_command_sandbox: default_trusted_command_sandbox(),
             delivery_ceiling_explicit: false,
             delivery_merge_method: MergeMethod::Squash,
             delivery_exclude_globs: Vec::new(),

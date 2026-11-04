@@ -551,6 +551,10 @@ pub async fn start(pool: &SqlitePool, request: StartRequest) -> Result<Started, 
     .map_err(|error| error.to_string())?;
 
     let (program, args) = shell_invocation(&request.command);
+    // M224/R3：后台任务与前台 bash 共用同一个沙箱入口，不允许一个在沙箱内、
+    // 一个在沙箱外。沙箱不可用时退回审批路径（spawn 前已被网关放行）。
+    let (program, args, _sandbox) =
+        crate::agent::trusted_sandbox::wrap_command(&request.cwd, None, &program, &args);
     let mut command = tokio::process::Command::new(&program).no_window();
     command
         .args(&args)
