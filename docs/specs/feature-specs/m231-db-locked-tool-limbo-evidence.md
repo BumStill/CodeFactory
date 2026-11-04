@@ -1,6 +1,6 @@
 # M231 交付证据
 
-Scenario-Test: HLT-001, HLT-004
+Scenario-Test: CXD-001, DAT-001, HLT-001, HLT-003, HLT-004, HLT-005, RTE-004, RTE-005
 README-Update: reviewed
 README-Update-Reason: 内部 SQLite 锁竞争与等待来源恢复，不改变公开安装、隐私或平台承诺。
 
