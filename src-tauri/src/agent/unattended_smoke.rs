@@ -462,18 +462,10 @@ fn spawn_worker(
 /// buys a real verdict instead of a coin flip. `CODEFACTORY_SMOKE_WORKER_TIMEOUT_SECS`
 /// overrides it for a deliberately short negative test.
 pub(super) fn worker_observation_budget() -> Duration {
-    worker_budget_from(
+    Duration::from_secs(codefactory_agent_core::smoke_worker_budget_secs(
         std::env::var("CODEFACTORY_SMOKE_WORKER_TIMEOUT_SECS")
             .ok()
             .as_deref(),
-    )
-}
-
-/// The one knob behind every wait in this smoke, exposed so a test can pin the
-/// cold-runner room and the override without mutating process environment.
-fn worker_budget_from(override_value: Option<&str>) -> Duration {
-    Duration::from_secs(codefactory_agent_core::smoke_worker_budget_secs(
-        override_value,
     ))
 }
 
@@ -502,14 +494,6 @@ async fn wait_for_fault_point(
     )
 }
 
-/// Wait for a restart phase to exit, with the caller's budget.
-///
-/// Every caller passes [`worker_observation_budget`]. These waits used to be a
-/// bare 45 seconds each even after [`wait_for_fault_point`] had outgrown its own
-/// bare wall, which is exactly how the cold-runner coin flip came back one phase
-/// later: `phase-two worker did not settle within 45s` on a contended Windows
-/// runner (PR #962, 2026-11-03), with no knob to tune because that number was
-/// not the configurable budget.
 async fn wait_for_worker(
     child: &mut std::process::Child,
     phase: &str,
@@ -757,12 +741,8 @@ pub(crate) async fn run_parent() -> UnattendedSmokeRunOutcome {
             process_sweep.clone(),
         )?;
         process_observation.replacement_process_distinct = phase_two.id() != phase_one_pid;
-        let phase_two_status = wait_for_worker(
-            phase_two.child_mut(),
-            "phase-two",
-            worker_observation_budget(),
-        )
-        .await?;
+        let phase_two_status =
+            wait_for_worker(phase_two.child_mut(), "phase-two", Duration::from_secs(45)).await?;
         phase_two.mark_reaped();
         if !phase_two_status.success() {
             bail!("phase-two worker exited {phase_two_status}");
@@ -822,7 +802,7 @@ pub(crate) async fn run_parent() -> UnattendedSmokeRunOutcome {
         let phase_three_status = wait_for_worker(
             phase_three.child_mut(),
             "phase-three",
-            worker_observation_budget(),
+            Duration::from_secs(45),
         )
         .await?;
         phase_three.mark_reaped();
@@ -918,12 +898,8 @@ pub(crate) async fn run_parent() -> UnattendedSmokeRunOutcome {
             live_workers.clone(),
             process_sweep.clone(),
         )?;
-        let phase_four_status = wait_for_worker(
-            phase_four.child_mut(),
-            "phase-four",
-            worker_observation_budget(),
-        )
-        .await?;
+        let phase_four_status =
+            wait_for_worker(phase_four.child_mut(), "phase-four", Duration::from_secs(45)).await?;
         phase_four.mark_reaped();
         if !phase_four_status.success() {
             bail!("phase-four worker exited {phase_four_status}");

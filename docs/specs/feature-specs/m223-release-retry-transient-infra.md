@@ -54,7 +54,7 @@
 - R2 注解使用 detailsUrl 中的数值 job 标识读取，不能拿 GraphQL node ID 调 REST check-runs 接口。
 - 合并要求 classifier 判断六个必需检查全部为 SUCCESS，额外的无关绿检查不能补足数量。
 
-CI 修复记录：Windows 第一次跨进程 smoke 在 phase-two 的硬编码 45s 超时，重跑执行通过；但旧尝试的异常收据仍被可信聚合器拒绝。未修改或削弱 validator；同步 main 并推送新 head 后重新从干净运行验证。三处 restart wait 统一采用已有的可配置 worker_observation_budget。此前 `cargo test --lib unattended_smoke::tests` 执行零个测试，不算验证证据；正式二进制跨进程 smoke 与 agent-core 单测才是有效证据。
+CI 修复记录：Windows 第一次跨进程 smoke 在 phase-two 的硬编码 45s 超时，重跑执行通过；但旧尝试的异常收据仍被可信聚合器拒绝。未修改或削弱 validator；同步 main 并推送新 head 后重新从干净运行验证。三处 restart wait 的预算改动后续已撤回：该 driver 属于可信根，普通 PR 修改会在所有目标执行前被摘要校验拒绝。详见 unattended-smoke-shared-phase-budget.md；本 PR 不再声称修复 smoke 预算。此前 `cargo test --lib unattended_smoke::tests` 执行零个测试，不算验证证据；正式二进制跨进程 smoke 与 agent-core 单测才是有效证据。
 
 原任务 Release-Urgency: default；不擅自触发发版。下一次真实发版与安装版验收由编排方另行发起，检查自动重试日志、最终非 Draft、完整平台资产及更新元数据。
 
