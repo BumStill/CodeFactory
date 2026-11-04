@@ -168,7 +168,8 @@ mod phase2_state_tests {
     async fn thin_state_round_trips_and_expired_wake_becomes_a_user_question() {
         let db = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
         thin_state::ensure(&db).await.unwrap();
-        thin_state::save(&db, "synthetic-session", &thin_state::after_final(WaitNeed::External { what: "CI 结束".into(), covered: true }, "")).await.unwrap();
+        // Persist a legacy expired wait directly: new source-free writes are rejected by R4.
+        sqlx::query("INSERT INTO thin_session_state(session_id,state,waiting_for,updated_at) VALUES ('synthetic-session','waiting_wake','CI 结束',0)").execute(&db).await.unwrap();
         let loaded = thin_state::load(&db, "synthetic-session").await.unwrap().unwrap();
         assert_eq!(loaded.state, SessionState::WaitingWake);
         let swept = thin_state::sweep(&db, i64::MAX / 4).await.unwrap();

@@ -188,6 +188,40 @@ pub async fn save(db: &SqlitePool, session_id: &str, state: &ThinState) -> sqlx:
         guarded = ThinState::running();
         &guarded
     } else { state };
+    let mut tx = crate::storage::db::begin_write(db).await?;
+    let stopped: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM thin_session_state WHERE session_id=? AND state='ended' AND reason LIKE 'cancelled%'")
+        .bind(session_id).fetch_one(&mut *tx).await?;
+    if stopped > 0 { return Ok(()); }
+    if state.state == SessionState::WaitingWake {
+        let pending: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM wakeup_schedules WHERE session_id=? AND status='pending'")
+            .bind(session_id).fetch_one(&mut *tx).await?;
+        let mut covered = pending > 0;
+        for (table, predicate) in [
+            ("background_tasks", "status='running'"),
+            ("thin_external_observations", "completed_reason IS NULL"),
+        ] {
+            let exists: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?")
+                .bind(table).fetch_one(&mut *tx).await?;
+            if exists > 0 {
+                let count: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table} WHERE session_id=? AND {predicate}"))
+                    .bind(session_id).fetch_one(&mut *tx).await?;
+                covered |= count > 0;
+            }
+        }
+        if !covered && state.waiting_for.as_deref().is_some_and(super::thin::is_external_object) {
+            // An external wait without a monitor is system-owned. Install the
+            // continuation before admitting its projection (same transaction).
+            sqlx::query("INSERT INTO wakeup_schedules(id,session_id,prompt,source,next_at,status,created_at) VALUES (?,?,?,'agent_decided',?,'pending',?)")
+                .bind(format!("thin-source-repair-{session_id}-{}", uuid::Uuid::new_v4()))
+                .bind(session_id).bind("系统自动重试/自愈：为当前外部等待核对事实，使用 background_task_start 或 schedule_wakeup 挂持久监视，继续原任务。")
+                .bind(chrono::Utc::now().timestamp() + 5).bind(chrono::Utc::now().timestamp())
+                .execute(&mut *tx).await?;
+            covered = true;
+        }
+        if !covered {
+            return Err(sqlx::Error::Protocol("waiting_wake requires a durable pending wake or external observer".into()));
+        }
+    }
     sqlx::query(
         "INSERT INTO thin_session_state
          (session_id, state, waiting_for, wake_source, question, reason,
@@ -213,8 +247,9 @@ pub async fn save(db: &SqlitePool, session_id: &str, state: &ThinState) -> sqlx:
     .bind(&state.failure_signature)
     .bind(state.consecutive_failures)
     .bind(state.updated_at)
-    .execute(db)
+    .execute(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(())
 }
 
@@ -357,6 +392,43 @@ pub async fn settle_error(db: &SqlitePool, session_id: &str, root_turn_id: &str,
     }
     let state = if error_text == "agent loop stopped: Cancelled" {
         ThinState::ended("cancelled：回合已取消", "本会话记录")
+    } else if crate::storage::db::is_lock_contention_message(error_text) {
+        // M231/R3: internal storage contention never enters model replay as a
+        // failed tool result. Count durable retries separately from model waits.
+        super::background_tasks::ensure_wake_schema(db).await?;
+        let mut tx = crate::storage::db::begin_write(db).await?;
+        let previous: Option<(String, Option<String>, i64)> = sqlx::query_as(
+            "SELECT state,reason,consecutive_failures FROM thin_session_state WHERE session_id=?",
+        ).bind(session_id).fetch_optional(&mut *tx).await?;
+        if previous.as_ref().is_some_and(|(state, _, _)| state == "ended") {
+            drop(tx);
+            return Ok(load(db, session_id).await?.unwrap());
+        }
+        let attempt = sqlx::query_scalar::<_, i64>(
+            "SELECT consecutive_failures FROM thin_session_state WHERE session_id=? AND failure_signature='local_store_contended'",
+        ).bind(session_id).fetch_optional(&mut *tx).await?.unwrap_or(0) + 1;
+        let reason = if attempt >= FAILURE_LIMIT {
+            format!("本地数据库持续繁忙，系统已尝试 {attempt} 次有界写入与自动恢复，任务明确失败；保留的改动和执行记录见本会话")
+        } else {
+            format!("本地数据库忙，系统自动重试/自愈：稍后自动继续（第 {attempt} 次）")
+        };
+        sqlx::query("UPDATE wakeup_schedules SET status='cancelled' WHERE session_id=? AND status='pending' AND id LIKE 'local-store-retry-%'")
+            .bind(session_id).execute(&mut *tx).await?;
+        if attempt < FAILURE_LIMIT {
+            let at = chrono::Utc::now().timestamp() + 5;
+            sqlx::query("INSERT INTO wakeup_schedules(id,session_id,root_turn_id,prompt,source,next_at,status,created_at) VALUES (?,?,?,?,'agent_decided',?,'pending',?)")
+                .bind(format!("local-store-retry-{session_id}-{}", uuid::Uuid::new_v4()))
+                .bind(session_id).bind(root_turn_id)
+                .bind("本地数据库忙后的恢复：系统自动重试/自愈。先核对工具持久收据与工作区事实，已执行的副作用不得重复执行；继续原任务。")
+                .bind(at).bind(at - 5).execute(&mut *tx).await?;
+        }
+        let next_state = if attempt >= FAILURE_LIMIT { "ended" } else { "waiting_wake" };
+        sqlx::query("INSERT INTO thin_session_state(session_id,state,waiting_for,wake_source,reason,failure_signature,consecutive_failures,updated_at) VALUES (?,?,? ,?,?, 'local_store_contended',?,?) ON CONFLICT(session_id) DO UPDATE SET state=excluded.state,waiting_for=excluded.waiting_for,wake_source=excluded.wake_source,reason=excluded.reason,question=NULL,failure_signature=excluded.failure_signature,consecutive_failures=excluded.consecutive_failures,updated_at=excluded.updated_at")
+            .bind(session_id).bind(next_state).bind("本地数据库写锁释放")
+            .bind(if attempt < FAILURE_LIMIT { Some("local-store-retry") } else { None })
+            .bind(&reason).bind(attempt).bind(now()).execute(&mut *tx).await?;
+        tx.commit().await?;
+        load(db, session_id).await?.unwrap()
     } else if let Some(unavailable) = super::failover::ModelUnavailable::parse(error_text) {
         let (unavailable, terminal) = super::usage_windows::model_wait::bound_transient(db, session_id, error_text, unavailable).await?;
         if terminal {
@@ -550,6 +622,35 @@ pub async fn close_objective(db: &SqlitePool, objective_id: &str, state: &ThinSt
 #[cfg(test)]
 mod settle_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn m231_uncovered_wait_is_rejected_and_contention_is_bounded() {
+        let dir = tempfile::tempdir().unwrap();
+        let url = format!("sqlite://{}?mode=rwc", dir.path().join("m231.db").display());
+        let db = crate::storage::db::connect(&url).await.unwrap();
+        sqlx::query("INSERT INTO sessions(id,title,cwd,model_id,created_at,updated_at,delivery_mode) VALUES ('m231','synthetic','/synthetic','model',1,1,'thin')").execute(&db).await.unwrap();
+        let uncovered = ThinState { state: SessionState::WaitingWake, waiting_for: Some("本地数据库".into()), wake_source: Some("invented source".into()), ..ThinState::running() };
+        assert!(save(&db, "m231", &uncovered).await.is_err(), "R4: prose is not a durable wake source");
+        for attempt in 1..=FAILURE_LIMIT {
+            let state = settle_error(&db, "m231", "m231-root", "Database error (code: 5) database is locked").await.unwrap();
+            assert_eq!(state.consecutive_failures, attempt);
+            assert!(!state.reason.as_deref().unwrap_or_default().contains("database is locked"));
+            if attempt < FAILURE_LIMIT {
+                assert_eq!(state.state, SessionState::WaitingWake);
+                assert!(state.reason.as_deref().unwrap().contains("本地数据库忙"));
+                assert!(super::super::background_tasks::wake_source_cover(&db, "m231").await.is_covered());
+            } else {
+                assert_eq!(state.state, SessionState::Ended);
+                assert!(state.reason.as_deref().unwrap().contains("3"));
+            }
+        }
+        let stopped = ThinState::ended("cancelled：用户停止", "本会话记录");
+        save(&db, "m231", &stopped).await.unwrap();
+        let state = settle_error(&db, "m231", "m231-root", "database is locked").await.unwrap();
+        assert_eq!(state, load(&db, "m231").await.unwrap().unwrap());
+        assert_eq!(state.reason, stopped.reason);
+        db.close().await;
+    }
 
     #[tokio::test]
     async fn m178_wait_has_reason_and_survives_real_process_restart() {
@@ -776,6 +877,8 @@ mod settle_tests {
         let third = settle_error(&db, "s-1", "root-1", "bash exited 1").await.unwrap();
         assert_eq!(third.state, SessionState::Ended);
         assert!(third.reason.unwrap().contains("bash exited 1"));
+        // A fresh admitted turn, rather than a late error, may resume a terminal task.
+        save(&db, "s-1", &ThinState::running()).await.unwrap();
         let model = settle_error(&db, "s-1", "root-1", "no endpoints are available: no_model_available").await.unwrap();
         assert_eq!(model.state, SessionState::WaitingWake);
     }

@@ -377,9 +377,14 @@ mod tests {
             "waiting_wake" => crate::agent::thin_state::SessionState::WaitingWake,
             _ => crate::agent::thin_state::SessionState::Ended,
         };
-        crate::agent::thin_state::save(db, id, &value)
-            .await
-            .unwrap();
+        if value.state == crate::agent::thin_state::SessionState::WaitingWake {
+            // A restart fixture may contain a legacy wait rejected by new R4 admission.
+            crate::agent::thin_state::ensure(db).await.unwrap();
+            sqlx::query("INSERT INTO thin_session_state(session_id,state,updated_at) VALUES (?,'waiting_wake',0)")
+                .bind(id).execute(db).await.unwrap();
+        } else {
+            crate::agent::thin_state::save(db, id, &value).await.unwrap();
+        }
         sqlx::query("UPDATE thin_session_state SET updated_at=? WHERE session_id=?")
             .bind(updated_at)
             .bind(id)
