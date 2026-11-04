@@ -236,6 +236,34 @@ API Key、Git token、Office pairing token 必须进 OS credential store 或等�
 - 如果使用外部 embedding 模型，必须在 UI 显示数据将发送到模型提供方；默认应允许本地 embedding provider。
 - Git 自动 merge 默认为关闭；用户明确开启前只创建 PR 和 evidence handoff。
 
+## CF-KB-R2 检索层修订（M192）
+
+### 已批准需求（任务原文）
+- R1 中文可用：用 SQLite FTS5（trigram tokenizer 或等价的 CJK bigram 方案）建全文索引，中英混合查询都能命中；保留现有来源字段（path/page/slide/heading/snippet）。
+- R2 排序：BM25（FTS5 自带 bm25）+ 标题/文件名加权；snippet 高亮命中词。
+- R3 索引随 M191 的增量更新/删除同步维护（同一事务）；旧库升级时自动重建索引，不丢数据。
+- R4 性能：合成 2 万 chunk 下单次检索 p95 < 200ms（测试断言量级）。
+- R5 调研结论（FTS5 trigram vs jieba 分词 vs bigram 的取舍）写进 CF-KB 规格修订。
+
+### Implementation Notes：选型与边界
+- FTS5 trigram 原生支持子串，但 MATCH 对少于三个字符的中文词（例如“产品”）无法满足本任务；不采用退回 LIKE 全表扫描的补丁。
+- jieba 依赖词典、额外依赖与版本管理，对产品名及混合文本有分词歧义；本次不引入。
+- 采用 FTS5 unicode61 + CJK 重叠 bigram，额外索引单字以支持单字查询；查询对连续 CJK 取 bigram，英文按词、忽略大小写，OR 支持词序变化与部分命中。非向量语义检索，不承诺同义词理解。
+- SQL 触发器在源行事务内维护索引，迁移事务一次回填旧 chunk；检索 MATCH + bm25 排序后 LIMIT，仅加载候选来源行。snippet 使用纯文本 `【】` 标注，不注入 HTML，保留既有整数 score 字段（由 BM25 单调映射）。
+- 不改生产数据，不发版；真实安装版验收由编排方在发版后完成。
+
+### Requirements Traceability 与测试矩阵
+| Req ID | 最低证据 |
+| --- | --- |
+| M192-R1 | 合成中文短语、词序变化、部分词、英文大小写、混合文本和字段级断言 |
+| M192-R2 | 标题/文件名优先、长度归一化、命中高亮、top_k |
+| M192-R3 | 旧库回填、重复迁移、更新/删除/事务回滚、禁用与库范围过滤；M191 回归 |
+| M192-R4 | 20,000 chunk 实际 search 计时 p95 < 200ms，EXPLAIN 验证 FTS MATCH |
+| M192-R5 | 本章节选型比较 |
+
+### Applicable Harnesses
+Spec、Compatibility（旧 SQLite 库与工具 JSON）、Payload（本地合成文档）、Observation（retrieval_events）、Release（仅合并交接，不发版）、AI Collaboration。无 UI 改动，不触发 Viewport。
+
 ## Spec Amendment — M191：知识库自动更新（2026-10-29）
 
 ### 修订原因
