@@ -715,6 +715,11 @@ async fn completed_external(db: &SqlitePool, session: &str) -> sqlx::Result<Opti
         .bind(session).fetch_optional(db).await.map(Option::flatten)
 }
 
+/// M237/R3：收尾迟迟结束不了时只放慢重排，不结束会话：它可能还有当前任务。
+fn closeout_rearm_delay(fires: i64) -> i64 {
+    if fires < 2 { 60 } else { (60_i64 << (fires - 1).min(6)).min(3_600) }
+}
+
 /// M199/R1-R4: a terminal PR can wait only on a persisted, bounded wake.
 /// Commit the wake and its projection together, including when called by a read.
 async fn ensure_terminal_wake(db: &SqlitePool, session: &str, reason: &str, prefix: &str) -> sqlx::Result<Result<String, String>> {
@@ -770,7 +775,7 @@ async fn ensure_terminal_wake(db: &SqlitePool, session: &str, reason: &str, pref
             };
             let now = chrono::Utc::now().timestamp();
             sqlx::query("INSERT INTO wakeup_schedules(id,session_id,prompt,source,after_sec,next_at,status,created_at) VALUES (?,?,?,'agent_decided',60,?,'pending',?) ON CONFLICT(id) DO UPDATE SET prompt=excluded.prompt,next_at=excluded.next_at,status='pending'")
-                .bind(&id).bind(session).bind(prompt).bind(now + 60).bind(now).execute(&mut *tx).await?;
+                .bind(&id).bind(session).bind(prompt).bind(now + closeout_rearm_delay(fires)).bind(now).execute(&mut *tx).await?;
             changed = true;
             id
         };
@@ -1603,6 +1608,12 @@ pub async fn refresh(db: &SqlitePool, session: &str) -> sqlx::Result<ThinState> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn m237_closeout_rearm_backs_off_after_two_fires() {
+        let delays: Vec<i64> = [0, 1, 2, 3, 7, 87].into_iter().map(super::closeout_rearm_delay).collect();
+        assert_eq!(delays, vec![60, 60, 120, 240, 3_600, 3_600]);
+    }
 
     #[tokio::test]
     async fn m206_output_numbers_never_claim_pr() {
