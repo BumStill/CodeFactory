@@ -552,10 +552,18 @@ mod tests {
     #[test]
     fn fallback_notice_is_explicit_and_absent_when_enforced() {
         let workspace = temp_dir("notice");
-        assert!(
-            fallback_notice(&workspace, None).is_none(),
-            "沙箱生效时不应提示降级"
-        );
+        if sandbox_application_refused() {
+            // 会话本身就在沙箱里：约束由外层提供，提示必须写"继承"，
+            // 不能冒充"没有系统沙箱约束"，也不能静默什么都不说。
+            let notice = fallback_notice(&workspace, None).expect("继承外层沙箱必须写明");
+            assert!(notice.contains("继承外层沙箱"), "{notice}");
+            assert!(!notice.contains("没有系统沙箱约束"), "{notice}");
+        } else {
+            assert!(
+                fallback_notice(&workspace, None).is_none(),
+                "沙箱生效时不应提示降级"
+            );
+        }
         let relative = Path::new("relative/workspace");
         let notice = fallback_notice(relative, None).expect("相对路径必须 fail-closed");
         assert!(notice.contains("系统沙箱不可用"), "{notice}");
