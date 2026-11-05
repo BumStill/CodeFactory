@@ -54,7 +54,7 @@ export function UpdateStatusPill() {
         title={[
           observingUnknownInstall
             ? "上次安装结果尚未确认；系统只读核对，不会重复安装。"
-            : "执行中的本地工作结束后会自动下载、安装并重启。",
+            : "执行中的本地工作结束后会自动下载、安装并重启；也可以在更新提示里选择立即更新。",
           objectiveBlockers,
           phase.safetyCheckError,
         ].filter(Boolean).join(" ")}

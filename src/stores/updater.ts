@@ -39,6 +39,7 @@ export interface UpdateSafetyStatus {
   update_receipt_id?: string | null;
   target_version?: string | null;
   target_build?: string | null;
+  forced?: boolean;
 }
 
 export interface UpdateInstallObservation {
@@ -83,6 +84,25 @@ export function describeUpdateObjectiveBlockers(status: UpdateSafetyStatus | nul
   return `${count} 个目标仍由 ${ownerText} 持有`;
 }
 
+/** One plain line per kind of work the update is waiting for. */
+export function describeUpdateBlockers(status: UpdateSafetyStatus): string[] {
+  const lines: Array<[number, string]> = [
+    [status.active_chat_turns, "个对话正在回答"],
+    [status.active_task_schedulers, "个定时任务正在运行"],
+    [status.active_delivery_leases, "个交付正在进行"],
+    [status.active_objective_leases ?? 0, "个后台任务正在运行"],
+    [status.pending_permissions, "个操作在等你批准"],
+    [status.managed_browser_sessions, "个自动浏览器窗口开着"],
+    [status.terminal_sessions, "个终端正在运行命令"],
+  ];
+  return lines.filter(([count]) => count > 0).map(([count, text]) => `${count} ${text}`);
+}
+
+/** Queued behind real work: the only state where the user can choose. */
+export function canChooseUpdateTiming(status: UpdateSafetyStatus | null): status is UpdateSafetyStatus {
+  return status?.update_install_state === "queued" && countUpdateBlockers(status) > 0;
+}
+
 function targetBuildIdentity(update: Update): string | null {
   const raw = (update as Update & { rawJson?: Record<string, unknown> }).rawJson ?? {};
   const value = raw.build_git_sha;
@@ -113,10 +133,14 @@ interface UpdaterStore {
   safeRetryHandle: number | null;
   progressListening: boolean;
   dismissedVersion: string | null;        // user dismissed this version's banner; new versions still show
+  forceRequested: boolean;                // user chose to interrupt running work for this update
+  updateMinimized: boolean;               // waiting window shrunk to a chip; waiting continues
 
   initialize: () => Promise<void>;        // start polling, fetch current version
   checkNow: () => Promise<void>;          // user-triggered check
   install: () => Promise<void>;
+  forceInstall: () => Promise<void>;      // user-confirmed: install now, interrupting running work
+  setUpdateMinimized: (minimized: boolean) => void;
   dismiss: () => void;                    // hide banner for this version
 }
 
@@ -127,6 +151,8 @@ export const useUpdaterStore = create<UpdaterStore>((set, get) => ({
   safeRetryHandle: null,
   progressListening: false,
   dismissedVersion: null,
+  forceRequested: false,
+  updateMinimized: false,
 
   initialize: async () => {
     // Download and installation are backend-owned after the renderer queues a
@@ -336,6 +362,22 @@ export const useUpdaterStore = create<UpdaterStore>((set, get) => ({
       });
     }
   },
+
+  forceInstall: async () => {
+    const phase = get().phase;
+    if (phase.kind !== "waiting_for_safe_restart") return;
+    const targetBuild = targetBuildIdentity(phase.update);
+    if (!targetBuild) return;
+    try {
+      await invoke("force_update_install", { targetVersion: phase.update.version, targetBuild });
+      set({ forceRequested: true, updateMinimized: false });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      set({ phase: { ...phase, safetyCheckError: `无法立即更新：${msg}` } });
+    }
+  },
+
+  setUpdateMinimized: (minimized) => set({ updateMinimized: minimized }),
 
   dismiss: () => {
     const phase = get().phase;

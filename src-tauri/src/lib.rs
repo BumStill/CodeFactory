@@ -572,6 +572,8 @@ pub struct AppState {
     /// Admission barrier set only after every live-work owner reports idle.
     /// New work must not enter between updater safety admission and relaunch.
     pub update_restart_reserved: Arc<AtomicBool>,
+    /// M238: exact (version, build) the user chose to install despite running work.
+    pub update_force_target: Arc<std::sync::Mutex<Option<(String, String)>>>,
     /// Serializes updater restart admission with Objective remediation claims.
     /// The Objective supervisor has no entry in the chat/task runtime maps, so
     /// the atomic flag alone cannot close its snapshot-to-claim race.
@@ -1731,6 +1733,7 @@ pub fn run() {
                 chat_cancels: Arc::new(Mutex::new(HashMap::new())),
                 interjections: Arc::new(Mutex::new(HashMap::new())),
                 update_restart_reserved: Arc::new(AtomicBool::new(false)),
+                update_force_target: Arc::new(std::sync::Mutex::new(None)),
                 update_restart_admission: Arc::new(tokio::sync::Mutex::new(())),
             });
             // Manage the Arc so all commands share the same McpManager instance.
@@ -2036,6 +2039,7 @@ pub fn run() {
             commands::update_safety::reserve_update_install,
             commands::update_safety::observe_update_install,
             commands::update_safety::release_update_install_reservation,
+            commands::update_safety::force_update_install,
             codex_auth::codex_login,
             codex_auth::codex_login_start,
             codex_auth::codex_login_status,

@@ -26,6 +26,8 @@ import {
   describeUpdateObjectiveBlockers,
   type UpdateSafetyStatus,
   useUpdaterStore,
+  canChooseUpdateTiming,
+  describeUpdateBlockers,
 } from "./updater";
 
 const TARGET_BUILD = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
@@ -382,5 +384,26 @@ describe("updater safe restart gate", () => {
     });
 
     expect(useUpdaterStore.getState().phase.kind).toBe("installing");
+  });
+});
+
+describe("M238 update blockers", () => {
+  const idle = {
+    safe_to_restart: false, restart_reserved: false, active_chat_turns: 0,
+    active_task_schedulers: 0, active_delivery_leases: 0, active_objective_leases: 0,
+    objective_blocker_owners: [], pending_permissions: 0, managed_browser_sessions: 0,
+    terminal_sessions: 0, update_install_state: "queued" as const,
+  };
+
+  it("offers a choice only when real work is queued ahead of the update", () => {
+    expect(canChooseUpdateTiming(idle)).toBe(false);
+    expect(canChooseUpdateTiming({ ...idle, terminal_sessions: 1 })).toBe(true);
+    expect(canChooseUpdateTiming({ ...idle, terminal_sessions: 1, update_install_state: "still_unknown" })).toBe(false);
+    expect(canChooseUpdateTiming(null)).toBe(false);
+  });
+
+  it("names each kind of running work", () => {
+    expect(describeUpdateBlockers({ ...idle, active_chat_turns: 2, pending_permissions: 1 }))
+      .toEqual(["2 个对话正在回答", "1 个操作在等你批准"]);
   });
 });

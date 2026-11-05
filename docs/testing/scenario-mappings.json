@@ -31,6 +31,12 @@
     { "pattern": "src-tauri/src/commands/mod.rs", "scenario_id": "CXD-002" },
     { "pattern": "src/lib/queuedSend.ts", "scenario_id": "CXD-002" },
     { "pattern": "src/lib/queuedDispatchTestBackend.ts", "scenario_id": "CXD-002" },
-    { "pattern": "src-tauri/src/agent/background_tasks.rs", "scenario_id": "RTE-005" }
+    { "pattern": "src-tauri/src/agent/background_tasks.rs", "scenario_id": "RTE-005" },
+    { "pattern": "src-tauri/src/commands/update_safety.rs", "scenario_id": "UI-005" },
+    { "pattern": "src-tauri/src/commands/terminal.rs", "scenario_id": "UI-005" },
+    { "pattern": "src/stores/updater.ts", "scenario_id": "UI-005" },
+    { "pattern": "src/components/UpdaterBanner.tsx", "scenario_id": "UI-005" },
+    { "pattern": "src/components/UpdateStatusPill.tsx", "scenario_id": "UI-005" },
+    { "pattern": "src/components/UpdateBlockerChoice.tsx", "scenario_id": "UI-005" }
   ]
 }

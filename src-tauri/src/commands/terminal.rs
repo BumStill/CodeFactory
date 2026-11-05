@@ -17,6 +17,8 @@ pub struct PtySession {
     writer: Box<dyn Write + Send>,
     /// Master side kept alive so the pty stays open.
     _master: Box<dyn portable_pty::MasterPty + Send>,
+    /// Shell process, used to tell an idle prompt from a running command.
+    shell_pid: Option<u32>,
 }
 
 pub struct TerminalState(pub Arc<Mutex<HashMap<String, PtySession>>>);
@@ -50,6 +52,63 @@ fn which_powershell() -> bool {
         .status()
         .map(|s| s.success())
         .unwrap_or(false)
+}
+
+/// M238: terminals with a running command. An idle shell has no child process;
+/// a shell we cannot inspect counts as busy so a running command is never lost.
+pub(crate) fn busy_session_count(sessions: &HashMap<String, PtySession>) -> usize {
+    sessions
+        .values()
+        .filter(|session| session.shell_pid.is_none_or(process_has_children))
+        .count()
+}
+
+#[cfg(unix)]
+fn process_has_children(pid: u32) -> bool {
+    std::process::Command::new("pgrep")
+        .no_window()
+        .args(["-P", &pid.to_string()])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map_or(true, |status| status.code() != Some(1))
+}
+
+#[cfg(windows)]
+fn process_has_children(pid: u32) -> bool {
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
+        TH32CS_SNAPPROCESS,
+    };
+    // SAFETY: the snapshot handle is checked and closed here, and the entry is
+    // initialised with its required dwSize before the Win32 calls fill it.
+    unsafe {
+        let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if snapshot == INVALID_HANDLE_VALUE {
+            return true;
+        }
+        let mut entry: PROCESSENTRY32W = std::mem::zeroed();
+        entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+        let mut found = false;
+        let mut more = Process32FirstW(snapshot, &mut entry) != 0;
+        while more {
+            if entry.th32ParentProcessID == pid && !is_console_host(&entry.szExeFile) {
+                found = true;
+                break;
+            }
+            more = Process32NextW(snapshot, &mut entry) != 0;
+        }
+        CloseHandle(snapshot);
+        found
+    }
+}
+
+/// A console host belongs to the console, not to a command the user started.
+#[cfg(windows)]
+fn is_console_host(exe: &[u16]) -> bool {
+    let end = exe.iter().position(|unit| *unit == 0).unwrap_or(exe.len());
+    String::from_utf16_lossy(&exe[..end]).eq_ignore_ascii_case("conhost.exe")
 }
 
 // ---------------------------------------------------------------------------
@@ -91,10 +150,12 @@ pub async fn terminal_create(
     // Give the shell a clean environment-ish start.
     cmd.env("TERM", "xterm-256color");
 
-    let _child = pair
+    let child = pair
         .slave
         .spawn_command(cmd)
         .map_err(|e| format!("spawn_command failed: {e}"))?;
+
+    let shell_pid = child.process_id();
 
     // We need a clone of the master for the reader thread.
     let mut reader = pair
@@ -126,6 +187,7 @@ pub async fn terminal_create(
     let session = PtySession {
         writer,
         _master: pair.master,
+        shell_pid,
     };
 
     sessions.insert(id, session);
@@ -180,4 +242,27 @@ pub async fn terminal_resize(
 pub async fn terminal_kill(id: String, state: State<'_, TerminalState>) -> Result<(), String> {
     state.0.lock().await.remove(&id);
     Ok(())
+}
+
+#[cfg(test)]
+mod m238_tests {
+    use super::process_has_children;
+    use crate::util::no_window::NoWindow;
+
+    #[test]
+    fn a_process_with_a_running_child_reads_as_busy() {
+        #[cfg(unix)]
+        let mut child = std::process::Command::new("sleep").no_window().arg("20").spawn().unwrap();
+        #[cfg(windows)]
+        let mut child = std::process::Command::new("ping")
+            .no_window()
+            .args(["-n", "20", "127.0.0.1"])
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        assert!(process_has_children(std::process::id()));
+        assert!(!process_has_children(child.id()), "a leaf process has no running command");
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
 }
