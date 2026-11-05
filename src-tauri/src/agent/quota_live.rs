@@ -31,10 +31,14 @@ pub const USAGE_URLS: [&str; 2] = [
     "https://chatgpt.com/backend-api/codex/usage",
 ];
 
+const WEEKLY_WINDOW_MIN_SECONDS: i64 = 86_400;
+
+/// Windows are told apart by their length, because a plan may report only a
+/// weekly limit in `primary_window`. A reading with no weekly window stays
+/// unreadable, which the route gate treats as over the cap.
 pub fn parse_usage(value: &serde_json::Value, now_ms: i64) -> Option<EndpointQuota> {
     let limits = value.get("rate_limit")?;
-    let window = |name: &str| -> Option<WindowUsage> {
-        let v = limits.get(name)?;
+    let read = |v: &serde_json::Value| -> Option<WindowUsage> {
         let percent = v.get("used_percent")?.as_f64()?;
         if !percent.is_finite() || !(0.0..=100.0).contains(&percent) { return None; }
         let reset = v.get("reset_at").and_then(|v| v.as_i64())
@@ -42,12 +46,34 @@ pub fn parse_usage(value: &serde_json::Value, now_ms: i64) -> Option<EndpointQuo
             .or_else(|| v.get("reset_after_seconds")?.as_i64()?.checked_mul(1000)?.checked_add(now_ms));
         Some(WindowUsage { used_ratio: percent / 100.0, resets_at_ms: reset })
     };
+    let (mut five_hour, mut weekly) = (None, None);
+    for (name, weekly_by_position) in [("primary_window", false), ("secondary_window", true)] {
+        let Some(v) = limits.get(name).filter(|v| !v.is_null()) else { continue };
+        let window = read(v)?;
+        let is_weekly = v.get("limit_window_seconds").and_then(|v| v.as_i64())
+            .map_or(weekly_by_position, |seconds| seconds >= WEEKLY_WINDOW_MIN_SECONDS);
+        let slot: &mut Option<WindowUsage> = if is_weekly { &mut weekly } else { &mut five_hour };
+        if slot.is_none_or(|kept| window.used_ratio > kept.used_ratio) { *slot = Some(window); }
+    }
     Some(EndpointQuota {
         source: UsageSource::LiveQuery,
-        five_hour: window("primary_window")?,
-        weekly: window("secondary_window")?,
+        five_hour: five_hour.unwrap_or_else(WindowUsage::empty),
+        weekly: weekly?,
         observed_at_ms: now_ms,
     })
+}
+
+/// Field names only, so a changed usage response can be diagnosed from the log.
+fn usage_shape(value: &serde_json::Value) -> String {
+    let keys = |v: Option<&serde_json::Value>| v.and_then(|v| v.as_object())
+        .map(|o| o.keys().cloned().collect::<Vec<_>>().join(",")).unwrap_or_default();
+    let limits = value.get("rate_limit");
+    format!(
+        "top=[{}] rate_limit=[{}] primary=[{}] secondary=[{}]",
+        keys(Some(value)), keys(limits),
+        keys(limits.and_then(|v| v.get("primary_window"))),
+        keys(limits.and_then(|v| v.get("secondary_window"))),
+    )
 }
 
 /// No configurable URLs, redirects, response bodies or credential-bearing errors.
@@ -102,6 +128,7 @@ pub async fn refresh_if_needed(settings: &crate::config::settings::Settings, for
                         }
                         return None;
                     }
+                    tracing::warn!(shape = %usage_shape(&value), "unreadable ChatGPT usage response");
                 }
                 error = "用量接口已变更";
             }
@@ -127,6 +154,46 @@ pub fn spawn_refresh(app: tauri::AppHandle) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_plan_with_only_a_weekly_window_is_read_as_weekly() {
+        let now = 1_000_000;
+        for limits in [
+            serde_json::json!({"primary_window": {"used_percent": 42.0, "limit_window_seconds": 604800, "reset_after_seconds": 100}, "secondary_window": null}),
+            serde_json::json!({"primary_window": {"used_percent": 42.0, "limit_window_seconds": 604800, "reset_after_seconds": 100}}),
+            serde_json::json!({"secondary_window": {"used_percent": 42.0, "limit_window_seconds": 604800, "reset_after_seconds": 100}}),
+        ] {
+            let quota = parse_usage(&serde_json::json!({"rate_limit": limits}), now).unwrap();
+            assert_eq!(quota.weekly.used_ratio, 0.42);
+            assert_eq!(quota.weekly.resets_at_ms, Some(now + 100_000));
+            assert_eq!(quota.five_hour.used_ratio, 0.0);
+        }
+    }
+
+    #[test]
+    fn both_windows_keep_their_meaning_whatever_order_they_arrive_in() {
+        let short = serde_json::json!({"used_percent": 10.0, "limit_window_seconds": 18000});
+        let long = serde_json::json!({"used_percent": 60.0, "limit_window_seconds": 604800});
+        let swapped = serde_json::json!({"rate_limit": {"primary_window": long, "secondary_window": short}});
+        let quota = parse_usage(&swapped, 0).unwrap();
+        assert_eq!((quota.five_hour.used_ratio, quota.weekly.used_ratio), (0.1, 0.6));
+        let unlabelled = serde_json::json!({"rate_limit": {
+            "primary_window": {"used_percent": 10.0}, "secondary_window": {"used_percent": 60.0}}});
+        let quota = parse_usage(&unlabelled, 0).unwrap();
+        assert_eq!((quota.five_hour.used_ratio, quota.weekly.used_ratio), (0.1, 0.6));
+    }
+
+    #[test]
+    fn usage_without_a_weekly_reading_stays_unreadable() {
+        for limits in [
+            serde_json::json!({"primary_window": {"used_percent": 10.0, "limit_window_seconds": 18000}}),
+            serde_json::json!({"primary_window": {"used_percent": 10.0}}),
+            serde_json::json!({"primary_window": null, "secondary_window": null}),
+        ] {
+            assert!(parse_usage(&serde_json::json!({"rate_limit": limits}), 0).is_none());
+        }
+    }
+
     #[tokio::test]
     async fn fresh_quota_does_not_wait_for_background_refresh_lock() {
         use crate::config::settings::{ApiStyle, Endpoint, Settings};
