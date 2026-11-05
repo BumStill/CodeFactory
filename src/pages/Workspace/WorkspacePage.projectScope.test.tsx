@@ -151,7 +151,7 @@ describe("picking a project never opens its history", () => {
       runtime: { [projectSession.id]: { ...useChatStore.getState().runtime[projectSession.id], messages: [], streaming: false, queue: [], pendingPermission: null } as never },
     });
     render(<WorkspacePage sessionId="s-old" onNewConversation={() => {}} onOpenSettings={() => {}} onOpenSession={() => {}} />);
-    const opener = screen.getByRole("button", { name: "QA/PM 证据", exact: true });
+    const opener = screen.getByRole("button", { name: "QA/PM 证据" });
     fireEvent.click(opener);
     expect(await screen.findByText("自主执行关闭")).toBeInTheDocument();
     expect(screen.getByLabelText("导入本地 QA/PM 报告")).toBeInTheDocument();

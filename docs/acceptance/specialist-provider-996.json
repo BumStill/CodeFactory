@@ -1,0 +1,108 @@
+{
+  "captured_at": "2026-11-05T18:37:32.065339+00:00",
+  "repo": "BumStill/CodeFactory",
+  "pr": 996,
+  "transport": "authenticated gh api GET; replay is not Tauri live validation",
+  "responses": {
+    "/user": {
+      "id": 1858168
+    },
+    "/repos/BumStill/CodeFactory": {
+      "id": 1239349968,
+      "full_name": "BumStill/CodeFactory",
+      "permissions": {
+        "pull": true
+      }
+    },
+    "/repos/BumStill/CodeFactory/pulls/996": {
+      "number": 996,
+      "state": "open",
+      "head": {
+        "sha": "5639560f0603fbb97d50d4805ded6adb603a57eb",
+        "repo": {
+          "id": 1239349968
+        }
+      },
+      "base": {
+        "repo": {
+          "id": 1239349968
+        }
+      }
+    },
+    "/repos/BumStill/CodeFactory/actions/runs?head_sha=5639560f0603fbb97d50d4805ded6adb603a57eb&per_page=100&page=1": {
+      "total_count": 5,
+      "workflow_runs": [
+        {
+          "id": 42082597984,
+          "run_attempt": 1,
+          "workflow_id": 277083151,
+          "head_sha": "5639560f0603fbb97d50d4805ded6adb603a57eb",
+          "repository": {
+            "id": 1239349968
+          },
+          "head_repository": {
+            "id": 1239349968
+          },
+          "status": "in_progress",
+          "conclusion": null
+        },
+        {
+          "id": 42082598277,
+          "run_attempt": 1,
+          "workflow_id": 277083152,
+          "head_sha": "5639560f0603fbb97d50d4805ded6adb603a57eb",
+          "repository": {
+            "id": 1239349968
+          },
+          "head_repository": {
+            "id": 1239349968
+          },
+          "status": "completed",
+          "conclusion": "success"
+        },
+        {
+          "id": 42082598110,
+          "run_attempt": 1,
+          "workflow_id": 342338097,
+          "head_sha": "5639560f0603fbb97d50d4805ded6adb603a57eb",
+          "repository": {
+            "id": 1239349968
+          },
+          "head_repository": {
+            "id": 1239349968
+          },
+          "status": "completed",
+          "conclusion": "success"
+        },
+        {
+          "id": 42082597923,
+          "run_attempt": 1,
+          "workflow_id": 341751339,
+          "head_sha": "5639560f0603fbb97d50d4805ded6adb603a57eb",
+          "repository": {
+            "id": 1239349968
+          },
+          "head_repository": {
+            "id": 1239349968
+          },
+          "status": "completed",
+          "conclusion": "success"
+        },
+        {
+          "id": 42082598388,
+          "run_attempt": 1,
+          "workflow_id": 313517647,
+          "head_sha": "5639560f0603fbb97d50d4805ded6adb603a57eb",
+          "repository": {
+            "id": 1239349968
+          },
+          "head_repository": {
+            "id": 1239349968
+          },
+          "status": "completed",
+          "conclusion": "success"
+        }
+      ]
+    }
+  }
+}

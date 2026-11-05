@@ -1,6 +1,14 @@
 {
   "schema_version": 1,
   "mappings": [
+    { "pattern": "src-tauri/src/git_remote/client.rs", "scenario_id": "UI-009" },
+    { "pattern": "src-tauri/src/secrets.rs", "scenario_id": "UI-009" },
+    { "pattern": "src-tauri/src/specialist_observations.rs", "scenario_id": "UI-009" },
+    { "pattern": "src-tauri/src/specialist_credential_fence.rs", "scenario_id": "UI-009" },
+    { "pattern": "src-tauri/src/commands/specialist_observations.rs", "scenario_id": "UI-009" },
+    { "pattern": "src-tauri/migrations/0027_specialist_observations.sql", "scenario_id": "UI-009" },
+    { "pattern": "src/components/SpecialistProjectObservations.tsx", "scenario_id": "UI-009" },
+
     { "pattern": "src/components/SpecialistEvidencePanel.tsx", "scenario_id": "UI-009" },
     { "pattern": "src/acceptance/specialistbots.tsx", "scenario_id": "UI-009" },
     { "pattern": "scripts/verify-specialistbots-headless.mjs", "scenario_id": "UI-009" },

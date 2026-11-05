@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+import { SpecialistProjectObservations } from "../../components/SpecialistProjectObservations";
 import { SpecialistEvidencePanel } from "../../components/SpecialistEvidencePanel";
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode, type RefObject, type PointerEvent as ReactPointerEvent } from "react";
 import {
@@ -1082,7 +1083,7 @@ export function WorkspacePage({
             onResize={setAuxiliaryPaneWidth}
             content={
               auxiliaryPaneKind === "specialists" ? (
-                activeCwd ? <SpecialistEvidencePanel key={activeCwd} project={activeCwd} /> : null
+                activeCwd ? <div key={activeCwd} className="min-h-0 flex-1 overflow-y-auto"><div className="p-4"><SpecialistProjectObservations project={activeCwd} /></div><SpecialistEvidencePanel project={activeCwd} /></div> : null
               ) : auxiliaryPaneKind === "git" ? (
                 gitPanel === "history" ? (
                   <GitHistoryPanel embedded onClose={() => {
