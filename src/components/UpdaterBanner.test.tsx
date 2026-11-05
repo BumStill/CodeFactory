@@ -20,11 +20,14 @@ const mocks = vi.hoisted(() => ({
     dismiss: vi.fn(),
     updateMinimized: false,
     setUpdateMinimized: vi.fn(),
+    retryInstall: vi.fn(),
+    stalled: false,
   },
 }));
 
 vi.mock("../stores/updater", () => ({
   canChooseUpdateTiming: () => false,
+  isUpdateStalled: () => mocks.state.stalled,
   countUpdateBlockers: (status: { active_objective_leases?: number } | null) =>
     status?.active_objective_leases ?? 0,
   describeUpdateObjectiveBlockers: (status: { active_objective_leases?: number } | null) =>
@@ -82,6 +85,28 @@ describe("UpdaterBanner", () => {
     expect(screen.queryByText("更新已排队，正在等待安全安装…")).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "等待更新 · 2" }));
     expect(mocks.state.setUpdateMinimized).toHaveBeenCalledWith(false);
+    mocks.state.updateMinimized = false;
+  });
+
+  it("offers a way out when nothing blocks the update and it still is not moving", () => {
+    mocks.state.phase = {
+      kind: "waiting_for_safe_restart",
+      update: { version: "1.92.0" },
+      blockers: null,
+      safetyCheckError: "update target cannot replace the old target",
+      checkedAt: 4,
+    } as unknown as typeof mocks.state.phase;
+    mocks.state.stalled = true;
+    mocks.state.updateMinimized = true;
+
+    render(<UpdaterBanner />);
+
+    expect(screen.getByText("更新没有开始")).toBeInTheDocument();
+    expect(screen.queryByText(/本地执行仍在运行/)).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "手动下载" })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "重试" }));
+    expect(mocks.state.retryInstall).toHaveBeenCalled();
+    mocks.state.stalled = false;
     mocks.state.updateMinimized = false;
   });
 

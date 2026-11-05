@@ -403,7 +403,71 @@ async fn ensure_update_receipt_schema(pool: &sqlx::SqlitePool) -> Result<(), sql
     )
     .execute(pool)
     .await?;
+    // M239: an attempt that ended without installing leaves the unresolved slot
+    // but stays on record, so a retry never rewrites what happened.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS update_install_receipts_retired (
+            id TEXT PRIMARY KEY,
+            objective_id TEXT,
+            target_version TEXT NOT NULL,
+            target_build TEXT NOT NULL,
+            pre_install_version TEXT,
+            pre_install_build TEXT,
+            recovery_replay_count INTEGER NOT NULL,
+            status TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            observed_at INTEGER NOT NULL,
+            retired_reason TEXT NOT NULL,
+            retired_at INTEGER NOT NULL
+        )",
+    )
+    .execute(pool)
+    .await?;
     Ok(())
+}
+
+async fn retire_receipt(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    receipt_id: &str,
+    reason: &str,
+    now: i64,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO update_install_receipts_retired
+         SELECT id, objective_id, target_version, target_build, pre_install_version,
+                pre_install_build, recovery_replay_count, status, created_at, observed_at, ?, ?
+         FROM update_install_receipts WHERE id=?",
+    )
+    .bind(reason)
+    .bind(now)
+    .bind(receipt_id)
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query("DELETE FROM update_install_receipts WHERE id=?")
+        .bind(receipt_id)
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
+/// M239: the user asked to try again. Only an attempt known to have ended
+/// (`unknown`) is released; `install_started` may still be running.
+pub(crate) async fn retire_failed_update_attempt(
+    pool: &sqlx::SqlitePool,
+    now: i64,
+) -> Result<bool, sqlx::Error> {
+    ensure_update_receipt_schema(pool).await?;
+    let mut tx = pool.begin().await?;
+    let id = sqlx::query_scalar::<_, String>(
+        "SELECT id FROM update_install_receipts WHERE status='unknown' LIMIT 1",
+    )
+    .fetch_optional(&mut *tx)
+    .await?;
+    if let Some(id) = &id {
+        retire_receipt(&mut tx, id, "user_retry", now).await?;
+    }
+    tx.commit().await?;
+    Ok(id.is_some())
 }
 
 fn update_receipt_view(
@@ -527,6 +591,13 @@ pub(crate) async fn admit_update_install(
                 tx.commit().await?;
                 return Ok(UpdateInstallAdmission::Applied(view));
             }
+        } else if unresolved_status == "unknown"
+            && claim.is_some()
+            && (unresolved_version != target_version || unresolved_build != target_build)
+        {
+            // M239: this attempt ended and the running app is not its target, so
+            // it can no longer install. Holding the slot would block every release.
+            retire_receipt(&mut tx, &unresolved_id, "superseded_by_newer_target", now).await?;
         } else {
             let unresolved_objective_id: Option<String> = unresolved.try_get("objective_id")?;
             let replay_count: i64 = unresolved.try_get("recovery_replay_count")?;
@@ -1022,10 +1093,13 @@ pub(crate) async fn ensure_update_objective(
             .await
             .map_err(|error| AppError::Other(error.to_string()))?
             .ok_or_else(|| AppError::Other("conflicting update objective disappeared".into()))?;
-        if existing.status == ObjectiveStatus::WaitingCoreInput
-            && existing.failure_code.as_deref()
-                == Some(crate::agent::objective::TECHNICAL_RECOVERY_EXHAUSTED)
-        {
+        // M239: the manifest has moved on, so a target nobody is working on can
+        // never install. Only a live worker keeps it.
+        let held = existing.lease_owner.is_some()
+            && existing
+                .lease_expires_at
+                .is_some_and(|expires| expires > chrono::Utc::now().timestamp_millis());
+        if !held {
             let mut decision = existing.as_decision();
             decision.decision_type = crate::agent::objective::DecisionType::FailedInternal;
             decision.status = ObjectiveStatus::LegacyOrphan;
@@ -1047,11 +1121,19 @@ pub(crate) async fn ensure_update_objective(
                 Ok(_) => {}
                 Err(error) if error.to_string().contains("revision") => {
                     return Err(AppError::Other(
-                        "update target changed while reconciling the exhausted target".into(),
+                        "update target changed while reconciling the old target".into(),
                     ));
                 }
                 Err(error) => return Err(AppError::Other(error.to_string())),
             }
+            sqlx::query(
+                "UPDATE objective_remediations
+                 SET status='superseded', lease_owner=NULL, lease_expires_at=NULL
+                 WHERE objective_id=? AND status NOT IN ('superseded','completed','failed')",
+            )
+            .bind(&objective_id)
+            .execute(pool)
+            .await?;
         } else {
             return Err(AppError::Other(format!(
                 "update target {resource_id} cannot replace the system-owned target {existing_resource} on objective {objective_id}"
@@ -1400,6 +1482,24 @@ pub async fn force_update_install(
     Ok(())
 }
 
+/// M239: the user asked to try again after an update stalled or failed.
+#[tauri::command]
+pub async fn retry_update_install(
+    target_version: String,
+    target_build: String,
+    state: State<'_, AppState>,
+) -> Result<(), AppError> {
+    let target_version = target_version.trim().to_string();
+    let target_build = target_build.trim().to_string();
+    validate_update_identity(&target_version, &target_build)?;
+    let pool = state.db.read().await;
+    let retired =
+        retire_failed_update_attempt(&pool, chrono::Utc::now().timestamp_millis()).await?;
+    tracing::warn!(%target_version, %target_build, retired, "user retried a stalled update");
+    ensure_update_objective(&pool, &target_version, &target_build).await?;
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn release_update_install_reservation(
     state: State<'_, AppState>,
@@ -1417,7 +1517,7 @@ mod tests {
     use super::{
         admit_update_install, count_active_delivery_leases, count_nonterminal_objectives,
         ensure_update_objective, load_objective_blockers, observe_latest_update_install,
-        run_update_upgrade_smoke_fixture, update_target_resource_id, UpdateClaimPermit,
+        retire_failed_update_attempt, run_update_upgrade_smoke_fixture, update_target_resource_id, UpdateClaimPermit,
         UpdateInstallAdmission, UpdateInstallState, UpdateSafetyStatus,
     };
     use crate::agent::objective::{ObjectiveStatus, ObjectiveStore, TECHNICAL_RECOVERY_EXHAUSTED};
@@ -2287,5 +2387,118 @@ mod tests {
             conflict,
             UpdateInstallAdmission::InstallPermitted(_)
         ));
+    }
+
+    /// M239: an attempt that ended without installing must not fence every later
+    /// release; it is the reason an idle Windows app sat in the queue with no exit.
+    #[tokio::test]
+    async fn a_failed_attempt_on_an_old_target_does_not_block_a_newer_target() {
+        for (current_version, current_build) in [
+            (CURRENT_VERSION, CURRENT_BUILD),
+            // The user installed a build by hand after the attempt failed.
+            ("1.79.5", "cccccccccccccccccccccccccccccccccccccccc"),
+        ] {
+            let pool = sqlx::sqlite::SqlitePoolOptions::new()
+                .max_connections(5)
+                .connect("sqlite::memory:")
+                .await
+                .unwrap();
+            let old = claimed_update_permit(&pool, "update-old", "owner", TARGET_VERSION, TARGET_BUILD).await;
+            admit_update_install(&pool, Some(&old), TARGET_VERSION, TARGET_BUILD, CURRENT_VERSION, CURRENT_BUILD, 1_000)
+                .await
+                .unwrap();
+            observe_latest_update_install(&pool, current_version, current_build, 1_500)
+                .await
+                .unwrap();
+
+            let next_build = "dddddddddddddddddddddddddddddddddddddddd";
+            let next = claimed_update_permit(&pool, "update-next", "owner", "1.81.0", next_build).await;
+            let admission = admit_update_install(&pool, Some(&next), "1.81.0", next_build, current_version, current_build, 2_000)
+                .await
+                .unwrap();
+            assert!(matches!(admission, UpdateInstallAdmission::InstallPermitted(_)));
+            let retired: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM update_install_receipts_retired WHERE target_version=?",
+            )
+            .bind(TARGET_VERSION)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(retired, 1, "the failed attempt stays on record");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_attempt_still_in_flight_keeps_fencing_a_newer_target() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(5)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        let old = claimed_update_permit(&pool, "update-old", "owner", TARGET_VERSION, TARGET_BUILD).await;
+        admit_update_install(&pool, Some(&old), TARGET_VERSION, TARGET_BUILD, CURRENT_VERSION, CURRENT_BUILD, 1_000)
+            .await
+            .unwrap();
+        let next_build = "dddddddddddddddddddddddddddddddddddddddd";
+        let next = claimed_update_permit(&pool, "update-next", "owner", "1.81.0", next_build).await;
+        let admission = admit_update_install(&pool, Some(&next), "1.81.0", next_build, CURRENT_VERSION, CURRENT_BUILD, 2_000)
+            .await
+            .unwrap();
+        assert!(!matches!(admission, UpdateInstallAdmission::InstallPermitted(_)));
+        assert!(!retire_failed_update_attempt(&pool, 3_000).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn user_retry_reopens_an_attempt_that_used_up_its_automatic_retry() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(5)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        let permit = claimed_update_permit(&pool, "update-retry", "owner", TARGET_VERSION, TARGET_BUILD).await;
+        let admit = |now| admit_update_install(&pool, Some(&permit), TARGET_VERSION, TARGET_BUILD, CURRENT_VERSION, CURRENT_BUILD, now);
+        admit(1_000).await.unwrap();
+        observe_latest_update_install(&pool, CURRENT_VERSION, CURRENT_BUILD, 1_100).await.unwrap();
+        admit(2_000).await.unwrap();
+        observe_latest_update_install(&pool, CURRENT_VERSION, CURRENT_BUILD, 2_100).await.unwrap();
+        assert!(!matches!(admit(3_000).await.unwrap(), UpdateInstallAdmission::InstallPermitted(_)));
+
+        assert!(retire_failed_update_attempt(&pool, 4_000).await.unwrap());
+        assert!(matches!(admit(5_000).await.unwrap(), UpdateInstallAdmission::InstallPermitted(_)));
+    }
+
+    #[tokio::test]
+    async fn a_newer_target_replaces_an_old_target_only_when_nothing_is_running_it() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(5)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        let old_id = ensure_update_objective(&pool, TARGET_VERSION, TARGET_BUILD).await.unwrap();
+        let store = ObjectiveStore::new(pool.clone());
+        assert_eq!(store.get(&old_id).await.unwrap().unwrap().status, ObjectiveStatus::WaitingSystem);
+
+        let next_build = "cccccccccccccccccccccccccccccccccccccccc";
+        let next_id = ensure_update_objective(&pool, "1.81.0", next_build).await.unwrap();
+        assert_ne!(next_id, old_id);
+        assert_eq!(store.get(&old_id).await.unwrap().unwrap().status, ObjectiveStatus::LegacyOrphan);
+        let open: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM objective_remediations
+             WHERE objective_id=? AND status NOT IN ('superseded','completed','failed')",
+        )
+        .bind(&old_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(open, 0, "the replaced target must not be claimable again");
+
+        let claimed = store.claim_due_remediations("owner", 1, 60_000).await.unwrap();
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].objective.id, next_id);
+        let third = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+        assert!(
+            ensure_update_objective(&pool, "1.82.0", third).await.is_err(),
+            "a target a worker holds right now cannot be swapped out"
+        );
     }
 }

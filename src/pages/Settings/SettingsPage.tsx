@@ -21,8 +21,9 @@ import {
 import { useSettingsStore } from "../../stores/settings";
 import { useChatStore } from "../../stores/chat";
 import { useGitRemoteStore } from "../../stores/gitRemote";
-import { canChooseUpdateTiming, countUpdateBlockers, useUpdaterStore, type UpdaterPhase } from "../../stores/updater";
+import { canChooseUpdateTiming, countUpdateBlockers, isUpdateStalled, useUpdaterStore, type UpdaterPhase } from "../../stores/updater";
 import { UpdateBlockerChoice } from "../../components/UpdateBlockerChoice";
+import { UpdateStalledChoice } from "../../components/UpdateStalledChoice";
 import type {
   Settings,
   Endpoint,
@@ -2462,10 +2463,12 @@ function ChatGptLoginCard() {
 function UpdateStatusLine({
   phase,
   currentVersion,
+  stalled,
   onInstall,
 }: {
   phase: UpdaterPhase;
   currentVersion: string | null;
+  stalled: boolean;
   onInstall: () => void;
 }) {
   switch (phase.kind) {
@@ -2537,6 +2540,14 @@ function UpdateStatusLine({
         </p>
       );
     case "waiting_for_safe_restart": {
+      if (stalled) {
+        return (
+          <div className="space-y-1.5 text-label text-amber-700 dark:text-amber-300">
+            <p className="flex items-center gap-1.5"><RefreshCw size={14} /> 更新没有开始</p>
+            <UpdateStalledChoice version={phase.update.version} detail={phase.safetyCheckError} />
+          </div>
+        );
+      }
       const observingUnknownInstall =
         phase.blockers?.update_install_state === "still_unknown" ||
         phase.blockers?.update_install_state === "observe_only";
@@ -2587,6 +2598,7 @@ const REPO_URL = "https://github.com/BumStill/CodeFactory";
 function AboutTab() {
   const phase = useUpdaterStore((s) => s.phase);
   const currentVersion = useUpdaterStore((s) => s.currentVersion);
+  const stalled = useUpdaterStore((s) => isUpdateStalled(s.phase, s.waitingSince, s.forceRequested));
   const checkNow = useUpdaterStore((s) => s.checkNow);
   const install = useUpdaterStore((s) => s.install);
   const initialize = useUpdaterStore((s) => s.initialize);
@@ -2640,6 +2652,7 @@ function AboutTab() {
 
         <UpdateStatusLine
           phase={phase}
+          stalled={stalled}
           currentVersion={currentVersion}
           onInstall={() => void install()}
         />

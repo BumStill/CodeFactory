@@ -14,6 +14,8 @@ import { invoke } from "../lib/tauri";
 
 const POLL_INTERVAL_MS = 30 * 60 * 1000; // 30 min — light on the GitHub CDN, fresh enough for users
 const SAFE_RESTART_RETRY_MS = 5_000;
+const UPDATE_STALL_MS = 60_000; // nothing to wait for, yet no download in sight
+const UPDATE_AUTO_RETRY_MS = 10 * 60 * 1000; // a stall recovers on its own; the button only skips this wait
 
 export interface UpdateSafetyStatus {
   safe_to_restart: boolean;
@@ -103,6 +105,21 @@ export function canChooseUpdateTiming(status: UpdateSafetyStatus | null): status
   return status?.update_install_state === "queued" && countUpdateBlockers(status) > 0;
 }
 
+/**
+ * The update is not waiting for anything the user can see, yet it is not moving.
+ * Whatever the cause, this is the state that must offer a way out.
+ */
+export function isUpdateStalled(
+  phase: UpdaterPhase,
+  waitingSince: number | null,
+  forceRequested: boolean,
+): boolean {
+  if (phase.kind !== "waiting_for_safe_restart") return false;
+  if (phase.safetyCheckError) return true;
+  if (!forceRequested && countUpdateBlockers(phase.blockers) > 0) return false;
+  return waitingSince !== null && phase.checkedAt - waitingSince >= UPDATE_STALL_MS;
+}
+
 function targetBuildIdentity(update: Update): string | null {
   const raw = (update as Update & { rawJson?: Record<string, unknown> }).rawJson ?? {};
   const value = raw.build_git_sha;
@@ -135,11 +152,13 @@ interface UpdaterStore {
   dismissedVersion: string | null;        // user dismissed this version's banner; new versions still show
   forceRequested: boolean;                // user chose to interrupt running work for this update
   updateMinimized: boolean;               // waiting window shrunk to a chip; waiting continues
+  waitingSince: number | null;            // when the current wait for a download began
 
   initialize: () => Promise<void>;        // start polling, fetch current version
   checkNow: () => Promise<void>;          // user-triggered check
   install: () => Promise<void>;
   forceInstall: () => Promise<void>;      // user-confirmed: install now, interrupting running work
+  retryInstall: () => Promise<void>;      // user-requested: clear a failed attempt and start over
   setUpdateMinimized: (minimized: boolean) => void;
   dismiss: () => void;                    // hide banner for this version
 }
@@ -153,6 +172,7 @@ export const useUpdaterStore = create<UpdaterStore>((set, get) => ({
   dismissedVersion: null,
   forceRequested: false,
   updateMinimized: false,
+  waitingSince: null,
 
   initialize: async () => {
     // Download and installation are backend-owned after the renderer queues a
@@ -333,13 +353,15 @@ export const useUpdaterStore = create<UpdaterStore>((set, get) => ({
       // mutation permit and therefore never downloads, installs, or relaunches
       // the app. The backend supervisor observes the exact target binding and
       // may install only with its current owner+epoch permit.
+      const checkedAt = Date.now();
       set({
+        waitingSince: get().waitingSince ?? checkedAt,
         phase: {
           kind: "waiting_for_safe_restart",
           update,
           blockers: safety,
           safetyCheckError,
-          checkedAt: Date.now(),
+          checkedAt,
         },
       });
       if (get().safeRetryHandle === null) {
@@ -348,6 +370,14 @@ export const useUpdaterStore = create<UpdaterStore>((set, get) => ({
           void get().install();
         }, SAFE_RESTART_RETRY_MS);
         set({ safeRetryHandle: handle });
+      }
+      const { phase: waiting, waitingSince, forceRequested } = get();
+      if (
+        waitingSince !== null &&
+        checkedAt - waitingSince >= UPDATE_AUTO_RETRY_MS &&
+        isUpdateStalled(waiting, waitingSince, forceRequested)
+      ) {
+        await get().retryInstall();
       }
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -370,10 +400,25 @@ export const useUpdaterStore = create<UpdaterStore>((set, get) => ({
     if (!targetBuild) return;
     try {
       await invoke("force_update_install", { targetVersion: phase.update.version, targetBuild });
-      set({ forceRequested: true, updateMinimized: false });
+      set({ forceRequested: true, updateMinimized: false, waitingSince: Date.now() });
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       set({ phase: { ...phase, safetyCheckError: `无法立即更新：${msg}` } });
+    }
+  },
+
+  retryInstall: async () => {
+    const phase = get().phase;
+    if (phase.kind !== "waiting_for_safe_restart") return;
+    const targetBuild = targetBuildIdentity(phase.update);
+    if (!targetBuild) return;
+    try {
+      await invoke("retry_update_install", { targetVersion: phase.update.version, targetBuild });
+      set({ waitingSince: Date.now() });
+      await get().install();
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      set({ phase: { ...phase, safetyCheckError: `无法重试：${msg}` } });
     }
   },
 
