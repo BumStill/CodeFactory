@@ -121,7 +121,9 @@ jobs:
   execute-macos:
     needs: plan
     if: ${{ needs.plan.outputs.run_macos == 'true' }}
-    runs-on: macos-14
+    # GitHub retired the macos-14 image. "macos-14" stays the policy's runner name;
+    # receipts bind to its os and arch, which macos-15 also reports.
+    runs-on: macos-15
     steps:
       - name: Checkout trusted base policy
         uses: actions/checkout@v4
