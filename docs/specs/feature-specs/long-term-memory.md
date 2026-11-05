@@ -33,7 +33,7 @@
 
 ## 验收
 - T1–T7：`src-tauri/src/agent/long_term_memory.rs`，真实 SQLite，T1 用真实 git worktree。
-- T8：CI 里的 `--unattended-long-task-smoke` 走真实 `AgentLoop::run`，新回合和进程重启后的回合都断言发给模型的请求带记忆索引。普通发送、继续、唤醒共用同一处装配，没有逐入口重放。
+- T8：真实 `AgentLoop::run` 发给模型的请求带记忆索引，新回合和进程重启后的回合都要断言。`unattended_smoke.rs` 属于 E2E-001 的受保护驱动，普通 PR 不能改，所以这条断言单独走信任根 PR；在它合并前，证据是对提交 `7fd5c4385` 的本机真实二进制运行。普通发送、继续、唤醒共用同一处装配。
 - 记忆页：`node scripts/verify-long-term-memory-headless.mjs`，light/dark，桌面和 375px。
 - 真机：说「记住：这个项目的回复结尾不要总结」，新开会话不提醒也遵守；记忆页能看到来源，删除后新会话不再遵守。
 
