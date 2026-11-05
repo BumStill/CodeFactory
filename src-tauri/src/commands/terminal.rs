@@ -66,6 +66,7 @@ pub(crate) fn busy_session_count(sessions: &HashMap<String, PtySession>) -> usiz
 #[cfg(unix)]
 fn process_has_children(pid: u32) -> bool {
     std::process::Command::new("pgrep")
+        .no_window()
         .args(["-P", &pid.to_string()])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -246,13 +247,15 @@ pub async fn terminal_kill(id: String, state: State<'_, TerminalState>) -> Resul
 #[cfg(test)]
 mod m238_tests {
     use super::process_has_children;
+    use crate::util::no_window::NoWindow;
 
     #[test]
     fn a_process_with_a_running_child_reads_as_busy() {
         #[cfg(unix)]
-        let mut child = std::process::Command::new("sleep").arg("20").spawn().unwrap();
+        let mut child = std::process::Command::new("sleep").no_window().arg("20").spawn().unwrap();
         #[cfg(windows)]
         let mut child = std::process::Command::new("ping")
+            .no_window()
             .args(["-n", "20", "127.0.0.1"])
             .stdout(std::process::Stdio::null())
             .spawn()
