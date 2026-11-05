@@ -1377,6 +1377,8 @@ pub async fn drain_due_wakeups_at(pool: &SqlitePool, sink: &dyn WakeSink, now: i
                     return 0;
                 }
             }
+            // M237：模型恢复前投递只会写一条无人回答的消息。顺延到模型唤醒，到点合并为一个回合。
+            if hold_for_model_wake(pool, &session, &wakes, now).await { return 0; }
             // M216：旧版本把准入失败记到了工作区预算，迁移时仅清除这类未结算技术记录。
             if let Err(error) = sqlx::query("DELETE FROM workspace_recovery_budget WHERE session_id=? AND settled_reason IS NULL AND last_error='唤醒投递失败；系统自动重试/自愈'")
                 .bind(&session).execute(pool).await {
@@ -1476,6 +1478,28 @@ pub async fn drain_due_wakeups_at(pool: &SqlitePool, sink: &dyn WakeSink, now: i
     let mut delivered = 0;
     while let Some(count) = pending.next().await { delivered += count; }
     delivered
+}
+
+/// M237：会话正在等模型恢复时，把到点的其它唤醒顺延到恢复时间。不计 `fire_count`。
+async fn hold_for_model_wake(pool: &SqlitePool, session: &str, wakes: &[WakeupSchedule], now: i64) -> bool {
+    if wakes.iter().any(|wake| wake.id.starts_with("model-availability-")) { return false; }
+    let resume_at: Option<i64> = match sqlx::query_scalar(
+        "SELECT MIN(next_at) FROM wakeup_schedules WHERE session_id=? AND status='pending' AND id LIKE 'model-availability-%' AND next_at>?",
+    ).bind(session).bind(now).fetch_one(pool).await {
+        Ok(resume_at) => resume_at,
+        Err(error) => {
+            tracing::warn!(%error, session, "model wake lookup failed; delivering due wakes");
+            return false;
+        }
+    };
+    let Some(resume_at) = resume_at else { return false; };
+    for wake in wakes {
+        if let Err(error) = sqlx::query("UPDATE wakeup_schedules SET next_at=? WHERE id=? AND status='pending' AND next_at=?")
+            .bind(resume_at).bind(&wake.id).bind(wake.next_at).execute(pool).await {
+            tracing::warn!(%error, wakeup = %wake.id, "wake hold deferred; automatic retry next tick");
+        }
+    }
+    true
 }
 
 /// 生产入口：用当前时间投递到点唤醒。
@@ -2701,6 +2725,35 @@ mod tests {
         assert_eq!(pending, 0, "all fire counts must be handled in one scan");
         let counts: Vec<i64> = sqlx::query_scalar("SELECT fire_count FROM wakeup_schedules ORDER BY fire_count").fetch_all(&pool).await.unwrap();
         assert_eq!(counts, vec![1,2,5]);
+    }
+
+    #[tokio::test]
+    async fn m237_due_wakes_hold_until_the_model_wake_without_writing_messages() {
+        let dir = scratch_dir("m237-hold");
+        let pool = file_pool(&dir).await;
+        super::super::thin_state::ensure(&pool).await.unwrap();
+        super::super::workspace_recovery_budget::ensure(&pool).await.unwrap();
+        sqlx::raw_sql("CREATE TABLE sessions(id TEXT PRIMARY KEY,delivery_mode TEXT);
+            CREATE TABLE thin_external_observations(session_id TEXT PRIMARY KEY,completed_reason TEXT);
+            CREATE TABLE session_audit_events(id TEXT PRIMARY KEY,session_id TEXT,kind TEXT,actor TEXT,detail_json TEXT,created_at INTEGER);
+            INSERT INTO sessions VALUES ('m237','thin');").execute(&pool).await.unwrap();
+        ensure_wakeup_schema(&pool).await.unwrap();
+        for (id, at) in [("thin-closeout-m237-42", 100), ("model-availability-m237", 5_000)] {
+            sqlx::query("INSERT INTO wakeup_schedules(id,session_id,prompt,source,after_sec,next_at,status,created_at) VALUES (?,'m237','PR #42 已合并，执行收尾','agent_decided',60,?,'pending',1)")
+                .bind(id).bind(at).execute(&pool).await.unwrap();
+        }
+        let recorder = Arc::new(Recorder::default());
+        for now in (200..4_000).step_by(60) {
+            assert_eq!(drain_due_wakeups_at(&pool, sink(&recorder), now).await, 0);
+        }
+        assert!(recorder.take().is_empty(), "no model means no wake text in the transcript");
+        let held: (i64, i64) = sqlx::query_as("SELECT fire_count,next_at FROM wakeup_schedules WHERE id='thin-closeout-m237-42'")
+            .fetch_one(&pool).await.unwrap();
+        assert_eq!(held, (0, 5_000), "a held wake is deferred to the model wake, not fired or left overdue");
+        assert_eq!(drain_due_wakeups_at(&pool, sink(&recorder), 5_000).await, 1);
+        assert_eq!(recorder.take().len(), 1, "wakes held for one session resume as one turn");
+        pool.close().await;
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[tokio::test]
