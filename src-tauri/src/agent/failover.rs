@@ -365,18 +365,31 @@ impl EndpointHealthRegistry {
     }
 
     pub fn is_available(&self, endpoint_name: &str) -> bool {
+        self.cooldown_remaining(endpoint_name).is_none()
+    }
+
+    /// M234：距离这个端点冷却结束还有多久。`None` 表示它现在就能用。
+    ///
+    /// 准入把冷却当成一条"时间会治好它"的原因，就必须知道**什么时候**治好，
+    /// 否则只能静默跳过——那正是 M234 的故障：ChatGPT 只因一次可解析失败进入
+    /// 120 秒冷却，会话却被挂到 DeepSeek 次日 0 点的预算重置上。
+    pub fn cooldown_remaining(&self, endpoint_name: &str) -> Option<Duration> {
         let mut states = self
             .inner
             .unavailable_since
             .lock()
             .expect("endpoint health mutex poisoned");
         match states.get(endpoint_name).copied() {
-            Some(since) if since.elapsed() < self.inner.cooldown => false,
-            Some(_) => {
-                states.remove(endpoint_name);
-                true
+            Some(since) => {
+                let remaining = self.inner.cooldown.saturating_sub(since.elapsed());
+                if remaining.is_zero() {
+                    states.remove(endpoint_name);
+                    None
+                } else {
+                    Some(remaining)
+                }
             }
-            None => true,
+            None => None,
         }
     }
 
@@ -694,11 +707,36 @@ impl ActiveRouteState {
             // M212：按端点的每日人民币预算用完了，和订阅额度一样是"会自己好"
             // 的等待理由，但原因文案不同（明天 0 点重置）。
             let mut spend_blocked: Vec<String> = Vec::new();
+            // M234：仅仅因为上一轮的瞬时失败还在冷却、本轮没被尝试的端点。
+            // 它既不是"这一轮失败了"，也不能静默消失——它是这条等待真正的起因。
+            let mut transient_blocked: Vec<String> = Vec::new();
             // M86：等待说明要列出**全部**原因（时段、额度、缺凭据）与最早可用时间。
             let mut causes: Vec<super::usage_windows::WaitCause> = Vec::new();
             let selected = inner.candidates.iter().enumerate().find_map(|(index, route)| {
                 let label = endpoint_label(&route.endpoint_name);
-                if inner.failed_indices.contains(&index) || !self.health.is_available(&route.endpoint_name) { return None; }
+                if inner.failed_indices.contains(&index) { return None; }
+                // M234：冷却中的端点是一条**会被时间治好**的原因，不是"没有这条路"。
+                // 静默跳过会让整条等待退化成别的端点的额度/预算重置时间。
+                if let Some(remaining) = self.health.cooldown_remaining(&route.endpoint_name) {
+                    use super::usage_windows::WaitCauseKind;
+                    let until = now.saturating_add(remaining.as_millis() as i64);
+                    skipped.push(RouteAttemptSnapshot {
+                        endpoint: route.endpoint_name.clone(),
+                        model: route.model_id.clone(),
+                        status: "skipped".into(),
+                        failure_code: Some(format!("endpoint_cooldown:{}", serde_json::json!({"until_ms": until}))),
+                        ..Default::default()
+                    });
+                    causes.push(super::usage_windows::WaitCause::new(
+                        label,
+                        WaitCauseKind::Transient,
+                        Some(until),
+                    ));
+                    if !transient_blocked.contains(&route.endpoint_name) {
+                        transient_blocked.push(route.endpoint_name.clone());
+                    }
+                    return None;
+                }
                 let window_cause = route.unavailable_cause(&config, now, ignore_windows);
                 let blocking: Vec<super::usage_windows::WaitCause> = window_cause.into_iter().collect();
                 if !blocking.is_empty() {
@@ -783,6 +821,16 @@ impl ActiveRouteState {
             }
             let decision = super::usage_windows::availability_decision(causes);
             if durable_wait && !decision.causes.is_empty() {
+                // M234：把"上一轮瞬时失败留下的冷却"和"别的端点自己的重置时间"
+                // 分开记：前者决定重试节奏，后者只是限制条件。
+                let transient_until = decision.causes.iter()
+                    .filter(|cause| cause.kind == super::usage_windows::WaitCauseKind::Transient)
+                    .filter_map(|cause| cause.until_ms)
+                    .max();
+                let restricted_at = decision.causes.iter()
+                    .filter(|cause| cause.kind != super::usage_windows::WaitCauseKind::Transient)
+                    .filter_map(|cause| cause.until_ms)
+                    .min();
                 let unavailable = ModelUnavailable::from_decision(decision);
                 if let Some(events) = events {
                     events.emit(crate::openrouter::types::StreamEvent::TransportRetry {
@@ -790,6 +838,18 @@ impl ActiveRouteState {
                         delay_ms: unavailable.resume_at_ms.map(|at| at.saturating_sub(now).max(0) as u64).unwrap_or(0),
                         reason: unavailable.notice.clone(),
                     });
+                }
+                // M234/R2+R5：这条等待的起因是瞬时失败，必须进入 M220 的持久退避
+                // （1/2/5/10/30 分钟，12 次后明确失败），而不是停在别的端点的
+                // 额度或预算重置时间上等一整夜。
+                if !transient_blocked.is_empty() {
+                    let mut payload = serde_json::to_value(&unavailable).unwrap_or_else(|_| serde_json::json!({}));
+                    if let Some(object) = payload.as_object_mut() {
+                        object.insert("transient_endpoints".into(), serde_json::json!(transient_blocked));
+                        object.insert("restriction_resume_at_ms".into(), serde_json::json!(restricted_at));
+                        object.insert("transient_not_before_ms".into(), serde_json::json!(transient_until));
+                    }
+                    return Err(format!("{}{}", ModelUnavailable::MARKER, payload));
                 }
                 return Err(unavailable.encode());
             }
@@ -1454,6 +1514,90 @@ mod tests {
         assert_eq!(wait.resume_at_ms, Some(next_day + 60_000 + 250));
         assert!(wait.notice.contains("高峰时段"));
         shared_quota_ledger().clear(&gpt.base_url);
+        super::super::usage_windows::set_clock_override_ms(None);
+    }
+
+    /// M234/T1+T2：上一轮 ChatGPT 只出了一次可解析失败（`error decoding response
+    /// body`）被置入冷却；下一轮准入必须把「冷却中的端点」当作一条瞬时原因，
+    /// 唤醒按退避重试（1 分钟后），而不是挂到 DeepSeek 的次日预算重置上。
+    #[tokio::test]
+    async fn m234_transient_cooldown_wakes_on_backoff_not_on_another_endpoints_reset() {
+        use super::super::quota_cap::daily_spend;
+        let _serial = super::super::usage_windows::clock_test_lock();
+        let now = chrono::DateTime::parse_from_rfc3339("2026-11-04T21:53:26+08:00").unwrap().timestamp_millis();
+        super::super::usage_windows::set_clock_override_ms(Some(now));
+        let mut gpt = route("chatgpt", "gpt-5.1");
+        gpt.api_style = ApiStyle::Chatgpt;
+        let mut plan = RouteCandidatePlan::new(gpt.clone());
+        plan.push_fallback(route("deepseek-m234", "deepseek-v4-pro"));
+        let mut missing = route("openrouter", "synthetic");
+        missing.credential_ref = None;
+        missing.legacy_inline_api_key = None;
+        plan.push_fallback(missing);
+        let health = EndpointHealthRegistry::new(Duration::from_secs(120));
+        // 21:52:21 那一轮的唯一一次瞬时失败留下的冷却。
+        health.mark_unavailable("chatgpt");
+        let state = ActiveRouteState::from_plan_with_health(plan, health);
+        let mut settings = crate::config::settings::Settings::default();
+        settings.endpoints.insert("chatgpt".into(), crate::config::settings::Endpoint {
+            base_url: gpt.base_url.clone(), key_ref: None, api_style: ApiStyle::Chatgpt,
+            custom_models: vec![], active_model: None,
+        });
+        daily_spend::ledger().record_estimated("deepseek-m234", 20.0, now);
+        state.attach_usage_settings(Arc::new(tokio::sync::RwLock::new(settings)));
+        let error = state.admit_model_availability(None, false, None).await.unwrap_err();
+        let wait = ModelUnavailable::parse(&error).expect("cooldown skip must still be a model wait");
+        let resume = wait.resume_at_ms.expect("a transient retry is always scheduled");
+        assert!(resume >= now, "wake must be in the future: {wait:?}");
+        assert!(resume <= now + 121_000, "first transient retry is bounded by the 1-minute backoff: {wait:?}");
+        assert!(
+            wait.notice.contains("ChatGPT") && wait.notice.contains("重试"),
+            "the wait reason must name the endpoint that actually failed: {}",
+            wait.notice
+        );
+        // R2：不得拿别的端点的预算/额度重置时间当唤醒理由。
+        let deepseek_reset = daily_spend::next_reset_ms(now).unwrap();
+        assert!(resume < deepseek_reset, "must not park until another endpoint's daily reset: {} vs {deepseek_reset}", resume);
+        // R5 的接线：这条等待必须带上瞬时端点，才能进入 M220 的持久退避与 12 次上限。
+        let payload: serde_json::Value = serde_json::from_str(error.split_once(ModelUnavailable::MARKER).unwrap().1).unwrap();
+        assert_eq!(payload["transient_endpoints"], serde_json::json!(["chatgpt"]));
+        assert_eq!(payload["restriction_resume_at_ms"], serde_json::json!(deepseek_reset));
+        // R3：冷却跳过必须留下可查的路由记录，且记录里带冷却结束时间。
+        let snapshot = state.attempt_snapshots(false).into_iter()
+            .find(|attempt| attempt.endpoint == "chatgpt")
+            .expect("a cooldown skip must be an auditable route attempt");
+        assert_eq!(snapshot.status, "skipped");
+        let code = snapshot.failure_code.expect("cooldown skip carries a code");
+        let json: serde_json::Value = serde_json::from_str(code.strip_prefix("endpoint_cooldown:").expect("namespaced code")).unwrap();
+        let cooldown_until = json["until_ms"].as_i64().expect("cooldown end is recorded");
+        assert!((now..=now + 120_000).contains(&cooldown_until), "cooldown end must be the real one: {cooldown_until}");
+        assert_eq!(payload["transient_not_before_ms"].as_i64(), Some(cooldown_until), "the cooldown end is the floor for the retry");
+        super::super::usage_windows::set_clock_override_ms(None);
+    }
+
+    /// M234/T2 的另一半：冷却结束后，紧接着的下一轮准入确实重新尝试该端点。
+    #[tokio::test]
+    async fn m234_next_round_retries_the_cooled_endpoint_once_it_expires() {
+        use super::super::quota_cap::daily_spend;
+        let _serial = super::super::usage_windows::clock_test_lock();
+        let now = chrono::DateTime::parse_from_rfc3339("2026-11-04T21:53:26+08:00").unwrap().timestamp_millis();
+        super::super::usage_windows::set_clock_override_ms(Some(now));
+        let health = EndpointHealthRegistry::new(Duration::from_millis(80));
+        health.mark_unavailable("chatgpt");
+        let mut plan = RouteCandidatePlan::new(route("chatgpt", "gpt-5.1"));
+        plan.push_fallback(route("deepseek-m234b", "deepseek-v4-pro"));
+        let state = ActiveRouteState::from_plan_with_health(plan, health);
+        let mut settings = crate::config::settings::Settings::default();
+        settings.endpoints.insert("chatgpt".into(), crate::config::settings::Endpoint {
+            base_url: "https://chatgpt.example".into(), key_ref: None, api_style: ApiStyle::Chatgpt,
+            custom_models: vec![], active_model: None,
+        });
+        daily_spend::ledger().record_estimated("deepseek-m234b", 20.0, now);
+        state.attach_usage_settings(Arc::new(tokio::sync::RwLock::new(settings)));
+        assert!(state.admit_model_availability(None, false, None).await.is_err(), "still cooling");
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        state.admit_model_availability(None, false, None).await.expect("cooldown over");
+        assert_eq!(state.current().endpoint_name, "chatgpt", "the transient endpoint must be retried first, not parked behind the other endpoint");
         super::super::usage_windows::set_clock_override_ms(None);
     }
 

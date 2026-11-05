@@ -1005,6 +1005,36 @@ mod m210_tests {
         assert!((before + 89_000..=now() + 90_000).contains(&wait.resume_at_ms.unwrap()));
     }
 
+    /// M234/T3：冷却跳过这条新路径同样计入 M220 的 12 次上限，超限后是
+    /// **明确失败**（说清试过什么），而不是继续挂着等。
+    #[tokio::test]
+    async fn m234_cooldown_wait_counts_toward_the_transient_cap() {
+        let db = db().await;
+        let cooldown_end = now() + 120_000;
+        let error = format!("MODEL_UNAVAILABLE:{}", serde_json::json!({
+            "resume_at_ms": cooldown_end + 250,
+            "notice": "当前没有可用模型：ChatGPT 连接出错，2 分钟后重试；系统自动重试/自愈，届时自动继续。",
+            "transient_endpoints": ["chatgpt"],
+            "restriction_resume_at_ms": serde_json::Value::Null,
+            "transient_not_before_ms": cooldown_end,
+        }));
+        for attempt in 1..=12 {
+            let unavailable = super::super::failover::ModelUnavailable::parse(&error).unwrap();
+            let (wait, terminal) = super::super::usage_windows::model_wait::bound_transient(&db, "m234", &error, unavailable).await.unwrap();
+            assert!(!terminal, "attempt {attempt} must keep retrying: {wait:?}");
+            let at = wait.resume_at_ms.unwrap();
+            assert!(at >= cooldown_end, "attempt {attempt} must not wake inside the cooldown: {wait:?}");
+            assert!(wait.notice.contains("分钟后重试"), "{wait:?}");
+            assert!(!wait.notice.contains("，1 分钟后重试（第 1 次）") || cooldown_end <= now(), "the retry time must match the real wake: {wait:?}");
+        }
+        let unavailable = super::super::failover::ModelUnavailable::parse(&error).unwrap();
+        let (wait, terminal) = super::super::usage_windows::model_wait::bound_transient(&db, "m234", &error, unavailable).await.unwrap();
+        assert!(terminal, "more than 12 transient failures must end the wait: {wait:?}");
+        assert!(wait.notice.contains("ChatGPT") && wait.notice.contains("12 次"), "{wait:?}");
+        assert!(wait.notice.contains("12 次仍连接失败"), "an explicit failure must say what was tried: {wait:?}");
+        assert!(wait.resume_at_ms.is_none(), "a terminal wait schedules nothing: {wait:?}");
+    }
+
     #[tokio::test]
     async fn m220_transient_budget_survives_database_reopen() {
         let dir = tempfile::tempdir().unwrap();
