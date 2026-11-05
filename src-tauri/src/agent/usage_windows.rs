@@ -202,7 +202,14 @@ impl WaitCause {
             (WaitCauseKind::DailySpendCap, Some(clock)) => format!("{} 今日预算已用完，{clock} 后继续", self.label),
             (WaitCauseKind::DailySpendCap, None) => format!("{} 今日预算已用完", self.label),
             (WaitCauseKind::MissingCredential, _) => format!("{} 尚未配置凭据", self.label),
-            (WaitCauseKind::Transient, _) => format!("{} 连接出错，1 分钟后重试", self.label),
+            // M234/R4：重试时间不是一个固定说法，而是这条原因真正的终点
+            // （冷却结束、或 M220 退避的下一档）。说 1 分钟却等 5 分钟就是撒谎。
+            (WaitCauseKind::Transient, _) => {
+                let minutes = self.until_ms
+                    .map(|until| (((until - now_ms()).max(1) + 59_999) / 60_000).clamp(1, 60))
+                    .unwrap_or(1);
+                format!("{} 连接出错，{minutes} 分钟后重试", self.label)
+            }
         }
     }
 }
@@ -298,6 +305,27 @@ impl UsageWindow {
 pub(crate) mod model_wait {
     use sqlx::SqlitePool;
 
+    /// M234：去掉 `…连接出错，N 分钟后重试` 这一段——N 现在由冷却剩余或退避档位
+    /// 决定，不再是固定值，所以按形状剥离而不是按字面替换。
+    fn strip_transient_retry(notice: &str) -> String {
+        const TAIL: &str = " 分钟后重试";
+        let mut out = String::with_capacity(notice.len());
+        let mut rest = notice;
+        while let Some(pos) = rest.find(TAIL) {
+            let head = &rest[..pos];
+            // 往回跳过数字，落在最后一个非数字字符之后（必须走 char 边界，不能 +1 字节）。
+            let digits_start = head.char_indices().rev()
+                .find(|(_, c)| !c.is_ascii_digit())
+                .map(|(at, c)| at + c.len_utf8())
+                .unwrap_or(0);
+            let cut = head[..digits_start].strip_suffix('，').map_or(digits_start, |head| head.len());
+            out.push_str(&head[..cut]);
+            rest = &rest[pos + TAIL.len()..];
+        }
+        out.push_str(rest);
+        out
+    }
+
     /// M210/R2：没有任何「时间会修好」的原因（全是致命错误）时的重试窗口。
     pub(crate) const FATAL_RETRY_MS: i64 = 5 * 60 * 1000;
     /// M123/M210：恢复时间已过但模型仍不可用时的下一次自动尝试间隔。
@@ -381,6 +409,8 @@ pub(crate) mod model_wait {
             .execute(db).await?;
         let now = chrono::Utc::now().timestamp_millis();
         let restriction = payload.as_ref().and_then(|value| value["restriction_resume_at_ms"].as_i64());
+        // M234：端点还在冷却里，比任何退避档位都更早唤醒只会空转一次。
+        let not_before = payload.as_ref().and_then(|value| value["transient_not_before_ms"].as_i64());
         let mut earliest = restriction;
         let mut retries = Vec::new();
         let mut exhausted = Vec::new();
@@ -393,13 +423,18 @@ pub(crate) mod model_wait {
                 continue;
             }
             let minutes = [1, 2, 5, 10, 30][((attempts - 1) as usize).min(4)];
-            let at = now + minutes * 60_000 + 250;
+            // 退避档位和"端点还在冷却"取较晚者：早了只会在冷却里空转一轮。
+            let at = (now + minutes * 60_000 + 250).max(not_before.unwrap_or(0));
             earliest = Some(earliest.map_or(at, |old| old.min(at)));
-            retries.push(format!("{label} 连接出错，{minutes} 分钟后重试（第 {attempts} 次）"));
+            // M234/R4：说多久就等多久。冷却比退避档位更长时，文案跟着冷却走。
+            let shown = minutes
+                .max(not_before.map(|floor| ((floor - now).max(1) + 59_999) / 60_000).unwrap_or(0))
+                .clamp(1, 60);
+            retries.push(format!("{label} 连接出错，{shown} 分钟后重试（第 {attempts} 次）"));
         }
         unavailable.resume_at_ms = earliest;
         let terminal = !exhausted.is_empty() && retries.is_empty() && restriction.is_none();
-        unavailable.notice = format!("{}；{}", unavailable.notice.replace("，1 分钟后重试", ""), retries.into_iter().chain(exhausted).collect::<Vec<_>>().join("；"));
+        unavailable.notice = format!("{}；{}", strip_transient_retry(&unavailable.notice), retries.into_iter().chain(exhausted).collect::<Vec<_>>().join("；"));
         if terminal {
             unavailable.notice = format!("已结束：连续瞬时故障已超过重试上限。{}。目标与失败证据已保留。", unavailable.notice
                 .replace("系统自动重试/自愈，届时自动继续。", "")
