@@ -21,7 +21,8 @@ import {
 import { useSettingsStore } from "../../stores/settings";
 import { useChatStore } from "../../stores/chat";
 import { useGitRemoteStore } from "../../stores/gitRemote";
-import { countUpdateBlockers, useUpdaterStore, type UpdaterPhase } from "../../stores/updater";
+import { canChooseUpdateTiming, countUpdateBlockers, useUpdaterStore, type UpdaterPhase } from "../../stores/updater";
+import { UpdateBlockerChoice } from "../../components/UpdateBlockerChoice";
 import type {
   Settings,
   Endpoint,
@@ -2557,6 +2558,7 @@ function UpdateStatusLine({
                 ? "后端正在取得安装许可；下载开始后会显示实时进度。"
               : `当前 ${countUpdateBlockers(phase.blockers)} 项工作仍在运行；结束后自动下载、安装并重启，无需再次点击。`}
           </p>
+          {canChooseUpdateTiming(phase.blockers) && <UpdateBlockerChoice blockers={phase.blockers} />}
         </div>
       );
     }

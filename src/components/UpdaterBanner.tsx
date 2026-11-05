@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 import { useEffect } from "react";
-import { Download, X, RefreshCw, CheckCircle, AlertCircle } from "lucide-react";
+import { Download, Minus, X, RefreshCw, CheckCircle, AlertCircle } from "lucide-react";
+import { UpdateBlockerChoice } from "./UpdateBlockerChoice";
 import {
+  canChooseUpdateTiming,
   countUpdateBlockers,
   describeUpdateObjectiveBlockers,
   useUpdaterStore,
@@ -19,6 +21,8 @@ export function UpdaterBanner() {
   const initialize = useUpdaterStore((s) => s.initialize);
   const install = useUpdaterStore((s) => s.install);
   const dismiss = useUpdaterStore((s) => s.dismiss);
+  const minimized = useUpdaterStore((s) => s.updateMinimized);
+  const setMinimized = useUpdaterStore((s) => s.setUpdateMinimized);
 
   useEffect(() => { void initialize(); }, [initialize]);
 
@@ -42,6 +46,20 @@ export function UpdaterBanner() {
     phase.blockers?.update_install_state === "queued" &&
     countUpdateBlockers(phase.blockers) === 0;
   if (!visible) return null;
+
+  if (phase.kind === "waiting_for_safe_restart" && minimized) {
+    return (
+      <button
+        type="button"
+        onClick={() => setMinimized(false)}
+        title="打开更新窗口"
+        className="fixed top-3 right-3 z-50 flex items-center gap-1.5 rounded-full border border-accent/40 bg-surface-2 px-2.5 py-1 text-caption text-amber-700 dark:text-amber-300 shadow-lg hover:bg-surface-3 transition-colors"
+      >
+        <RefreshCw size={14} />
+        等待更新 · {countUpdateBlockers(phase.blockers)}
+      </button>
+    );
+  }
 
   return (
     <div className="fixed top-3 right-3 z-50 w-80 rounded-lg border border-accent/40 bg-surface-2 shadow-2xl overflow-hidden">
@@ -118,13 +136,22 @@ export function UpdaterBanner() {
         <div className="p-3 space-y-1 text-label text-amber-700 dark:text-amber-300">
           <div className="flex items-center gap-2">
             <RefreshCw size={14} />
-            <span>
+            <span className="flex-1">
               {observingUnknownInstall
                 ? "正在核对上次安装结果…"
                 : startingDownload
                   ? "安全检查已通过，正在启动下载…"
                 : "更新已排队，正在等待安全安装…"}
             </span>
+            <button
+              type="button"
+              onClick={() => setMinimized(true)}
+              aria-label="收起"
+              title="收起，继续在后台等待"
+              className="p-0.5 text-gray-600 hover:text-gray-300 transition-colors"
+            >
+              <Minus size={14} />
+            </button>
           </div>
           {observingUnknownInstall ? (
             <p className="text-caption text-gray-500">
@@ -136,10 +163,12 @@ export function UpdaterBanner() {
             </p>
           ) : (
             <p className="text-caption text-gray-500">
-              当前 {countUpdateBlockers(phase.blockers)} 项本地执行仍在运行；结束后会自动下载、安装并重启。
+              当前 {countUpdateBlockers(phase.blockers)} 项本地执行仍在运行。
             </p>
           )}
-          {describeUpdateObjectiveBlockers(phase.blockers) && (
+          {canChooseUpdateTiming(phase.blockers) ? (
+            <UpdateBlockerChoice blockers={phase.blockers} />
+          ) : describeUpdateObjectiveBlockers(phase.blockers) && (
             <p className="text-caption text-gray-500">
               {describeUpdateObjectiveBlockers(phase.blockers)}。
             </p>

@@ -107,6 +107,7 @@ vi.mock("../../stores/gitRemote", () => ({
 
 vi.mock("../../stores/updater", () => ({
   useUpdaterStore: <T,>(selector: (state: typeof updaterState) => T) => selector(updaterState),
+  canChooseUpdateTiming: () => false,
   countUpdateBlockers: () => 1,
 }));
 

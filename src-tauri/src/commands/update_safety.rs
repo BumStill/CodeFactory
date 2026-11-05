@@ -108,6 +108,7 @@ pub struct UpdateSafetyStatus {
     pub update_receipt_id: Option<String>,
     pub target_version: Option<String>,
     pub target_build: Option<String>,
+    pub forced: bool,
 }
 
 impl UpdateSafetyStatus {
@@ -121,6 +122,24 @@ impl UpdateSafetyStatus {
             && self.terminal_sessions == 0;
         self
     }
+
+    /// M238: the user accepted interrupting the listed work for this exact target.
+    fn apply_force(mut self, forced: bool) -> Self {
+        if forced && !self.safe_to_restart {
+            self.safe_to_restart = true;
+            self.forced = true;
+        }
+        self
+    }
+}
+
+fn force_requested(state: &AppState, target_version: &str, target_build: &str) -> bool {
+    state
+        .update_force_target
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .as_ref()
+        .is_some_and(|(version, build)| version == target_version && build == target_build)
 }
 
 #[cfg(test)]
@@ -272,6 +291,16 @@ async fn update_claim_matches_target_in_tx(
 /// recovery state survive restart, but they do not represent executing work.
 /// Merely finding a unique Update claim in SQLite is never enough to infer
 /// that it owns this updater request.
+/// M238: the renderer's queued update Objective is the update itself. Once the
+/// supervisor claims it, its lease must not read as local work blocking the update.
+async fn load_queued_update_blockers(
+    pool: &sqlx::SqlitePool,
+    now: i64,
+    queued_objective_id: &str,
+) -> Result<ObjectiveBlockers, sqlx::Error> {
+    load_blockers_except(pool, now, Some(queued_objective_id)).await
+}
+
 async fn load_objective_blockers(
     pool: &sqlx::SqlitePool,
     now: i64,
@@ -286,7 +315,14 @@ async fn load_objective_blockers(
     } else {
         None
     };
+    load_blockers_except(pool, now, exempt_objective_id).await
+}
 
+async fn load_blockers_except(
+    pool: &sqlx::SqlitePool,
+    now: i64,
+    exempt_objective_id: Option<&str>,
+) -> Result<ObjectiveBlockers, sqlx::Error> {
     let rows = sqlx::query(
         "SELECT id, status, domain, recovery_owner
          FROM objectives
@@ -1157,14 +1193,16 @@ pub(crate) async fn observe_update_restart_safety_inner(
         objective_blocker_owners: objective_blockers.owners,
         pending_permissions: permissions.len(),
         managed_browser_sessions: crate::tools::browser_session::list_managed_sessions().len(),
-        terminal_sessions: terminal_map.len(),
+        terminal_sessions: crate::commands::terminal::busy_session_count(&terminal_map),
         update_objective_id: objective_blockers.exempt_objective_id,
         update_install_state: None,
         update_receipt_id: None,
         target_version: Some(target_version.to_string()),
         target_build: Some(target_build.to_string()),
+        forced: false,
     }
-    .evaluate();
+    .evaluate()
+    .apply_force(force_requested(state, target_version, target_build));
     if restart_reserved {
         status.safe_to_restart = false;
     }
@@ -1204,7 +1242,7 @@ pub(crate) async fn reserve_update_install_inner(
     let active_chat_turns = chat_turns.len();
     let active_task_schedulers = task_schedulers.len();
     let pending_permissions = permissions.len();
-    let terminal_sessions = terminal_map.len();
+    let terminal_sessions = crate::commands::terminal::busy_session_count(&terminal_map);
     let managed_browser_sessions = crate::tools::browser_session::list_managed_sessions().len();
 
     // A delivery worker can outlive the chat future that started it. Its
@@ -1213,14 +1251,18 @@ pub(crate) async fn reserve_update_install_inner(
     let pool = state.db.read().await;
     ensure_update_receipt_schema(&pool).await?;
     let active_delivery_leases = count_active_delivery_leases(&pool, now).await?;
-    let objective_blockers = load_objective_blockers(
-        &pool,
-        now,
-        claim_permit.as_ref(),
-        &target_version,
-        &target_build,
-    )
-    .await?;
+    let objective_blockers = if let Some(queued) = queued_objective_id.as_deref() {
+        load_queued_update_blockers(&pool, now, queued).await?
+    } else {
+        load_objective_blockers(
+            &pool,
+            now,
+            claim_permit.as_ref(),
+            &target_version,
+            &target_build,
+        )
+        .await?
+    };
     if claim_permit.is_some() && objective_blockers.exempt_objective_id.is_none() {
         return Err(AppError::Other(
             "update mutation permit is stale or bound to another target".into(),
@@ -1246,8 +1288,10 @@ pub(crate) async fn reserve_update_install_inner(
         update_receipt_id: None,
         target_version: Some(target_version.clone()),
         target_build: Some(target_build.clone()),
+        forced: false,
     }
-    .evaluate();
+    .evaluate()
+    .apply_force(force_requested(state, &target_version, &target_build));
     if queued_objective_id.is_some() {
         status.safe_to_restart = false;
         status.restart_reserved = false;
@@ -1335,6 +1379,25 @@ pub async fn observe_update_install(
         chrono::Utc::now().timestamp_millis(),
     )
     .await?)
+}
+
+/// M238: the user chose to install now. The consent is process-local and bound
+/// to one target, so it never survives a restart or carries to another version.
+#[tauri::command]
+pub async fn force_update_install(
+    target_version: String,
+    target_build: String,
+    state: State<'_, AppState>,
+) -> Result<(), AppError> {
+    let target_version = target_version.trim().to_string();
+    let target_build = target_build.trim().to_string();
+    validate_update_identity(&target_version, &target_build)?;
+    tracing::warn!(%target_version, %target_build, "user forced update install over running work");
+    *state
+        .update_force_target
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner()) = Some((target_version, target_build));
+    Ok(())
 }
 
 #[tauri::command]
@@ -1459,6 +1522,42 @@ mod tests {
             binding_id: claim.binding_id.unwrap(),
             resource_generation: claim.resource_generation.unwrap(),
         }
+    }
+
+    #[tokio::test]
+    async fn m238_queued_update_does_not_block_itself() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::raw_sql(
+            "CREATE TABLE objectives (
+                id TEXT PRIMARY KEY, status TEXT NOT NULL, domain TEXT NOT NULL,
+                recovery_owner TEXT, remediation_id TEXT, lease_owner TEXT,
+                lease_expires_at INTEGER
+            );
+            INSERT INTO objectives VALUES
+              ('update-self','active','update','update','r1','owner',9000),
+              ('real-work','active','task','task','r2','owner',9000);",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let blockers =
+            super::load_queued_update_blockers(&pool, 1_000, "update-self").await.unwrap();
+        assert_eq!(blockers.count, 1, "only real work blocks the update");
+    }
+
+    #[test]
+    fn m238_force_overrides_blockers_only_when_requested() {
+        let busy = UpdateSafetyStatus { active_chat_turns: 1, ..Default::default() };
+        let kept = busy.clone().evaluate().apply_force(false);
+        assert!(!kept.safe_to_restart && !kept.forced);
+        let forced = busy.evaluate().apply_force(true);
+        assert!(forced.safe_to_restart && forced.forced);
+        let idle = UpdateSafetyStatus::default().evaluate().apply_force(true);
+        assert!(idle.safe_to_restart && !idle.forced, "idle installs are not recorded as forced");
     }
 
     #[test]
