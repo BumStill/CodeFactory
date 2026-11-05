@@ -145,6 +145,21 @@ describe("picking a project never opens its history", () => {
     useChatStore.getState().beginDraft();
   });
 
+  it("opens the project QA/PM evidence pane and closes on Escape", async () => {
+    useChatStore.setState({
+      activeSession: { ...projectSession, permission_mode: "standard" }, draftSession: null,
+      runtime: { [projectSession.id]: { ...useChatStore.getState().runtime[projectSession.id], messages: [], streaming: false, queue: [], pendingPermission: null } as never },
+    });
+    render(<WorkspacePage sessionId="s-old" onNewConversation={() => {}} onOpenSettings={() => {}} onOpenSession={() => {}} />);
+    const opener = screen.getByRole("button", { name: "QA/PM 证据", exact: true });
+    fireEvent.click(opener);
+    expect(await screen.findByText("自主执行关闭")).toBeInTheDocument();
+    expect(screen.getByLabelText("导入本地 QA/PM 报告")).toBeInTheDocument();
+    expect(opener).toHaveAttribute("aria-expanded", "true");
+    fireEvent.keyDown(document, { key: "Escape" });
+    await waitFor(() => expect(opener).toHaveAttribute("aria-expanded", "false"));
+  });
+
   it("shows a per-session permission mode selector in the conversation toolbar", () => {
     useChatStore.setState({
       activeSession: { ...projectSession, permission_mode: "standard" },
