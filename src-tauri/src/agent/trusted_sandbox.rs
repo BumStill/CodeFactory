@@ -12,12 +12,46 @@
 use std::path::{Path, PathBuf};
 
 use crate::command_sandbox::{CommandSandbox, CommandLaunch, NetworkPolicy, WritablePath};
+use crate::util::no_window::NoWindow;
 use crate::config::settings::Settings;
+
+/// macOS 拒绝嵌套沙箱的判定探针。
+///
+/// 沙箱内再调 `sandbox-exec` 只会得到 `sandbox_apply: Operation not permitted`。
+/// 会话（agent）本身跑在沙箱里时，再包一层会把每条命令和整批测试变成假失败，
+/// 所以这里用一次真实探测判定，而不是靠环境变量猜。
+pub fn sandbox_application_refused() -> bool {
+    static REFUSED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *REFUSED.get_or_init(|| {
+        #[cfg(target_os = "macos")]
+        {
+            match std::process::Command::new(crate::command_sandbox::MACOS_SANDBOX_EXEC)
+                .no_window()
+                .args(["-p", "(version 1)(allow default)", "/usr/bin/true"])
+                .output()
+            {
+                Ok(output) => {
+                    !output.status.success()
+                        && String::from_utf8_lossy(&output.stderr).contains("sandbox_apply")
+                }
+                // 运行时缺失属于另一条失败路径（R7），不当作嵌套沙箱。
+                Err(_) => false,
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            false
+        }
+    })
+}
 
 /// 沙箱的最终决定：要么真的约束进程，要么退回审批。
 pub enum SandboxGate {
     /// 沙箱已就绪，命令必须以这个实例启动。
     Enforced(CommandSandbox),
+    /// 当前进程本身已在系统沙箱内（macOS 不允许嵌套）：命令不再二次包装，
+    /// 约束由外层沙箱提供；这不是"没有沙箱"，所以不能按 R7 的降级文案报。
+    Inherited(String),
     /// 沙箱不可用/被关闭：退回审批路径，并带上模型可读的原因。
     FallbackApproval(String),
 }
@@ -177,6 +211,7 @@ fn git_paths(workspace: &Path) -> (Vec<WritablePath>, Vec<WritablePath>) {
 /// `git rev-parse --git-dir --git-common-dir`，一次性拿到本工作区与公共仓库目录。
 fn git_dirs(workspace: &Path) -> Option<(PathBuf, PathBuf)> {
     let output = std::process::Command::new("git")
+        .no_window()
         .arg("-C")
         .arg(workspace)
         .args([
@@ -214,6 +249,15 @@ pub fn resolve(workspace: &Path, settings: Option<&Settings>) -> SandboxGate {
             workspace.display()
         ));
     };
+    // macOS 不允许嵌套沙箱：进程已经在沙箱里时再包一层只会拿到
+    // `sandbox_apply: Operation not permitted`，把每条命令变成假失败。
+    // 这不是"没有沙箱"，命令仍受外层策略约束，因此单列 Inherited。
+    if sandbox_application_refused() {
+        return SandboxGate::Inherited(
+            "M224：当前进程已在系统沙箱内（macOS 不允许嵌套沙箱），命令继承外层沙箱约束执行。"
+                .to_string(),
+        );
+    }
     let (writable, blocked) = sandbox_paths(&absolute);
     match CommandSandbox::new(&absolute, writable, blocked, NetworkPolicy::Enabled) {
         Ok(sandbox) => SandboxGate::Enforced(sandbox),
@@ -223,6 +267,8 @@ pub fn resolve(workspace: &Path, settings: Option<&Settings>) -> SandboxGate {
 
 /// R5：权限网关用的廉价判定——沙箱此刻是否真的会约束命令。
 pub fn is_enforced(workspace: &Path, settings: Option<&Settings>) -> bool {
+    // Inherited 不算"已强制"：外层策略不是我们生成的，无法据此免审批，
+    // 只能把"继承外层沙箱"如实写进提示（R7 的 fail-closed 语义保持不变）。
     matches!(resolve(workspace, settings), SandboxGate::Enforced(_))
 }
 
@@ -242,6 +288,7 @@ pub fn covers_local_command(
 pub fn fallback_notice(workspace: &Path, settings: Option<&Settings>) -> Option<String> {
     match resolve(workspace, settings) {
         SandboxGate::Enforced(_) => None,
+        SandboxGate::Inherited(reason) => Some(format!("{reason}未叠加第二层策略。")),
         SandboxGate::FallbackApproval(reason) => Some(if enabled(settings) {
             format!(
                 "M224：系统沙箱不可用（{reason}）；本命令按既有审批路径在本机执行，没有系统沙箱约束。"
@@ -261,6 +308,7 @@ pub fn describe(workspace: &Path, settings: Option<&Settings>) -> String {
             sandbox.workspace().display(),
             sandbox.writable().len()
         ),
+        SandboxGate::Inherited(reason) => format!("继承外层沙箱：{reason}"),
         SandboxGate::FallbackApproval(reason) => format!("退回审批：{reason}"),
     }
 }
@@ -281,7 +329,9 @@ pub fn wrap_command(
             } = sandbox.wrap(program, args);
             (wrapped_program, wrapped_args, Some(sandbox))
         }
-        SandboxGate::FallbackApproval(_) => (program.to_string(), args.to_vec(), None),
+        SandboxGate::Inherited(_) | SandboxGate::FallbackApproval(_) => {
+            (program.to_string(), args.to_vec(), None)
+        }
     }
 }
 
@@ -290,6 +340,24 @@ mod tests {
     use super::*;
     use std::process::Command;
     use std::time::{Duration, Instant};
+
+    /// macOS 不允许嵌套沙箱：沙箱内再调 sandbox-exec 会得到
+    /// `sandbox_apply: Operation not permitted`。当会话本身跑在沙箱里做全量测试时，
+    /// 这批"先新建沙箱再执行"的用例只能自报跳过（宿主侧仍全量执行），
+    /// 否则会把系统限制误报成产品失败。
+    fn skip_when_nested_sandbox() -> bool {
+        if sandbox_application_refused() {
+            eprintln!("skip: macOS 拒绝嵌套沙箱（本用例需要新建沙箱）");
+            return true;
+        }
+        false
+    }
+
+    /// 沙箱里 spawn 的任何进程都不该在 Windows 上闪出控制台窗口；
+    /// 统一经过 `.no_window()`，也避免回归测试逐个豁免。
+    fn sandboxed_command(program: &str) -> Command {
+        Command::new(program).no_window()
+    }
 
     fn temp_dir(tag: &str) -> PathBuf {
         // 目录名只能是安全的 shell/profile 字符：括号会破坏 sh -c 与 profile 字面量。
@@ -341,6 +409,9 @@ mod tests {
     /// 真实执行：工作区内写成功，工作区外写被系统拒绝，且提示可读（R5/R8）。
     #[test]
     fn real_spawn_allows_inside_and_denies_outside() {
+        if skip_when_nested_sandbox() {
+            return;
+        }
         let workspace = temp_dir("inside");
         let sandbox = sandbox(&workspace);
 
@@ -352,7 +423,7 @@ mod tests {
                 format!("printf hi > {}", inside_file.display()),
             ],
         );
-        let inside = Command::new(&inside_launch.program)
+        let inside = sandboxed_command(&inside_launch.program)
             .args(&inside_launch.args)
             .current_dir(&workspace)
             .output()
@@ -372,7 +443,7 @@ mod tests {
                 format!("printf hi > {}", outside_file.display()),
             ],
         );
-        let denied = Command::new(&outside_launch.program)
+        let denied = sandboxed_command(&outside_launch.program)
             .args(&outside_launch.args)
             .current_dir(&workspace)
             .output()
@@ -392,12 +463,15 @@ mod tests {
     /// `-f` 文件模式与 `-p` 内联模式必须等价（review 里两种调用都有背书）。
     #[test]
     fn profile_file_mode_runs_and_enforces() {
+        if skip_when_nested_sandbox() {
+            return;
+        }
         let workspace = temp_dir("filemode");
         let sandbox = sandbox(&workspace);
         let profile_path = workspace.join("m224.sb");
         std::fs::write(&profile_path, sandbox.profile()).expect("write profile");
 
-        let ok = Command::new(crate::command_sandbox::MACOS_SANDBOX_EXEC)
+        let ok = sandboxed_command(crate::command_sandbox::MACOS_SANDBOX_EXEC)
             .args(["-f", profile_path.to_str().unwrap()])
             .args(["/bin/sh", "-c", "printf ok"])
             .current_dir(&workspace)
@@ -407,7 +481,7 @@ mod tests {
         assert_eq!(String::from_utf8_lossy(&ok.stdout), "ok");
 
         let outside_file = outside_file("filemode");
-        let denied = Command::new(crate::command_sandbox::MACOS_SANDBOX_EXEC)
+        let denied = sandboxed_command(crate::command_sandbox::MACOS_SANDBOX_EXEC)
             .args(["-f", profile_path.to_str().unwrap()])
             .args([
                 "/bin/sh",
@@ -527,7 +601,7 @@ mod tests {
     }
 
     fn run_git(cwd: &Path, args: &[&str]) -> std::process::Output {
-        Command::new("/usr/bin/git")
+        sandboxed_command("/usr/bin/git")
             .args(args)
             .current_dir(cwd)
             .output()
@@ -574,6 +648,9 @@ mod tests {
     /// 都在工作区之外。沙箱必须放行它们，否则会话里的 add/commit/merge 全部失败。
     #[test]
     fn git_metadata_outside_the_workspace_stays_writable() {
+        if skip_when_nested_sandbox() {
+            return;
+        }
         let (base, worktree) = linked_worktree("git-worktree");
         assert!(
             worktree.join(".git").is_file(),
@@ -594,7 +671,7 @@ mod tests {
                     .into(),
             ],
         );
-        let output = Command::new(&launch.program)
+        let output = sandboxed_command(&launch.program)
             .args(&launch.args)
             .current_dir(&worktree)
             .output()
@@ -621,6 +698,9 @@ mod tests {
     /// 都在工作区外。这里验证"整棵放行 + 后置拒绝 config/hooks"这条分支真的成立。
     #[test]
     fn git_operations_work_in_a_plain_repository_without_opening_config() {
+        if skip_when_nested_sandbox() {
+            return;
+        }
         let base = fixture_dir("git-plain");
         assert!(run_git(&base, &["init", "-q", "-b", "main"]).status.success());
         assert!(
@@ -650,7 +730,7 @@ mod tests {
                     .into(),
             ],
         );
-        let output = Command::new(&launch.program)
+        let output = sandboxed_command(&launch.program)
             .args(&launch.args)
             .current_dir(&base)
             .output()
@@ -676,6 +756,9 @@ mod tests {
     /// 放行 git 元数据不等于允许植入"下次在沙箱外执行"的钩子或改配置。
     #[test]
     fn git_config_hooks_and_main_checkout_stay_read_only() {
+        if skip_when_nested_sandbox() {
+            return;
+        }
         let (base, worktree) = linked_worktree("git-guard");
         let config = base.join(".git/config");
         let hook = base.join(".git/hooks/m224-probe");
@@ -693,7 +776,7 @@ mod tests {
             main_file.display()
         );
         let launch = sandbox.wrap("/bin/sh", &["-c".into(), script]);
-        let output = Command::new(&launch.program)
+        let output = sandboxed_command(&launch.program)
             .args(&launch.args)
             .current_dir(&worktree)
             .output()
@@ -722,6 +805,9 @@ mod tests {
     /// 否则沙箱内进程能植入下次在沙箱外运行的程序。
     #[test]
     fn cargo_payload_paths_stay_read_only() {
+        if skip_when_nested_sandbox() {
+            return;
+        }
         let workspace = temp_dir("cargo-payload");
         let sandbox = sandbox(&workspace);
         let home = PathBuf::from(std::env::var("HOME").expect("HOME"));
@@ -771,7 +857,7 @@ mod tests {
                 ),
             ],
         );
-        let output = Command::new(&launch.program)
+        let output = sandboxed_command(&launch.program)
             .args(&launch.args)
             .current_dir(&workspace)
             .output()
@@ -800,10 +886,13 @@ mod tests {
     /// 且那个进程要活着。这是 R3/R4 之外最容易漏的一条边界。
     #[test]
     fn signals_cannot_escape_the_sandbox() {
+        if skip_when_nested_sandbox() {
+            return;
+        }
         let workspace = temp_dir("signal-outside");
         let sandbox = sandbox(&workspace);
 
-        let mut outsider = Command::new("/bin/sleep")
+        let mut outsider = sandboxed_command("/bin/sleep")
             .arg("30")
             .spawn()
             .expect("spawn outsider");
@@ -816,7 +905,7 @@ mod tests {
                 format!("kill -TERM {outsider_pid}; echo outside=$?"),
             ],
         );
-        let output = Command::new(&launch.program)
+        let output = sandboxed_command(&launch.program)
             .args(&launch.args)
             .output()
             .expect("run kill");
@@ -839,6 +928,9 @@ mod tests {
     /// 同一沙箱内的子进程必须还能被结束，否则构建/测试工具会挂死。
     #[test]
     fn signals_reach_processes_inside_the_same_sandbox() {
+        if skip_when_nested_sandbox() {
+            return;
+        }
         let workspace = temp_dir("signal-inside");
         let sandbox = sandbox(&workspace);
         let launch = sandbox.wrap(
@@ -848,7 +940,7 @@ mod tests {
                 "sleep 30 & child=$!; kill -TERM $child; echo inside=$?".into(),
             ],
         );
-        let output = Command::new(&launch.program)
+        let output = sandboxed_command(&launch.program)
             .args(&launch.args)
             .output()
             .expect("run kill inside");
@@ -865,6 +957,9 @@ mod tests {
     /// 证明：两者都出现，说明确实有一个进程带着这份 profile 跑过。
     #[test]
     fn spawn_is_observable_before_and_after() {
+        if skip_when_nested_sandbox() {
+            return;
+        }
         let workspace = temp_dir("spawncount");
         let sandbox = sandbox(&workspace);
         let started = workspace.join("started.txt");
@@ -883,7 +978,7 @@ mod tests {
         );
 
         assert!(!started.exists(), "nothing should have run before the spawn");
-        let mut child = Command::new(&launch.program)
+        let mut child = sandboxed_command(&launch.program)
             .args(&launch.args)
             .current_dir(&workspace)
             .spawn()

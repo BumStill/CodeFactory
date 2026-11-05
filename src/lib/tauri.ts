@@ -686,7 +686,10 @@ export interface Settings {
   /** Shell isolation for the bash tool: docker wraps every command in a disposable container mounting only the project dir. */
   sandbox_mode?: 'off' | 'docker';
   sandbox_image?: string;
-  /** macOS/Linux: wrap trusted-mode commands in the OS sandbox; defaults to on. */
+  /**
+   * 内部回退开关：macOS/Linux 可信模式下把命令包进系统沙箱，默认开。
+   * 不是产品选项，设置页不提供开关；仅供内部回退与排障使用。
+   */
   trusted_command_sandbox?: boolean;
   /** Merge strategy for delivery at ThroughMerge+. Missing → "squash". */
   delivery_merge_method?: 'squash' | 'merge' | 'rebase';

@@ -5,6 +5,18 @@ mod command_sandbox;
 use command_sandbox::{CommandSandbox, NetworkPolicy, WritablePath};
 use std::path::PathBuf;
 
+/// 集成测试独立判定嵌套沙箱（`#[path]` 引入的模块拿不到库内 util）。
+fn nested_sandbox_refused() -> bool {
+    std::process::Command::new(command_sandbox::MACOS_SANDBOX_EXEC)
+        .args(["-p", "(version 1)(allow default)", "/usr/bin/true"])
+        .output()
+        .map(|output| {
+            !output.status.success()
+                && String::from_utf8_lossy(&output.stderr).contains("sandbox_apply")
+        })
+        .unwrap_or(false)
+}
+
 #[test]
 fn m224_bypass_is_denied_with_recovery_guidance() {
     for command in [
@@ -26,6 +38,11 @@ fn m224_bypass_is_denied_with_recovery_guidance() {
 #[cfg(target_os = "macos")]
 #[test]
 fn m224_real_seatbelt_default_deny_and_children() {
+    // macOS 不允许嵌套沙箱：会话本身在沙箱里跑全量测试时跳过，宿主侧仍执行。
+    if nested_sandbox_refused() {
+        eprintln!("skip: macOS 拒绝嵌套沙箱（本用例需要新建沙箱）");
+        return;
+    }
     let root = std::env::temp_dir().join(format!("m224-{}", std::process::id()));
     let app = root.join("app-data");
     let ws = app.join("execution-workspaces/current");

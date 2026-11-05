@@ -446,7 +446,6 @@ export function SettingsPage({
     im_webhook_format: NonNullable<Settings["im_webhook_format"]>;
     sandbox_mode: NonNullable<Settings["sandbox_mode"]>;
     sandbox_image: string;
-    trusted_command_sandbox: boolean;
   } | null>(null);
   const [generalSaved, setGeneralSaved] = useState(false);
   const [showImBindingDialog, setShowImBindingDialog] = useState(false);
@@ -489,7 +488,6 @@ export function SettingsPage({
       im_webhook_format: settings.im_webhook_format ?? "wecom",
       sandbox_mode: settings.sandbox_mode ?? "off",
       sandbox_image: settings.sandbox_image ?? "ubuntu:24.04",
-      trusted_command_sandbox: settings.trusted_command_sandbox ?? true,
     });
   }, [settings]);
 
@@ -599,7 +597,6 @@ export function SettingsPage({
       im_webhook_format: generalDraft.im_webhook_format,
       sandbox_mode: generalDraft.sandbox_mode,
       sandbox_image: generalDraft.sandbox_image.trim() || "ubuntu:24.04",
-      trusted_command_sandbox: generalDraft.trusted_command_sandbox,
     } as Settings & { auto_create_pr: boolean });
 
     setGeneralSaved(true);
@@ -1197,26 +1194,9 @@ export function SettingsPage({
               </div>
             </div>
 
-            <div className="space-y-1">
-              <label className="flex items-center gap-2 text-label text-gray-300">
-                <input
-                  type="checkbox"
-                  aria-label="可信模式命令使用系统沙箱"
-                  checked={generalDraft.trusted_command_sandbox}
-                  onChange={(e) =>
-                    setGeneralDraft({
-                      ...generalDraft,
-                      trusted_command_sandbox: e.target.checked,
-                    })
-                  }
-                />
-                可信模式命令使用系统沙箱(默认开启)
-              </label>
-              <p className="text-caption leading-5 text-gray-600">
-                macOS 用 sandbox-exec、Linux 用 bubblewrap
-                把命令限制在项目目录与共享编译缓存内,项目外写入会被系统直接拒绝。关闭后恢复本机无隔离执行。
-              </p>
-            </div>
+            {/* R9 `trusted_command_sandbox` 是内部回退开关，不是产品选项：
+                可信模式下的系统沙箱始终生效，会话内不再暴露"关闭沙箱"的入口。
+                设置项本身仍保留在 settings.json，供内部回退与排障使用。 */}
 
             <div className="flex justify-end">
               <button
