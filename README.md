@@ -209,7 +209,10 @@ CodeFactory's tagline is **软件工厂 · 本地助手 · 自进化** — it's 
 better from its own use. Concretely, today: sessions are mined locally for
 reusable patterns with no model call and no data leaving your machine, and
 accepted lessons land in a per-project `memory.md` that's injected back into
-future context — automatically, no "remember" button required. Skill
+future context — automatically, no "remember" button required. Say "记住…"
+in a conversation and your own words are kept across sessions: preferences
+follow you everywhere, project facts stay in that repository, and Settings →
+记忆 shows the source of each one and lets you edit, delete or turn it off. Skill
 proposals and tool-permission tightening go through a human review step
 before they take effect. This is still an early, honestly-scoped version of
 the idea — memory has no decay/retirement loop yet, and full autonomous

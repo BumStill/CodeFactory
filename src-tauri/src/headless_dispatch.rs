@@ -147,6 +147,10 @@ pub enum Request {
     SetUsageWindow { endpoint: String, #[serde(default)] model: Option<String>, rule: Option<crate::agent::usage_windows::UsageWindow> },
     GetQuota {},
     UsageStatus {},
+    /// M235: same data and actions as the Settings memory page.
+    ListMemories {},
+    DeleteMemory { id: String },
+    SetMemoryEnabled { enabled: bool },
     /// CF-QUOTA-R2: partial per-endpoint cap update; no paid endpoint changes.
     SetQuotaCap {
         endpoint: String,
@@ -349,6 +353,8 @@ pub fn validate_request(request: &Request) -> Result<(), ErrorBody> {
             if let Some(rule) = rule { rule.validate().map_err(ErrorBody::invalid)?; }
         }
         Request::CleanBuildCache {} | Request::GetQuota {} | Request::UsageStatus {} => {}
+        Request::ListMemories {} | Request::SetMemoryEnabled { .. } => {}
+        Request::DeleteMemory { id } => require_non_empty("id", id)?,
         Request::SetQuotaCap { endpoint, five_hour_percent, weekly_percent } => {
             require_non_empty("endpoint", endpoint)?;
             if five_hour_percent.is_none() && weekly_percent.is_none() {
@@ -479,7 +485,9 @@ impl AuditEntry {
             Request::SetUsageWindow { endpoint, model, rule } => {
                 entry.message = Some(format!("endpoint={endpoint}; model={}; rule={}", model.as_deref().unwrap_or("<endpoint>"), serde_json::to_string(rule).unwrap_or_default()));
             }
-            Request::GetQuota {} | Request::UsageStatus {} => {}
+            Request::GetQuota {} | Request::UsageStatus {} | Request::ListMemories {} => {}
+            Request::DeleteMemory { id } => entry.message = Some(format!("id={id}")),
+            Request::SetMemoryEnabled { enabled } => entry.message = Some(format!("enabled={enabled}")),
             Request::SetQuotaCap { endpoint, five_hour_percent, weekly_percent } => {
                 entry.message = Some(format!("endpoint={endpoint}; five_hour_percent={five_hour_percent:?}; weekly_percent={weekly_percent:?}"));
             }
@@ -512,6 +520,9 @@ pub fn operation_of(request: &Request) -> &'static str {
         Request::SetUsageWindow { .. } => "set_usage_window",
         Request::GetQuota {} => "get_quota",
         Request::UsageStatus {} => "usage_status",
+        Request::ListMemories {} => "list_memories",
+        Request::DeleteMemory { .. } => "delete_memory",
+        Request::SetMemoryEnabled { .. } => "set_memory_enabled",
         Request::SetQuotaCap { .. } => "set_quota_cap",
     }
 }

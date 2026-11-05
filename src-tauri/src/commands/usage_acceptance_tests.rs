@@ -872,3 +872,13 @@ async fn budget_threshold_receipts_are_exact_once_across_repeated_queries() {
             .unwrap();
     assert_eq!(daily_receipts, 3);
 }
+
+#[test]
+fn m235_memory_operations_are_typed_dispatch_requests() {
+    use crate::headless_dispatch::{operation_of, parse_request};
+    assert_eq!(operation_of(&parse_request(r#"{"operation":"list_memories"}"#).unwrap()), "list_memories");
+    assert_eq!(operation_of(&parse_request(r#"{"operation":"delete_memory","id":"m1"}"#).unwrap()), "delete_memory");
+    assert_eq!(operation_of(&parse_request(r#"{"operation":"set_memory_enabled","enabled":false}"#).unwrap()), "set_memory_enabled");
+    assert!(parse_request(r#"{"operation":"delete_memory","id":" "}"#).is_err());
+    assert!(parse_request(r#"{"operation":"set_memory_enabled"}"#).is_err());
+}

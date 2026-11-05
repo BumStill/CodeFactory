@@ -38,11 +38,12 @@ import type {
 } from "../../lib/tauri";
 import { CHATGPT_DEFAULT_MODEL, CHATGPT_ENDPOINT_KEY } from "../../lib/chatgptModels";
 import { syncChatGptCatalog } from "../../stores/chatgptCatalog";
+import { LongTermMemorySection } from "../../components/LongTermMemorySection";
 import { UsageDashboardSection } from "../../components/UsageDashboardSection";
 import { ModelUsageWindowsSection } from "../../components/ModelUsageWindowsSection";
 import { SubscriptionQuotaSection } from "../../components/SubscriptionQuotaSection";
 
-export type SettingsTab = "capabilities" | "usage" | "endpoints" | "browser" | "general" | "hooks" | "remotes" | "appearance" | "about";
+export type SettingsTab = "capabilities" | "memory" | "usage" | "endpoints" | "browser" | "general" | "hooks" | "remotes" | "appearance" | "about";
 
 interface Props {
   onBack: () => void;
@@ -611,6 +612,7 @@ export function SettingsPage({
       label: "工作流",
       tabs: [
         { id: "capabilities", label: "功能", description: "管理跨会话能力。当前会话的模型、Git 和检查点仍留在工作区顶栏。" },
+        { id: "memory", label: "记忆", description: "查看你让 CodeFactory 记住的内容，可以修改、删除或全部关闭。" },
         { id: "usage", label: "用量与预算", description: "查看模型调用、Token 成本趋势和预算提醒。" },
         { id: "general", label: "通用", description: "设置 shell、并行任务、交付上限、通知、沙箱和数据备份。" },
       ],
@@ -740,6 +742,8 @@ export function SettingsPage({
         )}
 
         {/* ── Usage & budgets ── */}
+        {tab === "memory" && <LongTermMemorySection />}
+
         {tab === "usage" && (
           <>
             <UsageDashboardSection onOpenSession={onOpenSession} onOpenJobLog={onOpenJobLog} />
