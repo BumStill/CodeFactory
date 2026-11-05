@@ -47,6 +47,9 @@
     { "pattern": "src/components/UpdateStatusPill.tsx", "scenario_id": "UI-005" },
     { "pattern": "src/components/UpdateBlockerChoice.tsx", "scenario_id": "UI-005" },
     { "pattern": "src/components/UpdateStalledChoice.tsx", "scenario_id": "UI-005" },
+    { "pattern": "src-tauri/src/agent/trusted_sandbox.rs", "scenario_id": "RTE-005" },
+    { "pattern": "src-tauri/src/command_sandbox.rs", "scenario_id": "RTE-005" },
+    { "pattern": "tools/verify/m224-r10-matrix.mjs", "scenario_id": "RTE-005" },
     { "pattern": "src-tauri/src/agent/quota_live.rs", "scenario_id": "RTE-005" }
   ]
 }

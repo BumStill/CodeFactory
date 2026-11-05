@@ -381,6 +381,10 @@ async fn execute_inner(
     // Set by whichever sandbox branch actually builds the command; the branches
     // that bail out return before anything reads it.
     let launched_program;
+    // M224：`Some` 表示这次启动真的被系统沙箱约束，失败输出要带修复提示（R8）。
+    let mut trusted_sandbox: Option<crate::command_sandbox::CommandSandbox> = None;
+    // R7：沙箱不可用/被关闭时写入结果的说明，保证降级不是静默的。
+    let mut sandbox_notice: Option<String> = None;
     let sandboxed = matches!(sandbox_mode, crate::config::settings::SandboxMode::Docker);
     let cmd = match sandbox_mode {
         crate::config::settings::SandboxMode::Docker => {
@@ -412,9 +416,24 @@ async fn execute_inner(
         }
         crate::config::settings::SandboxMode::Off => {
             let shell = command_env::shell_invocation(&a.command);
-            launched_program = shell.program.to_string();
-            let mut cmd = Command::new(shell.program).no_window();
-            cmd.args(shell.args)
+            // M224/R1+R5：信任模式的本地命令走系统沙箱；沙箱不可用时
+            // `wrap_command` 返回 None，命令保持原样，由权限网关退回审批（R7）。
+            let (program, program_args, sandbox) = crate::agent::trusted_sandbox::wrap_command(
+                &ctx.cwd,
+                ctx.settings.as_ref(),
+                &shell.program,
+                &shell.args,
+            );
+            trusted_sandbox = sandbox;
+            if trusted_sandbox.is_none() {
+                sandbox_notice = crate::agent::trusted_sandbox::fallback_notice(
+                    &ctx.cwd,
+                    ctx.settings.as_ref(),
+                );
+            }
+            launched_program = program.clone();
+            let mut cmd = Command::new(program).no_window();
+            cmd.args(program_args)
                 .current_dir(&ctx.cwd)
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
@@ -509,6 +528,12 @@ async fn execute_inner(
             }
             if !output.status.success() {
                 combined.push_str(command_env::shell_failure_hint(&launched_program, &combined));
+                if let Some(sandbox) = trusted_sandbox.as_ref() {
+                    // R8：沙箱拒绝写入时，模型拿到的必须是"哪个边界、怎么修"，
+                    // 而不是一句裸的 Permission denied 去猜。
+                    combined.push('\n');
+                    combined.push_str(&sandbox.failure_hint(&combined));
+                }
             }
             append_audit(
                 &mut combined,
@@ -523,6 +548,10 @@ async fn execute_inner(
                 combined.push_str(&format!("\n[m147b] {}\n", guarded.note));
             }
 
+            if let Some(notice) = sandbox_notice.as_ref() {
+                combined.push('\n');
+                combined.push_str(notice);
+            }
             let is_error = !output.status.success();
             if is_error {
                 let return_code = output.status.code();

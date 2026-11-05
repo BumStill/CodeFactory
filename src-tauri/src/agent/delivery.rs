@@ -12980,6 +12980,10 @@ mod tests {
 
     #[test]
     fn readiness_note_reports_ceiling_when_remote_is_configured() {
+    if crate::agent::trusted_sandbox::sandbox_application_refused() {
+        eprintln!("skip: 沙箱按 R3 有意拒绝写应用数据目录，该用例需要写凭据回退文件；宿主侧仍全量执行");
+        return;
+    }
         let mut settings = crate::config::settings::Settings::default();
         settings
             .git_remotes
@@ -13023,6 +13027,10 @@ mod tests {
 
     #[test]
     fn readiness_note_supports_configured_enterprise_gitlab_origin() {
+    if crate::agent::trusted_sandbox::sandbox_application_refused() {
+        eprintln!("skip: 沙箱按 R3 有意拒绝写应用数据目录，该用例需要写凭据回退文件；宿主侧仍全量执行");
+        return;
+    }
         let mut settings = crate::config::settings::Settings::default();
         settings
             .git_remotes
@@ -14627,6 +14635,10 @@ README-Update-Reason: synthetic fixture\n\nbody"
 
     #[test]
     fn configured_gitlab_remote_is_resolved_from_enterprise_origin() {
+    if crate::agent::trusted_sandbox::sandbox_application_refused() {
+        eprintln!("skip: 沙箱按 R3 有意拒绝写应用数据目录，该用例需要写凭据回退文件；宿主侧仍全量执行");
+        return;
+    }
         let root = make_repo("gitlab-resolve");
         let mut settings = crate::config::settings::Settings::default();
         settings

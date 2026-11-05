@@ -181,6 +181,18 @@ impl PermissionGateway for DesktopPermissionGateway {
                 return self.request_permission(tool_call, args.clone(), bash_command).await;
             }
         }
+        // M224/R6：沙箱覆盖范围里被主动拒绝的命令不提供审批绕过——审批只决定
+        // "要不要跑"，不能决定"跑的时候要不要守约束"。放在所有 allow 分支之前。
+        if tool_call.function.name == "bash" {
+            if let Some(reason) = bash_command.and_then(crate::command_sandbox::gate_bypass) {
+                return self.request_permission_with_reason(
+                    tool_call,
+                    args.clone(),
+                    bash_command,
+                    Some(("trusted.sandbox.bypass", reason)),
+                ).await;
+            }
+        }
         // M159: delivery authority is not authority to force-push, delete a
         // remote ref, or discard local work. Prove and snapshot first.
         // M221: a proved heredoc already answered this for its read-only and
@@ -197,7 +209,20 @@ impl PermissionGateway for DesktopPermissionGateway {
             }
             if let (Some(root), Some(command)) = (self.managed_workspace_root().await, bash_command) {
                 if let Some(roots) = registered_git_roots(&self.db, &self.session_id).await {
-                    if super::trusted_git::registered_rewrite(&roots, &root, command) {
+                    // M224/R5：沙箱生效时，本地命令的访问范围由内核保证，不再因为
+                    // 「无法用命令文字证明范围」(trusted.git.unproved) 进入审批。
+                    // 破坏性改写与远端动作不受此豁免；沙箱不可用时 is_enforced 为
+                    // false，整条路径完全退回原有的文字证明 + 审批（R7）。
+                    let rewrite = super::trusted_git::registered_rewrite(&roots, &root, command);
+                    if super::trusted_sandbox::covers_local_command(
+                        super::trusted_sandbox::is_enforced(&root, None),
+                        rewrite,
+                        remote,
+                        super::trusted_git::outside_write_sandbox_scope(command),
+                    ) {
+                        return PermissionOutcome::Allow;
+                    }
+                    if rewrite {
                         if super::trusted_git::backup_registered(&roots, &root, command).is_some() {
                             return PermissionOutcome::Allow;
                         }

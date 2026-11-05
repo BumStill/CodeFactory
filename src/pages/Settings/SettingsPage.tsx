@@ -1194,6 +1194,10 @@ export function SettingsPage({
               </div>
             </div>
 
+            {/* R9 `trusted_command_sandbox` 是内部回退开关，不是产品选项：
+                可信模式下的系统沙箱始终生效，会话内不再暴露"关闭沙箱"的入口。
+                设置项本身仍保留在 settings.json，供内部回退与排障使用。 */}
+
             <div className="flex justify-end">
               <button
                 onClick={handleSaveGeneral}

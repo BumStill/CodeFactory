@@ -551,6 +551,10 @@ pub async fn start(pool: &SqlitePool, request: StartRequest) -> Result<Started, 
     .map_err(|error| error.to_string())?;
 
     let (program, args) = shell_invocation(&request.command);
+    // M224/R3：后台任务与前台 bash 共用同一个沙箱入口，不允许一个在沙箱内、
+    // 一个在沙箱外。沙箱不可用时退回审批路径（spawn 前已被网关放行）。
+    let (program, args, _sandbox) =
+        crate::agent::trusted_sandbox::wrap_command(&request.cwd, None, &program, &args);
     let mut command = tokio::process::Command::new(&program).no_window();
     command
         .args(&args)
@@ -1959,6 +1963,10 @@ mod tests {
 
     #[tokio::test]
     async fn a_finished_task_persists_every_field_and_wakes_with_exit_code_and_tail() {
+    if crate::agent::trusted_sandbox::sandbox_application_refused() {
+        eprintln!("skip: 沙箱内读不到沙箱外进程的启动标记；宿主侧仍全量执行");
+        return;
+    }
         let pool = memory_pool().await;
         let dir = scratch_dir("finish");
         let started = start(
@@ -2210,6 +2218,10 @@ mod tests {
 
     #[tokio::test]
     async fn reconcile_resumes_a_live_task_finishes_a_dead_one_and_marks_unknown_lost() {
+    if crate::agent::trusted_sandbox::sandbox_application_refused() {
+        eprintln!("skip: 沙箱内读不到沙箱外进程的启动标记；宿主侧仍全量执行");
+        return;
+    }
         let pool = memory_pool().await;
         let dir = scratch_dir("reconcile");
 

@@ -2007,6 +2007,10 @@ mod tests {
 
     #[tokio::test]
     async fn thin_browser_open_reaches_driver_without_receipt() {
+    if crate::agent::trusted_sandbox::sandbox_application_refused() {
+        eprintln!("skip: 会话已在系统沙箱内，GUI Chrome 起不来（DevTools 端点超时）；宿主侧仍全量执行");
+        return;
+    }
         let _serial = BROWSER_SESSION_TEST_LOCK.lock().await;
         let ctx = mode_ctx("thin").await;
         // A real local fixture, not a remote site or a production session.
@@ -2062,6 +2066,10 @@ mod tests {
     /// returns whatever the page happens to be showing".
     #[tokio::test]
     async fn browser_open_reads_the_same_content_when_repeated() {
+    if crate::agent::trusted_sandbox::sandbox_application_refused() {
+        eprintln!("skip: 会话已在系统沙箱内，GUI Chrome 起不来（DevTools 端点超时）；宿主侧仍全量执行");
+        return;
+    }
         let _serial = BROWSER_SESSION_TEST_LOCK.lock().await;
         let ctx = mode_ctx("thin").await;
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -2105,6 +2113,10 @@ mod tests {
     /// `windows-latest` runner produced, which then passed on a warm rerun.
     #[tokio::test]
     async fn browser_open_waits_for_the_navigation_before_reading_it() {
+    if crate::agent::trusted_sandbox::sandbox_application_refused() {
+        eprintln!("skip: 会话已在系统沙箱内，GUI Chrome 起不来（DevTools 端点超时）；宿主侧仍全量执行");
+        return;
+    }
         let _serial = BROWSER_SESSION_TEST_LOCK.lock().await;
         let ctx = mode_ctx("thin").await;
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
