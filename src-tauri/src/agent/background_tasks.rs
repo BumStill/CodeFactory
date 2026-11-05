@@ -1341,6 +1341,11 @@ async fn record_wake_rejection(pool: &SqlitePool, session: &str, error: &str, no
     tx.commit().await
 }
 
+/// R3 precedence window: a queued user message younger than this defers the
+/// wake-up. Older rows stop blocking so a stuck message cannot freeze the
+/// schedule forever (it stays visible as a queue row / failure).
+pub const QUEUED_MESSAGE_PRECEDENCE_SECS: i64 = 600;
+
 pub async fn drain_due_wakeups_at(pool: &SqlitePool, sink: &dyn WakeSink, now: i64) -> usize {
     use futures_util::{stream::FuturesUnordered, StreamExt};
     // 同一进程只有一个扫描器可推进计划；先锁再读，不能依赖入队后的 CAS 去重。
@@ -1376,6 +1381,8 @@ pub async fn drain_due_wakeups_at(pool: &SqlitePool, sink: &dyn WakeSink, now: i
                     return 0;
                 }
             }
+            // M237：模型恢复前投递只会写一条无人回答的消息。顺延到模型唤醒，到点合并为一个回合。
+            if hold_for_model_wake(pool, &session, &wakes, now).await { return 0; }
             // M216：旧版本把准入失败记到了工作区预算，迁移时仅清除这类未结算技术记录。
             if let Err(error) = sqlx::query("DELETE FROM workspace_recovery_budget WHERE session_id=? AND settled_reason IS NULL AND last_error='唤醒投递失败；系统自动重试/自愈'")
                 .bind(&session).execute(pool).await {
@@ -1416,6 +1423,20 @@ pub async fn drain_due_wakeups_at(pool: &SqlitePool, sink: &dyn WakeSink, now: i
                 tracing::warn!(session, pending_seconds = now.saturating_sub(due), "wake overdue over two minutes; automatic retry");
                 let _ = sqlx::query("INSERT INTO wakeup_alerts(session_id,first_seen_at,last_retry_at,delay_secs,retry_count) VALUES (?,?,?,?,1) ON CONFLICT(session_id) DO UPDATE SET last_retry_at=excluded.last_retry_at,delay_secs=excluded.delay_secs,retry_count=wakeup_alerts.retry_count+1")
                     .bind(&session).bind(now).bind(now).bind(now.saturating_sub(due)).execute(pool).await;
+            }
+            // M236/R3：用户消息优先于系统唤醒。会话里还有新入队的用户消息时，
+            // 本次唤醒不起回合（也不推进 next_at），让那条消息先投递；
+            // 唤醒计划保持 pending，等它结算后下一轮扫描继续投递。
+            if crate::commands::queued_delivery::has_fresh_pending(
+                pool,
+                &session,
+                now.saturating_mul(1000),
+                QUEUED_MESSAGE_PRECEDENCE_SECS * 1000,
+            )
+            .await
+            {
+                tracing::info!(session, "queued user message takes precedence over this wake-up");
+                return 0;
             }
             let text = wakes.iter().map(|wake| {
                 wakeup_text(wake, wake.fire_count + 1, now.saturating_sub(wake.next_at) >= wake.every_sec.unwrap_or(1).max(1) as i64)
@@ -1461,6 +1482,28 @@ pub async fn drain_due_wakeups_at(pool: &SqlitePool, sink: &dyn WakeSink, now: i
     let mut delivered = 0;
     while let Some(count) = pending.next().await { delivered += count; }
     delivered
+}
+
+/// M237：会话正在等模型恢复时，把到点的其它唤醒顺延到恢复时间。不计 `fire_count`。
+async fn hold_for_model_wake(pool: &SqlitePool, session: &str, wakes: &[WakeupSchedule], now: i64) -> bool {
+    if wakes.iter().any(|wake| wake.id.starts_with("model-availability-")) { return false; }
+    let resume_at: Option<i64> = match sqlx::query_scalar(
+        "SELECT MIN(next_at) FROM wakeup_schedules WHERE session_id=? AND status='pending' AND id LIKE 'model-availability-%' AND next_at>?",
+    ).bind(session).bind(now).fetch_one(pool).await {
+        Ok(resume_at) => resume_at,
+        Err(error) => {
+            tracing::warn!(%error, session, "model wake lookup failed; delivering due wakes");
+            return false;
+        }
+    };
+    let Some(resume_at) = resume_at else { return false; };
+    for wake in wakes {
+        if let Err(error) = sqlx::query("UPDATE wakeup_schedules SET next_at=? WHERE id=? AND status='pending' AND next_at=?")
+            .bind(resume_at).bind(&wake.id).bind(wake.next_at).execute(pool).await {
+            tracing::warn!(%error, wakeup = %wake.id, "wake hold deferred; automatic retry next tick");
+        }
+    }
+    true
 }
 
 /// 生产入口：用当前时间投递到点唤醒。
@@ -2339,6 +2382,48 @@ mod tests {
         }
     }
 
+    /// M236/R3：会话里还有新入队的用户消息时，到点的系统唤醒必须让路。
+    #[tokio::test]
+    async fn a_queued_user_message_defers_a_due_wakeup() {
+        let pool = memory_pool().await;
+        let request = WakeupRequest {
+            after_sec: Some(MIN_WAKEUP_SECS),
+            ..wakeup_request("s1", "看一下 CI 状态", None)
+        };
+        let schedule = schedule_wakeup_at(&pool, request, 1_000).await.unwrap();
+        let queued = crate::commands::queued_delivery::enqueue(
+            &pool,
+            "s1",
+            "先按我的方案走",
+            Some("turn-user"),
+        )
+        .await
+        .unwrap();
+
+        let recorder = Arc::new(Recorder::default());
+        assert_eq!(
+            drain_due_wakeups_at(&pool, sink(&recorder), schedule.next_at).await,
+            0,
+            "the user's queued message outranks the wake-up"
+        );
+        assert!(recorder.take().is_empty());
+
+        // The wake-up is deferred, not consumed: it stays pending for the next scan.
+        let still_pending = get_wakeup(&pool, &schedule.id).await.unwrap().unwrap();
+        assert_eq!(still_pending.next_at, schedule.next_at);
+        assert_eq!(still_pending.status, "pending");
+
+        // Once the user's message is delivered, the wake-up fires normally.
+        crate::commands::queued_delivery::mark_delivered(&pool, "s1", &queued.id)
+            .await
+            .unwrap();
+        assert_eq!(
+            drain_due_wakeups_at(&pool, sink(&recorder), schedule.next_at).await,
+            1
+        );
+        assert_eq!(recorder.take().len(), 1);
+    }
+
     #[tokio::test]
     async fn a_due_wakeup_wakes_the_session_and_is_not_fired_early() {
         let pool = memory_pool().await;
@@ -2644,6 +2729,35 @@ mod tests {
         assert_eq!(pending, 0, "all fire counts must be handled in one scan");
         let counts: Vec<i64> = sqlx::query_scalar("SELECT fire_count FROM wakeup_schedules ORDER BY fire_count").fetch_all(&pool).await.unwrap();
         assert_eq!(counts, vec![1,2,5]);
+    }
+
+    #[tokio::test]
+    async fn m237_due_wakes_hold_until_the_model_wake_without_writing_messages() {
+        let dir = scratch_dir("m237-hold");
+        let pool = file_pool(&dir).await;
+        super::super::thin_state::ensure(&pool).await.unwrap();
+        super::super::workspace_recovery_budget::ensure(&pool).await.unwrap();
+        sqlx::raw_sql("CREATE TABLE sessions(id TEXT PRIMARY KEY,delivery_mode TEXT);
+            CREATE TABLE thin_external_observations(session_id TEXT PRIMARY KEY,completed_reason TEXT);
+            CREATE TABLE session_audit_events(id TEXT PRIMARY KEY,session_id TEXT,kind TEXT,actor TEXT,detail_json TEXT,created_at INTEGER);
+            INSERT INTO sessions VALUES ('m237','thin');").execute(&pool).await.unwrap();
+        ensure_wakeup_schema(&pool).await.unwrap();
+        for (id, at) in [("thin-closeout-m237-42", 100), ("model-availability-m237", 5_000)] {
+            sqlx::query("INSERT INTO wakeup_schedules(id,session_id,prompt,source,after_sec,next_at,status,created_at) VALUES (?,'m237','PR #42 已合并，执行收尾','agent_decided',60,?,'pending',1)")
+                .bind(id).bind(at).execute(&pool).await.unwrap();
+        }
+        let recorder = Arc::new(Recorder::default());
+        for now in (200..4_000).step_by(60) {
+            assert_eq!(drain_due_wakeups_at(&pool, sink(&recorder), now).await, 0);
+        }
+        assert!(recorder.take().is_empty(), "no model means no wake text in the transcript");
+        let held: (i64, i64) = sqlx::query_as("SELECT fire_count,next_at FROM wakeup_schedules WHERE id='thin-closeout-m237-42'")
+            .fetch_one(&pool).await.unwrap();
+        assert_eq!(held, (0, 5_000), "a held wake is deferred to the model wake, not fired or left overdue");
+        assert_eq!(drain_due_wakeups_at(&pool, sink(&recorder), 5_000).await, 1);
+        assert_eq!(recorder.take().len(), 1, "wakes held for one session resume as one turn");
+        pool.close().await;
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[tokio::test]

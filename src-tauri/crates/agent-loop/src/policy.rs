@@ -889,6 +889,7 @@ fn is_review_safe_named_tool(tool_name: &str) -> bool {
             | "read_xlsx"
             | "skill_list"
             | "skill_search"
+            | "memory_save"
             | "bash"
             // M131b: reading a public page is the most common read-only
             // request there is. Leaving the page reader out of this list left

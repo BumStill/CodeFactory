@@ -26,6 +26,10 @@ import {
   describeUpdateObjectiveBlockers,
   type UpdateSafetyStatus,
   useUpdaterStore,
+  canChooseUpdateTiming,
+  describeUpdateBlockers,
+  isUpdateStalled,
+  type UpdaterPhase,
 } from "./updater";
 
 const TARGET_BUILD = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
@@ -168,6 +172,79 @@ describe("updater safe restart gate", () => {
       blockers: null,
       safetyCheckError: "safety database unavailable",
     });
+  });
+
+  it("treats an update as stalled only when nothing real explains the wait", () => {
+    const waiting = (blockers: UpdateSafetyStatus | null, checkedAt: number, error: string | null = null) =>
+      ({
+        kind: "waiting_for_safe_restart",
+        update: {} as Update,
+        blockers,
+        safetyCheckError: error,
+        checkedAt,
+      }) as UpdaterPhase;
+    const idle = idleSafety();
+    const busy = idleSafety({ terminal_sessions: 1 });
+
+    expect(isUpdateStalled(waiting(idle, 59_000), 0, false)).toBe(false);
+    expect(isUpdateStalled(waiting(idle, 60_000), 0, false)).toBe(true);
+    expect(isUpdateStalled(waiting(busy, 600_000), 0, false)).toBe(false);
+    expect(isUpdateStalled(waiting(busy, 60_000), 0, true)).toBe(true);
+    expect(isUpdateStalled(waiting(null, 1, "database unavailable"), 0, false)).toBe(true);
+    expect(isUpdateStalled({ kind: "idle" }, 0, false)).toBe(false);
+  });
+
+  it("recovers a stalled update on its own after ten minutes, but never over real work", async () => {
+    const update = {
+      available: true,
+      version: "1.79.1",
+      body: "",
+      rawJson: { build_git_sha: TARGET_BUILD },
+      download: mocks.download,
+      install: mocks.install,
+    };
+    mocks.check.mockResolvedValue(update);
+    const commands = () => mocks.invoke.mock.calls.map(([command]) => command);
+
+    mocks.invoke.mockResolvedValue(idleSafety({ terminal_sessions: 1 }));
+    await useUpdaterStore.getState().checkNow();
+    useUpdaterStore.setState({ waitingSince: Date.now() - 11 * 60_000 });
+    await useUpdaterStore.getState().install();
+    expect(commands()).not.toContain("retry_update_install");
+
+    mocks.invoke.mockClear();
+    mocks.invoke.mockResolvedValue(idleSafety());
+    useUpdaterStore.setState({ waitingSince: Date.now() - 9 * 60_000 });
+    await useUpdaterStore.getState().install();
+    expect(commands()).not.toContain("retry_update_install");
+
+    useUpdaterStore.setState({ waitingSince: Date.now() - 11 * 60_000 });
+    await useUpdaterStore.getState().install();
+    expect(commands()).toContain("retry_update_install");
+    expect(useUpdaterStore.getState().waitingSince).toBeGreaterThan(Date.now() - 60_000);
+  });
+
+  it("clears the failed attempt before asking for the update again", async () => {
+    const update = {
+      available: true,
+      version: "1.79.1",
+      body: "",
+      rawJson: { build_git_sha: TARGET_BUILD },
+      download: mocks.download,
+      install: mocks.install,
+    };
+    mocks.check.mockResolvedValue(update);
+    mocks.invoke.mockResolvedValue(idleSafety());
+    await useUpdaterStore.getState().checkNow();
+    await useUpdaterStore.getState().install();
+    mocks.invoke.mockClear();
+
+    await useUpdaterStore.getState().retryInstall();
+
+    expect(mocks.invoke.mock.calls.map(([command]) => command)).toEqual([
+      "retry_update_install",
+      "reserve_update_install",
+    ]);
   });
 
   it("never accepts install_permitted as renderer authority without an exact permit", async () => {
@@ -382,5 +459,26 @@ describe("updater safe restart gate", () => {
     });
 
     expect(useUpdaterStore.getState().phase.kind).toBe("installing");
+  });
+});
+
+describe("M238 update blockers", () => {
+  const idle = {
+    safe_to_restart: false, restart_reserved: false, active_chat_turns: 0,
+    active_task_schedulers: 0, active_delivery_leases: 0, active_objective_leases: 0,
+    objective_blocker_owners: [], pending_permissions: 0, managed_browser_sessions: 0,
+    terminal_sessions: 0, update_install_state: "queued" as const,
+  };
+
+  it("offers a choice only when real work is queued ahead of the update", () => {
+    expect(canChooseUpdateTiming(idle)).toBe(false);
+    expect(canChooseUpdateTiming({ ...idle, terminal_sessions: 1 })).toBe(true);
+    expect(canChooseUpdateTiming({ ...idle, terminal_sessions: 1, update_install_state: "still_unknown" })).toBe(false);
+    expect(canChooseUpdateTiming(null)).toBe(false);
+  });
+
+  it("names each kind of running work", () => {
+    expect(describeUpdateBlockers({ ...idle, active_chat_turns: 2, pending_permissions: 1 }))
+      .toEqual(["2 个对话正在回答", "1 个操作在等你批准"]);
   });
 });

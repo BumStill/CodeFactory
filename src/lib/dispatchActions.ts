@@ -262,7 +262,9 @@ export async function dispatchSend(
 
   if (state.running) {
     if (input.mode === "queue") {
-      const queued = useChatStore.getState().enqueueMessage(session.id, input.message);
+      // M236: `queued` is only reported after the row is committed, so this
+      // await is what makes the dispatch answer a durability promise.
+      const queued = await useChatStore.getState().enqueueMessage(session.id, input.message);
       if (queued !== "queued") {
         throw new DispatchRequestError(
           "delivery_failed",

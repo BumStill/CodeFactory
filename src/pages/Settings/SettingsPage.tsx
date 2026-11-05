@@ -21,7 +21,9 @@ import {
 import { useSettingsStore } from "../../stores/settings";
 import { useChatStore } from "../../stores/chat";
 import { useGitRemoteStore } from "../../stores/gitRemote";
-import { countUpdateBlockers, useUpdaterStore, type UpdaterPhase } from "../../stores/updater";
+import { canChooseUpdateTiming, countUpdateBlockers, isUpdateStalled, useUpdaterStore, type UpdaterPhase } from "../../stores/updater";
+import { UpdateBlockerChoice } from "../../components/UpdateBlockerChoice";
+import { UpdateStalledChoice } from "../../components/UpdateStalledChoice";
 import type {
   Settings,
   Endpoint,
@@ -37,11 +39,12 @@ import type {
 } from "../../lib/tauri";
 import { CHATGPT_DEFAULT_MODEL, CHATGPT_ENDPOINT_KEY } from "../../lib/chatgptModels";
 import { syncChatGptCatalog } from "../../stores/chatgptCatalog";
+import { LongTermMemorySection } from "../../components/LongTermMemorySection";
 import { UsageDashboardSection } from "../../components/UsageDashboardSection";
 import { ModelUsageWindowsSection } from "../../components/ModelUsageWindowsSection";
 import { SubscriptionQuotaSection } from "../../components/SubscriptionQuotaSection";
 
-export type SettingsTab = "capabilities" | "usage" | "endpoints" | "browser" | "general" | "hooks" | "remotes" | "appearance" | "about";
+export type SettingsTab = "capabilities" | "memory" | "usage" | "endpoints" | "browser" | "general" | "hooks" | "remotes" | "appearance" | "about";
 
 interface Props {
   onBack: () => void;
@@ -613,6 +616,7 @@ export function SettingsPage({
       label: "工作流",
       tabs: [
         { id: "capabilities", label: "功能", description: "管理跨会话能力。当前会话的模型、Git 和检查点仍留在工作区顶栏。" },
+        { id: "memory", label: "记忆", description: "查看你让 CodeFactory 记住的内容，可以修改、删除或全部关闭。" },
         { id: "usage", label: "用量与预算", description: "查看模型调用、Token 成本趋势和预算提醒。" },
         { id: "general", label: "通用", description: "设置 shell、并行任务、交付上限、通知、沙箱和数据备份。" },
       ],
@@ -742,6 +746,8 @@ export function SettingsPage({
         )}
 
         {/* ── Usage & budgets ── */}
+        {tab === "memory" && <LongTermMemorySection />}
+
         {tab === "usage" && (
           <>
             <UsageDashboardSection onOpenSession={onOpenSession} onOpenJobLog={onOpenJobLog} />
@@ -2481,10 +2487,12 @@ function ChatGptLoginCard() {
 function UpdateStatusLine({
   phase,
   currentVersion,
+  stalled,
   onInstall,
 }: {
   phase: UpdaterPhase;
   currentVersion: string | null;
+  stalled: boolean;
   onInstall: () => void;
 }) {
   switch (phase.kind) {
@@ -2556,6 +2564,14 @@ function UpdateStatusLine({
         </p>
       );
     case "waiting_for_safe_restart": {
+      if (stalled) {
+        return (
+          <div className="space-y-1.5 text-label text-amber-700 dark:text-amber-300">
+            <p className="flex items-center gap-1.5"><RefreshCw size={14} /> 更新没有开始</p>
+            <UpdateStalledChoice version={phase.update.version} detail={phase.safetyCheckError} />
+          </div>
+        );
+      }
       const observingUnknownInstall =
         phase.blockers?.update_install_state === "still_unknown" ||
         phase.blockers?.update_install_state === "observe_only";
@@ -2581,6 +2597,7 @@ function UpdateStatusLine({
                 ? "后端正在取得安装许可；下载开始后会显示实时进度。"
               : `当前 ${countUpdateBlockers(phase.blockers)} 项工作仍在运行；结束后自动下载、安装并重启，无需再次点击。`}
           </p>
+          {canChooseUpdateTiming(phase.blockers) && <UpdateBlockerChoice blockers={phase.blockers} />}
         </div>
       );
     }
@@ -2605,6 +2622,7 @@ const REPO_URL = "https://github.com/BumStill/CodeFactory";
 function AboutTab() {
   const phase = useUpdaterStore((s) => s.phase);
   const currentVersion = useUpdaterStore((s) => s.currentVersion);
+  const stalled = useUpdaterStore((s) => isUpdateStalled(s.phase, s.waitingSince, s.forceRequested));
   const checkNow = useUpdaterStore((s) => s.checkNow);
   const install = useUpdaterStore((s) => s.install);
   const initialize = useUpdaterStore((s) => s.initialize);
@@ -2658,6 +2676,7 @@ function AboutTab() {
 
         <UpdateStatusLine
           phase={phase}
+          stalled={stalled}
           currentVersion={currentVersion}
           onInstall={() => void install()}
         />

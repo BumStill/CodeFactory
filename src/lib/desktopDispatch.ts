@@ -271,6 +271,16 @@ export async function applyDispatchRequest(
       case "usage_status":
         result = await invoke("get_endpoint_spend_status");
         break;
+      case "list_memories":
+        result = await invoke("list_long_term_memories");
+        break;
+      case "delete_memory":
+        result = await invoke("delete_long_term_memory", { id: requiredString(body.id, "id") });
+        break;
+      case "set_memory_enabled":
+        if (typeof body.enabled !== "boolean") return invalid("enabled must be a boolean");
+        result = await invoke("set_long_term_memory_enabled", { enabled: body.enabled });
+        break;
       case "get_quota":
         if (!handlers.getQuota) return invalid("get_quota is not available");
         result = await handlers.getQuota();

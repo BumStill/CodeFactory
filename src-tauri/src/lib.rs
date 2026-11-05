@@ -573,6 +573,8 @@ pub struct AppState {
     /// Admission barrier set only after every live-work owner reports idle.
     /// New work must not enter between updater safety admission and relaunch.
     pub update_restart_reserved: Arc<AtomicBool>,
+    /// M238: exact (version, build) the user chose to install despite running work.
+    pub update_force_target: Arc<std::sync::Mutex<Option<(String, String)>>>,
     /// Serializes updater restart admission with Objective remediation claims.
     /// The Objective supervisor has no entry in the chat/task runtime maps, so
     /// the atomic flag alone cannot close its snapshot-to-claim race.
@@ -1732,6 +1734,7 @@ pub fn run() {
                 chat_cancels: Arc::new(Mutex::new(HashMap::new())),
                 interjections: Arc::new(Mutex::new(HashMap::new())),
                 update_restart_reserved: Arc::new(AtomicBool::new(false)),
+                update_force_target: Arc::new(std::sync::Mutex::new(None)),
                 update_restart_admission: Arc::new(tokio::sync::Mutex::new(())),
             });
             // Manage the Arc so all commands share the same McpManager instance.
@@ -2035,8 +2038,10 @@ pub fn run() {
             commands::settings::save_api_key,
             commands::settings::delete_api_key,
             commands::update_safety::reserve_update_install,
+            commands::update_safety::retry_update_install,
             commands::update_safety::observe_update_install,
             commands::update_safety::release_update_install_reservation,
+            commands::update_safety::force_update_install,
             codex_auth::codex_login,
             codex_auth::codex_login_start,
             codex_auth::codex_login_status,
@@ -2078,6 +2083,10 @@ pub fn run() {
             commands::session::session_diagnostics,
             commands::session::reset_session_state,
             commands::document::read_document,
+            commands::long_term_memory::list_long_term_memories,
+            commands::long_term_memory::edit_long_term_memory,
+            commands::long_term_memory::delete_long_term_memory,
+            commands::long_term_memory::set_long_term_memory_enabled,
             commands::memory::read_project_memory,
             commands::memory::write_project_memory,
             commands::learning::list_learning_events,
@@ -2101,6 +2110,14 @@ pub fn run() {
             commands::preferences::get_effective_user_preference,
             commands::preferences::upsert_user_preference,
             commands::interjections::queue_interjection,
+            commands::queued_delivery::enqueue_queued_dispatch_message,
+            commands::queued_delivery::list_queued_dispatch_messages,
+            commands::queued_delivery::claim_next_queued_dispatch_message,
+            commands::queued_delivery::mark_queued_dispatch_message_delivered,
+            commands::queued_delivery::mark_queued_dispatch_message_failed,
+            commands::queued_delivery::fail_pending_queued_dispatch_messages,
+            commands::queued_delivery::dispatch_message_status,
+            commands::queued_delivery::list_sessions_with_queued_dispatch_messages,
             commands::knowledge::register_knowledge_library,
             commands::knowledge::list_knowledge_libraries,
             commands::knowledge::scan_knowledge_library,
