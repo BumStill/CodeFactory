@@ -2,10 +2,12 @@
 import { useEffect } from "react";
 import { Download, Minus, X, RefreshCw, CheckCircle, AlertCircle } from "lucide-react";
 import { UpdateBlockerChoice } from "./UpdateBlockerChoice";
+import { UpdateStalledChoice } from "./UpdateStalledChoice";
 import {
   canChooseUpdateTiming,
   countUpdateBlockers,
   describeUpdateObjectiveBlockers,
+  isUpdateStalled,
   useUpdaterStore,
 } from "../stores/updater";
 
@@ -23,6 +25,8 @@ export function UpdaterBanner() {
   const dismiss = useUpdaterStore((s) => s.dismiss);
   const minimized = useUpdaterStore((s) => s.updateMinimized);
   const setMinimized = useUpdaterStore((s) => s.setUpdateMinimized);
+  const waitingSince = useUpdaterStore((s) => s.waitingSince);
+  const forceRequested = useUpdaterStore((s) => s.forceRequested);
 
   useEffect(() => { void initialize(); }, [initialize]);
 
@@ -45,9 +49,10 @@ export function UpdaterBanner() {
     !phase.safetyCheckError &&
     phase.blockers?.update_install_state === "queued" &&
     countUpdateBlockers(phase.blockers) === 0;
+  const stalled = isUpdateStalled(phase, waitingSince, forceRequested);
   if (!visible) return null;
 
-  if (phase.kind === "waiting_for_safe_restart" && minimized) {
+  if (phase.kind === "waiting_for_safe_restart" && minimized && !stalled) {
     return (
       <button
         type="button"
@@ -137,7 +142,9 @@ export function UpdaterBanner() {
           <div className="flex items-center gap-2">
             <RefreshCw size={14} />
             <span className="flex-1">
-              {observingUnknownInstall
+              {stalled
+                ? "更新没有开始"
+                : observingUnknownInstall
                 ? "正在核对上次安装结果…"
                 : startingDownload
                   ? "安全检查已通过，正在启动下载…"
@@ -153,7 +160,9 @@ export function UpdaterBanner() {
               <Minus size={14} />
             </button>
           </div>
-          {observingUnknownInstall ? (
+          {stalled ? (
+            <UpdateStalledChoice version={phase.update.version} detail={phase.safetyCheckError} />
+          ) : observingUnknownInstall ? (
             <p className="text-caption text-gray-500">
               当前仅观察目标版本与 build_git_sha，不会重复安装未知结果。
             </p>
@@ -166,15 +175,12 @@ export function UpdaterBanner() {
               当前 {countUpdateBlockers(phase.blockers)} 项本地执行仍在运行。
             </p>
           )}
-          {canChooseUpdateTiming(phase.blockers) ? (
+          {stalled ? null : canChooseUpdateTiming(phase.blockers) ? (
             <UpdateBlockerChoice blockers={phase.blockers} />
           ) : describeUpdateObjectiveBlockers(phase.blockers) && (
             <p className="text-caption text-gray-500">
               {describeUpdateObjectiveBlockers(phase.blockers)}。
             </p>
-          )}
-          {phase.safetyCheckError && (
-            <p className="text-caption text-gray-500">{phase.safetyCheckError}</p>
           )}
         </div>
       )}

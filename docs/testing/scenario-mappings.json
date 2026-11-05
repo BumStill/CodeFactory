@@ -45,6 +45,7 @@
     { "pattern": "src/stores/updater.ts", "scenario_id": "UI-005" },
     { "pattern": "src/components/UpdaterBanner.tsx", "scenario_id": "UI-005" },
     { "pattern": "src/components/UpdateStatusPill.tsx", "scenario_id": "UI-005" },
-    { "pattern": "src/components/UpdateBlockerChoice.tsx", "scenario_id": "UI-005" }
+    { "pattern": "src/components/UpdateBlockerChoice.tsx", "scenario_id": "UI-005" },
+    { "pattern": "src/components/UpdateStalledChoice.tsx", "scenario_id": "UI-005" }
   ]
 }
