@@ -785,6 +785,9 @@ fn native_requires_mutation_receipt(
         // treating it as an unobservable external effect creates a false
         // `unknown` receipt that poisons every later tool in the Objective.
         "update_plan" => false,
+        // Same shape: a transactional row in CodeFactory's own database, and a
+        // refused save is known not-applied.
+        "memory_save" => false,
         _ => true,
     }
 }

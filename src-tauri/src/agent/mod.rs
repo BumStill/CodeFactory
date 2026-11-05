@@ -58,6 +58,7 @@ pub(crate) mod tool_recovery;
 mod trusted_workspace;
 mod trusted_git;
 pub(crate) mod update_recovery;
+pub mod long_term_memory;
 pub mod user_context;
 pub mod verification;
 pub mod worktree;
@@ -1262,6 +1263,9 @@ impl AgentLoop {
         if !supports_plan {
             tool_defs.retain(|definition| definition.function.name != "update_plan");
         }
+        if self.anonymous {
+            tool_defs.retain(|definition| definition.function.name != "memory_save");
+        }
         // Anonymous runs must leave NO DB trace. The knowledge tools
         // (kb_search / kb_get_chunk) write a `retrieval_events` audit row —
         // including the user's query text — keyed on the session, so withhold
@@ -1300,6 +1304,17 @@ impl AgentLoop {
         let user_ctx = user_context::build_prefs_and_learnings(&self.db, &cwd_str).await;
         if !user_ctx.is_empty() {
             blocks.push(context_budget::Block::new(user_ctx, 0, 2500));
+        }
+        // Anonymous runs must leave no DB trace, and reading the index records use.
+        if !self.anonymous {
+            let memories = long_term_memory::session_block(&self.db, &self.cwd).await;
+            if !memories.is_empty() {
+                blocks.push(context_budget::Block::new(
+                    memories,
+                    0,
+                    long_term_memory::INDEX_MAX_CHARS,
+                ));
+            }
         }
         first_request_latency::record("skills_memory", skills_memory_started);
         let mut system_prompt = context_budget::assemble(
@@ -2909,6 +2924,7 @@ pub(super) fn permission_policy_for_mode(mode: &str) -> PermissionPolicy {
         "kb_search".to_string(),
         "kb_get_chunk".to_string(),
         "update_plan".to_string(),
+        "memory_save".to_string(),
     ];
     match mode {
         "safe" => PermissionPolicy {
@@ -3067,7 +3083,9 @@ fn decide_permission(
     tool_name: &str,
     cmd: Option<&str>,
 ) -> PermissionDecision {
-    if tool_name == "update_plan" {
+    // memory_save proves its own source server-side and the user asked for it,
+    // so an approval prompt would only re-ask what they just said.
+    if tool_name == "update_plan" || tool_name == "memory_save" {
         return PermissionDecision::Allow;
     }
     const KNOWN_SKILL_TOOLS: &[&str] = &[
@@ -4395,6 +4413,17 @@ mod tests {
             decide_permission(&policy, "bash", Some("pnpm build")),
             PermissionDecision::Ask
         );
+    }
+
+    #[test]
+    fn memory_save_needs_no_second_approval_in_any_mode() {
+        for mode in ["safe", "standard", "trusted"] {
+            assert_eq!(
+                decide_permission(&permission_policy_for_mode(mode), "memory_save", None),
+                PermissionDecision::Allow,
+                "{mode}"
+            );
+        }
     }
 
     #[test]

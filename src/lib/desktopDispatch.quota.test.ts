@@ -27,6 +27,15 @@ describe("CF-QUOTA-R2 background settings integration", () => {
     expect(await dispatch("usage_status")).toEqual({ ok: true, result: report });
     expect(mocks.invoke).toHaveBeenCalledWith("get_endpoint_spend_status");
   });
+  it("M235 routes memory operations to the same commands as the memory page", async () => {
+    mocks.invoke.mockResolvedValue(null);
+    await dispatch("list_memories");
+    expect(mocks.invoke).toHaveBeenCalledWith("list_long_term_memories");
+    await dispatch("delete_memory", { id: "m1" });
+    expect(mocks.invoke).toHaveBeenCalledWith("delete_long_term_memory", { id: "m1" });
+    await dispatch("set_memory_enabled", { enabled: false });
+    expect(mocks.invoke).toHaveBeenCalledWith("set_long_term_memory_enabled", { enabled: false });
+  });
   it("returns the same usage/caps/reset readings as settings without exposing credentials", async () => {
     const readings = [{ endpoint: "subscription", source: "本地估算", five_hour_percent: 37,
       weekly_percent: 12, five_hour_cap_percent: 80, weekly_cap_percent: 80,

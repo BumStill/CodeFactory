@@ -283,7 +283,7 @@ pub(crate) struct UnattendedSmokeRunOutcome {
     pub error: Option<anyhow::Error>,
 }
 
-fn read_http_request(stream: &mut TcpStream) -> anyhow::Result<()> {
+fn read_http_request(stream: &mut TcpStream) -> anyhow::Result<String> {
     stream.set_read_timeout(Some(Duration::from_secs(5)))?;
     let mut bytes = Vec::new();
     let mut header_end = None;
@@ -320,7 +320,8 @@ fn read_http_request(stream: &mut TcpStream) -> anyhow::Result<()> {
             break;
         }
     }
-    Ok(())
+    let body = bytes.get(header_end.unwrap_or(bytes.len())..).unwrap_or_default();
+    Ok(String::from_utf8_lossy(body).into_owned())
 }
 
 fn tool_sse(call_id: &str, name: &str, arguments: serde_json::Value) -> String {
@@ -372,7 +373,13 @@ fn handle_provider_request(
     // wins the race against the client's bytes arriving on loopback. Restore
     // blocking mode for the whole connection instead of retrying the symptom.
     stream.set_nonblocking(false)?;
-    read_http_request(&mut stream)?;
+    let request = read_http_request(&mut stream)?;
+    // M235: every round, including the ones after the process restart, must
+    // carry the memory saved in phase one. The user's message alone cannot
+    // satisfy this; only the index heading proves the prompt path ran.
+    if !request.contains(crate::agent::long_term_memory::INDEX_TITLE) {
+        bail!("M235: long-term memory did not reach provider request {request_index}");
+    }
     if request_index == 2 {
         blocked_round_seen.store(true, Ordering::SeqCst);
         while !stop.load(Ordering::SeqCst) {
@@ -1179,6 +1186,24 @@ fn build_agent(
     .with_turn_capability(TurnCapability::Implement)
 }
 
+async fn save_user_memory(pool: &sqlx::SqlitePool, project: &Path) -> anyhow::Result<()> {
+    use crate::agent::long_term_memory as memory;
+    memory::ensure(pool).await?;
+    let source = memory::latest_user_message_id(pool, SESSION_ID)
+        .await?
+        .ok_or_else(|| anyhow!("the admitted turn has no user message"))?;
+    let request = memory::SaveRequest {
+        content: USER_INSTRUCTION,
+        kind: "preference",
+        scope: "user",
+        replaces: None,
+    };
+    memory::save_from_user_message(pool, SESSION_ID, &source, &memory::repo_scope_for(project), request)
+        .await
+        .map_err(|error| anyhow!(error))?;
+    Ok(())
+}
+
 pub(crate) async fn run_worker(state_dir: &Path, base_url: &str, phase: u8) -> anyhow::Result<()> {
     let project = state_dir.join("project");
     let db_url = format!("sqlite:{}", state_dir.join("smoke.db").display());
@@ -1196,6 +1221,7 @@ pub(crate) async fn run_worker(state_dir: &Path, base_url: &str, phase: u8) -> a
         if admission.objective.root_turn_id.as_deref() != Some(admission.root_turn_id.as_str()) {
             bail!("headless admission split its Objective and root-turn identity");
         }
+        save_user_memory(&pool, &project).await?;
         let history = crate::storage::load_agent_history(&pool, SESSION_ID).await?;
         let mut agent = build_agent(pool.clone(), project, base_url, None);
         let _never_returns_before_parent_kill = agent.run(history).await?;
