@@ -15,6 +15,7 @@ import { invoke } from "../lib/tauri";
 const POLL_INTERVAL_MS = 30 * 60 * 1000; // 30 min — light on the GitHub CDN, fresh enough for users
 const SAFE_RESTART_RETRY_MS = 5_000;
 const UPDATE_STALL_MS = 60_000; // nothing to wait for, yet no download in sight
+const UPDATE_AUTO_RETRY_MS = 10 * 60 * 1000; // a stall recovers on its own; the button only skips this wait
 
 export interface UpdateSafetyStatus {
   safe_to_restart: boolean;
@@ -369,6 +370,14 @@ export const useUpdaterStore = create<UpdaterStore>((set, get) => ({
           void get().install();
         }, SAFE_RESTART_RETRY_MS);
         set({ safeRetryHandle: handle });
+      }
+      const { phase: waiting, waitingSince, forceRequested } = get();
+      if (
+        waitingSince !== null &&
+        checkedAt - waitingSince >= UPDATE_AUTO_RETRY_MS &&
+        isUpdateStalled(waiting, waitingSince, forceRequested)
+      ) {
+        await get().retryInstall();
       }
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);

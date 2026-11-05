@@ -194,6 +194,36 @@ describe("updater safe restart gate", () => {
     expect(isUpdateStalled({ kind: "idle" }, 0, false)).toBe(false);
   });
 
+  it("recovers a stalled update on its own after ten minutes, but never over real work", async () => {
+    const update = {
+      available: true,
+      version: "1.79.1",
+      body: "",
+      rawJson: { build_git_sha: TARGET_BUILD },
+      download: mocks.download,
+      install: mocks.install,
+    };
+    mocks.check.mockResolvedValue(update);
+    const commands = () => mocks.invoke.mock.calls.map(([command]) => command);
+
+    mocks.invoke.mockResolvedValue(idleSafety({ terminal_sessions: 1 }));
+    await useUpdaterStore.getState().checkNow();
+    useUpdaterStore.setState({ waitingSince: Date.now() - 11 * 60_000 });
+    await useUpdaterStore.getState().install();
+    expect(commands()).not.toContain("retry_update_install");
+
+    mocks.invoke.mockClear();
+    mocks.invoke.mockResolvedValue(idleSafety());
+    useUpdaterStore.setState({ waitingSince: Date.now() - 9 * 60_000 });
+    await useUpdaterStore.getState().install();
+    expect(commands()).not.toContain("retry_update_install");
+
+    useUpdaterStore.setState({ waitingSince: Date.now() - 11 * 60_000 });
+    await useUpdaterStore.getState().install();
+    expect(commands()).toContain("retry_update_install");
+    expect(useUpdaterStore.getState().waitingSince).toBeGreaterThan(Date.now() - 60_000);
+  });
+
   it("clears the failed attempt before asking for the update again", async () => {
     const update = {
       available: true,
