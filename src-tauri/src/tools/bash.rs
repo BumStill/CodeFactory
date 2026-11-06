@@ -531,8 +531,11 @@ async fn execute_inner(
                 if let Some(sandbox) = trusted_sandbox.as_ref() {
                     // R8：沙箱拒绝写入时，模型拿到的必须是"哪个边界、怎么修"，
                     // 而不是一句裸的 Permission denied 去猜。
-                    combined.push('\n');
-                    combined.push_str(&sandbox.failure_hint(&combined));
+                    let hint = sandbox.failure_hint(&format!("{stdout}{stderr}"));
+                    if !hint.is_empty() {
+                        combined.push('\n');
+                        combined.push_str(&hint);
+                    }
                 }
             }
             append_audit(

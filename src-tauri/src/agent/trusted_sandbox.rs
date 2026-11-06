@@ -403,7 +403,11 @@ mod tests {
             launch.args[2..].to_vec(),
             vec!["bash".to_string(), "-lc".to_string(), "printf ok".to_string()]
         );
-        assert!(!sandbox.failure_hint("").trim().is_empty());
+        // M250 R1/R2: an empty failure is not evidence of a sandbox denial.
+        assert!(sandbox.failure_hint("").is_empty());
+        assert!(sandbox
+            .failure_hint("sandbox-exec: sandbox_apply: Operation not permitted")
+            .contains("沙箱拦截"));
     }
 
     /// 真实执行：工作区内写成功，工作区外写被系统拒绝，且提示可读（R5/R8）。

@@ -167,6 +167,13 @@ impl CommandSandbox {
 
     /// R8：把沙箱拒绝翻译成模型能照着改的诊断；绝不建议自动提权重试。
     pub fn failure_hint(&self, stderr: &str) -> String {
+        // M250 R1/R2: nonzero status alone says nothing about Seatbelt.
+        // macOS reports denied writes (shell, Git, Python) as EPERM;
+        // sandbox-exec also uses this diagnostic when sandbox_apply fails.
+        // Do not classify generic EACCES/Permission denied as Seatbelt evidence.
+        if !stderr.contains("Operation not permitted") {
+            return String::new();
+        }
         let workspace = self.workspace.display();
         match denied_path(stderr) {
             Some(path) => format!(
