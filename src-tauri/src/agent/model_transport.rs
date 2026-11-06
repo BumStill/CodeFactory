@@ -2073,8 +2073,8 @@ impl ModelTransport for RoutedDesktopModelTransport {
                         attempt.commit_response(&response).await?;
                     }
                     self.route_state.mark_current_success();
-                    if let Err(error) = super::usage_windows::model_wait::clear_transient_endpoint(&self.db, &self.session_id, &route.endpoint_name).await {
-                        tracing::warn!("transient retry reset failed: {error}");
+                    if let Err(error) = super::usage_windows::model_wait::clear(&self.db, &self.session_id).await {
+                        tracing::warn!("model availability wait reset failed: {error}");
                     }
                     // CF-QUOTA-R1 (estimate path): charge this round's real
                     // tokens to the subscription endpoint's local estimate, the
@@ -4873,6 +4873,35 @@ data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":
     /// whole OBJECTIVE in a wait whose episode identity is the candidate
     /// snapshot — so only the same endpoint could ever leave it. With a usable
     /// fallback configured the task must continue there instead.
+    #[tokio::test]
+    async fn m252_successful_model_call_clears_stale_wait() {
+        let (pool, objective) = durable_foreground_fixture("m252-success").await;
+        let session = objective.session_id.clone().unwrap();
+        super::super::usage_windows::model_wait::record(&pool, &session, "过期用量上限", Some(i64::MAX)).await.unwrap();
+        super::super::background_tasks::persist_model_wakeup(&pool, &session, objective.root_turn_id.as_deref().unwrap(), chrono::Utc::now().timestamp_millis() + 600_000, "过期用量上限").await.unwrap();
+        let (url, hits) = serve_responses(vec![OPENAI_OK]);
+        let transport = RoutedDesktopModelTransport {
+            http: test_client(),
+            events: Arc::new(super::super::events::CollectingEventSink::new()),
+            session_id: session.clone(),
+            route_state: ActiveRouteState::from_plan_with_health(
+                super::super::failover::RouteCandidatePlan::new(openai_candidate("synthetic", "model", url)),
+                super::super::failover::EndpointHealthRegistry::new(std::time::Duration::from_secs(120))),
+            cancel: None,
+            turn_uncommitted_output: Arc::new(AtomicBool::new(false)),
+            turn_uncommitted_side_effect: Arc::new(AtomicBool::new(false)),
+            db: pool.clone(), root_turn_id: objective.root_turn_id.clone(),
+            mutation_permit: None, context_authorization: None,
+            anonymous: false, durable_provider_required: true,
+        };
+        transport.complete(&[], &[], &RoundOptions::default()).await.unwrap();
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        assert!(super::super::usage_windows::model_wait::load(&pool, &session).await.unwrap().is_none());
+        let pending: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM wakeup_schedules WHERE session_id=? AND status='pending' AND id LIKE 'model-availability-%'")
+            .bind(&session).fetch_one(&pool).await.unwrap();
+        assert_eq!(pending, 0);
+    }
+
     #[tokio::test]
     async fn prefer_mode_switches_instead_of_burning_the_overload_budget() {
         const OVERLOADED: (&str, &str, &str) = (

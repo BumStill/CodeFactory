@@ -2985,6 +2985,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn m252_success_does_not_hold_other_wakes() {
+        let dir = scratch_dir("m252-wakes");
+        let pool = file_pool(&dir).await;
+        super::super::thin_state::ensure(&pool).await.unwrap();
+        ensure_wakeup_schema(&pool).await.unwrap();
+        for (id, at) in [("permission-m252", 100), ("model-availability-m252", 5_000)] {
+            sqlx::query("INSERT INTO wakeup_schedules(id,session_id,prompt,source,next_at,status,created_at) VALUES (?,'m252','synthetic','agent_decided',?,'pending',1)")
+                .bind(id).bind(at).execute(&pool).await.unwrap();
+        }
+        super::super::usage_windows::model_wait::record(&pool, "m252", "过期原因", Some(5_000_000)).await.unwrap();
+        super::super::usage_windows::model_wait::clear(&pool, "m252").await.unwrap();
+        let due = list_wakeups(&pool, "m252").await.unwrap();
+        assert!(!hold_for_model_wake(&pool, "m252", &due, 200).await);
+        let next: i64 = sqlx::query_scalar("SELECT next_at FROM wakeup_schedules WHERE id='permission-m252'").fetch_one(&pool).await.unwrap();
+        assert_eq!(next, 100);
+    }
+
+    #[tokio::test]
     async fn m237_due_wakes_hold_until_the_model_wake_without_writing_messages() {
         let dir = scratch_dir("m237-hold");
         let pool = file_pool(&dir).await;

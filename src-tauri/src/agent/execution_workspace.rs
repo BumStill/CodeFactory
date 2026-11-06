@@ -3205,7 +3205,8 @@ pub(crate) async fn mark_objective_terminal_in_tx(
 async fn reclaim_dead_repo_locks(pool: &SqlitePool) -> Result<()> {
     let locks: Vec<(String, String)> = sqlx::query_as("SELECT repo_identity,lease_owner FROM execution_workspace_repo_locks").fetch_all(pool).await?;
     for (repo, owner) in locks {
-        let Some((pid, token)) = owner.split_once(':') else { continue; };
+        let identity = owner.strip_prefix("workspace-cleanup:").unwrap_or(&owner);
+        let Some((pid, token)) = identity.split_once(':') else { continue; };
         let Ok(pid) = pid.parse::<u32>() else { continue; };
         if !crate::storage::db::process_identity_is_live(pid, Some(token)) {
             sqlx::query("DELETE FROM execution_workspace_repo_locks WHERE repo_identity=? AND lease_owner=?")
@@ -4947,6 +4948,32 @@ mod tests {
             assert!(!root.join(&name).exists());
         }
         assert_eq!(git(&root, &["status", "--porcelain"]), before);
+    }
+
+    #[tokio::test]
+    async fn m252_live_cleanup_lock_waits_then_allocates_once() {
+        let (_temp, root, _remote, container) = init_repo();
+        let pool = pool_with_objective("objective-dirty-root").await;
+        let seed = super::inspect_source_repo(&root).unwrap();
+        let owner = format!("workspace-cleanup:{}", crate::agent::objective::current_process_instance());
+        acquire_repo_allocation_lock(&pool, &seed.repo_identity, &owner).await.unwrap();
+        let error = allocate_or_attach(&pool, request(&root, &container, "replacement")).await.unwrap_err();
+        assert!(error.to_string().contains("another live process"));
+        release_repo_allocation_lock(&pool, &seed.repo_identity, &owner).await;
+        let first = allocate_or_attach(&pool, request(&root, &container, "replacement")).await.unwrap();
+        let second = allocate_or_attach(&pool, request(&root, &container, "replacement")).await.unwrap();
+        assert_eq!(first.id, second.id);
+        assert_eq!(first.worktree_path, second.worktree_path);
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM execution_workspaces WHERE objective_id='objective-dirty-root'").fetch_one(&pool).await.unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[tokio::test]
+    async fn m252_prefixed_dead_cleanup_lock_is_reclaimed() {
+        let pool = pool_with_objective("objective-dirty-root").await;
+        let owner = format!("workspace-cleanup:{}:stale-start", std::process::id());
+        acquire_repo_allocation_lock(&pool, "synthetic-cleanup-repo", &owner).await.unwrap();
+        acquire_repo_allocation_lock(&pool, "synthetic-cleanup-repo", "replacement").await.unwrap();
     }
 
     #[tokio::test]

@@ -2360,6 +2360,9 @@ async fn settle_chat_objective_from_error(
 /// contain paths, error chains or internal codes.
 fn setup_failure_reason(error: &AppError) -> String {
     let text = error.to_string();
+    if text.contains("repository workspace allocation is owned by another live process") {
+        return text;
+    }
     if text.contains("branch changed with uncommitted changes") {
         return "这个会话的工作区被切到了别的分支，而且还有未提交的改动。系统没有动你的文件：\
                 请提交或暂存后重试，也可以直接新建会话继续。"
@@ -2565,6 +2568,7 @@ async fn converge_aborted_chat_setup(
             let retry = crate::agent::failover::ModelUnavailable::parse(reason)
                 .map(|_| reason.to_string())
                 .or_else(|| reason.contains("no_model_available").then(|| reason.to_string()))
+                .or_else(|| reason.contains("repository workspace allocation is owned by another live process").then(|| reason.to_string()))
                 .or_else(|| failure_text.is_none().then(|| crate::agent::failover::ModelUnavailable {
                     resume_at_ms: Some(Utc::now().timestamp_millis() + 60_000),
                     notice: reason.into(),
@@ -2573,7 +2577,7 @@ async fn converge_aborted_chat_setup(
                 crate::agent::thin_state::settle_error(pool, session_id, &root_turn_id, &retry).await?
             } else {
                 crate::agent::thin_state::ask_user(pool, session_id,
-                    &format!("任务未能启动：{}。请检查模型凭据或项目配置后重试。", reason)).await?
+                    &format!("任务未能启动：{}。用户消息已保留在本会话。", reason)).await?
             };
             crate::agent::thin_state::project_turn(pool, &root_turn_id, &thin).await?;
         }
@@ -5241,6 +5245,53 @@ fn select_chat_mode(
 mod tests {
     use super::*;
     use crate::agent::failover::{ActiveRouteState, EndpointHealthRegistry};
+
+    #[tokio::test]
+    async fn m252_busy_setup_preserves_message_and_wakes_once() {
+        use crate::agent::{thin_state, background_tasks};
+        let dir = tempfile::tempdir().unwrap();
+        let url = format!("sqlite://{}?mode=rwc", dir.path().join("workspace.db").display());
+        let pool = crate::storage::db::connect(&url).await.unwrap();
+        sqlx::query("INSERT INTO sessions(id,title,cwd,model_id,created_at,updated_at,delivery_mode) VALUES ('m252','synthetic','/synthetic','model',1,1,'thin')").execute(&pool).await.unwrap();
+        let control = crate::ChatRunControl::pending();
+        let admission = admit_persisted_chat_turn_with_origin(&pool, &control, "m252", None, "synthetic retained request", crate::agent::objective::TurnOrigin::User).await.unwrap();
+        let error = setup_failure_reason(&AppError::Other("MANAGED_WORKSPACE_UNAVAILABLE: repository workspace allocation is owned by another live process".into()));
+        converge_aborted_chat_setup(&pool, &control, "m252", Some(&error)).await.unwrap();
+        let state = thin_state::load(&pool, "m252").await.unwrap().unwrap();
+        assert_eq!(state.state, thin_state::SessionState::WaitingWake);
+        assert!(state.question.is_none());
+        assert!(!state.reason.unwrap().contains("凭据"));
+        let messages: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages WHERE session_id='m252' AND role='user' AND content='synthetic retained request'").fetch_one(&pool).await.unwrap();
+        assert_eq!(messages, 1);
+        let wakes = background_tasks::list_wakeups(&pool, "m252").await.unwrap();
+        assert_eq!(wakes.len(), 1);
+        struct Sink(std::sync::atomic::AtomicUsize);
+        impl background_tasks::WakeSink for Sink {
+            fn enqueue(&self, session: String, text: String) -> background_tasks::WakeFuture {
+                assert_eq!(session, "m252");
+                assert!(text.contains("继续原任务"));
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async { true })
+            }
+        }
+        let sink = Sink(std::sync::atomic::AtomicUsize::new(0));
+        assert_eq!(background_tasks::drain_due_wakeups_at(&pool, &sink, wakes[0].next_at).await, 1);
+        assert_eq!(background_tasks::drain_due_wakeups_at(&pool, &sink, wakes[0].next_at).await, 0);
+        assert_eq!(sink.0.load(Ordering::SeqCst), 1);
+        for attempt in 2..=3 {
+            let next = crate::ChatRunControl::pending();
+            admit_persisted_chat_turn_with_origin(&pool, &next, "m252", None, "系统自动重试/自愈，继续原任务", crate::agent::objective::TurnOrigin::SystemWake).await.unwrap();
+            converge_aborted_chat_setup(&pool, &next, "m252", Some(&error)).await.unwrap();
+            let state = thin_state::load(&pool, "m252").await.unwrap().unwrap();
+            assert_eq!(state.consecutive_failures, attempt);
+            assert_eq!(state.state, if attempt == 3 { thin_state::SessionState::Ended } else { thin_state::SessionState::WaitingWake });
+        }
+        let completed: Option<i64> = sqlx::query_scalar("SELECT completed_at FROM chat_turn_state WHERE session_id='m252' ORDER BY updated_at DESC LIMIT 1").fetch_one(&pool).await.unwrap();
+        assert!(completed.is_some(), "bounded workspace failure must terminalize its turn receipt");
+        let state = crate::agent::thin_derive::refresh(&pool, "m252").await.unwrap();
+        assert_eq!(state.state, thin_state::SessionState::Ended);
+        assert!(!admission.root_turn_id.is_empty());
+    }
 
     #[tokio::test]
     async fn m173_thin_setup_failure_keeps_durable_wake_and_never_orphans() {

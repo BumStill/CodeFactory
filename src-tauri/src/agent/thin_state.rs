@@ -392,6 +392,40 @@ pub async fn settle_error(db: &SqlitePool, session_id: &str, root_turn_id: &str,
     }
     let state = if error_text == "agent loop stopped: Cancelled" {
         ThinState::ended("cancelled：回合已取消", "本会话记录")
+    } else if error_text.contains("repository workspace allocation is owned by another live process") {
+        // M252/R1: count actual setup failures, never supervisor observations.
+        super::background_tasks::ensure_wake_schema(db).await?;
+        let mut tx = crate::storage::db::begin_write(db).await?;
+        let attempt: i64 = sqlx::query_scalar("SELECT consecutive_failures FROM thin_session_state WHERE session_id=? AND failure_signature='workspace_busy'")
+            .bind(session_id).fetch_optional(&mut *tx).await?.unwrap_or(0) + 1;
+        let terminal = attempt >= FAILURE_LIMIT;
+        let reason = if terminal {
+            format!("工作区分配锁仍由另一个存活进程持有，已实际尝试 {attempt} 次，任务明确失败；用户消息已保留在本会话。")
+        } else {
+            format!("工作区分配忙，系统自动重试/自愈（第 {attempt} 次）；用户消息已保留，稍后自动继续。")
+        };
+        sqlx::query("UPDATE wakeup_schedules SET status='cancelled' WHERE session_id=? AND status='pending' AND id LIKE 'workspace-retry-%'")
+            .bind(session_id).execute(&mut *tx).await?;
+        if !terminal {
+            let delay = if attempt == 1 { 5 } else { 30 };
+            let at = chrono::Utc::now().timestamp() + delay;
+            sqlx::query("INSERT INTO wakeup_schedules(id,session_id,root_turn_id,prompt,source,next_at,status,created_at) VALUES (?,?,?,?,'agent_decided',?,'pending',?)")
+                .bind(format!("workspace-retry-{session_id}-{}", uuid::Uuid::new_v4()))
+                .bind(session_id).bind(root_turn_id)
+                .bind("工作区分配忙后的恢复：系统自动重试/自愈，继续原任务；用户消息已保存，不要重复发送。")
+                .bind(at).bind(at - delay).execute(&mut *tx).await?;
+        }
+        sqlx::query("INSERT INTO thin_session_state(session_id,state,waiting_for,wake_source,reason,failure_signature,consecutive_failures,updated_at) VALUES (?,?,?,?,?,'workspace_busy',?,?) ON CONFLICT(session_id) DO UPDATE SET state=excluded.state,waiting_for=excluded.waiting_for,wake_source=excluded.wake_source,reason=excluded.reason,question=NULL,failure_signature=excluded.failure_signature,consecutive_failures=excluded.consecutive_failures,updated_at=excluded.updated_at")
+            .bind(session_id).bind(if terminal { "ended" } else { "waiting_wake" })
+            .bind(if terminal { None } else { Some("工作区分配锁释放") })
+            .bind(if terminal { None } else { Some("workspace-retry") })
+            .bind(reason).bind(attempt).bind(now()).execute(&mut *tx).await?;
+        tx.commit().await?;
+        let state = load(db, session_id).await?.unwrap();
+        // A retained unanswered message is intentional on bounded setup failure;
+        // the generic final-answer guard must not reopen this explicit result.
+        project_turn(db, root_turn_id, &state).await?;
+        return Ok(state);
     } else if crate::storage::db::is_lock_contention_message(error_text) {
         // M231/R3: internal storage contention never enters model replay as a
         // failed tool result. Count durable retries separately from model waits.
@@ -574,7 +608,9 @@ fn waiting_wake_label(state: &ThinState) -> String {
 }
 
 pub(crate) async fn project_turn(db: &SqlitePool, root_turn_id: &str, state: &ThinState) -> sqlx::Result<()> {
-    if state.state == SessionState::Ended && !state.reason.as_deref().is_some_and(|reason| reason.starts_with("cancelled")) {
+    if state.state == SessionState::Ended
+        && state.failure_signature.as_deref() != Some("workspace_busy")
+        && !state.reason.as_deref().is_some_and(|reason| reason.starts_with("cancelled")) {
         let session: Option<String> = sqlx::query_scalar("SELECT session_id FROM chat_turn_state WHERE root_turn_id=?").bind(root_turn_id).fetch_optional(db).await?;
         if let Some(session) = session {
             if super::thin_derive::unanswered_user(db, &session).await? { return Ok(()); }
@@ -1051,6 +1087,23 @@ mod m210_tests {
             assert!(wait.resume_at_ms.unwrap() >= before + minutes * 60_000);
             assert!(wait.notice.contains(&format!("{minutes} 分钟后重试")));
             db.close().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn m252_workspace_busy_is_bounded_system_wait() {
+        let db = db().await;
+        let error = "MANAGED_WORKSPACE_UNAVAILABLE: repository workspace allocation is owned by another live process";
+        for attempt in 1..=3 {
+            let state = settle_error(&db, "s-1", "root-1", error).await.unwrap();
+            assert_eq!(state.consecutive_failures, attempt);
+            assert_eq!(state.state, if attempt < 3 { SessionState::WaitingWake } else { SessionState::Ended });
+            assert!(state.question.is_none());
+            assert!(state.reason.as_deref().unwrap().contains("用户消息"));
+            assert!(!state.reason.as_deref().unwrap().contains("凭据"));
+            let pending: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM wakeup_schedules WHERE session_id='s-1' AND status='pending' AND id LIKE 'workspace-retry-%'")
+                .fetch_one(&db).await.unwrap();
+            assert_eq!(pending, if attempt < 3 { 1 } else { 0 });
         }
     }
 
