@@ -413,6 +413,71 @@ describe("inline active-turn status", () => {
   });
 });
 
+// M254：回合行里的状态是当时的快照。已结束的回合、不是最新的回合都不能再说自己的状态。
+describe("thin status belongs to the latest unsettled turn", () => {
+  const activity = (kind: string, rootTurnId: string) => ({
+    rootTurnId,
+    revision: 1,
+    phase: "working",
+    status: "active",
+    kind,
+    label: "运行中",
+    waitingReason: null,
+    updatedAt: NOW,
+    terminalReason: null,
+  });
+  const user = (id: string, createdAt: number): UIMessage => ({ id, role: "user", content: "继续", createdAt });
+
+  it("does not say running on a turn that has settled", () => {
+    render(
+      <MessageList
+        messages={[
+          user("root", NOW - 120_000),
+          assistant({ content: "已合并", turnSettledAt: NOW - 4_000, turnActivity: activity("thin_running", "root") }),
+        ]}
+        streaming={false}
+        cwd={null}
+        conversationKey="s1"
+      />,
+    );
+    expect(screen.getByTestId("settled-turn-status")).toHaveTextContent("已结束");
+    expect(screen.queryByTestId("thin-state")).toBeNull();
+    expect(screen.queryByRole("button", { name: "重置会话状态" })).toBeNull();
+  });
+
+  it("keeps a stale waiting status off an older turn", () => {
+    render(
+      <MessageList
+        messages={[
+          user("first", NOW - 120_000),
+          assistant({ id: "old", content: "旧回合", turnSettledAt: NOW - 90_000, turnActivity: activity("thin_waiting_wake", "first") }),
+          user("second", NOW - 60_000),
+          assistant({ id: "new", content: "新回合", turnSettledAt: NOW - 4_000 }),
+        ]}
+        streaming={false}
+        cwd={null}
+        conversationKey="s1"
+      />,
+    );
+    expect(screen.queryByTestId("thin-state")).toBeNull();
+  });
+
+  it("still shows waiting on the latest settled turn", () => {
+    render(
+      <MessageList
+        messages={[
+          user("root", NOW - 120_000),
+          assistant({ content: "等 CI", turnSettledAt: NOW - 4_000, turnActivity: activity("thin_waiting_wake", "root") }),
+        ]}
+        streaming={false}
+        cwd={null}
+        conversationKey="s1"
+      />,
+    );
+    expect(screen.getByTestId("thin-state")).toHaveAttribute("data-thin-state", "waiting_wake");
+  });
+});
+
 // M151：卡住的会话在「正在做」旁边给出自救入口——导出事实，或在没有活执行者时
 // 重置状态。被拒绝时必须说明原因，不能假装成功。
 describe("stuck session recovery", () => {

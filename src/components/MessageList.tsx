@@ -4,7 +4,7 @@ import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useStat
 import ReactMarkdown, { defaultUrlTransform } from "react-markdown";
 import type { UrlTransform } from "react-markdown";
 import { convertFileSrc } from "@tauri-apps/api/core";
-import { projectThinState, thinStateCopy } from "../lib/thinState";
+import { projectThinState, showsThinStatus, thinStateCopy } from "../lib/thinState";
 import remarkGfm from "remark-gfm";
 import type { Components } from "react-markdown";
 import { createHighlighter, type Highlighter } from "shiki";
@@ -601,6 +601,7 @@ export function MessageList({
     }
   }
   const lastAssistantIdsByUserTurn = new Set(lastAssistantIdByRootTurn.values());
+  const latestAssistantId = [...messages].reverse().find((message) => message.role === "assistant")?.id;
 
   return (
     <FileLinkScope.Provider value={{ cwd, sessionId: conversationKey }}>
@@ -685,6 +686,7 @@ export function MessageList({
               }
               isCurrentAssistant={msg.id === currentAssistantId}
               isLastAssistantInUserTurn={lastAssistantIdsByUserTurn.has(msg.id)}
+              isLatestAssistant={msg.id === latestAssistantId}
               turnTokenTotal={turnTokenTotalsByAssistantId.get(msg.id) ?? 0}
               turnStartedAt={turnStartedAtByAssistantId.get(msg.id) ?? msg.createdAt}
               conversationKey={resolvedConversationKey}
@@ -1040,6 +1042,7 @@ const MessageRow = memo(function MessageRow({
   isTurnActive,
   isCurrentAssistant,
   isLastAssistantInUserTurn,
+  isLatestAssistant,
   turnTokenTotal,
   turnStartedAt,
   conversationKey,
@@ -1053,6 +1056,7 @@ const MessageRow = memo(function MessageRow({
   isTurnActive: boolean;
   isCurrentAssistant: boolean;
   isLastAssistantInUserTurn: boolean;
+  isLatestAssistant: boolean;
   turnTokenTotal: number;
   turnStartedAt: number;
   conversationKey: string | null;
@@ -1462,7 +1466,7 @@ const MessageRow = memo(function MessageRow({
           waitingReason: msg.turnActivity?.waitingReason,
         });
         const copy = thinStateCopy(thin);
-        if (!copy || thin.state === "ended") return null;
+        if (!copy || !showsThinStatus(thin, { settled: msg.turnSettledAt != null, latest: isLatestAssistant })) return null;
         return (
           <div className="mt-1 flex max-w-[72ch] flex-col gap-1">
             <div
@@ -1500,7 +1504,7 @@ const MessageRow = memo(function MessageRow({
               if (kind === "thin_ended") return "completed";
               if (kind === "thin_waiting_wake") return "waiting_system";
               if (kind === "thin_waiting_user") return "waiting_core_input";
-              if (kind === "thin_running") return "active";
+              if (kind === "thin_running" && msg.turnSettledAt == null) return "active";
               return msg.turnActivity?.objectiveStatus ?? null;
             })()}
             turnBoundaryFailure={turnBoundaryFailure}
