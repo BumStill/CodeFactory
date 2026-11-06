@@ -215,7 +215,7 @@ impl PermissionGateway for DesktopPermissionGateway {
                     let rewrite = super::trusted_git::registered_rewrite(&roots, &root, command);
                     if super::trusted_sandbox::covers_local_command(
                         super::trusted_sandbox::is_enforced(&root, None),
-                        rewrite,
+                        super::trusted_git::destructive_intent(command),
                         remote,
                         super::trusted_git::outside_write_sandbox_scope(command),
                     ) {
@@ -990,6 +990,69 @@ mod tests {
         let output = std::process::Command::new("git").current_dir(root).args(args).output().unwrap();
         assert!(output.status.success(), "{args:?}: {}", String::from_utf8_lossy(&output.stderr));
         String::from_utf8(output.stdout).unwrap().trim().into()
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn m248_real_sandbox_sync_keeps_config_protected() {
+        if super::super::trusted_sandbox::sandbox_application_refused() {
+            eprintln!("skip: nested Seatbelt unavailable; CI host executes this integration");
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("workspace");
+        std::fs::create_dir(&root).unwrap();
+        for args in [vec!["init", "-q", "-b", "main"], vec!["config", "user.name", "Synthetic"], vec!["config", "user.email", "synthetic@example.invalid"], vec!["commit", "--allow-empty", "-qm", "base"]] {
+            m159_git(&root, &args);
+        }
+        let remote = temp.path().join("remote.git");
+        m159_git(temp.path(), &["init", "--bare", "-q", remote.to_str().unwrap()]);
+        m159_git(&root, &["remote", "add", "origin", remote.to_str().unwrap()]);
+        m159_git(&root, &["push", "-q", "origin", "main"]);
+        std::fs::write(root.join("tracked.txt"), "synthetic git push token\n").unwrap();
+        let command = "git branch --show-current; git fetch --prune origin main && git merge origin/main && git config core.hooksPath .githooks; grep -n 'git push token' tracked.txt; cat tracked.txt";
+        assert!(super::super::trusted_sandbox::is_enforced(&root, None));
+        assert!(super::super::trusted_sandbox::covers_local_command(true, super::super::trusted_git::destructive_intent(command), codefactory_agent_loop::policy::is_delivery_command(command), super::super::trusted_git::outside_write_sandbox_scope(command)));
+        assert!(!super::super::trusted_sandbox::covers_local_command(false, super::super::trusted_git::destructive_intent(command), false, false));
+        let (program, args, sandbox) = super::super::trusted_sandbox::wrap_command(&root, None, "/bin/sh", &["-c".into(), command.into()]);
+        assert!(sandbox.is_some());
+        let output = std::process::Command::new(program).no_window().args(args).current_dir(&root).output().unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        assert!(stdout.contains("Already up to date.") && stdout.contains("synthetic git push token"), "{stdout}");
+        assert_eq!(m159_git(&root, &["rev-parse", "origin/main"]), m159_git(&root, &["rev-parse", "HEAD"]));
+        // R5: approval exemption must not unlock the protected Git config.
+        assert!(String::from_utf8_lossy(&output.stderr).contains("Operation not permitted"));
+    }
+
+    #[tokio::test]
+    async fn m248_registered_sync_discovery_has_no_permission_intent() {
+        let gateway = durable_test_gateway().await;
+        sqlx::query("UPDATE sessions SET permission_mode='trusted'").execute(&gateway.db).await.unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("workspace");
+        std::fs::create_dir(&root).unwrap();
+        for args in [vec!["init", "-q"], vec!["config", "user.name", "Synthetic"], vec!["config", "user.email", "synthetic@example.invalid"], vec!["commit", "--allow-empty", "-qm", "synthetic"], vec!["update-ref", "refs/remotes/origin/main", "HEAD"]] {
+            m159_git(&root, &args);
+        }
+        let remote = temp.path().join("remote.git");
+        m159_git(temp.path(), &["init", "--bare", "-q", remote.to_str().unwrap()]);
+        m159_git(&root, &["remote", "add", "origin", remote.to_str().unwrap()]);
+        super::super::execution_workspace::ensure_schema(&gateway.db).await.unwrap();
+        let repo = super::super::delivery::resolve_repo(&root, None).unwrap();
+        let identity = super::super::delivery::capture_delivery_identity(&repo).unwrap();
+        let common = m159_git(&root, &["rev-parse", "--path-format=absolute", "--git-common-dir"]);
+        let branch = m159_git(&root, &["branch", "--show-current"]);
+        let head = m159_git(&root, &["rev-parse", "HEAD"]);
+        sqlx::query("INSERT INTO execution_workspaces(id,objective_id,session_id,repo_identity,repo_root,git_common_dir,worktree_path,worktree_identity,branch_name,base_ref,base_sha,head_sha,state,created_at,updated_at) VALUES ('m248-workspace','5eea633e-59f9-42bc-91f8-0a19a5c49711','permission-test',?,?,?,?,?,?,'HEAD',?,?,'active',1,1)")
+            .bind(identity.repo_identity).bind(root.to_string_lossy().as_ref()).bind(common).bind(root.to_string_lossy().as_ref()).bind(identity.worktree_identity).bind(branch).bind(&head).bind(&head).execute(&gateway.db).await.unwrap();
+        for query in ["grep -n 'gh token git push' tracked.txt", "grep -n 'ssh|curl|wget' tracked.txt", "cat tracked.txt"] {
+            let command = format!("git branch --show-current; git fetch --prune origin main && git merge origin/main && git config core.hooksPath .githooks; {query}; cat tracked.txt");
+            let args = serde_json::json!({"command":command});
+            let call = ToolCall { id: "m248-sync".into(), r#type: "function".into(), function: FunctionCall { name: "bash".into(), arguments: args.to_string() } };
+            assert_eq!(gateway.authorize(&call, &args, Some(&command)).await, PermissionOutcome::Allow, "{command}");
+        }
+        assert_eq!(sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM permission_intents").fetch_one(&gateway.db).await.unwrap(), 0);
     }
 
     #[tokio::test]

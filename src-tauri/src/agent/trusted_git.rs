@@ -196,6 +196,31 @@ pub(super) fn python_heredoc_proof(root: Option<&Path>, command: &str) -> Result
 /// 决定"要不要动别的 checkout"。这些类别即便在沙箱里也必须继续走审批，
 /// 否则沙箱会变成"凭据外带/远端改写"的白名单。
 pub(crate) fn outside_write_sandbox_scope(command: &str) -> bool {
+    let Some(segments) = command_segments(command) else {
+        // Existing heredoc authorization is handled separately by the gateway.
+        // Preserve its scope predicate when this simple grammar cannot parse it.
+        return outside_write_sandbox_segment(command);
+    };
+    segments.iter().any(|segment| {
+        // M248: the shared query classifier understands executable positions;
+        // a search pattern mentioning a remote command is not a remote action.
+        if codefactory_agent_core::command_segment_is_read_only_probe(segment)
+            && executable_segments(segment).is_some_and(|parts| parts.iter().all(|words| {
+                words.first().is_some_and(|program| !outside_write_sandbox_segment(program))
+                    && words.iter().skip(1).all(|word| {
+                        // Query status cannot authorize credential-path reads or
+                        // cross-checkout targets. Keep their existing fence.
+                        !((word.contains('/') || word == ".." || word == "token" || word == "netrc")
+                            && outside_write_sandbox_segment(word))
+                    })
+            })) {
+            return false;
+        }
+        outside_write_sandbox_segment(segment)
+    })
+}
+
+fn outside_write_sandbox_segment(command: &str) -> bool {
     let lowered = command.to_ascii_lowercase();
     let words = lowered
         .split(|c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '-')
@@ -1732,6 +1757,25 @@ fn prove(roots: &[std::path::PathBuf], cwd: &Path, command: &str) -> Option<Vec<
 
 pub(super) fn local_rewrite(root: &Path, command: &str) -> bool {
     prove(&[root.into()], root, command).is_some()
+}
+
+/// M248: registration proves confinement, not destructive intent. Ordinary
+/// synchronization is kernel-confined; all other sensitive actions keep M159.
+pub(super) fn destructive_intent(command: &str) -> bool {
+    let Some(segments) = command_segments(command) else { return true };
+    segments.iter().any(|segment| {
+        if !sensitive(segment) { return false; }
+        let Some(words) = executable_segments(segment) else { return true };
+        let [words] = words.as_slice() else { return true };
+        let args: Vec<_> = words.iter().map(String::as_str).collect();
+        match args.as_slice() {
+            ["git", "fetch", rest @ ..] => !fetch_args(rest),
+            ["git", "merge", rest @ ..] => !merge_args(rest),
+            ["git", "config", "core.hooksPath", ".githooks"]
+            | ["git", "config", "--local", "core.hooksPath", ".githooks"] => false,
+            _ => true,
+        }
+    })
 }
 
 pub(super) fn registered_rewrite(roots: &[std::path::PathBuf], cwd: &Path, command: &str) -> bool {
