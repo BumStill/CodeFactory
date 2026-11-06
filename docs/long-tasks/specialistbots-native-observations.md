@@ -43,3 +43,5 @@ Chromium沙箱配置不符、受限Docker用户命名空间拒绝、本线程无
 
 ## 独立交付准备（2026-11-06）
 只读S7/S8已从最新主线提取到feat/specialist-readonly-delivery；不依赖执行账本或runner，不应等自治隔离才交付。保留凭据屏障/0027/Stop修复及fixture。独立前端19项、类型与构建通过，Rust专项16项通过；同步3324d40c后组合复验记录于specialist-readonly-rust-synced.log。验收记录已列AGENTS降级条款、真实门禁状态、S8待人工场景及下一harness工程项。仍not live；当前不推送、不PR、不合并、不部署。
+
+S8跨平台浏览器脚本已补本地可执行入口和合成IPC竞态/重开/失败路径；2项契约先红后绿，未启动真实浏览器。Rust同步后16项通过。下一步是外部送审授权及新增浏览器target的可信治理注册，非等待自主执行器。

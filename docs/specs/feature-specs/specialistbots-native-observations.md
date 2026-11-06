@@ -25,3 +25,7 @@ Spec、Compatibility、Payload、Viewport、AI Collaboration。先后端/前端�
 应用内set/delete凭据及git_remotes配置变更共享进程内屏障；最终观察提交在blocking worker持锁驱动DB事务，异步调用者的同步mutation使用try_lock冲突即返回可重试错误，不阻塞Tokio。配置与凭据发生变更（即使改回）使本进程旧绑定失效；所有凭据写入采取保守全局失效。重启生成新nonce，历史可查但再次查询需显式绑定。外部进程直接改系统钥匙串及GitHub远端权限在最后API检查后改变，仍无跨系统原子撤权保证；本片只保存带时间的只读事实，不据此授予执行权。
 
 本地schema只接受当前固定表/索引/版本，未知触发器、索引、部分schema或弱约束拒绝；BEGIN IMMEDIATE保证并发初始化与提交顺序。Stop epoch溢出返回错误并回滚，不伪报成功。与凭据提交冲突的保存/删除应稍后重试，不扩大授权。
+
+
+## 浏览器验收分层
+只读入口的真实DOM验收使用test:specialistbots:headless，保持浏览器沙箱，复用现有headless服务生命周期。合成IPC覆盖交互/竞态，sessionStorage仅模拟历史重开；不能替代原生认证/SQLite/进程重启验证。通过契约测试和语法检查不等于浏览器场景通过。新增canonical target须通过可信registry治理，普通分支不得降低门禁。

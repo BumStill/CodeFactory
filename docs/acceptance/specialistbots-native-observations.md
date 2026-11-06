@@ -47,10 +47,20 @@ not live。本地实现、测试与真实API快照不替代桌面/浏览器验�
 - 远端必需：agent-bridge-linux、check-frontend、check-rust、governance-baseline、remote-real-app-gui、scenario-gate-pr；本分支未推送，六项尚未执行。CI的Windows headless与精确head场景计划可复用，不必等待本云容器桌面恢复。
 - agent live verification not feasible：本任务无可调用桌面/浏览器工具，现Chromium沙箱helper归属异常，未关闭沙箱。此前失败不是只读功能失败；无新条件不重复启动。AGENTS“如果出现新的harness限制”允许明确降级送审，不能豁免必需CI或伪称live通过。
 - scenarios needing manual verification：真实已有GitHub凭据绑定open PR精确head→查询→关闭重开历史；Stop与查询竞态；刷新失败后禁用；跨项目切换与旧head拒绝；进程重启需重新授权；宽/窄布局、Escape焦点。已存在对应组件/服务失败测试作为有限替代证据，不能替代完整Tauri链路。
-- 立即列为下一工程问题 CF-SPECIALISTBOTS-UI-S8-BROWSER：复用已有headless生命周期工具，使S7脚本跨平台、自启Vite，补S8交互并按治理注册所需target；同时准备真实Tauri凭据/持久化验收。现脚本默认/usr/bin/chromium（可用CHROMIUM_PATH指定Windows/macOS浏览器），且仅S7，UI-009现target不是S8完整覆盖；不靠旧CI或窗口截图填补。
+- 立即列为下一工程问题 CF-SPECIALISTBOTS-UI-S8-BROWSER：复用已有headless生命周期工具，使S7脚本跨平台、自启Vite，补S8交互并按治理注册所需target；同时准备真实Tauri凭据/持久化验收。现脚本已补跨平台发现与S8合成交互，但尚未实际运行；UI-009现target尚未注册此脚本，且不包含真实Tauri认证链路；不靠旧CI或窗口截图填补。
 - 自主执行隔离、资源限制、executor receipt属于后续自治能力，不是只读切片门禁。真实认证/本地数据安全与迁移仍是本切片必需项。跨平台扩充和完整自治属于增强范围。
 
 ### 最短交付路径与授权
 本地准备→授权向BumStill/CodeFactory推送feat/specialist-readonly-delivery并开draft PR→仓库自动运行六项必需检查/精确head场景→独立审核降级声明与缺失证据→另获合并权限后按队列严格检查合并。合并不等于发版；依据release-cadence另由授权按需或每日批次发布，并验证tag、资产和updater。合并后可能进入每日批次，申请合并授权时必须说明这一点，不把“不主动dispatch”当永不发布保证。
 
 当前只获本地开发与测试范围，“为啥没上线”“继续验收”不单独等于文件上传、PR、合并或部署授权。最小待授权外部动作是上传此候选分支并开draft PR（将公开代码/证据并触发CI资源使用），不是修改云容器安全配置。不打merge-queue:armed、不主动dispatch发布、不使用未授权Mac。若选择先补真实UI覆盖，仍可本地开发；运行远端新增target须遵守trusted registry/CI修改流程，不能普通PR自行降低或改写裁判规则。
+
+
+### S8 浏览器验收入口补全
+`pnpm test:specialistbots:headless` 已准备：复用allocateLoopbackPort/waitForAcceptanceDocument，发现系统Chrome/Edge（允许CHROMIUM_PATH），自启并有界清理Vite，保持chromiumSandbox=true。375/1280宽度下覆盖S7和S8绑定→查询→关开/页面reload历史、Stop晚到拒绝、来源失败、Stop成功而列表失败、跨项目隔离、主题与截图。IPC和sessionStorage均明确为synthetic；不证明真实GitHub认证、SQLite或应用进程重启。
+
+新增Node vm契约先失败（缺bind），实现后2项通过；独立QA发现晚到请求未等settled，新增断言先失败再修正，最终2项通过、node --check通过。真实浏览器未执行，不记录DOM通过；当前云沙箱前提未变化。既有权限模式headless CI可运行真实Chrome/Edge，但不会自动调用新命令。
+
+新增target的最小治理变更是给UI-009 automated_by增加pnpm:test:specialistbots:headless；这是TRUST_ROOT_FILES保护的scenario-registry，需由受信治理更新流程审查/落地，不能由普通功能PR自认证。已在本地准备建议patch，不改可信根。也可在已授权桌面直接运行同一命令取得补充证据；不为此开放未授权Mac。六项required checks依旧全部必需。
+
+最终组合验证：主线3324d40c+独立切片的Rust16项全部通过，记录specialist-readonly-rust-synced.log；本次未改前端产品源码，19项UI、tsc、Vite构建证据仍适用于该前端树。完整全量/跨平台required CI尚未执行。构建生成的schema仅留本地证据，不纳入产品提交。
