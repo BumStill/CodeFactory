@@ -1250,6 +1250,8 @@ pub(crate) async fn settle_objectiveless_wake(pool: &SqlitePool, session: &str, 
     super::workspace_recovery_budget::ensure(pool).await?;
     let retry_at: Option<i64> = sqlx::query_scalar("SELECT next_at FROM workspace_recovery_budget WHERE session_id=?").bind(format!("wake-objective:{session}")).fetch_optional(pool).await?;
     if retry_at.is_some_and(|at| at > now) { anyhow::bail!("objective wake probe is waiting for bounded retry"); }
+    // M251：升级重启会退休 objective，它不代表任务做完；PR 还开着就不能结束会话。
+    if super::thin_derive::unfinished_delivery(pool, session).await?.is_some() { return Ok(false); }
     let mut tx = crate::storage::db::begin_write(pool).await?;
     let has_objectives: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='objectives'").fetch_one(&mut *tx).await?;
     if has_objectives == 0 { return Ok(false); }
@@ -2040,6 +2042,31 @@ mod tests {
                 assert_eq!(sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM objectives").fetch_one(&pool).await.unwrap(), 2);
             }
         }
+    }
+
+    // M251: an upgrade restart retires objectives, so "no unsettled objective"
+    // alone must not end a session whose PR is still open.
+    #[tokio::test]
+    async fn m251_open_pr_keeps_session_when_objective_is_retired() {
+        for status in ["completed", "legacy_orphan"] {
+            let pool = m241_fixture(status, "thin-repair").await;
+            sqlx::query("CREATE TABLE IF NOT EXISTS thin_delivery_refs(session_id TEXT PRIMARY KEY,branch TEXT NOT NULL,pr_number INTEGER NOT NULL,ceiling TEXT NOT NULL)").execute(&pool).await.unwrap();
+            sqlx::query("INSERT INTO thin_delivery_refs(session_id,branch,pr_number,ceiling) VALUES ('m241','synthetic',1010,'merged')").execute(&pool).await.unwrap();
+            assert!(!settle_objectiveless_wake(&pool, "m241", 200).await.unwrap(), "{status}");
+            let state = super::super::thin_state::load(&pool, "m241").await.unwrap().unwrap();
+            assert_ne!(state.state, super::super::thin_state::SessionState::Ended, "{status}");
+            assert_eq!(sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM wakeup_schedules WHERE status='cancelled'").fetch_one(&pool).await.unwrap(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn m251_finished_pr_still_ends_a_settled_session() {
+        let pool = m241_fixture("completed", "thin-repair").await;
+        sqlx::query("CREATE TABLE IF NOT EXISTS thin_delivery_refs(session_id TEXT PRIMARY KEY,branch TEXT NOT NULL,pr_number INTEGER NOT NULL,ceiling TEXT NOT NULL)").execute(&pool).await.unwrap();
+        sqlx::query("CREATE TABLE IF NOT EXISTS thin_external_observations(session_id TEXT PRIMARY KEY,pr_number INTEGER NOT NULL,ceiling TEXT NOT NULL,observed_at INTEGER NOT NULL,completed_reason TEXT,closeout_queued INTEGER)").execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO thin_delivery_refs(session_id,branch,pr_number,ceiling) VALUES ('m241','synthetic',1002,'merged')").execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO thin_external_observations(session_id,pr_number,ceiling,observed_at,completed_reason,closeout_queued) VALUES ('m241',1002,'merged',1,'merged',1)").execute(&pool).await.unwrap();
+        assert!(settle_objectiveless_wake(&pool, "m241", 200).await.unwrap());
     }
 
     #[tokio::test]

@@ -973,7 +973,7 @@ async fn continue_state(db: &SqlitePool, session: &str, at: i64, why: &str) -> s
 /// M148/R3：未完成的已交付 PR —— 有引用、且没有被成功关闭（closeout 未入队或
 /// 观测结果是故障）—— 就是「外部进行中事项」。只要它还在，会话就不能被判 ended，
 /// 否则 M142 的系统 PR 监视随 waiting 一起停摆，PR 失败无人处理。
-async fn unfinished_delivery(db: &SqlitePool, session: &str) -> sqlx::Result<Option<i64>> {
+pub(crate) async fn unfinished_delivery(db: &SqlitePool, session: &str) -> sqlx::Result<Option<i64>> {
     if !has_table(db, "thin_delivery_refs").await? {
         return Ok(None);
     }
