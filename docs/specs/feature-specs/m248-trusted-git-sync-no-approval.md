@@ -29,6 +29,8 @@
 
 ## Implementation Notes
 - R1：只读查询本机 `permission_intents`，以 M224 合并提交时间为下界，`prompt_args_json` 含该原因码共 2 条：fetch + merge + hooks 配置组合 1 条；merge 查询 + 删除远端分支组合 1 条。不持久化原始命令、路径、凭据或会话标识。
+- R2：真实 Git fixture 复现 `registered_rewrite=true`、`remote=false`；该字段实际表示“可在登记工作区证明并备份”，不是破坏性意图，却被直接传给 `covers_local_command` 的 `destructive_rewrite` 参数，导致正常同步无法使用沙箱豁免。同时原范围判定扫描整段文字，grep/rg 的引用参数含远端关键词时 `outside_write_sandbox_scope=true`。修复复用现有分段解析、共享只读查询分类及 Git 参数校验，不增加危险词表。继承未知外层沙箱仍不冒充本应用建立的 Enforced。
+- R3/R5 执行边界：免审批不等于沙箱允许修改 config。原样组合中 hooks 配置写入仍会被内核阻止；集成测试断言 fetch/merge/后续查询完成且 config 保持不可写。此安全边界不在本任务放宽；若希望重复 hooks 设置也执行成功，需独立设计幂等的结构化设置入口。
 - R4：本任务保留远端混合命令审批，标记 deferred；不扩张远端授权范围。
 - 真机安装版验收由编排方发版后完成，本任务不发版（not live）。
 
