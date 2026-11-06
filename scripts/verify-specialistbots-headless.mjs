@@ -8,7 +8,7 @@ import { access, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
 import { fileURLToPath } from 'node:url';
-import { allocateLoopbackPort, waitForAcceptanceDocument } from './headless-acceptance-support.mjs';
+import { allocateLoopbackPort, waitForAcceptanceDocument, waitForFocused } from './headless-acceptance-support.mjs';
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const output = process.env.SPECIALIST_ARTIFACT_DIR ?? path.join(process.env.RUNNER_TEMP ?? os.tmpdir(),'specialistbots-ui');
 await mkdir(output, {recursive:true});
@@ -100,6 +100,7 @@ for (const [width, theme] of [[1280,'dark'],[375,'light']]) {
   assert(overflow <= 1, 'evidence content overflows horizontally');
   await page.keyboard.press('Escape');
   assert.equal(await opener.getAttribute('aria-expanded'),'false');
+  await waitForFocused(opener);
   assert(await opener.evaluate(el => document.activeElement === el));
   await opener.click();
   await input().setInputFiles({name:'forged.json',mimeType:'application/json',buffer:Buffer.from(JSON.stringify({...fixture,autonomous_dispatch_enabled:true}))});
