@@ -28,6 +28,11 @@ export function SpecialistProjectObservations({ project }: {project:string}) {
     const version=++generation.current;setBusy(true);setError("");
     try {
       await invoke(command,{project,...args});
+      if(command==="stop_specialist_observations" && version===generation.current) {
+        // Revocation succeeded even if the subsequent status refresh fails.
+        setRecords(previous=>previous.map(record=>({...record,active:false})));
+        setEpoch(null);
+      }
       const [r,rows]=await Promise.all([invoke<GitRemoteConfig[]>("list_git_remotes"),invoke<ProjectStatus>("list_specialist_observations",{project})]);
       if(version===generation.current) {
         setRecords(status(rows).records);setEpoch(rows.epoch);

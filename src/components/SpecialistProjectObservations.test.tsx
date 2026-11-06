@@ -63,3 +63,26 @@ it("uses the newly returned epoch only for a fresh explicit bind after Stop",asy
  expect(invoke).toHaveBeenCalledWith("bind_specialist_project",{project:"/project/a",remoteId:"remote",repo:"owner/repo",pr:1,expectedEpoch:1});
  await screen.findByText("仅授权只读取证");
 });
+
+it.each(["list_specialist_observations", "list_git_remotes"])("keeps Stop effective when %s refresh fails",async(failingCommand)=>{
+ records=[{binding:b,active:true,observations:[{id:"o",observed_at:"2026-11-05T00:00:00Z",pm_state:"needs_execution_provenance",runs:[]}]}];
+ const normal=vi.mocked(invoke).getMockImplementation()!;
+ let stopped=false;
+ vi.mocked(invoke).mockImplementation(async(cmd,args)=>{
+  if(stopped && cmd===failingCommand) throw new Error("refresh unavailable");
+  const result=await normal(cmd,args);
+  if(cmd==="stop_specialist_observations")stopped=true;
+  return result;
+ });
+ render(<SpecialistProjectObservations project="/project/a"/>);
+ await screen.findByText("仅授权只读取证");
+ fireEvent.change(screen.getByLabelText("GitHub 连接"),{target:{value:"remote"}});
+ fireEvent.change(screen.getByLabelText("仓库 owner/repo"),{target:{value:"owner/repo"}});
+ fireEvent.change(screen.getByLabelText("PR 编号"),{target:{value:"1"}});
+ fireEvent.click(screen.getByRole("button",{name:"停止并撤销本项目查询授权"}));
+ await screen.findByRole("alert");
+ expect(screen.getByRole("button",{name:"查询此 head"})).toBeDisabled();
+ expect(screen.getByRole("button",{name:"绑定并授权只读观察"})).toBeDisabled();
+ expect(screen.queryByText("仅授权只读取证")).toBeNull();
+ expect(screen.getByText("待补执行证明")).toBeInTheDocument();
+});

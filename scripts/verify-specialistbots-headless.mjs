@@ -8,11 +8,13 @@ await mkdir(output, {recursive:true});
 const browser = await chromium.launch({ executablePath: process.env.CHROMIUM_PATH ?? '/usr/bin/chromium', headless:true, chromiumSandbox:true });
 try {
 const page = await browser.newPage();
-page.on('pageerror', e => console.error('PAGEERROR', e.message));
+const pageErrors = [];
+page.on('pageerror', e => pageErrors.push(e.message));
 await page.addInitScript(() => {
   let callback = 0;
   window.__TAURI_INTERNALS__ = { transformCallback: () => ++callback, unregisterCallback: () => {}, invoke: async (cmd) => {
     if (cmd === 'plugin:event|listen') return ++callback;
+    if (cmd === 'list_specialist_observations') return {epoch:0, records:[]};
     if (/list_|get_models/.test(cmd)) return [];
     if (cmd === 'get_git_status') return {is_repo:false, staged:[],unstaged:[],untracked:[]};
     if (cmd === 'get_message_page') return {messages:[],has_more:false};
@@ -35,19 +37,24 @@ for (const [width, theme] of [[1280,'dark'],[375,'light']]) {
   await page.screenshot({path:`${output}/${width}-${theme}.png`,fullPage:true});
   const geometry = await page.getByRole('region',{name:'QA/PM 证据内容'}).boundingBox();
   assert(geometry.x >= 0 && geometry.x + geometry.width <= width+1);
+  const overflow = await page.getByRole('region',{name:'QA/PM 证据内容'}).evaluate(el => el.scrollWidth - el.clientWidth);
+  assert(overflow <= 1, 'evidence content overflows horizontally');
   await page.keyboard.press('Escape');
   assert.equal(await opener.getAttribute('aria-expanded'),'false');
   assert(await opener.evaluate(el => document.activeElement === el));
   await opener.click();
   await input().setInputFiles({name:'forged.json',mimeType:'application/json',buffer:Buffer.from(JSON.stringify({...fixture,autonomous_dispatch_enabled:true}))});
-  await page.getByRole('alert').waitFor();
+  await page.getByRole('alert').filter({hasText:'无法显示报告：'}).waitFor();
   assert.equal(await page.getByText(fixture.pm.title,{exact:true}).count(),0);
   await input().setInputFiles({name:'real-993.json',mimeType:'application/json',buffer:Buffer.from(JSON.stringify(fixture))});
   await page.getByText('待补执行证明',{exact:true}).waitFor();
-  await page.keyboard.press('Escape');
-  await page.getByRole('button',{name:'验收：切换项目'}).click();
+  // Synthetic project-change event while the report remains mounted. The overlay
+  // intentionally prevents clicking background controls, so invoke only this harness control.
+  await page.getByRole('button',{name:'验收：切换项目'}).evaluate(button => button.click());
   await opener.click();
+  await page.getByText('/acceptance/project-b',{exact:true}).waitFor();
   assert.equal(await page.getByText(fixture.pm.title,{exact:true}).count(),0);
+  assert.deepEqual(pageErrors, [], 'browser runtime errors');
   console.log(JSON.stringify({width,theme,import:true,forgeryRejected:true,escapeFocus:true,projectReset:true}));
 }
 } finally {await browser.close();}

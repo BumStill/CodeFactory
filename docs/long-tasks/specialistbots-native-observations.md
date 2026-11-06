@@ -39,3 +39,7 @@ Chromium沙箱配置不符、受限Docker用户命名空间拒绝、本线程无
 
 ## Stop Boundary
 本地提交后交接；不推送、合并、部署。观察命令不会运行测试/模型或写远端；重启/凭据变更后只保留历史读取，查询需显式重新授权。
+
+
+## 独立交付准备（2026-11-06）
+只读S7/S8已从最新主线提取到feat/specialist-readonly-delivery；不依赖执行账本或runner，不应等自治隔离才交付。保留凭据屏障/0027/Stop修复及fixture。独立前端19项、类型与构建通过，Rust专项16项通过；同步3324d40c后组合复验记录于specialist-readonly-rust-synced.log。验收记录已列AGENTS降级条款、真实门禁状态、S8待人工场景及下一harness工程项。仍not live；当前不推送、不PR、不合并、不部署。

@@ -1,0 +1,42 @@
+{
+  "schema_version": 1,
+  "observation_id": "30e83a948880891f87bc718446b71445183c4082ab0a2cd69630f4c26bd90442",
+  "evidence_trust": "local_supplied",
+  "source": {
+    "repository_id": 1239349968,
+    "pr": 993,
+    "head": "d162cf6049a95f241b09aafd82e9dac1c4320e63",
+    "evidence_sha256": "bcbd1fb585ad183cd61186b3380b7f6af84d75b5e0bab6c8a0dd86438c2009d6"
+  },
+  "qa": {
+    "local_checks": "consistent",
+    "limitations": [
+      "test_execution_not_attested",
+      "red_source_digest_not_recorded",
+      "synthetic_inputs_not_original_incident"
+    ],
+    "missing": [],
+    "target_test": "agent::quota_live::tests::present_invalid_window_duration_is_not_a_position_fallback",
+    "green_passed": 46
+  },
+  "pm": {
+    "task_id": "finding-4187349088a368e0ebe8d8d3143d96625ea339c381b95ffb245689cf7b613b4e",
+    "finding_id": "DM-993-001",
+    "title": "已存在但格式错误的窗口时长不能按位置回退",
+    "state": "needs_execution_provenance",
+    "delivery_state": "not_verified",
+    "original_review_head": "d162cf6049a95f241b09aafd82e9dac1c4320e63",
+    "fix_base": "cc36802180339c692ed91ce7e5a61ad3122c0e83",
+    "fix_branch": "fix/mr993-window-duration",
+    "fix_source_sha256": "b2f5d964ac23b7e6d7f4b64d35f5d04ba218374cd791f3899d057c753dd4a626",
+    "next_step": "由可信受限执行器补齐红绿源码与执行证明；不得据此自动派发或关闭任务。"
+  },
+  "qa_dot_autonomous": false,
+  "pm_dot_autonomous": false,
+  "autonomous_dispatch_enabled": false,
+  "model_called": false,
+  "tests_executed_by_this_tool": false,
+  "remote_writes": false,
+  "persistent_pm_update": false,
+  "original_user_incident_resolved": "unverified"
+}

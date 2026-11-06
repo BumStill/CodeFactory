@@ -37,3 +37,20 @@
 not live。本地实现、测试与真实API快照不替代桌面/浏览器验收。凭据屏障只覆盖本进程，不能原子约束外部钥匙串/远端撤权；进程重启保留历史但重新授权才能查询。凭据写入与观察提交临界区冲突会返回可重试错误；所有凭据变更保守失效本进程旧观察绑定。没有可控执行器，因此自主执行继续关闭。
 
 未合并、未推送、未部署。下一步为已授权桌面的真实入口验收，以及受认证执行器的隔离、Stop终止和执行receipt；不是继续扩展导入报告。
+
+
+## 2026-11-06 独立只读交付候选
+本候选分支 feat/specialist-readonly-delivery 从主线 c5e232d0 提取S7/S8，带Stop刷新失败修复、浏览器mock契约修复及报告fixture，不包含S1-S3执行账本、S6采集CLI或S9探针。服务只依赖现有GitHub连接/凭据与SQLite；0027通过ensure_schema接入，不依赖0024/0025 Dot表。凭据屏障和settings/secrets接入不可拆掉。自主执行仍关闭；没有待部署的执行器依赖。
+
+### 真实门禁状态
+- 仓库必需：相关失败回归、类型/构建、迁移及权限兼容、独立QA、治理/scenario门禁；独立候选的19项组件/Workspace测试、类型检查、前端构建与脚本契约测试已通过。Rust专项16项在独立候选通过（凭据屏障2、观察13、transport1）；其后同步主线3324d40c，组合复验以specialist-readonly-rust-synced.log为准，不沿用旧head结果。
+- 远端必需：agent-bridge-linux、check-frontend、check-rust、governance-baseline、remote-real-app-gui、scenario-gate-pr；本分支未推送，六项尚未执行。CI的Windows headless与精确head场景计划可复用，不必等待本云容器桌面恢复。
+- agent live verification not feasible：本任务无可调用桌面/浏览器工具，现Chromium沙箱helper归属异常，未关闭沙箱。此前失败不是只读功能失败；无新条件不重复启动。AGENTS“如果出现新的harness限制”允许明确降级送审，不能豁免必需CI或伪称live通过。
+- scenarios needing manual verification：真实已有GitHub凭据绑定open PR精确head→查询→关闭重开历史；Stop与查询竞态；刷新失败后禁用；跨项目切换与旧head拒绝；进程重启需重新授权；宽/窄布局、Escape焦点。已存在对应组件/服务失败测试作为有限替代证据，不能替代完整Tauri链路。
+- 立即列为下一工程问题 CF-SPECIALISTBOTS-UI-S8-BROWSER：复用已有headless生命周期工具，使S7脚本跨平台、自启Vite，补S8交互并按治理注册所需target；同时准备真实Tauri凭据/持久化验收。现脚本默认/usr/bin/chromium（可用CHROMIUM_PATH指定Windows/macOS浏览器），且仅S7，UI-009现target不是S8完整覆盖；不靠旧CI或窗口截图填补。
+- 自主执行隔离、资源限制、executor receipt属于后续自治能力，不是只读切片门禁。真实认证/本地数据安全与迁移仍是本切片必需项。跨平台扩充和完整自治属于增强范围。
+
+### 最短交付路径与授权
+本地准备→授权向BumStill/CodeFactory推送feat/specialist-readonly-delivery并开draft PR→仓库自动运行六项必需检查/精确head场景→独立审核降级声明与缺失证据→另获合并权限后按队列严格检查合并。合并不等于发版；依据release-cadence另由授权按需或每日批次发布，并验证tag、资产和updater。合并后可能进入每日批次，申请合并授权时必须说明这一点，不把“不主动dispatch”当永不发布保证。
+
+当前只获本地开发与测试范围，“为啥没上线”“继续验收”不单独等于文件上传、PR、合并或部署授权。最小待授权外部动作是上传此候选分支并开draft PR（将公开代码/证据并触发CI资源使用），不是修改云容器安全配置。不打merge-queue:armed、不主动dispatch发布、不使用未授权Mac。若选择先补真实UI覆盖，仍可本地开发；运行远端新增target须遵守trusted registry/CI修改流程，不能普通PR自行降低或改写裁判规则。
