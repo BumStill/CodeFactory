@@ -1250,6 +1250,32 @@ pub(crate) async fn settle_objectiveless_wake(pool: &SqlitePool, session: &str, 
     super::workspace_recovery_budget::ensure(pool).await?;
     let retry_at: Option<i64> = sqlx::query_scalar("SELECT next_at FROM workspace_recovery_budget WHERE session_id=?").bind(format!("wake-objective:{session}")).fetch_optional(pool).await?;
     if retry_at.is_some_and(|at| at > now) { anyhow::bail!("objective wake probe is waiting for bounded retry"); }
+    // M255/R3-R5: the merge is independent of Objective retirement and of a
+    // historical release ceiling. One admitted wake owns §8 for this PR.
+    let merged = super::thin_derive::merged_closeout_fact(pool, session).await?;
+    if let Some((reason, fires)) = merged.as_ref() {
+        if fires == &0 {
+            // Repair a legacy release-ceiling projection before admission.
+            sqlx::query("UPDATE thin_external_observations SET completed_reason=?,closeout_queued=1 WHERE session_id=?").bind(reason).bind(session).execute(pool).await?;
+            sqlx::query("UPDATE wakeup_schedules SET prompt=? WHERE session_id=? AND status='pending' AND (id LIKE 'thin-closeout-%' OR id LIKE 'thin-source-repair-%' OR id LIKE 'thin-repair-%' OR id LIKE 'thin-continue-%' OR id LIKE 'continue-%')")
+                .bind(format!("{reason}。系统自动重试/自愈：只执行任务模板 §8 收尾，核验 squash commit、远端分支、本地状态并清理本任务产物与后台进程，然后报告真实结果；不要重复交付。"))
+                .bind(session).execute(pool).await?;
+            return Ok(false);
+        }
+        if crate::session_executor_alive(session) == Some(true) { return Ok(false); }
+        if super::thin_derive::unanswered_user(pool, session).await? { return Ok(false); }
+        if crate::commands::queued_delivery::has_fresh_pending(pool, session, now.saturating_mul(1000), QUEUED_MESSAGE_PRECEDENCE_SECS * 1000).await { return Ok(false); }
+        let active: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM chat_run_controls WHERE session_id=? AND status IN ('active','cancel_requested')").bind(session).fetch_one(pool).await?;
+        if active > 0 { return Ok(false); }
+        let report = super::thin_derive::closeout_report(pool, session).await?;
+        let result = if report.is_some() { format!("{reason}；§8 收尾完成，核验详情见本会话收尾报告与工具收据") }
+            else { super::thin_derive::closeout_bounded_result(reason, *fires) };
+        let state = super::thin_state::ThinState::ended(&result, "本会话记录");
+        super::thin_state::save(pool, session, &state).await?;
+        sqlx::query("UPDATE wakeup_schedules SET status='cancelled' WHERE session_id=? AND status='pending'").bind(session).execute(pool).await?;
+        sqlx::query("UPDATE background_tasks SET wake_state='cancelled' WHERE session_id=? AND wake_state='pending'").bind(session).execute(pool).await?;
+        return Ok(true);
+    }
     // M251：升级重启会退休 objective，它不代表任务做完；PR 还开着就不能结束会话。
     if super::thin_derive::unfinished_delivery(pool, session).await?.is_some() { return Ok(false); }
     let mut tx = crate::storage::db::begin_write(pool).await?;
@@ -1507,9 +1533,13 @@ pub async fn drain_due_wakeups_at(pool: &SqlitePool, sink: &dyn WakeSink, now: i
                 tracing::info!(session, "queued user message takes precedence over this wake-up");
                 return 0;
             }
-            let text = wakes.iter().map(|wake| {
-                wakeup_text(wake, wake.fire_count + 1, now.saturating_sub(wake.next_at) >= wake.every_sec.unwrap_or(1).max(1) as i64)
-            }).collect::<Vec<_>>().join("\n\n");
+            let text = if let Ok(Some((reason, _))) = super::thin_derive::merged_closeout_fact(pool, &session).await {
+                format!("{reason}。系统自动重试/自愈：现在只执行任务模板 §8 收尾，确认 squash commit、检查并清理远端分支、检查本地未提交/未推送状态并清理本任务构建产物与后台进程；报告真实结果，不重复交付。")
+            } else {
+                wakes.iter().map(|wake| {
+                    wakeup_text(wake, wake.fire_count + 1, now.saturating_sub(wake.next_at) >= wake.every_sec.unwrap_or(1).max(1) as i64)
+                }).collect::<Vec<_>>().join("\n\n")
+            };
             let delivery = tokio::time::timeout(Duration::from_secs(5), sink.enqueue_detailed(session.clone(), text)).await
                 .unwrap_or_else(|_| Err("唤醒准入超时（5 秒）".into()));
             if let Err(error) = delivery {
@@ -2046,6 +2076,43 @@ mod tests {
 
     // M251: an upgrade restart retires objectives, so "no unsettled objective"
     // alone must not end a session whose PR is still open.
+    #[tokio::test]
+    async fn m255_merged_orphan_gets_one_closeout_across_wake_family() {
+        for prefix in ["thin-closeout", "thin-source-repair", "thin-repair", "thin-continue"] {
+            let pool = m241_fixture("legacy_orphan", prefix).await;
+            // The original task predates its merge; a newer task must stay protected.
+            sqlx::query("UPDATE objectives SET created_at=1 WHERE session_id='m241'").execute(&pool).await.unwrap();
+            sqlx::query("CREATE TABLE IF NOT EXISTS thin_delivery_refs(session_id TEXT PRIMARY KEY,branch TEXT NOT NULL,pr_number INTEGER NOT NULL,ceiling TEXT NOT NULL)").execute(&pool).await.unwrap();
+            sqlx::query("CREATE TABLE IF NOT EXISTS thin_external_observations(session_id TEXT PRIMARY KEY,pr_number INTEGER NOT NULL,ceiling TEXT NOT NULL,observed_at INTEGER NOT NULL,completed_reason TEXT,closeout_queued INTEGER,merged_at INTEGER)").execute(&pool).await.unwrap();
+            sqlx::query("INSERT INTO thin_delivery_refs VALUES ('m241','synthetic',1002,'merged')").execute(&pool).await.unwrap();
+            sqlx::query("INSERT INTO thin_external_observations VALUES ('m241',1002,'merged',100000,'PR #1002 已合并',1,100000)").execute(&pool).await.unwrap();
+            assert!(!settle_objectiveless_wake(&pool, "m241", 200).await.unwrap(), "{prefix}: retired is not closed out");
+            let recorder = Arc::new(Recorder::default());
+            assert_eq!(drain_due_wakeups_at(&pool, sink(&recorder), 200).await, 1, "{prefix}");
+            let delivered = recorder.take();
+            assert_eq!(delivered.len(), 1);
+            assert!(delivered[0].1.contains("§8 收尾") && delivered[0].1.contains("不重复交付"));
+            let store = super::super::objective::ObjectiveStore::new(pool.clone());
+            let mut tx = crate::storage::db::begin_write(&pool).await.unwrap();
+            let admitted = store.ensure_or_continue_chat_objective_in_tx_with_origin(
+                &mut tx, "m241", "fresh-user", None,
+                super::super::objective::ObjectiveKind::Delivery, "delivery_receipt",
+                super::super::objective::TurnOrigin::SystemWake,
+            ).await.unwrap();
+            tx.commit().await.unwrap();
+            assert_eq!(sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM objectives WHERE session_id='m241'").fetch_one(&pool).await.unwrap(), 1);
+            assert_eq!(admitted.status.as_str(), "active");
+            sqlx::query("INSERT INTO messages(id,session_id,role,content,created_at) VALUES ('answer','m241','assistant','已完成',201000)").execute(&pool).await.unwrap();
+            assert!(settle_objectiveless_wake(&pool, "m241", 300).await.unwrap(), "{prefix}: no-tool answer cannot spin");
+            assert_eq!(drain_due_wakeups_at(&pool, sink(&recorder), 20000).await, 0);
+            let state = super::super::thin_state::load(&pool, "m241").await.unwrap().unwrap();
+            assert_eq!(state.state, super::super::thin_state::SessionState::Ended);
+            let reason = state.reason.unwrap();
+            assert!(reason.contains("已合并"), "{reason}");
+            assert!(reason.contains("未核验"), "a bare answer is not §8 evidence: {reason}");
+        }
+    }
+
     #[tokio::test]
     async fn m251_open_pr_keeps_session_when_objective_is_retired() {
         for status in ["completed", "legacy_orphan"] {

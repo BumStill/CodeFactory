@@ -2932,6 +2932,8 @@ impl ObjectiveStore {
             } else {
                 // M209: recover only the exact task of a genuine unanswered
                 // human root. A wake is not authority to create another task.
+                sqlx::query("CREATE TABLE IF NOT EXISTS thin_system_wake_roots(root_turn_id TEXT PRIMARY KEY)")
+                    .execute(&mut **tx).await?;
                 recovery_objective = sqlx::query_scalar(
                     "SELECT objective.id FROM messages user
                      JOIN chat_turn_state turn ON turn.root_turn_id=user.id AND turn.session_id=user.session_id
@@ -2956,6 +2958,16 @@ impl ObjectiveStore {
                                AND objective.status IN ('completed','legacy_orphan')
                                AND EXISTS (SELECT 1 FROM thin_session_state thin WHERE thin.session_id=wake.session_id AND thin.state='waiting_wake')
                              ORDER BY wake.next_at,wake.id LIMIT 1")
+                            .bind(session_id).fetch_optional(&mut **tx).await?;
+                    }
+                }
+                if recovery_objective.is_none() {
+                    // M255: merged delivery closeout reuses the exact retired
+                    // identity. This is not authority to create a new task.
+                    let has_refs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='thin_delivery_refs'").fetch_one(&mut **tx).await?;
+                    let has_observations: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='thin_external_observations'").fetch_one(&mut **tx).await?;
+                    if has_refs > 0 && has_observations > 0 {
+                        recovery_objective = sqlx::query_scalar("SELECT objective.id FROM objectives objective JOIN thin_delivery_refs ref ON ref.session_id=objective.session_id JOIN thin_external_observations observation ON observation.session_id=ref.session_id AND observation.pr_number=ref.pr_number WHERE objective.session_id=? AND objective.status IN ('legacy_orphan','completed') AND observation.completed_reason LIKE '%已合并%' ORDER BY objective.created_at DESC,objective.rowid DESC LIMIT 1")
                             .bind(session_id).fetch_optional(&mut **tx).await?;
                     }
                 }
@@ -5999,6 +6011,11 @@ impl ObjectiveStore {
                 session_id = session,
                 "legacy decision withheld: thin session still running"
             );
+            return self.get(&current.id).await;
+        }
+        // M255/R2: a PR wait still belongs to its original executor identity.
+        // Incident/startup decisions may not retire the identity needed by wakes.
+        if super::thin_derive::unfinished_delivery(&self.pool, session).await?.is_some() {
             return self.get(&current.id).await;
         }
         let now = Utc::now().timestamp_millis();
@@ -14216,6 +14233,21 @@ CREATE TABLE objectives (
     /// `technical_recovery_exhausted` and wrote
     /// "已结束：连续三次遇到相同失败" into the transcript. A legacy (`project`)
     /// session keeps its old settlement, so the guard is scoped, not global.
+    #[tokio::test]
+    async fn m255_waiting_pr_objective_is_not_retired() {
+        let pool = crate::storage::db::connect("sqlite::memory:").await.unwrap();
+        crate::agent::thin_state::ensure(&pool).await.unwrap();
+        sqlx::query("INSERT INTO sessions(id,title,cwd,model_id,created_at,updated_at,delivery_mode) VALUES ('m255','synthetic','/synthetic','model',1,1,'thin')").execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO chat_turn_state(root_turn_id,session_id,phase,status,started_at,updated_at) VALUES ('root','m255','working','active',1,1)").execute(&pool).await.unwrap();
+        let store = ObjectiveStore::new(pool.clone());
+        let current = store.ensure_chat_objective("m255", "root", ObjectiveKind::Delivery, "delivery_receipt").await.unwrap();
+        sqlx::query("CREATE TABLE IF NOT EXISTS thin_delivery_refs(session_id TEXT PRIMARY KEY,branch TEXT NOT NULL,pr_number INTEGER NOT NULL,ceiling TEXT NOT NULL)").execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO thin_delivery_refs VALUES ('m255','synthetic',42,'ThroughMerge')").execute(&pool).await.unwrap();
+        let result = store.retire_legacy_objective_on_thin_session(&current, false).await.unwrap().unwrap();
+        assert_eq!(result.status, current.status);
+        assert_eq!(result.revision, current.revision);
+    }
+
     #[tokio::test]
     async fn legacy_incident_controller_never_settles_a_thin_session() {
         fn parked_settlement(objective: &ObjectiveSnapshot) -> DecisionEnvelope {
