@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { projectThinState, thinStateCopy } from "./thinState";
+import { projectThinState, showsThinStatus, thinStateCopy } from "./thinState";
 
 describe("thin 四态界面投影", () => {
   it("四态各自映射到一句人话，且不读 legacy 失败码", () => {
@@ -36,5 +36,22 @@ describe("thin 四态界面投影", () => {
     const projection = projectThinState({ kind: "technical_recovery_exhausted", label: "失败" });
     expect(projection.isThin).toBe(false);
     expect(thinStateCopy(projection)).toBeNull();
+  });
+});
+
+describe("showsThinStatus", () => {
+  const running = projectThinState({ kind: "thin_running" });
+  const waiting = projectThinState({ kind: "thin_waiting_wake", label: "等 CI" });
+  const ended = projectThinState({ kind: "thin_ended" });
+
+  it("keeps a settled turn from saying running", () => {
+    expect(showsThinStatus(running, { settled: true, latest: true })).toBe(false);
+    expect(showsThinStatus(running, { settled: false, latest: true })).toBe(true);
+  });
+
+  it("only lets the latest turn speak for the session", () => {
+    expect(showsThinStatus(waiting, { settled: true, latest: false })).toBe(false);
+    expect(showsThinStatus(waiting, { settled: true, latest: true })).toBe(true);
+    expect(showsThinStatus(ended, { settled: true, latest: true })).toBe(false);
   });
 });
