@@ -969,6 +969,35 @@ async fn continue_state(db: &SqlitePool, session: &str, at: i64, why: &str) -> s
     }))
 }
 
+pub(crate) fn closeout_bounded_result(reason: &str, fires: i64) -> String {
+    format!("{reason}；合并后收尾唤醒已触发 {fires} 次，不再重复起回合；§8 收尾未核验项：squash commit、远端分支清理、本地未提交/未推送状态、构建产物与后台进程清理。详见本会话工具收据。")
+}
+
+/// A successful tool receipt plus an explicit closeout final is stronger than
+/// a bare 'done'. Keep the final report as the outcome location, not a promise.
+pub(crate) async fn closeout_report(db: &SqlitePool, session: &str) -> sqlx::Result<Option<String>> {
+    if !has_table(db, "tool_calls").await? { return Ok(None); }
+    sqlx::query_scalar("SELECT answer.content FROM messages answer JOIN thin_external_observations observation ON observation.session_id=answer.session_id WHERE answer.session_id=? AND answer.role='assistant' AND answer.created_at>=observation.merged_at AND answer.content LIKE '%§8 收尾完成%' AND EXISTS (SELECT 1 FROM tool_calls tool JOIN messages owner ON owner.id=tool.message_id WHERE owner.session_id=answer.session_id AND tool.created_at>=observation.merged_at AND tool.created_at<=answer.created_at AND tool.status='done' AND tool.error IS NULL AND tool.result IS NOT NULL) ORDER BY answer.created_at DESC LIMIT 1")
+        .bind(session).fetch_optional(db).await
+}
+
+/// M255: one post-merge budget across all recovery sources, including legacy
+/// rows whose prompt does not name the PR. Count actual fires, never row count.
+pub(crate) async fn merged_closeout_fact(db: &SqlitePool, session: &str) -> sqlx::Result<Option<(String, i64)>> {
+    if !has_table(db, "thin_external_observations").await?
+        || !has_column(db, "thin_external_observations", "merged_at").await?
+        || stale_delivery_scope(db, session).await?
+        || delivery_fact_belongs_to_earlier_objective(db, session).await? { return Ok(None); }
+    let fact: Option<(i64, i64)> = sqlx::query_as("SELECT observation.pr_number,observation.merged_at FROM thin_external_observations observation JOIN thin_delivery_refs ref ON ref.session_id=observation.session_id AND ref.pr_number=observation.pr_number WHERE observation.session_id=? AND observation.merged_at IS NOT NULL")
+        .bind(session).fetch_optional(db).await?;
+    let Some((number, merged_at)) = fact else { return Ok(None); };
+    let fires = if has_table(db, "wakeup_schedules").await? {
+        sqlx::query_scalar("SELECT COALESCE(SUM(fire_count),0) FROM wakeup_schedules WHERE session_id=? AND last_fired_at*1000>=? AND (id LIKE 'thin-closeout-%' OR id LIKE 'thin-source-repair-%' OR id LIKE 'thin-repair-%' OR id LIKE 'thin-continue-%' OR id LIKE 'continue-%')")
+            .bind(session).bind(merged_at).fetch_one(db).await?
+    } else { 0 };
+    Ok(Some((format!("PR #{number} 已合并"), fires)))
+}
+
 /// 唯一四态判定。缓存中的 state/question/reason 不参与事实选择。
 /// M148/R3：未完成的已交付 PR —— 有引用、且没有被成功关闭（closeout 未入队或
 /// 观测结果是故障）—— 就是「外部进行中事项」。只要它还在，会话就不能被判 ended，
@@ -1287,6 +1316,20 @@ async fn derive_candidate(db: &SqlitePool, session: &str) -> sqlx::Result<ThinSt
             ..ThinState::running()
         }),
         Some(false) => {}
+    }
+    // M255: same-PR post-merge recovery is bounded before any source-repair
+    // or assistant-declared-unfinished branch can rearm a model round.
+    if let Some((reason, fires)) = merged_closeout_fact(db, session).await? {
+        if fires > 0 {
+            let result = if closeout_report(db, session).await?.is_some() {
+                format!("{reason}；§8 收尾完成，核验详情见本会话收尾报告与工具收据")
+            } else { closeout_bounded_result(&reason, fires) };
+            return Ok(ThinState::ended(&result, "本会话记录"));
+        }
+        // merged_at remains authoritative when a legacy through_release
+        // observation cleared completed_reason while waiting for a release.
+        sqlx::query("UPDATE thin_external_observations SET completed_reason=? WHERE session_id=? AND completed_reason IS NULL")
+            .bind(&reason).bind(session).execute(db).await?;
     }
     // M211/R2：回合自己说「还没做完」不能被翻译成「任务结束」；必须有真实续接唤醒。
     if let Some((at_answer, why)) = assistant_declared_unfinished(db, session).await? {
@@ -1608,6 +1651,27 @@ pub async fn refresh(db: &SqlitePool, session: &str) -> sqlx::Result<ThinState> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn m255_merge_budget_counts_fires_not_rows_and_respects_new_work() {
+        let db = fixture().await;
+        ensure_external(&db).await.unwrap();
+        ensure_wake_table(&db).await;
+        sqlx::query("INSERT INTO thin_delivery_refs VALUES ('derive','synthetic',42,'ThroughRelease')").execute(&db).await.unwrap();
+        sqlx::query("INSERT INTO thin_external_observations(session_id,pr_number,ceiling,merged_at) VALUES ('derive',42,'ThroughRelease',100000)").execute(&db).await.unwrap();
+        for (id, fires, last) in [("thin-source-repair-one", 7, 200), ("thin-closeout-old", 9, 50), ("thin-repair-new", 0, 0)] {
+            sqlx::query("INSERT INTO wakeup_schedules(id,session_id,prompt,source,next_at,status,fire_count,created_at,last_fired_at) VALUES (?,'derive','synthetic','agent_decided',1,'done',?,1,?)")
+                .bind(id).bind(fires).bind(last).execute(&db).await.unwrap();
+        }
+        assert_eq!(merged_closeout_fact(&db, "derive").await.unwrap(), Some(("PR #42 已合并".into(), 7)));
+        assert!(closeout_report(&db, "derive").await.unwrap().is_none());
+        sqlx::query("INSERT INTO messages(id,session_id,role,content,created_at) VALUES ('report','derive','assistant','§8 收尾完成',201000)").execute(&db).await.unwrap();
+        assert!(closeout_report(&db, "derive").await.unwrap().is_none(), "text alone is not tool evidence");
+        sqlx::query("INSERT INTO tool_calls(id,message_id,tool_name,arguments,result,status,created_at) VALUES ('receipt','report','bash','{}','verified','done',200000)").execute(&db).await.unwrap();
+        assert!(closeout_report(&db, "derive").await.unwrap().is_some());
+        sqlx::query("INSERT INTO objectives(id,kind,session_id,root_turn_id,status,decision_type,domain,requested_acceptance,created_at,updated_at) VALUES ('new-work','local_mutation','derive','new-root','active','continue','chat','validated_change',300000,300000)").execute(&db).await.unwrap();
+        assert!(merged_closeout_fact(&db, "derive").await.unwrap().is_none(), "old merge cannot end a newer objective");
+    }
 
     #[test]
     fn m237_closeout_rearm_backs_off_after_two_fires() {
