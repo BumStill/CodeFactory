@@ -1986,6 +1986,10 @@ async fn reclaim_expired(pool: Option<&sqlx::SqlitePool>) {
 }
 
 #[cfg(test)]
+#[path = "browser_repeat_fixture.rs"]
+mod repeat_fixture;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -2072,36 +2076,29 @@ mod tests {
     }
         let _serial = BROWSER_SESSION_TEST_LOCK.lock().await;
         let ctx = mode_ctx("thin").await;
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = std::thread::spawn(move || {
-            use std::io::{Read, Write};
-            for _ in 0..8 {
-                let Ok((mut stream, _)) = listener.accept() else {
-                    break;
-                };
-                let mut request = [0; 4096];
-                let _ = stream.read(&mut request);
-                let body = "<html><head><title>Repeat Fixture</title></head><body><h1>Same document twice</h1></body></html>";
-                let _ = write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
-            }
-        });
+        let fixture = repeat_fixture::RepeatFixture::start();
+        let address = fixture.address;
         let first = execute(json!({"action":"open", "url":format!("http://{address}/repeat")}), &ctx)
             .await
             .unwrap();
+        // Force the cold-start connection shape: an accepted TCP connection
+        // with no HTTP request must not starve the second browser's GET.
+        let idle = fixture.idle_preconnect();
         let second = execute(json!({"action":"open", "url":format!("http://{address}/repeat")}), &ctx)
             .await
             .unwrap();
+        drop(idle);
         let cleanup = close_all_for_owner_session("synthetic-browser").await;
-        // Each `open` owns its own Managed session — the second open is a
-        // second session, not a re-use — so two are torn down here.
-        assert_eq!(cleanup, 2);
-        assert_eq!(first.status, super::super::ToolExecutionStatus::Done, "{first:?}");
-        assert_eq!(second.status, super::super::ToolExecutionStatus::Done, "{second:?}");
-        assert!(first.content.contains("Same document twice"), "{first:?}");
+        drop(fixture);
+        let diagnostic = format!("first={first:?}\nsecond={second:?}");
+        assert_eq!(first.status, super::super::ToolExecutionStatus::Done, "{diagnostic}");
+        assert_eq!(second.status, super::super::ToolExecutionStatus::Done, "{diagnostic}");
+        assert!(first.content.contains("Same document twice"), "{diagnostic}");
+        assert!(second.content.contains("Same document twice"), "{diagnostic}");
         let body = |content: &str| content.splitn(2, "\n---\n").nth(1).unwrap_or_default().to_string();
-        assert_eq!(body(&first.content), body(&second.content), "repeated open must be stable");
-        drop(server);
+        assert_eq!(body(&first.content), body(&second.content), "repeated open must be stable: {diagnostic}");
+        // Each successful open must remain independently owned and cleanable.
+        assert_eq!(cleanup, 2, "{diagnostic}");
     }
 
     /// Deterministic reproducer for the M121 family on a cold runner.
