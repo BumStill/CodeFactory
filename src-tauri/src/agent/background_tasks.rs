@@ -1534,7 +1534,7 @@ pub async fn drain_due_wakeups_at(pool: &SqlitePool, sink: &dyn WakeSink, now: i
                 return 0;
             }
             let text = if let Ok(Some((reason, _))) = super::thin_derive::merged_closeout_fact(pool, &session).await {
-                format!("{reason}。系统自动重试/自愈：现在只执行任务模板 §8 收尾，确认 squash commit、远端分支、本地未提交/未推送状态并清理本任务构建产物与后台进程；报告真实结果，不重复交付。")
+                format!("{reason}。系统自动重试/自愈：现在只执行任务模板 §8 收尾，确认 squash commit、检查并清理远端分支、检查本地未提交/未推送状态并清理本任务构建产物与后台进程；报告真实结果，不重复交付。")
             } else {
                 wakes.iter().map(|wake| {
                     wakeup_text(wake, wake.fire_count + 1, now.saturating_sub(wake.next_at) >= wake.every_sec.unwrap_or(1).max(1) as i64)
