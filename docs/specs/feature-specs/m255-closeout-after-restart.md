@@ -30,4 +30,4 @@ AI Collaboration：context scope 为任务原文、现场 SQLite 时间线及 ob
 - db17572f：external observation 已记录 PR #1008 合并（1793969494000）。closeout 单行累计 fire_count=4、source-repair 累计 6、continue 1、model-availability 1；不是按行数计数。最后系统续接事件在 1793972455075，decision_applied cancelled=1793972925514，26 个 chat_turn_state 最终 cancelled，由编排方 stop 终止；无证据证明 §8 已执行。
 
 ### R5 来源行为约束
-closeout（含 closeout-source）、source-repair、repair（含 repair-source）、continue 都必须在共享唤醒入口核对同一 PR 合并事实；合并前保持原等待/修复语义，合并后只准入一次收尾，不按来源各领一次额度。已有收尾工具证据与最终回答则结束；没有证据的纯文本「已完成」只能报告未核验的收尾项，不能宣称收尾成功。迟到来源全部取消，不新建 objective/工作区。
+系统自动重试/自愈：closeout（含 closeout-source）、source-repair、repair（含 repair-source）、continue 都必须在共享唤醒入口核对同一 PR 合并事实；合并前保持原等待/修复语义，合并后只准入一次收尾，不按来源各领一次额度。已有收尾工具证据与最终回答则结束；没有证据的纯文本「已完成」只能报告未核验的收尾项，不能宣称收尾成功。迟到来源全部取消，不新建 objective/工作区。
