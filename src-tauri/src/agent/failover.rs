@@ -750,7 +750,19 @@ impl ActiveRouteState {
                             }
                             WaitCauseKind::QuotaCap => {
                                 quota_blocked.push(route.model_id.clone());
-                                format!("subscription_quota_cap:{}", serde_json::json!({"resets_at_ms":cause.until_ms}))
+                                // M244：写明是哪个窗口、多少用量拦下的，否则事后无从分辨误判。
+                                let ledger = super::quota_cap::shared_quota_ledger();
+                                let cap = config.quota_cap_for(&route.endpoint_name);
+                                let budget = super::quota_cap::SubscriptionBudget::default();
+                                let breach = ledger.evaluate(&route.endpoint_name, cap, budget, now)
+                                    .or_else(|| ledger.evaluate(&route.base_url, cap, budget, now));
+                                format!("subscription_quota_cap:{}", serde_json::json!({
+                                    "resets_at_ms":cause.until_ms,
+                                    "window":breach.map(|b| b.window.label()),
+                                    "used_percent":breach.map(|b| b.used_percent),
+                                    "cap_percent":breach.map(|b| b.cap_percent),
+                                    "source":breach.map(|b| b.source.label()),
+                                }))
                             }
                             WaitCauseKind::Transient => unreachable!("transient causes are added only after route exhaustion"),
                             WaitCauseKind::DailySpendCap => {

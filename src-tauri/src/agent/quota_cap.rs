@@ -340,6 +340,14 @@ where
         let reset_after_secs = by_name
             .get(&format!("x-codex-{prefix}-reset-after-seconds"))
             .and_then(|raw| raw.parse::<i64>().ok());
+        // M244: a plan without this window still sends the header set, zeroed.
+        // Kept, it reads as a window that already reset, which the cap treats
+        // as fully used.
+        if window_minutes.is_some_and(|minutes| minutes <= 0)
+            || reset_after_secs.is_some_and(|secs| secs <= 0)
+        {
+            continue;
+        }
         let kind = match window_minutes {
             Some(minutes) if minutes > 24 * 60 => QuotaWindowKind::Weekly,
             Some(_) => QuotaWindowKind::FiveHour,
@@ -658,6 +666,54 @@ mod tests {
 
     // CF-QUOTA-R1: no usage header at all → the parser says "unknown" instead of
     // inventing a reading.
+    // M244: a weekly-only plan still sends the second header set, with an empty
+    // window. It used to land as a 5-hour window that had "already reset".
+    #[test]
+    fn an_empty_header_window_does_not_block_a_weekly_only_plan() {
+        let headers = vec![
+            ("x-codex-primary-used-percent", "32"),
+            ("x-codex-primary-window-minutes", "10080"),
+            ("x-codex-primary-reset-after-seconds", "530000"),
+            ("x-codex-secondary-used-percent", "0"),
+            ("x-codex-secondary-window-minutes", "0"),
+            ("x-codex-secondary-reset-after-seconds", "0"),
+        ];
+        let quota = parse_codex_usage_headers(headers, NOW).unwrap();
+        assert_eq!(quota.five_hour, WindowUsage::empty());
+        assert_eq!(quota.weekly.used_percent(NOW), 32);
+        assert!(evaluate_cap(&quota, QuotaCap::new(80, 50), NOW + 1_000).is_none());
+    }
+
+    #[test]
+    fn a_header_window_with_no_time_left_is_not_a_reading() {
+        let headers = vec![
+            ("x-codex-primary-used-percent", "0"),
+            ("x-codex-primary-window-minutes", "300"),
+            ("x-codex-primary-reset-after-seconds", "0"),
+            ("x-codex-secondary-used-percent", "32"),
+            ("x-codex-secondary-window-minutes", "10080"),
+            ("x-codex-secondary-reset-after-seconds", "530000"),
+        ];
+        let quota = parse_codex_usage_headers(headers, NOW).unwrap();
+        assert_eq!(quota.five_hour, WindowUsage::empty());
+        assert!(evaluate_cap(&quota, QuotaCap::new(80, 50), NOW + 1_000).is_none());
+    }
+
+    #[test]
+    fn a_real_header_reading_over_the_cap_still_blocks() {
+        let headers = vec![
+            ("x-codex-primary-used-percent", "50"),
+            ("x-codex-primary-window-minutes", "10080"),
+            ("x-codex-primary-reset-after-seconds", "530000"),
+            ("x-codex-secondary-used-percent", "0"),
+            ("x-codex-secondary-window-minutes", "0"),
+            ("x-codex-secondary-reset-after-seconds", "0"),
+        ];
+        let quota = parse_codex_usage_headers(headers, NOW).unwrap();
+        let breach = evaluate_cap(&quota, QuotaCap::new(80, 50), NOW + 1_000).unwrap();
+        assert_eq!(breach.window, QuotaWindowKind::Weekly);
+    }
+
     #[test]
     fn absent_usage_headers_produce_no_snapshot() {
         let headers = [
