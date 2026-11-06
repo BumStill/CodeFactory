@@ -38,6 +38,18 @@ export function projectThinState(activity: {
   };
 }
 
+/**
+ * M254：回合行里的状态是写入那一刻的快照，之后不再更新。只有最新的回合能代表
+ * 会话现在的状态；已结束的回合不能再说自己「正在做」。
+ */
+export function showsThinStatus(
+  projection: ThinProjection,
+  turn: { settled: boolean; latest: boolean },
+): boolean {
+  if (!turn.latest || projection.state === "ended") return false;
+  return !(projection.state === "running" && turn.settled);
+}
+
 function prefixed(text: string | null, prefix: string): string {
   if (!text) return prefix;
   return text.startsWith(prefix) ? text : `${prefix}：${text}`;
