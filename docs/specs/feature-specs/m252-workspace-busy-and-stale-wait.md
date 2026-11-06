@@ -17,4 +17,22 @@
 升级重启后立刻发消息，会话自动开始，不出现「请检查模型凭据」。
 
 ## Implementation Notes
-待补充现场锁归属调查、Req ID 对照与验证证据。真实安装版验收由编排方发版后完成；本任务不发版、不修改用户数据。
+
+### R2 现场调查
+- 只读查询当前真实 DB 和 11-06 的独立 SQLite 备份：备份内仓库分配锁为空，未发现持久记录 lock acquire/release 的审计事件。因此无法从现存证据精确追溯 11-06 瞬时锁的原始持有人；不把当前锁或失败请求的进程误认为历史持锁人。
+- 当前 DB 实际观察到 `workspace-cleanup:<pid>:<start-token>` 格式的分配锁。代码确认它来自 `run_cleanup_pass_with`；旧回收函数直接把首段解析为 PID，遇到 `workspace-cleanup` 会跳过，导致旧清理进程退出后仍等待 300 秒租约。
+- 已修复清理前缀解析，继续用 OS PID + start token 判活；检查失败仍保守保留存活锁。回归分别覆盖存活清理锁、旧 start token、已退出普通进程。
+
+### Requirements Traceability / 测试矩阵
+| Req | 实现与最低证据 |
+| --- | --- |
+| R1 | 工作区锁忙走既有 waiting_wake，5/30 秒退避，第三次真实失败明确 ended；真实 SQLite 启动测试核对消息保留、跨回合次数和只投递一次；真实 git 工作区验证释放锁后唯一分配。 |
+| R2 | 前缀回收修复；历史精确持有人不可追溯的证据边界如上。 |
+| R3 | 启动失败移除统一凭据指引；锁忙保留可分类原因。 |
+| R4 | 成功 HTTP 模型调用立即清除会话 model_wait 与关联模型唤醒；其它唤醒不再被旧恢复时间阻挡。 |
+| R5 | 不新增枚举、schema 或前端组件，沿用 running / waiting_wake / waiting_user / ended。 |
+
+### Applicable Harnesses / 协作
+Spec、Compatibility、Observation、Release、AI Collaboration。上下文限定于工作区锁、启动收束、模型成功响应和 SQLite 唤醒；只读角色审查锁回收与等待清理。无 UI 布局变化，不启用 Viewport。后台入口继续复用 dispatch 和持久唤醒，锁屏可运行。
+
+真实安装版验收由编排方发版后完成：升级重启立即发送消息，核对自动开始且无凭据误导；模型限制恢复后核对等待原因和权限唤醒时间。本任务只合并，不发版（not live）。
