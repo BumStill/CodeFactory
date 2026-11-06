@@ -224,29 +224,126 @@ pub fn gate_bypass(command: &str) -> Option<String> {
         ));
     }
 
-    if let Some(rest) = lower.split("core.hookspath").nth(1) {
-        let rest = rest.trim_start_matches(|c: char| c == '=' || c.is_whitespace());
-        let value = rest
-            .split(|c: char| c.is_whitespace() || c == '"' || c == '\'')
-            .next()
-            .unwrap_or("")
-            .trim_end_matches([';', '&', '|']);
-        // 只有把钩子目录显式设成 .githooks 才算合规；取消（--unset）或指向别处都算绕过。
-        let allowed = value == ".githooks" || value == "./.githooks";
-        if !allowed {
-            let shown = if value.is_empty() {
-                "（取消设置）".to_string()
-            } else {
-                value.to_string()
-            };
-            return Some(format!(
-                "{prefix}：检测到修改 core.hooksPath {shown}，钩子目录必须保持 .githooks。\
-                 修复指引：运行 git config core.hooksPath .githooks 恢复，再重试原操作。"
-            ));
-        }
+    if lower.contains("core.hookspath") && !hooks_path_command_safe(command) {
+        return Some(format!(
+            "{prefix}：检测到修改 core.hooksPath 或无法安全解析该命令，钩子目录必须保持 .githooks。\
+             修复指引：运行 git config core.hooksPath .githooks 恢复，再重试原操作。"
+        ));
     }
 
     None
+}
+
+/// Parse shell command boundaries without interpreting expansions. Quoted prose
+/// stays data; shell/interpreter input and ambiguous syntax fail closed.
+fn hooks_path_command_safe(command: &str) -> bool {
+    let mut commands = Vec::new();
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut started = false;
+    let mut quote = None;
+    let mut escaped = false;
+    for c in command.chars() {
+        if escaped {
+            word.push(c);
+            escaped = false;
+            started = true;
+            continue;
+        }
+        if c == '\\' && quote != Some('\'') {
+            escaped = true;
+            continue;
+        }
+        if let Some(q) = quote {
+            if q == '"' && matches!(c, '$' | '`') { return false; }
+            if c == q { quote = None; } else { word.push(c); }
+            continue;
+        }
+        match c {
+            '\'' | '"' => { quote = Some(c); started = true; }
+            // Expansions and heredocs can hide executable commands, not data.
+            '`' | '$' | '<' => return false,
+            ';' | '&' | '|' | '\n' | '(' | ')' => {
+                if started { words.push(std::mem::take(&mut word)); started = false; }
+                if !words.is_empty() { commands.push(std::mem::take(&mut words)); }
+            }
+            c if c.is_whitespace() => {
+                if started { words.push(std::mem::take(&mut word)); started = false; }
+            }
+            _ => { word.push(c); started = true; }
+        }
+    }
+    if quote.is_some() || escaped { return false; }
+    if started { words.push(word); }
+    if !words.is_empty() { commands.push(words); }
+    commands.iter().all(|words| hooks_path_words_safe(words))
+}
+
+fn hooks_path_words_safe(words: &[String]) -> bool {
+    let lower: Vec<String> = words.iter().map(|word| word.to_ascii_lowercase()).collect();
+    // Git's environment configuration is an override even without `git config`.
+    if lower.iter().any(|word| word.starts_with("git_config_key_")
+        && word.split_once('=').is_some_and(|(_, value)| value == "core.hookspath")) {
+        return false;
+    }
+    let Some(start) = lower.iter().position(|word| !word.contains('=') && word != "env" && word != "command") else {
+        return !lower.iter().any(|word| word.contains("core.hookspath"));
+    };
+    let executable = lower[start].rsplit('/').next().unwrap_or("");
+    let args = &lower[start + 1..];
+    if matches!(executable, "bash" | "sh" | "zsh" | "dash" | "pwsh" | "powershell") {
+        return args.iter().all(|arg| !arg.contains("core.hookspath") || hooks_path_command_safe(arg));
+    }
+    if executable != "git" {
+        // grep/sed/echo arguments are data, not Git options. Other interpreters
+        // are not proved safe by this deliberately bounded shell parser.
+        return matches!(executable, "grep" | "sed" | "echo" | "printf" | "cat")
+            || !args.iter().any(|arg| arg.contains("core.hookspath"));
+    }
+    for (arg, original) in args.iter().zip(&words[start + 1..]) {
+        if let Some((key, _)) = arg.split_once('=') {
+            if key.trim_start_matches("-c") == "core.hookspath"
+                && !original.split_once('=').is_some_and(|(_, value)| matches!(value, ".githooks" | "./.githooks")) { return false; }
+        }
+    }
+    let Some(config) = args.iter().position(|arg| arg == "config") else {
+        for arg in args {
+            if arg.contains("core.hookspath") {
+                let Some((key, value)) = arg.split_once('=') else { return false; };
+                if !matches!(key, "core.hookspath" | "-ccore.hookspath")
+                    || !matches!(value, ".githooks" | "./.githooks") { return false; }
+            }
+        }
+        return true;
+    };
+    let args = &args[config + 1..];
+    if !args.iter().any(|arg| arg == "core.hookspath") {
+        return !args.iter().any(|arg| arg.contains("core.hookspath"));
+    }
+    let mut positional = Vec::new();
+    let mut read = false;
+    let mut write = false;
+    for arg in args {
+        match arg.as_str() {
+            "--get" | "--get-all" | "--get-regexp" | "--get-urlmatch" | "--list" | "-l" => read = true,
+            "--unset" | "--unset-all" | "--remove-section" | "--rename-section" => return false,
+            "--add" | "--replace-all" => write = true,
+            "--global" | "--local" | "--system" | "--worktree" | "--includes" | "--no-includes" | "--show-origin" | "--show-scope" | "--null" | "-z" | "--" => {},
+            option if option.starts_with('-') => return false,
+            _ => positional.push(arg.as_str()),
+        }
+    }
+    if !read && positional.len() > 1 && positional[0] == "core.hookspath" {
+        let originals = &words[start + config + 2..];
+        let Some(key) = args.iter().position(|arg| arg == "core.hookspath") else { return false; };
+        if !originals.get(key + 1).is_some_and(|value| matches!(value.as_str(), ".githooks" | "./.githooks")) { return false; }
+    }
+    if read { return !write; }
+    match positional.as_slice() {
+        ["core.hookspath"] => !write,
+        ["core.hookspath", ".githooks" | "./.githooks"] => true,
+        _ => false,
+    }
 }
 
 fn canonical(path: &Path) -> Result<PathBuf, String> {
@@ -368,6 +465,77 @@ mod tests {
         assert!(gate_bypass("git config --unset core.hooksPath").is_some());
         assert!(gate_bypass("git config core.hooksPath .githooks").is_none());
         assert!(gate_bypass("cargo test").is_none());
+    }
+
+    #[test]
+    fn m245_read_only_hooks_path_is_not_bypass() {
+        for command in [
+            "git config --get core.hooksPath",
+            "git config --get-all core.hooksPath",
+            "git config core.hooksPath",
+            "git config --list",
+            "grep core.hooksPath AGENTS.md",
+            "sed -n '/core.hooksPath/p' AGENTS.md",
+            "echo 'git config --unset core.hooksPath'",
+            "git config --get core.hooksPath; git status",
+            "(git config --get core.hooksPath)",
+            "git config --get core.hooksPath | cat",
+            "git config --get core.hooksPath && git config --get-all core.hooksPath",
+            "git config core.hooksPath '.githooks'",
+        ] {
+            assert!(gate_bypass(command).is_none(), "read-only command: {command}");
+        }
+    }
+
+    #[test]
+    fn m245_hooks_path_writes_and_compounds_are_blocked() {
+        for command in [
+            "git config core.hooksPath /tmp/x",
+            "git config --unset core.hooksPath",
+            "git config --unset-all core.hooksPath",
+            "git config --global core.hooksPath /tmp/x",
+            "git config --local --replace-all core.hooksPath /tmp/x",
+            "git -c core.hooksPath=/dev/null commit",
+            "git -c core.hooksPath= commit",
+            "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.hooksPath GIT_CONFIG_VALUE_0=/tmp/x git commit",
+            "git config --get core.hooksPath; git config --unset core.hooksPath",
+            "git config --get core.hooksPath && git config --unset core.hooksPath",
+            "git config --get core.hooksPath || git config --unset core.hooksPath",
+            "git config --get core.hooksPath | git config --unset core.hooksPath",
+            "git config --get core.hooksPath\ngit config --unset core.hooksPath",
+            "(git config --get core.hooksPath; git config --unset core.hooksPath)",
+            "git config core.hooksPath .githooks; git config --unset core.hooksPath",
+            "git config core.hooksPath .githooks; git -c core.hooksPath= commit",
+            "bash -c 'git config --unset core.hooksPath'",
+            "echo $(git config --unset core.hooksPath)",
+            "git config --get 'core.hooksPath",
+            "git config core.hooksPath \"$HOOKS\"",
+            "git config --no-such-option core.hooksPath",
+            "git --config-env=core.hooksPath=SYNTHETIC commit",
+            "git config core.hooksPath .GITHOOKS",
+            "git -c core.hooksPath=.GITHOOKS commit",
+            "git config set core.hooksPath /tmp/x",
+            "echo \"$(git config --unset core.hooksPath)\"",
+            "git commit --no-verify -m x",
+            "CODEFACTORY_SKIP_SYNC_GATE=1 git commit -m x",
+        ] {
+            assert!(gate_bypass(command).is_some(), "unsafe command: {command}");
+        }
+    }
+
+    #[test]
+    fn m245_generated_command_boundaries_never_hide_mutations() {
+        let reads = ["git config --get core.hooksPath", "grep core.hooksPath AGENTS.md", "git config core.hooksPath .githooks"];
+        let writes = ["git config --unset core.hooksPath", "git -c core.hooksPath= commit", "git config --global core.hooksPath /tmp/synthetic"];
+        for read in reads {
+            for write in writes {
+                for separator in [";", "&&", "||", "|", "\n"] {
+                    for command in [format!("{read} {separator} {write}"), format!("({write}) {separator} {read}")] {
+                        assert!(gate_bypass(&command).is_some(), "{command}");
+                    }
+                }
+            }
+        }
     }
 
     #[test]
