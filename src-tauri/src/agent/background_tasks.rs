@@ -849,6 +849,14 @@ pub async fn drain_pending_wakes(pool: &SqlitePool, sink: &dyn WakeSink) -> usiz
     for row in rows {
         let task = row_to_task(&row);
         pending.push(async move {
+            match settle_objectiveless_wake(pool, &task.session_id, now_secs()).await {
+                Ok(true) => return 0,
+                Ok(false) => {},
+                Err(error) => {
+                    defer_objective_probe(pool, &task.session_id, now_secs(), &error.to_string()).await;
+                    return 0;
+                }
+            }
             let text = wake_text(&task);
             if !deliver_wake(sink, task.session_id.clone(), text, task.finished_at.unwrap_or(task.created_at)).await { return 0; }
             sqlx::query("UPDATE background_tasks SET wake_state='enqueued' WHERE id=? AND wake_state='pending'")
@@ -1234,6 +1242,57 @@ async fn preserve_cancelled_wait(tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>, s
     Ok(())
 }
 
+/// M241：只有确定已无任务才结束会话。查询失败回滚，由调用方退避重试。
+/// 保留 M209/M228 已存在的真实用户任务与模型恢复例外，不赋予新授权。
+pub(crate) async fn settle_objectiveless_wake(pool: &SqlitePool, session: &str, now: i64) -> anyhow::Result<bool> {
+    super::thin_state::ensure(pool).await?;
+    ensure_wakeup_schema(pool).await?;
+    super::workspace_recovery_budget::ensure(pool).await?;
+    let retry_at: Option<i64> = sqlx::query_scalar("SELECT next_at FROM workspace_recovery_budget WHERE session_id=?").bind(format!("wake-objective:{session}")).fetch_optional(pool).await?;
+    if retry_at.is_some_and(|at| at > now) { anyhow::bail!("objective wake probe is waiting for bounded retry"); }
+    let mut tx = crate::storage::db::begin_write(pool).await?;
+    let has_objectives: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='objectives'").fetch_one(&mut *tx).await?;
+    if has_objectives == 0 { return Ok(false); }
+    // 极简历史库没有目标准入事实，不把未知当作已完成。
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM objectives WHERE session_id=?").bind(session).fetch_one(&mut *tx).await?;
+    if count == 0 { return Ok(false); }
+    let unfinished: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM objectives WHERE session_id=? AND status NOT IN ('completed','cancelled','legacy_orphan')").bind(session).fetch_one(&mut *tx).await?;
+    if unfinished > 0 || super::objective::open_delivery_objective_id_in_tx(&mut tx, session).await?.is_some() { return Ok(false); }
+    sqlx::query("CREATE TABLE IF NOT EXISTS thin_system_wake_roots(root_turn_id TEXT PRIMARY KEY)").execute(&mut *tx).await?;
+    let recovery: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM objectives objective WHERE objective.session_id=? AND objective.status IN ('completed','legacy_orphan') AND (
+          EXISTS (SELECT 1 FROM messages user JOIN chat_turn_state turn ON turn.root_turn_id=user.id AND turn.session_id=user.session_id
+            WHERE user.session_id=objective.session_id AND turn.objective_id=objective.id AND user.role='user'
+              AND NOT EXISTS (SELECT 1 FROM thin_system_wake_roots wake WHERE wake.root_turn_id=user.id)
+              AND NOT EXISTS (SELECT 1 FROM messages answer WHERE answer.session_id=user.session_id AND answer.role='assistant' AND answer.created_at>=user.created_at)
+              AND NOT EXISTS (SELECT 1 FROM chat_session_cancel_intents stop WHERE stop.session_id=user.session_id AND stop.requested_at>=user.created_at))
+          OR EXISTS (SELECT 1 FROM wakeup_schedules wake JOIN chat_turn_state turn ON turn.root_turn_id=wake.root_turn_id AND turn.session_id=wake.session_id
+            JOIN thin_session_state thin ON thin.session_id=wake.session_id
+            WHERE wake.session_id=objective.session_id AND turn.objective_id=objective.id AND wake.status='pending' AND wake.id LIKE 'model-availability-%' AND thin.state='waiting_wake'))")
+        .bind(session).fetch_one(&mut *tx).await?;
+    if recovery > 0 { return Ok(false); }
+    // 用户新消息仍由正常入口处理；定时器不能结算正在执行的新回合。
+    let active: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM chat_run_controls WHERE session_id=? AND status IN ('active','cancel_requested')").bind(session).fetch_one(&mut *tx).await?;
+    if active > 0 || crate::session_executor_alive(session) == Some(true) { return Ok(false); }
+    let reason = "会话没有未结算的 objective；迟到系统唤醒已取消，未启动新回合";
+    sqlx::query("INSERT INTO thin_session_state(session_id,state,reason,outcome_location,updated_at) VALUES (?,'ended',?,'本会话记录',?) ON CONFLICT(session_id) DO UPDATE SET state='ended',reason=excluded.reason,waiting_for=NULL,wake_source=NULL,question=NULL,updated_at=excluded.updated_at")
+        .bind(session).bind(reason).bind(now.saturating_mul(1000)).execute(&mut *tx).await?;
+    sqlx::query("UPDATE wakeup_schedules SET status='cancelled' WHERE session_id=? AND status='pending'").bind(session).execute(&mut *tx).await?;
+    sqlx::query("UPDATE background_tasks SET wake_state='cancelled' WHERE session_id=? AND wake_state='pending'").bind(session).execute(&mut *tx).await?;
+    tx.commit().await?;
+    Ok(true)
+}
+
+/// M241/R5：事实查询失败只延后，不耗尽后误判任务结束。
+async fn defer_objective_probe(pool: &SqlitePool, session: &str, now: i64, error: &str) {
+    if super::workspace_recovery_budget::ensure(pool).await.is_err() { return; }
+    let key = format!("wake-objective:{session}");
+    if let Err(error) = sqlx::query("INSERT INTO workspace_recovery_budget(session_id,attempts,next_at,last_error) VALUES (?,1,?+60,?) ON CONFLICT(session_id) DO UPDATE SET attempts=attempts+1,next_at=?+60*(1 << MIN(attempts,6)),last_error=excluded.last_error WHERE workspace_recovery_budget.next_at<=?")
+        .bind(&key).bind(now).bind(error).bind(now).bind(now).execute(pool).await {
+        tracing::warn!(%error, session, "objective wake probe backoff failed; automatic retry next tick");
+    }
+}
+
 /// R2：会话停止/结案时取消其全部待触发唤醒（与后台任务回收同一入口）。
 pub async fn cancel_session_wakeups(pool: &SqlitePool, session_id: &str) -> usize {
     if ensure_wakeup_schema(pool).await.is_err() {
@@ -1378,6 +1437,14 @@ pub async fn drain_due_wakeups_at(pool: &SqlitePool, sink: &dyn WakeSink, now: i
             if let Ok(Some(state)) = super::thin_state::load(pool, &session).await {
                 if state.state == super::thin_state::SessionState::Ended {
                     cancel_session_wakeups(pool, &session).await;
+                    return 0;
+                }
+            }
+            match settle_objectiveless_wake(pool, &session, now).await {
+                Ok(true) => return 0,
+                Ok(false) => {},
+                Err(error) => {
+                    defer_objective_probe(pool, &session, now, &error.to_string()).await;
                     return 0;
                 }
             }
@@ -1930,6 +1997,90 @@ mod tests {
         assert_eq!(drain_due_wakeups_at(&pool, sink(&recorder), 161).await, 0);
         assert_eq!(drain_due_wakeups_at(&pool, sink(&recorder), 220).await, 1);
         assert_eq!(recorder.take().len(), 1);
+    }
+
+    async fn m241_fixture(status: &str, prefix: &str) -> SqlitePool {
+        let pool = crate::storage::db::connect("sqlite::memory:").await.unwrap();
+        ensure_schema(&pool).await.unwrap();
+        super::super::thin_state::ensure(&pool).await.unwrap();
+        sqlx::query("INSERT INTO sessions(id,title,cwd,model_id,created_at,updated_at) VALUES ('m241','synthetic','/synthetic','model',1,1)").execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO chat_turn_state(root_turn_id,session_id,phase,status,started_at,updated_at) VALUES ('original','m241','working','active',1,1),('fresh-user','m241','working','active',1,1)").execute(&pool).await.unwrap();
+        let objective = super::super::objective::ObjectiveStore::new(pool.clone())
+            .ensure_chat_objective("m241", "original", super::super::objective::ObjectiveKind::Delivery, "delivery_receipt").await.unwrap();
+        sqlx::query("UPDATE objectives SET status=?,decision_type=CASE WHEN ?='completed' THEN 'complete' WHEN ?='cancelled' THEN 'cancelled' ELSE decision_type END,cancellation_provenance=CASE WHEN ?='cancelled' THEN 'explicit_cancel' ELSE NULL END,evidence_ref='synthetic-receipt',reached_acceptance='delivery_receipt',completed_at=1,recovery_owner=NULL,remediation_id=NULL,lease_owner=NULL,lease_expires_at=NULL WHERE id=?").bind(status).bind(status).bind(status).bind(status).bind(objective.id).execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO thin_session_state(session_id,state,waiting_for,wake_source,updated_at) VALUES ('m241','waiting_wake','PR repair','pending wake',1)").execute(&pool).await.unwrap();
+        for (suffix, at) in [("due", 100_i64), ("future", 10000)] {
+            sqlx::query("INSERT INTO wakeup_schedules(id,session_id,prompt,source,next_at,status,created_at) VALUES (?,'m241','synthetic wake','agent_decided',?,'pending',1)")
+                .bind(format!("{prefix}-{suffix}")).bind(at).execute(&pool).await.unwrap();
+        }
+        pool
+    }
+
+    #[tokio::test]
+    async fn m241_settled_objective_cancels_wake_family_without_admission() {
+        for status in ["completed", "cancelled"] {
+            for prefix in ["thin-repair", "thin-closeout", "thin-source-repair", "continue", "model-availability", "scheduled"] {
+                let pool = m241_fixture(status, prefix).await;
+                let workspaces: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM execution_workspaces").fetch_one(&pool).await.unwrap();
+                let recorder = Arc::new(Recorder::default());
+                assert_eq!(drain_due_wakeups_at(&pool, sink(&recorder), 200).await, 0, "{status}/{prefix}");
+                assert!(recorder.take().is_empty(), "no turn admission");
+                let state = super::super::thin_state::load(&pool, "m241").await.unwrap().unwrap();
+                assert_eq!(state.state, super::super::thin_state::SessionState::Ended);
+                assert!(state.reason.unwrap().contains("没有未结算"));
+                assert!(state.waiting_for.is_none() && state.wake_source.is_none());
+                assert_eq!(sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM wakeup_schedules WHERE status='cancelled'").fetch_one(&pool).await.unwrap(), 2);
+                assert_eq!(sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM messages WHERE role='user'").fetch_one(&pool).await.unwrap(), 0);
+                assert_eq!(sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM objectives").fetch_one(&pool).await.unwrap(), 1);
+                assert_eq!(sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM execution_workspaces").fetch_one(&pool).await.unwrap(), workspaces);
+                assert_eq!(drain_due_wakeups_at(&pool, sink(&recorder), 20000).await, 0);
+                let next = super::super::objective::ObjectiveStore::new(pool.clone())
+                    .ensure_or_continue_chat_objective("m241", "fresh-user", None, super::super::objective::ObjectiveKind::Delivery, "delivery_receipt").await.unwrap();
+                assert_ne!(next.status.as_str(), "completed");
+                assert_eq!(sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM objectives").fetch_one(&pool).await.unwrap(), 2);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn m241_unfinished_objective_delivers_normally() {
+        let pool = m241_fixture("active", "thin-repair").await;
+        let recorder = Arc::new(Recorder::default());
+        assert_eq!(drain_due_wakeups_at(&pool, sink(&recorder), 200).await, 1);
+        assert_eq!(recorder.take().len(), 1);
+        assert_eq!(super::super::thin_state::load(&pool, "m241").await.unwrap().unwrap().state, super::super::thin_state::SessionState::WaitingWake);
+    }
+
+    #[tokio::test]
+    async fn m241_background_completion_is_cancelled_without_admission() {
+        let pool = m241_fixture("completed", "thin-repair").await;
+        sqlx::query("INSERT INTO background_tasks(id,session_id,command,cwd,source,status,output_path,created_at,finished_at,timeout_sec,wake_state) VALUES ('m241-bg','m241','synthetic','/synthetic','agent_decided','completed','/synthetic/output',1,100,60,'pending')").execute(&pool).await.unwrap();
+        let recorder = Arc::new(Recorder::default());
+        assert_eq!(drain_pending_wakes(&pool, sink(&recorder)).await, 0);
+        assert!(recorder.take().is_empty());
+        assert_eq!(sqlx::query_scalar::<_, String>("SELECT wake_state FROM background_tasks WHERE id='m241-bg'").fetch_one(&pool).await.unwrap(), "cancelled");
+        assert_eq!(super::super::thin_state::load(&pool, "m241").await.unwrap().unwrap().state, super::super::thin_state::SessionState::Ended);
+    }
+
+    #[tokio::test]
+    async fn m241_model_wait_still_resumes_original_objective() {
+        let pool = m241_fixture("completed", "model-availability").await;
+        sqlx::query("UPDATE wakeup_schedules SET root_turn_id='original'").execute(&pool).await.unwrap();
+        let recorder = Arc::new(Recorder::default());
+        assert_eq!(drain_due_wakeups_at(&pool, sink(&recorder), 200).await, 1);
+        assert_eq!(recorder.take().len(), 1);
+        assert_eq!(super::super::thin_state::load(&pool, "m241").await.unwrap().unwrap().state, super::super::thin_state::SessionState::WaitingWake);
+    }
+
+    #[tokio::test]
+    async fn m241_objective_query_error_does_not_end_session() {
+        let pool = m241_fixture("completed", "thin-repair").await;
+        sqlx::query("ALTER TABLE objectives RENAME COLUMN status TO broken_status").execute(&pool).await.unwrap();
+        let recorder = Arc::new(Recorder::default());
+        assert_eq!(drain_due_wakeups_at(&pool, sink(&recorder), 200).await, 0);
+        assert!(recorder.take().is_empty());
+        assert_eq!(super::super::thin_state::load(&pool, "m241").await.unwrap().unwrap().state, super::super::thin_state::SessionState::WaitingWake);
+        assert_eq!(sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM wakeup_schedules WHERE status='pending'").fetch_one(&pool).await.unwrap(), 2);
     }
 
     #[derive(Default)]
