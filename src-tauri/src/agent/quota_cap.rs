@@ -605,11 +605,27 @@ impl QuotaLedger {
     }
 }
 
+#[cfg(not(test))]
 static SHARED_QUOTA_LEDGER: OnceLock<QuotaLedger> = OnceLock::new();
 
 /// The process-wide ledger route planning consults.
+#[cfg(not(test))]
 pub fn shared_quota_ledger() -> &'static QuotaLedger {
     SHARED_QUOTA_LEDGER.get_or_init(QuotaLedger::new)
+}
+
+// M249/R2: libtest gives each test its own thread; the quota consumers' Tokio
+// tests use the current-thread runtime. Keep indirect readers (route planning,
+// refresh and transport) in the same test ledger without changing production.
+#[cfg(test)]
+std::thread_local! {
+    static TEST_QUOTA_LEDGER: std::sync::Arc<QuotaLedger> =
+        std::sync::Arc::new(QuotaLedger::new());
+}
+
+#[cfg(test)]
+pub fn shared_quota_ledger() -> std::sync::Arc<QuotaLedger> {
+    TEST_QUOTA_LEDGER.with(std::sync::Arc::clone)
 }
 
 #[cfg(test)]
@@ -631,6 +647,31 @@ mod tests {
             },
             observed_at_ms: NOW,
         }
+    }
+
+    // R2: identical endpoint keys in concurrent tests must not share writes or
+    // clears. Channels establish ordering without sleeps or scheduler luck.
+    #[test]
+    fn m249_parallel_ledger_write_and_clear_are_isolated() {
+        let ledger = shared_quota_ledger();
+        let key = "https://synthetic.invalid/m249-same-key";
+        ledger.record_server_usage(key, server_quota(0.85, 0.2));
+        let (written_tx, written_rx) = std::sync::mpsc::channel();
+        let (clear_tx, clear_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            shared_quota_ledger().record_server_usage(key, server_quota(1.0, 0.9));
+            written_tx.send(()).unwrap();
+            clear_rx.recv().unwrap();
+            shared_quota_ledger().clear(key);
+        });
+        written_rx.recv().unwrap();
+        let after_write = ledger.snapshot(key, Default::default(), NOW);
+        clear_tx.send(()).unwrap();
+        worker.join().unwrap();
+        let after_clear = ledger.snapshot(key, Default::default(), NOW);
+        ledger.clear(key);
+        assert_eq!(after_write.unwrap().five_hour.used_ratio, 0.85);
+        assert_eq!(after_clear.unwrap().five_hour.used_ratio, 0.85);
     }
 
     // CF-QUOTA-R1: synthetic service data parses correctly.

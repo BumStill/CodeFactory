@@ -133,14 +133,27 @@ pub fn migrate_endpoint_defaults(settings: &mut crate::config::settings::Setting
 
 /// 未固定时的哨兵值：沿用系统时钟。
 const WALL_CLOCK: i64 = i64::MIN;
+#[cfg(not(test))]
 static CLOCK_OVERRIDE_MS: std::sync::atomic::AtomicI64 =
     std::sync::atomic::AtomicI64::new(WALL_CLOCK);
+
+// M249/R1: a test pin must not expire another test's quota readings. Libtest
+// and the quota consumers' current-thread Tokio runtimes retain this scope.
+#[cfg(test)]
+std::thread_local! {
+    static TEST_CLOCK_OVERRIDE_MS: std::cell::Cell<i64> =
+        const { std::cell::Cell::new(WALL_CLOCK) };
+}
 
 /// 时段判定读的唯一时钟。CF-WINDOW-R4/R5 的验收要把"跨过边界"做成
 /// 可注入的积分测试（不真的等到 18:00），所以时钟在这里留一个接缝；
 /// 生产路径不设置它，读到的就是真实时间。
 pub fn now_ms() -> i64 {
-    match CLOCK_OVERRIDE_MS.load(std::sync::atomic::Ordering::SeqCst) {
+    #[cfg(not(test))]
+    let pinned = CLOCK_OVERRIDE_MS.load(std::sync::atomic::Ordering::SeqCst);
+    #[cfg(test)]
+    let pinned = TEST_CLOCK_OVERRIDE_MS.with(std::cell::Cell::get);
+    match pinned {
         WALL_CLOCK => chrono::Utc::now().timestamp_millis(),
         pinned => pinned,
     }
@@ -149,7 +162,10 @@ pub fn now_ms() -> i64 {
 /// 测试接缝：`None` 恢复真实时钟。
 #[doc(hidden)]
 pub fn set_clock_override_ms(pinned: Option<i64>) {
+    #[cfg(not(test))]
     CLOCK_OVERRIDE_MS.store(pinned.unwrap_or(WALL_CLOCK), std::sync::atomic::Ordering::SeqCst);
+    #[cfg(test)]
+    TEST_CLOCK_OVERRIDE_MS.with(|clock| clock.set(pinned.unwrap_or(WALL_CLOCK)));
 }
 
 /// 固定时钟的测试之间串行进行——时钟是进程级的，不能让两个测试互相插队。
