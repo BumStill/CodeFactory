@@ -175,7 +175,14 @@ impl PermissionGateway for DesktopPermissionGateway {
                     if roots.iter().any(|r| r.canonicalize().ok() == root.canonicalize().ok()) {
                         // M215: a refusal names the script line that could not be
                         // proved instead of only restating "unproved".
-                        match super::trusted_git::python_heredoc_proof(Some(&root), command) {
+                        let proof = if super::trusted_sandbox::is_enforced(&root, None)
+                            && !super::trusted_git::outside_write_sandbox_scope(command)
+                        {
+                            super::trusted_git::sandboxed_heredoc_proof(&root, command)
+                        } else {
+                            super::trusted_git::python_heredoc_proof(Some(&root), command)
+                        };
+                        match proof {
                             Ok(()) if !remote => return PermissionOutcome::Allow,
                             Ok(()) => heredoc_proved = true,
                             Err(reason) => return self.request_permission_with_reason(
@@ -1023,6 +1030,20 @@ mod tests {
         assert_eq!(m159_git(&root, &["rev-parse", "origin/main"]), m159_git(&root, &["rev-parse", "HEAD"]));
         // R5: approval exemption must not unlock the protected Git config.
         assert!(String::from_utf8_lossy(&output.stderr).contains("Operation not permitted"));
+        // M248b R3: execute, not just classify, an outside read and rejected
+        // write through the exact same launch wrapper used by bash.
+        let outside = temp.path().join("outside.txt");
+        std::fs::write(&outside, "synthetic outside readable").unwrap();
+        let script = format!("python3 - <<'PY'\np={:?}\nprint(open(p).read())\nopen(p,'w').write('forbidden')\nPY", outside.to_string_lossy());
+        assert!(super::super::trusted_git::sandboxed_heredoc_proof(&root, &script).is_ok());
+        // A narrow instance avoids the runtime's intentional temp/cache write
+        // exceptions; exercise the same kernel wrapper with only workspace writes.
+        let sandbox = crate::command_sandbox::CommandSandbox::new(&root, vec![crate::command_sandbox::WritablePath::tree(&root)], vec![], crate::command_sandbox::NetworkPolicy::Enabled).unwrap();
+        let launch = sandbox.wrap("/bin/sh", &["-c".into(), script]);
+        let output = std::process::Command::new(launch.program).no_window().args(launch.args).current_dir(&root).output().unwrap();
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stdout).contains("synthetic outside readable"));
+        assert_eq!(std::fs::read_to_string(&outside).unwrap(), "synthetic outside readable");
     }
 
     #[tokio::test]
@@ -1046,8 +1067,21 @@ mod tests {
         let head = m159_git(&root, &["rev-parse", "HEAD"]);
         sqlx::query("INSERT INTO execution_workspaces(id,objective_id,session_id,repo_identity,repo_root,git_common_dir,worktree_path,worktree_identity,branch_name,base_ref,base_sha,head_sha,state,created_at,updated_at) VALUES ('m248-workspace','5eea633e-59f9-42bc-91f8-0a19a5c49711','permission-test',?,?,?,?,?,?,'HEAD',?,?,'active',1,1)")
             .bind(identity.repo_identity).bind(root.to_string_lossy().as_ref()).bind(common).bind(root.to_string_lossy().as_ref()).bind(identity.worktree_identity).bind(branch).bind(&head).bind(&head).execute(&gateway.db).await.unwrap();
-        for query in ["grep -n 'gh token git push' tracked.txt", "grep -n 'ssh|curl|wget' tracked.txt", "cat tracked.txt"] {
-            let command = format!("git branch --show-current; git fetch --prune origin main && git merge origin/main && git config core.hooksPath .githooks; {query}; cat tracked.txt");
+        let mut commands: Vec<String> = [
+            "git fetch --prune origin main && git merge origin/main && git config core.hooksPath .githooks; gh auth status; sed ...; rg ...; cat ...",
+            "git fetch --prune origin main && git merge-base --is-ancestor origin/main HEAD && git config core.hooksPath .githooks; cat ...; rg ...; ls '<应用数据目录>'; ...",
+            "git add docs/specs/... && git commit -m 'docs: ...'; sed ...; grep -n 'fn git' ...; grep -n 'pub.*register\\|fn.*execut\\|static.*' ...; command -v cargo; df -h .; git status --short",
+        ].into_iter().map(String::from).collect();
+        // Exact registration still provides a fallback on unsupported platforms;
+        // only a live sandbox may waive an unproved external file boundary.
+        let enforced = super::super::trusted_sandbox::is_enforced(&root, None);
+        if enforced {
+            commands.push("python3 - <<'PY'\nprint(open('/synthetic/outside.txt').read())\nPY".into());
+        }
+        for command in commands {
+            if !enforced && !super::super::trusted_git::registered_rewrite(&[root.clone()], &root, &command) {
+                continue;
+            }
             let args = serde_json::json!({"command":command});
             let call = ToolCall { id: "m248-sync".into(), r#type: "function".into(), function: FunctionCall { name: "bash".into(), arguments: args.to_string() } };
             assert_eq!(gateway.authorize(&call, &args, Some(&command)).await, PermissionOutcome::Allow, "{command}");

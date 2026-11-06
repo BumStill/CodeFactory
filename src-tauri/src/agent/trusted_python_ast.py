@@ -28,7 +28,8 @@ for _stream in (sys.stdout, sys.stderr):
         pass
 
 root = pathlib.Path(sys.argv[1]).resolve() if len(sys.argv) > 1 and sys.argv[1] else None
-STR, INT, BOOL, FILE, NONE, MODULE, PATH = 'str', 'int', 'bool', 'file', 'none', 'module', 'path'
+sandboxed = len(sys.argv) > 3 and sys.argv[3] == 'sandboxed'
+STR, INT, BOOL, FILE, NONE, MODULE, PATH, DATABASE, ROWS = 'str', 'int', 'bool', 'file', 'none', 'module', 'path', 'database', 'rows'
 values = {}
 functions = {}
 MODULES = ('io', 'pathlib')
@@ -36,6 +37,9 @@ ENCODINGS = ('utf-8', 'UTF-8', 'utf8')
 
 
 def path(value):
+    if sandboxed:
+        # The kernel owns file scope; the AST owns effects, not path text.
+        return value
     if not isinstance(value, str) or not value or '\\' in value:
         raise ValueError('dynamic or nonportable path')
     p = pathlib.PurePosixPath(value)
@@ -114,13 +118,33 @@ def expr(n, env):
         if not all(isinstance(x, (ast.Eq, ast.NotEq, ast.Gt, ast.GtE, ast.Lt, ast.LtE)) for x in n.ops): raise ValueError('comparison')
         return (BOOL, None)
     if isinstance(n, ast.Call):
+        if sandboxed and isinstance(n.func, ast.Attribute):
+            receiver = expr(n.func.value, env)
+            if receiver == (MODULE, 'sqlite3') and n.func.attr == 'connect':
+                args = [expr(x, env) for x in n.args]
+                # Read-only SQLite is a capability, not a SQL keyword filter.
+                from urllib.parse import urlsplit, parse_qs
+                if len(args) != 1 or args[0][0] != STR or not isinstance(args[0][1], str):
+                    raise ValueError('database URI')
+                uri = urlsplit(args[0][1])
+                if uri.scheme != 'file' or parse_qs(uri.query).get('mode') != ['ro']:
+                    raise ValueError('database is not read-only')
+                if len(n.keywords) != 1 or n.keywords[0].arg != 'uri' or not isinstance(n.keywords[0].value, ast.Constant) or n.keywords[0].value.value is not True:
+                    raise ValueError('database URI mode')
+                return (DATABASE, None)
+            if receiver[0] == DATABASE and n.func.attr == 'execute':
+                if n.keywords or len(n.args) != 1 or expr(n.args[0], env)[0] != STR:
+                    raise ValueError('database query')
+                return (ROWS, None)
+            if receiver[0] == ROWS and n.func.attr in ('fetchall', 'fetchone') and not n.args and not n.keywords:
+                return (ROWS, None)
         keywords(n)
         args = [expr(x, env) for x in n.args]
         if isinstance(n.func, ast.Name):
             if n.func.id == 'open':
                 return opened(args)
             if n.func.id == 'print':
-                if any(x[0] not in (STR, INT, BOOL, NONE) for x in args): raise ValueError('print capability')
+                if any(x[0] not in (STR, INT, BOOL, NONE, ROWS) for x in args): raise ValueError('print capability')
                 return (NONE, None)
             if n.func.id in env and env[n.func.id][0] == MODULE:
                 return module_call(env[n.func.id][1], args)
@@ -187,7 +211,8 @@ def statement(n, env, in_function=False):
         # Only the two modules M215 can prove. `os`, `subprocess`, `socket` and
         # `shutil` stay unprovable imports, never inert data.
         for alias in n.names:
-            if alias.name not in MODULES or (alias.asname or alias.name) not in MODULES: raise ValueError('module ' + alias.name)
+            allowed = MODULES + (('sqlite3',) if sandboxed else ())
+            if alias.name not in allowed: raise ValueError('module ' + alias.name)
             env[alias.asname or alias.name] = (MODULE, alias.name)
     elif isinstance(n, ast.ImportFrom):
         if n.level or n.module not in MODULES: raise ValueError('module import')
