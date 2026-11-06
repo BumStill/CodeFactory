@@ -2228,6 +2228,29 @@ mod tests {
     /// M164/R1/R5：用户上限是硬门禁，无备选也不得继续请求 GPT。
     #[tokio::test]
     async fn m164_reserve_capped_primary_waits_when_every_alternative_is_blocked() {
+        m249_reserve_cap_assertions(|| {}).await;
+    }
+
+    // R1: deterministically interleave another test's clock write between the
+    // quota observation and admission, retaining the original field assertion.
+    #[tokio::test]
+    async fn m249_parallel_clock_change_preserves_reserve_cap_resume() {
+        let _serial = super::super::usage_windows::clock_test_lock();
+        struct ResetClock;
+        impl Drop for ResetClock {
+            fn drop(&mut self) {
+                super::super::usage_windows::set_clock_override_ms(None);
+            }
+        }
+        let _reset = ResetClock;
+        m249_reserve_cap_assertions(|| {
+            std::thread::spawn(|| {
+                super::super::usage_windows::set_clock_override_ms(Some(4_000_000_000_000));
+            }).join().unwrap();
+        }).await;
+    }
+
+    async fn m249_reserve_cap_assertions(interleave: impl FnOnce()) {
         let mut primary = route("chatgpt", "gpt-5.5");
         primary.base_url = "https://m152-primary.example".into();
         let mut fallback = route("chatgpt-backup", "gpt-5.5");
@@ -2266,6 +2289,7 @@ mod tests {
         };
         ledger.record_server_usage(&primary.base_url, quota(0.85));
         ledger.record_server_usage(&fallback.base_url, quota(1.0));
+        interleave();
 
         let mut plan = RouteCandidatePlan::new(primary.clone());
         plan.push_fallback(fallback.clone());
