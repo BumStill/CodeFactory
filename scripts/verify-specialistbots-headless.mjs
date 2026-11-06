@@ -111,7 +111,7 @@ for (const [width, theme] of [[1280,'dark'],[375,'light']]) {
   // intentionally prevents clicking background controls, so invoke only this harness control.
   await page.getByRole('button',{name:'验收：切换项目'}).evaluate(button => button.click());
   await opener.click();
-  await page.getByText('/acceptance/project-b',{exact:true}).waitFor();
+  await page.getByRole('region',{name:'QA/PM 证据内容'}).getByText('/acceptance/project-b',{exact:true}).waitFor();
   assert.equal(await page.getByText(fixture.pm.title,{exact:true}).count(),0);
   assert.deepEqual(pageErrors, [], 'browser runtime errors');
   // Real DOM interactions against explicit synthetic IPC. Not live GitHub/Tauri.
@@ -170,7 +170,7 @@ for (const [width, theme] of [[1280,'dark'],[375,'light']]) {
   await page.screenshot({path:path.join(output,`${width}-${theme}-native-observation.png`),fullPage:true});
   await page.getByRole('button',{name:'验收：切换项目'}).evaluate(button=>button.click());
   await opener.click();
-  await page.getByText('/acceptance/project-b',{exact:true}).waitFor();
+  await page.getByRole('region',{name:'QA/PM 证据内容'}).getByText('/acceptance/project-b',{exact:true}).waitFor();
   assert.equal(await query.count(),0);
   assert.equal(await page.getByText('待补执行证明',{exact:true}).count(),0);
   assert.deepEqual(pageErrors, [], 'browser runtime errors');
