@@ -25,7 +25,7 @@ const page = {addInitScript: fn => fn()};
   assert(Array.isArray(result.records), 'native status requires records');
 })().catch(error => {console.error(error);process.exitCode=1;});
 '''
-        result = subprocess.run(['node','-e',script],cwd=ROOT,capture_output=True,text=True)
+        result = subprocess.run(['node','-e',script],cwd=ROOT,capture_output=True,text=True,encoding="utf-8")
         self.assertEqual(result.returncode,0,result.stderr)
 
     def test_readonly_fixture_persists_partitions_and_revokes_pending_query(self):
@@ -62,5 +62,5 @@ const init=()=>vm.runInNewContext('(async()=>{'+source.slice(start,end)+'})()',{
  await assert.rejects(invoke('execute_specialist_task',{project:'/a'}));
 })().catch(e=>{console.error(e);process.exitCode=1;});
 '''
-        result=subprocess.run(['node','-e',script],cwd=ROOT,capture_output=True,text=True)
+        result=subprocess.run(['node','-e',script],cwd=ROOT,capture_output=True,text=True,encoding="utf-8")
         self.assertEqual(result.returncode,0,result.stderr)
