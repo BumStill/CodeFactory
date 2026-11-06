@@ -113,6 +113,17 @@ impl PermissionGateway for DesktopPermissionGateway {
         args: &serde_json::Value,
         bash_command: Option<&str>,
     ) -> PermissionOutcome {
+        // M245/R4, M224/R6: a bypass is a policy denial, never an approval.
+        // Check before receipt replay, heredoc proof, or owned-remote allows.
+        if tool_call.function.name == "bash" {
+            if let Some(reason) = bash_command.and_then(crate::command_sandbox::gate_bypass) {
+                return PermissionOutcome::Deny(PermissionDenial {
+                    content: reason,
+                    reason: PermissionDenialReason::PolicyDenied,
+                    duration_ms: 0,
+                });
+            }
+        }
         // M130: never infer remote authority from model/user wording or the
         // loop's cached capability. Shell and structured delivery share this gate.
         let remote = (tool_call.function.name == "deliver_changes" && args["ceiling"] != "off")
@@ -179,18 +190,6 @@ impl PermissionGateway for DesktopPermissionGateway {
             }
             if !heredoc_proved {
                 return self.request_permission(tool_call, args.clone(), bash_command).await;
-            }
-        }
-        // M224/R6：沙箱覆盖范围里被主动拒绝的命令不提供审批绕过——审批只决定
-        // "要不要跑"，不能决定"跑的时候要不要守约束"。放在所有 allow 分支之前。
-        if tool_call.function.name == "bash" {
-            if let Some(reason) = bash_command.and_then(crate::command_sandbox::gate_bypass) {
-                return self.request_permission_with_reason(
-                    tool_call,
-                    args.clone(),
-                    bash_command,
-                    Some(("trusted.sandbox.bypass", reason)),
-                ).await;
             }
         }
         // M159: delivery authority is not authority to force-push, delete a
@@ -1308,7 +1307,7 @@ mod tests {
         let compound_call = ToolCall { id: "m166-compound".into(), r#type: "function".into(), function: FunctionCall { name: "bash".into(), arguments: compound_args.to_string() } };
         assert_eq!(gateway.authorize(&compound_call, &compound_args, Some(&compound)).await, PermissionOutcome::Allow);
         assert!(gateway.pending_permissions.lock().await.is_empty());
-        for command in ["gh auth token", "gh pr merge 7 --squash", "gh pr edit 778 --remove-label 'merge-queue: armed'", "gh pr comment 778 --body 'not ours'", "git config --global core.hooksPath /tmp/hooks", "git push --force origin main", "git push origin :main", "git checkout -- ../other", "git reset --hard HEAD && rm -rf ../other"] {
+        for command in ["gh auth token", "gh pr merge 7 --squash", "gh pr edit 778 --remove-label 'merge-queue: armed'", "gh pr comment 778 --body 'not ours'", "git push --force origin main", "git push origin :main", "git checkout -- ../other", "git reset --hard HEAD && rm -rf ../other"] {
             let args = serde_json::json!({"command":command});
             let call = ToolCall { id: "m159-remote".into(), r#type: "function".into(), function: FunctionCall { name: "bash".into(), arguments: args.to_string() } };
             let other = gateway.clone();
@@ -1323,6 +1322,47 @@ mod tests {
         // Another session's registered workspace never establishes ownership.
         sqlx::query("UPDATE execution_workspaces SET session_id='other-session'").execute(&gateway.db).await.unwrap();
         assert!(gateway.managed_workspace_root().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn m245_bypass_is_denied_without_permission_prompt() {
+        for mode in ["trusted", "standard"] {
+            let gateway = test_gateway(mode).await;
+            for command in ["git config --unset core.hooksPath", "git config --global core.hooksPath /tmp/hooks", "git commit --no-verify -m synthetic", "CODEFACTORY_SKIP_SYNC_GATE=1 git commit"] {
+                let args = serde_json::json!({"command":command});
+                let call = ToolCall { id: "m245-deny".into(), r#type: "function".into(), function: FunctionCall { name: "bash".into(), arguments: args.to_string() } };
+                let outcome = gateway.authorize(&call, &args, Some(command)).await;
+                let PermissionOutcome::Deny(denial) = outcome else { panic!("bypass must be denied"); };
+                assert_eq!(denial.reason, PermissionDenialReason::PolicyDenied);
+                assert!(denial.content.contains("修复指引"), "{}", denial.content);
+                assert!(gateway.pending_permissions.lock().await.is_empty());
+                let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='permission_intents'").fetch_one(&gateway.db).await.unwrap();
+                assert_eq!(count, 0, "bypass must not create approval intents");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn m245_real_git_read_and_blocked_unset_preserve_configuration() {
+        let gateway = test_gateway("trusted").await;
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        m159_git(root, &["init", "-q"]);
+        m159_git(root, &["config", "core.hooksPath", ".githooks"]);
+        let command = "git config --get core.hooksPath";
+        let args = serde_json::json!({"command":command});
+        let call = ToolCall { id: "m245-read".into(), r#type: "function".into(), function: FunctionCall { name: "bash".into(), arguments: args.to_string() } };
+        assert_eq!(gateway.authorize(&call, &args, Some(command)).await, PermissionOutcome::Allow);
+        assert_eq!(m159_git(root, &["config", "--get", "core.hooksPath"]), ".githooks");
+        let before = std::fs::read(root.join(".git/config")).unwrap();
+        let command = "git config --unset core.hooksPath";
+        let args = serde_json::json!({"command":command});
+        let call = ToolCall { id: "m245-unset".into(), r#type: "function".into(), function: FunctionCall { name: "bash".into(), arguments: args.to_string() } };
+        assert!(matches!(gateway.authorize(&call, &args, Some(command)).await,
+            PermissionOutcome::Deny(PermissionDenial { reason: PermissionDenialReason::PolicyDenied, .. })));
+        assert_eq!(std::fs::read(root.join(".git/config")).unwrap(), before);
+        assert_eq!(m159_git(root, &["config", "--get", "core.hooksPath"]), ".githooks");
+        assert!(gateway.pending_permissions.lock().await.is_empty());
     }
 
     #[tokio::test]
