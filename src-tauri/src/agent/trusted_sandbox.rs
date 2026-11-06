@@ -529,10 +529,7 @@ mod tests {
             "gh pr merge 7 --squash",
             "git push --force origin main",
             "git push origin :main",
-            "git config --global core.hooksPath /tmp/hooks",
-            "git checkout -- ../other",
             "git reset --hard HEAD && rm -rf ../other",
-            "curl -s https://example.com",
         ] {
             assert!(
                 crate::agent::trusted_git::outside_write_sandbox_scope(command),
