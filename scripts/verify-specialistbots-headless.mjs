@@ -30,6 +30,7 @@ let browser;
 try {
 await waitForAcceptanceDocument(vite,baseUrl,'specialistbots.tsx');
 browser = await chromium.launch({ executablePath, headless:true, chromiumSandbox:true });
+console.log(JSON.stringify({browserVersion:browser.version(),executablePath,evidence:'real-browser-synthetic-ipc',nativeTauriVerified:false}));
 const page = await browser.newPage();
 const pageErrors = [];
 page.on('pageerror', e => pageErrors.push(e.message));

@@ -46,6 +46,7 @@ your own API key, or sign in with ChatGPT for the Codex-backed provider.
 | | |
 |---|---|
 | 🔌 **Multi-provider** | OpenRouter, DeepSeek, Anthropic, OpenAI, LMStudio, Ollama. Per-endpoint custom models + auto vendor-prefix normalization (`deepseek/v4-pro` → `v4-pro` for direct providers). |
+| **项目 QA/PM 证据** | 在项目工作区手动导入报告，或绑定已有 GitHub 连接与 PR 精确提交、查询并保存 CI 观察。显示本地待补证明状态，支持撤销查询授权；不运行自主审查、测试、修复或远端任务写入。 |
 | 🛠 **Real tool use** | `read_file`, `write_file`, `edit_file`, `bash` (PowerShell), `grep`, `glob`. Per-file locks + atomic writes + post-write byte-level integrity check. |
 | 🧱 **Trusted-mode OS sandbox** | On macOS, trusted-mode commands run inside a real Seatbelt sandbox: writes are confined to the project folder, the shared build cache and this worktree's git metadata, and signals stay inside it. It is **not** a universal cage — reads are unrestricted, network is not restricted in this stage, and there is no user-facing switch (on by default; Windows/Linux not covered yet). Boundaries in [docs/specs/feature-specs/m224-os-sandbox-trusted-commands.md](docs/specs/feature-specs/m224-os-sandbox-trusted-commands.md). |
 | 📄 **Documents** | Generate and edit Office files from chat: PowerPoint (`read`/`edit`/`format`/`write_pptx`), Word (`write_docx`), Excel (`read_xlsx` / `edit_xlsx` — e.g. summarize a column into the next one row by row). Drop a `.pptx` / `.docx` / `.pdf` / `.xlsx` into the message box and the agent reads it. Upload attachments even in a chat without a project, and open file links directly from the conversation. |

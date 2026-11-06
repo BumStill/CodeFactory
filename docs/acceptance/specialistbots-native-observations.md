@@ -43,7 +43,7 @@ not live。本地实现、测试与真实API快照不替代桌面/浏览器验�
 本候选分支 feat/specialist-readonly-delivery 从主线 c5e232d0 提取S7/S8，带Stop刷新失败修复、浏览器mock契约修复及报告fixture，不包含S1-S3执行账本、S6采集CLI或S9探针。服务只依赖现有GitHub连接/凭据与SQLite；0027通过ensure_schema接入，不依赖0024/0025 Dot表。凭据屏障和settings/secrets接入不可拆掉。自主执行仍关闭；没有待部署的执行器依赖。
 
 ### 真实门禁状态
-- 仓库必需：相关失败回归、类型/构建、迁移及权限兼容、独立QA、治理/scenario门禁；独立候选的19项组件/Workspace测试、类型检查、前端构建与脚本契约测试已通过。Rust专项16项在独立候选通过（凭据屏障2、观察13、transport1）；其后同步主线3324d40c，组合复验以specialist-readonly-rust-synced.log为准，不沿用旧head结果。
+- 仓库必需：相关失败回归、类型/构建、迁移及权限兼容、独立QA、治理/scenario门禁；独立候选的19项组件/Workspace测试、类型检查、前端构建与脚本契约测试已通过。Rust专项15个测试入口在独立候选通过（凭据屏障1（内部含取消调用回归）、观察13、transport1）；其后同步主线3324d40c，组合复验以specialist-readonly-rust-synced.log为准，不沿用旧head结果。
 - 远端必需：agent-bridge-linux、check-frontend、check-rust、governance-baseline、remote-real-app-gui、scenario-gate-pr；本分支未推送，六项尚未执行。CI的Windows headless与精确head场景计划可复用，不必等待本云容器桌面恢复。
 - agent live verification not feasible：本任务无可调用桌面/浏览器工具，现Chromium沙箱helper归属异常，未关闭沙箱。此前失败不是只读功能失败；无新条件不重复启动。AGENTS“如果出现新的harness限制”允许明确降级送审，不能豁免必需CI或伪称live通过。
 - scenarios needing manual verification：真实已有GitHub凭据绑定open PR精确head→查询→关闭重开历史；Stop与查询竞态；刷新失败后禁用；跨项目切换与旧head拒绝；进程重启需重新授权；宽/窄布局、Escape焦点。已存在对应组件/服务失败测试作为有限替代证据，不能替代完整Tauri链路。
@@ -63,4 +63,10 @@ not live。本地实现、测试与真实API快照不替代桌面/浏览器验�
 
 新增target的最小治理变更是给UI-009 automated_by增加pnpm:test:specialistbots:headless；这是TRUST_ROOT_FILES保护的scenario-registry，需由受信治理更新流程审查/落地，不能由普通功能PR自认证。已在本地准备建议patch，不改可信根。也可在已授权桌面直接运行同一命令取得补充证据；不为此开放未授权Mac。六项required checks依旧全部必需。
 
-最终组合验证：主线3324d40c+独立切片的Rust16项全部通过，记录specialist-readonly-rust-synced.log；本次未改前端产品源码，19项UI、tsc、Vite构建证据仍适用于该前端树。完整全量/跨平台required CI尚未执行。构建生成的schema仅留本地证据，不纳入产品提交。
+最终组合验证：主线3324d40c+独立切片的Rust15个测试入口全部通过，记录specialist-readonly-rust-synced.log；本次未改前端产品源码，19项UI、tsc、Vite构建证据仍适用于该前端树。完整全量/跨平台required CI尚未执行。构建生成的schema仅留本地证据，不纳入产品提交。
+
+
+### PR1006 补充浏览器实跑入口
+已获推送本分支、创建draft PR和继续验收授权；PR1006保持draft，不armed、不合并、不部署。新增独立非required的specialist-browser-supplement job，普通pull_request、Windows hosted runner、contents:read、无secrets、checkout精确head且不持久凭据，超时20分钟。执行同一个test:specialistbots:headless入口；日志记录浏览器版本，receipt记录head/run/attempt/退出码，失败也上传日志。此workflow不是TRUST_ROOT_FILES成员，不修改既有CI、registry或ruleset，不代替canonical gate。正式target注册仍需独立治理流程；补充真实DOM证据不必等待该注册。
+
+首次远端governance发现两个Python子进程缺显式UTF-8，已先本地复现再修复，当前复验通过。Rust计数以15个入口为准，取消调用为凭据屏障入口内部子用例，不再重复计数。旧桌面artifact下载返回403，未查看截图内容，不重试绕过访问限制。
