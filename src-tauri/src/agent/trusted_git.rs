@@ -79,6 +79,16 @@ pub(super) fn python_heredoc_proved(root: Option<&Path>, command: &str) -> bool 
 /// line the prover could not prove) so the approval text can name it instead of
 /// only saying "unproved".
 pub(super) fn python_heredoc_proof(root: Option<&Path>, command: &str) -> Result<(), String> {
+    python_heredoc_proof_with_sandbox(root, command, false)
+}
+
+/// M248b: the AST still proves effects (no network/process capability), while
+/// the live kernel sandbox, not path spelling, confines filesystem writes.
+pub(super) fn sandboxed_heredoc_proof(root: &Path, command: &str) -> Result<(), String> {
+    python_heredoc_proof_with_sandbox(Some(root), command, true)
+}
+
+fn python_heredoc_proof_with_sandbox(root: Option<&Path>, command: &str, sandboxed: bool) -> Result<(), String> {
     if command.len() > 256 * 1024 { return Err("脚本超过 256 KiB".into()); }
     // M221: the heredoc may start on a later line (`git add -A` then
     // `git commit -F - <<'MSG'`), so the header is every line up to and
@@ -168,13 +178,14 @@ pub(super) fn python_heredoc_proof(root: Option<&Path>, command: &str) -> Result
     // The static AST proof stays the strong path; containment is only the
     // fallback for bodies that proof cannot model (e.g. `json.load`).
     let contained = match base {
-        Some(base) => { heredoc_body_contained(base, &body, false)?; true }
-        None => false,
+        Some(base) if !sandboxed => { heredoc_body_contained(base, &body, false)?; true }
+        _ => false,
     };
     let mut cmd = Command::new(if cfg!(windows) { "python" } else { "python3" });
     cmd.args(["-I", "-c", include_str!("trusted_python_ast.py")]);
     if let Some(root) = base { cmd.arg(root); } else { cmd.arg(""); }
-    if node { cmd.arg("node"); }
+    if node { cmd.arg("node"); } else { cmd.arg("python"); }
+    if sandboxed { cmd.arg("sandboxed"); }
     let Ok(mut child) = cmd.no_window().stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::piped()).spawn() else {
         return Err(format!("无法启动{}证明进程", if node { " node " } else { " python " }));
     };
@@ -192,62 +203,13 @@ pub(super) fn python_heredoc_proof(root: Option<&Path>, command: &str) -> Result
 /// M215: prover diagnostics travel through the host console, and a Windows code
 /// page that cannot encode CJK escapes them as `\uXXXX`. Decode those escapes so
 /// the approval text names the line in readable Chinese on every platform.
-/// M224/R5：沙箱约束的是文件写入，不是凭据读取，也不是远端动作，更不替用户
-/// 决定"要不要动别的 checkout"。这些类别即便在沙箱里也必须继续走审批，
-/// 否则沙箱会变成"凭据外带/远端改写"的白名单。
+/// M248b: filesystem scope belongs to the OS sandbox. Only existing effect
+/// classifiers retain authority here: network writes and explicit shell risks.
+/// No credential/path/command-word denylist is maintained in this layer.
 pub(crate) fn outside_write_sandbox_scope(command: &str) -> bool {
-    let Some(segments) = command_segments(command) else {
-        // Existing heredoc authorization is handled separately by the gateway.
-        // Preserve its scope predicate when this simple grammar cannot parse it.
-        return outside_write_sandbox_segment(command);
-    };
-    segments.iter().any(|segment| {
-        // M248: the shared query classifier understands executable positions;
-        // a search pattern mentioning a remote command is not a remote action.
-        if codefactory_agent_core::command_segment_is_read_only_probe(segment)
-            && executable_segments(segment).is_some_and(|parts| parts.iter().all(|words| {
-                words.first().is_some_and(|program| !outside_write_sandbox_segment(program))
-                    && words.iter().skip(1).all(|word| {
-                        // Query status cannot authorize credential-path reads or
-                        // cross-checkout targets. Keep their existing fence.
-                        !((word.contains('/') || word == ".." || word == "token" || word == "netrc")
-                            && outside_write_sandbox_segment(word))
-                    })
-            })) {
-            return false;
-        }
-        outside_write_sandbox_segment(segment)
-    })
-}
-
-fn outside_write_sandbox_segment(command: &str) -> bool {
-    let lowered = command.to_ascii_lowercase();
-    let words = lowered
-        .split(|c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '-')
-        .filter(|w| !w.is_empty());
-    for word in words {
-        if matches!(word, "gh" | "curl" | "wget" | "ssh" | "scp" | "netrc" | "token") {
-            return true;
-        }
-    }
-    for needle in [
-        "git push",
-        "git config --global",
-        "git config --system",
-        "config --global",
-        "config --system",
-        "~/.ssh",
-        ".aws/",
-    ] {
-        if lowered.contains(needle) {
-            return true;
-        }
-    }
-    // `..` 段可能指向另一个 checkout：沙箱会拒绝写入，但"要不要动别人的目录"
-    // 是用户决定，不是沙箱能替代的裁决。
-    command
-        .split(|c: char| c.is_whitespace() || c == ';' || c == '\'' || c == '"')
-        .any(|token| token == ".." || token.starts_with("../") || token.contains("/../"))
+    codefactory_agent_loop::policy::is_delivery_command(command)
+        || !matches!(standalone_shell_policy::classify_command(command),
+            standalone_shell_policy::ShellCommandPolicy::Allow { .. })
 }
 
 pub(crate) fn decode_prover_escapes(text: &str) -> String {
@@ -1762,15 +1724,17 @@ pub(super) fn local_rewrite(root: &Path, command: &str) -> bool {
 /// M248: registration proves confinement, not destructive intent. Ordinary
 /// synchronization is kernel-confined; all other sensitive actions keep M159.
 pub(super) fn destructive_intent(command: &str) -> bool {
-    let Some(segments) = command_segments(command) else { return true };
-    segments.iter().any(|segment| {
-        if !sensitive(segment) { return false; }
-        let Some(words) = executable_segments(segment) else { return true };
-        let [words] = words.as_slice() else { return true };
+    let Some(segments) = executable_segments(command) else { return true };
+    segments.iter().any(|words| {
+        if !segment_is_sensitive(words) { return false; }
         let args: Vec<_> = words.iter().map(String::as_str).collect();
         match args.as_slice() {
             ["git", "fetch", rest @ ..] => !fetch_args(rest),
             ["git", "merge", rest @ ..] => !merge_args(rest),
+            // Staging and a new commit preserve existing history. Amend and
+            // unsupported flags remain under the snapshot/approval path.
+            ["git", "add", ..] => false,
+            ["git", "commit", rest @ ..] => !commit_args(rest) || rest.contains(&"--amend"),
             ["git", "config", "core.hooksPath", ".githooks"]
             | ["git", "config", "--local", "core.hooksPath", ".githooks"] => false,
             _ => true,

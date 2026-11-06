@@ -19,8 +19,11 @@ fn m248_local_discovery_arguments_are_not_remote_actions() {
 
 #[test]
 fn m248_remote_and_history_actions_keep_their_existing_fence() {
-    for command in ["git push origin main", "git push --force origin main", "git push origin --delete someone-else", "gh auth token", "curl https://example.invalid", "git config --global user.name test", "git checkout -- ../other", "cat ~/.ssh/id_ed25519", "cat ../other/token", "grep synthetic .aws/credentials", "gh pr view 7 --json state"] {
+    for command in ["git push origin main", "git push --force origin main", "git push origin --delete someone-else", "gh auth token"] {
         assert!(trusted_git::outside_write_sandbox_scope(command), "{command}");
+    }
+    for command in ["cat ~/.ssh/id_ed25519", "cat ../other/token", "grep synthetic .aws/credentials", "gh pr view 7 --json state", "git config --global user.name test", "git checkout -- ../other", "curl https://example.invalid"] {
+        assert!(!trusted_git::outside_write_sandbox_scope(command), "filesystem scope is kernel-owned: {command}");
     }
     assert!(trusted_git::sensitive("git reset --hard HEAD"));
     assert!(trusted_git::sensitive("git rebase origin/main"));
