@@ -58,6 +58,38 @@ fn owned_group_observation_rejects_empty_missing_leader_and_truncation() {
     }
 }
 
+fn worker_diagnostic(phase: &str, pid: u32, elapsed: Duration, log: &str) -> String {
+    let stage = log.lines().rev().find(|line| line.contains("M256 stage="))
+        .unwrap_or("worker process startup");
+    format!("worker deadline: phase={phase} pid={pid} elapsed={elapsed:?} stage={stage}\n{log}")
+}
+
+#[test]
+fn m256_empty_worker_log_still_identifies_startup_phase() {
+    for log in ["", "\nrunning 1 test\n"] {
+        let diagnostic = worker_diagnostic("ci-pending", 256, Duration::from_secs(45), log);
+        for required in ["ci-pending", "256", "45", "worker process startup"] {
+            assert!(diagnostic.contains(required), "missing {required}: {diagnostic}");
+        }
+    }
+    let diagnostic = worker_diagnostic("recover", 257, Duration::from_secs(45),
+        "M256 stage=runtime-build\nM256 stage=git-world-init\n");
+    assert!(diagnostic.contains("stage=M256 stage=git-world-init"), "{diagnostic}");
+}
+
+fn worker_runtime() -> tokio::runtime::Runtime {
+    // Supervisors already run separate processes; avoid host-sized thread pools
+    // in every concurrent worker (10 scheduler threads per worker on this Mac).
+    tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap()
+}
+
+#[test]
+fn m256_worker_runtime_does_not_multiply_host_cpu_threads() {
+    let runtime = worker_runtime();
+    assert_eq!(runtime.metrics().num_workers(), 1,
+        "each concurrent forge worker needs one async scheduler, not one per host CPU");
+}
+
 struct FakeForge {
     db: sqlx::SqlitePool,
     world: PathBuf,
@@ -734,6 +766,7 @@ async fn slice2_run(world: &Path, forge: &FakeForge, phase: &str) -> (DeliveryOu
 #[test]
 #[ignore = "only the scoped supervisor may run this with a temporary world"]
 fn delivery_fake_forge_worker() {
+    eprintln!("M256 stage=worker-enter pid={}", std::process::id());
     let world = PathBuf::from(
         std::env::var_os("CF_DELIVERY_FIXTURE_WORLD").expect("supervised worker only"),
     );
@@ -772,9 +805,13 @@ fn delivery_fake_forge_worker() {
         }
         return; // The owner exits first; its live descendant must still be reclaimed.
     }
-    tokio::runtime::Runtime::new().unwrap().block_on(async {
+    eprintln!("M256 stage=runtime-build phase={phase}");
+    worker_runtime().block_on(async {
+        eprintln!("M256 stage=git-world-init phase={phase}");
         init_world(&world);
+        eprintln!("M256 stage=forge-open phase={phase}");
         let forge = FakeForge::open(&world).await;
+        eprintln!("M256 stage=delivery-run phase={phase}");
         if phase == "ci-failure" || phase == "ci-pending" {
             let state = if phase == "ci-failure" {
                 "failure"
@@ -858,6 +895,7 @@ struct Worker {
     tree: StdProcessTree,
     reaped: bool,
     log: PathBuf,
+    phase: String,
 }
 
 impl Worker {
@@ -923,13 +961,15 @@ impl Worker {
             tree,
             reaped: false,
             log,
+            phase: phase.into(),
         };
         std::fs::write(world.join(format!("{phase}-start")), "owned").unwrap();
         worker
     }
 
     fn wait(&mut self) {
-        let deadline = Instant::now() + Duration::from_secs(45);
+        let started = Instant::now();
+        let deadline = started + Duration::from_secs(45);
         loop {
             if self.exited_without_reaping().unwrap() {
                 let status = self.terminate_then_reap().unwrap();
@@ -943,8 +983,9 @@ impl Worker {
             }
             assert!(
                 Instant::now() < deadline,
-                "worker deadline: {}",
-                std::fs::read_to_string(&self.log).unwrap()
+                "{}",
+                worker_diagnostic(&self.phase, self.child.id(), started.elapsed(),
+                    &std::fs::read_to_string(&self.log).unwrap())
             );
             std::thread::sleep(Duration::from_millis(25));
         }

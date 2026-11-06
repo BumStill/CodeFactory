@@ -2775,25 +2775,46 @@ mod tests {
         assert_eq!(count, 0, "first admission is not a stock interrupted wait");
     }
 
+    fn m203_executor_session() -> String {
+        format!("derive-m203-first-executor-{}", uuid::Uuid::new_v4())
+    }
+
+    #[test]
+    fn m256_startup_fixture_cannot_claim_another_fixtures_executor() {
+        let control = crate::ChatRunControl::pending();
+        let session_id = m203_executor_session();
+        let session = session_id.as_str();
+        crate::register_session_executor(session, &control);
+        let unrelated_alive = crate::session_executor_alive("derive");
+        crate::unregister_session_executor(session, &control);
+        assert_eq!(unrelated_alive, Some(false),
+            "startup fixture must not make the independent m202 database look Running");
+    }
+
     #[tokio::test]
     async fn m203_startup_skips_fresh_session_then_first_executor_runs() {
         let db = fixture().await;
+        let session_id = m203_executor_session();
+        let session = session_id.as_str();
+        // Rename before creating dependent rows: foreign keys stay enabled.
+        sqlx::query("UPDATE sessions SET id=? WHERE id='derive'")
+            .bind(session).execute(&db).await.unwrap();
         super::super::background_tasks::ensure_wake_schema(&db).await.unwrap();
         let now = chrono::Utc::now().timestamp_millis();
-        sqlx::query("UPDATE sessions SET created_at=? WHERE id='derive'").bind(now).execute(&db).await.unwrap();
-        sqlx::query("INSERT INTO messages(id,session_id,role,content,created_at) VALUES ('m203-user','derive','user','synthetic create_and_send',?)")
-            .bind(now).execute(&db).await.unwrap();
-        m197_wait("derive", &db, "系统自动重试/自愈：接续中断回合").await;
+        sqlx::query("UPDATE sessions SET created_at=? WHERE id=?").bind(now).bind(session).execute(&db).await.unwrap();
+        sqlx::query("INSERT INTO messages(id,session_id,role,content,created_at) VALUES ('m203-user',?,'user','synthetic create_and_send',?)")
+            .bind(session).bind(now).execute(&db).await.unwrap();
+        m197_wait(session, &db, "系统自动重试/自愈：接续中断回合").await;
         for _ in 0..2 { reconcile_waiting_on_startup(&db).await.unwrap(); }
-        let wakes: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM wakeup_schedules WHERE session_id='derive'").fetch_one(&db).await.unwrap();
+        let wakes: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM wakeup_schedules WHERE session_id=?").bind(session).fetch_one(&db).await.unwrap();
         assert_eq!(wakes, 0);
-        sqlx::query("INSERT INTO chat_turn_state(root_turn_id,session_id,phase,status,started_at,updated_at) VALUES ('m203-user','derive','working','active',?,?)")
-            .bind(now).bind(now).execute(&db).await.unwrap();
+        sqlx::query("INSERT INTO chat_turn_state(root_turn_id,session_id,phase,status,started_at,updated_at) VALUES ('m203-user',?,'working','active',?,?)")
+            .bind(session).bind(now).bind(now).execute(&db).await.unwrap();
         let control = crate::ChatRunControl::pending();
-        crate::register_session_executor("derive", &control);
+        crate::register_session_executor(session, &control);
         reconcile_waiting_on_startup(&db).await.unwrap();
-        let state = refresh(&db, "derive").await.unwrap();
-        crate::unregister_session_executor("derive", &control);
+        let state = refresh(&db, session).await.unwrap();
+        crate::unregister_session_executor(session, &control);
         assert_eq!(state.state, SessionState::Running);
         let reason: Option<String> = sqlx::query_scalar("SELECT terminal_reason FROM chat_turn_state WHERE root_turn_id='m203-user'").fetch_one(&db).await.unwrap();
         assert!(reason.is_none());
