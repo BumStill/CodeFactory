@@ -1001,6 +1001,8 @@ pub(crate) struct CloseoutTarget {
 }
 
 const CLOSEOUT_GIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+/// M262：读合并提交编号是 GitHub API 调用，给它的预算要留在一个整体探测窗口之内。
+const CLOSEOUT_GH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(12);
 const CLOSEOUT_PROBE_BUDGET: std::time::Duration = std::time::Duration::from_secs(45);
 
 fn closeout_git(root: &std::path::Path, args: &[&str]) -> Result<String, String> {
@@ -1012,24 +1014,111 @@ fn closeout_git(root: &std::path::Path, args: &[&str]) -> Result<String, String>
     crate::agent::delivery::bounded_delivery_output_with_timeout(&mut command, CLOSEOUT_GIT_TIMEOUT)
 }
 
+/// M262：这个 PR 真实的合并提交编号。提交信息里带 `(#N)` 并不可靠——本仓库 PR #1031
+/// 的合并提交 `139f4488a` 标题和正文都没有 `1031`，按文本匹配会把已合并说成没合并。
+fn closeout_gh_merge_commit(target: &CloseoutTarget) -> Result<String, String> {
+    let number = target.pr_number.to_string();
+    let mut command = crate::agent::delivery::dev_command("gh");
+    command
+        .current_dir(&target.root)
+        .env("GH_PROMPT_DISABLED", "1")
+        .args([
+            "pr",
+            "view",
+            number.as_str(),
+            "--json",
+            "mergeCommit",
+            "--jq",
+            ".mergeCommit.oid",
+        ]);
+    let raw = crate::agent::delivery::bounded_delivery_output_with_timeout(
+        &mut command,
+        CLOSEOUT_GH_TIMEOUT,
+    )
+    .map_err(|error| format!("读不到 PR #{number} 的合并提交（{error}）"))?;
+    let sha = raw.trim().to_string();
+    if sha.len() == 40 && sha.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        Ok(sha)
+    } else {
+        Err(format!(
+            "PR #{number} 没有可用的合并提交编号（gh 返回 {}）",
+            if sha.is_empty() { "空" } else { sha.as_str() }
+        ))
+    }
+}
+
+/// M262：合并提交是否已在默认分支上。能用真实合并提交编号就用它判定；取不到编号时才
+/// 退回提交信息里的 `(#N)`（查完整历史，不设条数上限）；两样都确认不了就写未核验，
+/// 绝不写成「还没有这个 PR 的合并提交」。
+fn closeout_merge_commit_fact(
+    target: &CloseoutTarget,
+    tracked: &str,
+    merge_commit: Result<String, String>,
+) -> String {
+    let fallback_reason = match merge_commit {
+        Ok(sha) => {
+            let default_branch = &target.default_branch;
+            match closeout_git(
+                &target.root,
+                &["branch", "-a", "--contains", &sha, "--format=%(refname)"],
+            ) {
+                Err(error) => format!("合并提交 {sha} 不在本地仓库对象里（{error}）"),
+                Ok(contains) => {
+                    let wanted = format!("refs/remotes/{tracked}");
+                    let local = format!("refs/heads/{default_branch}");
+                    if contains
+                        .lines()
+                        .map(str::trim)
+                        .any(|line| line == wanted || line == local)
+                    {
+                        return format!(
+                            "合并提交已在 {default_branch} 分支（{}）",
+                            &sha[..sha.len().min(8)]
+                        );
+                    }
+                    return format!("{default_branch} 分支上还没有这个 PR 的合并提交");
+                }
+            }
+        }
+        Err(error) => error,
+    };
+    let needle = format!("(#{})", target.pr_number);
+    let grep_arg = format!("--grep={needle}");
+    match closeout_git(
+        &target.root,
+        &["log", "--fixed-strings", "--format=%H", &grep_arg, tracked],
+    ) {
+        Ok(hits) if !hits.trim().is_empty() => format!(
+            "合并提交已在 {} 分支（提交信息里的 PR 号）",
+            target.default_branch
+        ),
+        Ok(_) => format!(
+            "合并提交未核验：{fallback_reason}；{} 的完整历史里也没有带 {needle} 的合并提交",
+            target.default_branch
+        ),
+        Err(error) => format!("合并提交未核验：{fallback_reason}；完整历史检索失败（{error}）"),
+    }
+}
+
 /// M259/R1/R2/R3：逐项核对，返回按固定顺序排列的事实句。
 pub(crate) fn verify_closeout(target: &CloseoutTarget) -> Vec<String> {
+    verify_closeout_with(target, closeout_gh_merge_commit)
+}
+
+fn verify_closeout_with(
+    target: &CloseoutTarget,
+    merge_commit_of: impl Fn(&CloseoutTarget) -> Result<String, String>,
+) -> Vec<String> {
     let mut facts = Vec::new();
     let tracked = format!("{}/{}", target.remote, target.default_branch);
     // 1. 合并提交是否已经在默认分支上（需要先更新远端引用，否则看到的是旧历史）。
     match closeout_git(&target.root, &["fetch", "--prune", &target.remote, &target.default_branch]) {
         Err(error) => facts.push(format!("合并提交未核验：{error}")),
-        Ok(_) => match closeout_git(&target.root, &["log", "--format=%s", "-n", "500", &tracked]) {
-            Err(error) => facts.push(format!("合并提交未核验：{error}")),
-            Ok(log) => {
-                let needle = format!("(#{})", target.pr_number);
-                if log.lines().any(|line| line.contains(&needle)) {
-                    facts.push(format!("合并提交已在 {} 分支", target.default_branch));
-                } else {
-                    facts.push(format!("{} 分支上还没有这个 PR 的合并提交", target.default_branch));
-                }
-            }
-        },
+        Ok(_) => facts.push(closeout_merge_commit_fact(
+            target,
+            &tracked,
+            merge_commit_of(target),
+        )),
     }
     // 2. 远端分支：仍在本会话自己的分支上才删除（M257 授权边界不变）。
     let own_branch = !target.branch.is_empty()
@@ -4774,5 +4863,64 @@ mod m210_tests {
         }
         assert!(git_in(&work, &["ls-remote", "--heads", "origin", "feat-m259"]).is_empty());
         db.close().await;
+    }
+
+    /// M262：本仓库真实发生过的事故——PR #1031 的合并提交 139f4488a 的提交信息里
+    /// 根本没有 "1031"，于是「提交标题里带 (#N)」这条判据把已合并说成没合并。
+    fn m262_repo_without_pr_marker() -> (tempfile::TempDir, std::path::PathBuf, String) {
+        let tmp = tempfile::tempdir().unwrap();
+        let remote = tmp.path().join("remote.git");
+        std::fs::create_dir_all(&remote).unwrap();
+        git_in(&remote, &["init", "--bare", "--initial-branch=main"]);
+        let work = tmp.path().join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        git_in(&work, &["init", "--initial-branch=main"]);
+        std::fs::write(work.join("README.md"), "base\n").unwrap();
+        git_in(&work, &["add", "-A"]);
+        git_in(&work, &["commit", "-m", "base"]);
+        git_in(&work, &["remote", "add", "origin", remote.to_str().unwrap()]);
+        git_in(&work, &["push", "-u", "origin", "main"]);
+        git_in(&work, &["checkout", "-b", "feat-m262"]);
+        std::fs::write(work.join("feature.txt"), "feature\n").unwrap();
+        git_in(&work, &["add", "-A"]);
+        git_in(&work, &["commit", "-m", "feat: closeout probe"]);
+        git_in(&work, &["push", "-u", "origin", "feat-m262"]);
+        git_in(&work, &["checkout", "main"]);
+        git_in(&work, &["merge", "--squash", "feat-m262"]);
+        git_in(&work, &["commit", "-m", "feat: closeout probe"]);
+        let sha = git_in(&work, &["rev-parse", "HEAD"]);
+        git_in(&work, &["push", "origin", "main"]);
+        git_in(&work, &["push", "origin", "--delete", "feat-m262"]);
+        (tmp, work, sha)
+    }
+
+    fn m262_target(work: &std::path::Path) -> CloseoutTarget {
+        CloseoutTarget { branch: "feat-m262".into(), ..closeout_target_for(work) }
+    }
+
+    /// R1/R2：确认不了的事必须写「未核验」，不能写成「还没合并」。
+    #[test]
+    fn m262_unknown_merge_commit_is_unverified_not_absent() {
+        let (_tmp, work, _sha) = m262_repo_without_pr_marker();
+        let facts = verify_closeout(&m262_target(&work)).join("；");
+        assert!(
+            !facts.contains("还没有这个 PR 的合并提交"),
+            "查不到合并提交时不能断言没合并：{facts}"
+        );
+        assert!(facts.contains("合并提交未核验"), "查不到就必须说未核验：{facts}");
+    }
+
+    /// R1：拿到真实合并提交编号后，标题里没有 PR 号也必须认定已在 main 上。
+    #[test]
+    fn m262_real_merge_commit_on_default_branch_is_reported_from_its_sha() {
+        let (_tmp, work, sha) = m262_repo_without_pr_marker();
+        let target = m262_target(&work);
+        assert!(
+            !git_in(&work, &["log", "--format=%B", "-1", &sha]).contains("(#42)"),
+            "夹具必须复现事故形态：合并提交信息里没有 PR 号"
+        );
+        let facts = verify_closeout_with(&target, |_| Ok(sha.clone())).join("；");
+        assert!(facts.contains("合并提交已在 main 分支"), "{facts}");
+        assert!(!facts.contains("还没有这个 PR 的合并提交"), "{facts}");
     }
 }
