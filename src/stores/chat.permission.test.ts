@@ -124,4 +124,21 @@ describe("respondPermission — session permission mode", () => {
     expect(respondCall![1]).toEqual({ intentId: "intent-tc1", allow: true });
     consoleError.mockRestore();
   });
+
+  // M265: the reason travels with the decision, on the very same call.
+  it("carries a rejection note on the same call as the denial", async () => {
+    await useChatStore.getState().respondPermission(false, { note: "  keep the stash  " });
+
+    const respondCall = invokeMock.mock.calls.find((c) => c[0] === "respond_to_permission");
+    expect(respondCall![1]).toEqual({ intentId: "intent-tc1", allow: false, note: "keep the stash" });
+  });
+
+  // M265 R5: an unexplained denial must stay byte-for-byte what it was.
+  it("adds no note field when the user writes nothing", async () => {
+    await useChatStore.getState().respondPermission(false);
+
+    const respondCall = invokeMock.mock.calls.find((c) => c[0] === "respond_to_permission");
+    expect(respondCall![1]).toEqual({ intentId: "intent-tc1", allow: false });
+    expect(respondCall![1]).not.toHaveProperty("note");
+  });
 });

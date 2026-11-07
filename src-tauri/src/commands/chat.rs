@@ -394,8 +394,14 @@ pub async fn respond_to_permission(
     app: AppHandle,
     intent_id: String,
     allow: bool,
+    // M265: the sentence the user attached to this decision. It rides on the
+    // same channel as `allow`, so the model reads one decision with its reason.
+    note: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<(), AppError> {
+    // Same limit as the dispatch boundary: one shared rule, two entrances.
+    let note = crate::agent::permission_intent::normalize_permission_note(note)
+        .map_err(AppError::Other)?;
     let pool = state.db.read().await.clone();
     let store = crate::agent::permission_intent::PermissionIntentStore::new(pool.clone());
     let intent = store
@@ -422,7 +428,13 @@ pub async fn respond_to_permission(
         // disappeared after removal from the registry, immediately adopt the
         // exact response into the same Objective instead of inviting a retry
         // or waiting for another application restart.
-        if sender.send(allow).is_err() {
+        if sender
+            .send(crate::PermissionDecision {
+                allow,
+                note: note.clone(),
+            })
+            .is_err()
+        {
             let settlement = store
                 .reconcile_orphaned_response(&intent_id, Utc::now().timestamp_millis())
                 .await

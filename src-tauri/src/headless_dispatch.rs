@@ -131,7 +131,17 @@ pub enum Request {
     ListApprovals {},
     /// CF-HDE-R6: approve/deny one pending request. Approving still goes
     /// through the same permission rules — this is not a blanket grant.
-    ResolveApproval { approval_id: String, approve: bool },
+    ///
+    /// M265: `note` is the optional sentence the user attaches to the decision
+    /// ("don't hard reset, keep the stash"). It travels with the decision so
+    /// the model reads one refusal with its reason. It is commentary only and
+    /// never widens what was approved.
+    ResolveApproval {
+        approval_id: String,
+        approve: bool,
+        #[serde(default)]
+        note: Option<String>,
+    },
     /// CF-HDE-R6 (M42): move the main window back to the main display.
     FocusMainDisplay {},
     /// CF-BLD-R4: reclaim what is safe to reclaim from the build cache
@@ -240,9 +250,15 @@ impl Response {
 /// Validation is fail-closed: anything the entry point cannot fully understand
 /// is rejected here, before the host is asked to do anything.
 pub fn parse_request(raw: &str) -> Result<Request, ErrorBody> {
-    let request: Request = serde_json::from_str(raw)
+    let mut request: Request = serde_json::from_str(raw)
         .map_err(|error| ErrorBody::invalid(format!("malformed dispatch request: {error}")))?;
     validate_request(&request)?;
+    if let Request::ResolveApproval { note, .. } = &mut request {
+        // Validation proved the length; normalization makes what reaches the
+        // model identical no matter which entrance the note came through.
+        *note = crate::agent::permission_intent::normalize_permission_note(note.take())
+            .map_err(ErrorBody::invalid)?;
+    }
     Ok(request)
 }
 
@@ -341,8 +357,10 @@ pub fn validate_request(request: &Request) -> Result<(), ErrorBody> {
             }
         }
         Request::ListApprovals {} => {}
-        Request::ResolveApproval { approval_id, .. } => {
-            require_non_empty("approval_id", approval_id)?
+        Request::ResolveApproval { approval_id, note, .. } => {
+            require_non_empty("approval_id", approval_id)?;
+            crate::agent::permission_intent::normalize_permission_note(note.clone())
+                .map_err(ErrorBody::invalid)?;
         }
         Request::FocusMainDisplay {} => {}
         Request::SetSessionUsageWindowOverride { session_id, .. } => require_non_empty("session_id", session_id)?,
@@ -492,8 +510,14 @@ impl AuditEntry {
                 entry.message = Some(format!("endpoint={endpoint}; five_hour_percent={five_hour_percent:?}; weekly_percent={weekly_percent:?}"));
             }
             Request::ListApprovals {} | Request::FocusMainDisplay {} | Request::CleanBuildCache {} => {}
-            Request::ResolveApproval { approval_id, .. } => {
-                entry.message = Some(format!("approval_id={approval_id}"));
+            Request::ResolveApproval { approval_id, note, .. } => {
+                // The note's text is the user's words, not audit metadata: the
+                // audit line records only that an explanation came with the
+                // decision (Observation Harness, M265).
+                entry.message = Some(match note {
+                    Some(_) => format!("approval_id={approval_id}; note=provided"),
+                    None => format!("approval_id={approval_id}"),
+                });
             }
         }
         entry
@@ -1330,6 +1354,42 @@ mod tests {
         }
         assert_eq!(ErrorBody::not_found("x").code, "not_found");
         assert_eq!(ErrorBody::internal("x").code, "internal");
+    }
+
+    #[test]
+    fn resolve_approval_carries_an_optional_note_but_never_widens_the_decision() {
+        // M265: the reason for a rejection rides along with the rejection, so the
+        // model sees one decision instead of a denial followed by a separate steer.
+        let with_note = parse_request(
+            r#"{"operation":"resolve_approval","approval_id":"a-1","approve":false,"note":"  keep the stash  "}"#,
+        )
+        .expect("an optional note is legal");
+        match with_note {
+            Request::ResolveApproval { approve, note, .. } => {
+                assert!(!approve, "a note never turns a denial into an approval");
+                assert_eq!(note.as_deref(), Some("keep the stash"));
+            }
+            other => panic!("expected resolve_approval, got {other:?}"),
+        }
+
+        // Absent and blank notes stay "no note": the pre-M265 request is unchanged.
+        let absent = parse_request(r#"{"operation":"resolve_approval","approval_id":"a-1","approve":true}"#)
+            .expect("the note is optional");
+        assert!(matches!(absent, Request::ResolveApproval { note: None, .. }));
+        let blank = parse_request(
+            r#"{"operation":"resolve_approval","approval_id":"a-1","approve":false,"note":"   "}"#,
+        )
+        .expect("a blank note is not a failure");
+        assert!(matches!(blank, Request::ResolveApproval { note: None, .. }));
+
+        // Over the limit is refused at the boundary, never silently truncated.
+        let long = format!(
+            r#"{{"operation":"resolve_approval","approval_id":"a-1","approve":false,"note":"{}"}}"#,
+            "x".repeat(crate::agent::permission_intent::PERMISSION_NOTE_MAX_CHARS + 1)
+        );
+        let error = parse_request(&long).expect_err("an over-long note is refused");
+        assert_eq!(error.code, "invalid_request");
+        assert!(error.message.contains("note"), "{}", error.message);
     }
 
     #[test]

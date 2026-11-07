@@ -12,6 +12,15 @@ describe("CF-HDE-R12 durable dispatch integration", () => {
   it("resolves exactly one intent using the existing permission command", () => {
     const source = readFileSync("src/lib/useAppDispatchBridge.ts", "utf8");
     const handler = source.slice(source.indexOf("resolveApproval: async"), source.indexOf("status: async"));
-    expect(handler).toContain('invoke("respond_to_permission", { intentId: approvalId, allow: approve })');
+    expect(handler).toContain('"respond_to_permission"');
+    expect(handler).toContain("{ intentId: approvalId, allow: approve }");
+  });
+  // M265: the note rides on that same command, never a second call.
+  it("forwards the rejection note on the same permission command", () => {
+    const source = readFileSync("src/lib/useAppDispatchBridge.ts", "utf8");
+    const handler = source.slice(source.indexOf("resolveApproval: async"), source.indexOf("status: async"));
+    expect(handler).toContain("note ? { intentId: approvalId, allow: approve, note }");
+    expect(handler).toContain("note: note ?? null");
+    expect(handler.match(/respond_to_permission/g)).toHaveLength(1);
   });
 });

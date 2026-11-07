@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-import { useLayoutEffect, useRef, type KeyboardEvent as ReactKeyboardEvent } from "react";
+import { useLayoutEffect, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from "react";
 import { Check, ShieldAlert, X, Unlock } from "lucide-react";
 import { createTwoFilesPatch } from "diff";
 import type { PendingPermission } from "../stores/chat";
@@ -10,9 +10,13 @@ interface Props {
   request: PendingPermission;
   trusted: boolean;
   onAllow: () => void;
-  onDeny: () => void;
+  /** `note` is the optional reason the user typed for refusing (M265). */
+  onDeny: (note?: string) => void;
   onAllowFullAccess: () => void;
 }
+
+/** Must stay equal to the Rust dispatch boundary's cap (`PERMISSION_NOTE_MAX_CHARS`). */
+export const PERMISSION_NOTE_MAX_CHARS = 1000;
 
 const FOCUSABLE_SELECTOR = [
   "a[href]",
@@ -96,6 +100,7 @@ export function PermissionDialog({
     ? diagnostic as Record<string, unknown> : null;
   const remoteDelivery = request.toolName === "deliver_changes"
     || (request.toolName === "bash" && /\b(git\s+(push|tag)|gh\s+(pr\s+(create|merge)|release)|glab\s+mr\s+(create|merge))\b/.test(formatToolArgs(request.args)));
+  const [note, setNote] = useState("");
   const dialogRef = useRef<HTMLDivElement>(null);
   const denyButtonRef = useRef<HTMLButtonElement>(null);
   const restoreFocusRef = useRef<HTMLElement | null>(null);
@@ -116,6 +121,8 @@ export function PermissionDialog({
     if (event.key === "Escape") {
       event.preventDefault();
       event.stopPropagation();
+      // Escape stays a plain refusal: an unfinished sentence in the box is
+      // being abandoned, not submitted (M265 keeps the note on the button).
       onDeny();
       return;
     }
@@ -172,6 +179,19 @@ export function PermissionDialog({
           </div>
           <div className="mb-2 text-label text-gray-600">参数</div>
           <ToolArgsPreview request={request} />
+          <label className="mt-3 block text-label text-gray-500" htmlFor="permission-note-input">
+            拒绝理由（可选，会原样告知模型）
+          </label>
+          <textarea
+            id="permission-note-input"
+            data-testid="permission-note"
+            value={note}
+            maxLength={PERMISSION_NOTE_MAX_CHARS}
+            rows={2}
+            onChange={(event) => setNote(event.target.value)}
+            placeholder="例如：先别动 stash，我需要保留这些改动"
+            className="mt-1 w-full resize-y rounded border border-border bg-surface-1 px-2 py-1.5 text-label text-gray-200 placeholder:text-gray-600 focus:border-accent focus:outline-none"
+          />
           <div className="mt-3 rounded border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-label text-amber-800 dark:text-amber-200">
             等待你的批准；超时或无人应答不会记成你拒绝，请确认操作范围后再批准。
           </div>
@@ -185,7 +205,7 @@ export function PermissionDialog({
         <div className="flex flex-wrap justify-end gap-2 border-t border-border px-4 py-3">
           <button
             ref={denyButtonRef}
-            onClick={onDeny}
+            onClick={() => onDeny(note.trim() || undefined)}
             className="inline-flex min-h-11 items-center gap-1.5 rounded border border-border px-3 text-label text-gray-400 hover:bg-surface-3 hover:text-gray-100 lg:min-h-9"
           >
             <X size={14} />
