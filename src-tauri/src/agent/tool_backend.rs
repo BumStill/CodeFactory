@@ -263,43 +263,13 @@ async fn prepare_file_observation(
                     ))
                 }
             };
-            let Some(old_string) = args.get("old_string").and_then(serde_json::Value::as_str)
-            else {
-                return FileObservationAdmission::Refused(
-                    "`edit_file` 缺少字符串参数 `old_string`，未执行。请补上要替换的原文后再调用。"
-                        .to_string(),
-                );
-            };
-            let Some(new_string) = args.get("new_string").and_then(serde_json::Value::as_str)
-            else {
-                return FileObservationAdmission::Refused(
-                    "`edit_file` 缺少字符串参数 `new_string`，未执行。请补上替换后的内容后再调用。"
-                        .to_string(),
-                );
-            };
-            let replace_all = args
-                .get("replace_all")
-                .and_then(serde_json::Value::as_bool)
-                .unwrap_or(false);
-            if !replace_all {
-                let count = original.matches(old_string).count();
-                if count == 0 {
-                    return FileObservationAdmission::Refused(format!(
-                        "`{relative}` 里没有找到 `old_string`（出现 0 次）。\
-请先 read_file 核对这段原文，包括缩进和空白，再调用。"
-                    ));
-                }
-                if count > 1 {
-                    return FileObservationAdmission::Refused(format!(
-                        "`old_string` 在 `{relative}` 里出现了 {count} 次。\
-请加长它使其唯一，或设 `replace_all: true`。"
-                    ));
-                }
-            }
-            if replace_all {
-                original.replace(old_string, new_string).into_bytes()
-            } else {
-                original.replacen(old_string, new_string, 1).into_bytes()
+            // M263: the batch form carries its changes in `edits` instead of
+            // `old_string`/`new_string`, and is planned by the very helper the
+            // tool executes, so the expected digest cannot drift from the write.
+            // The legacy single-edit wording and no-match tolerance stay as-is.
+            match edit_file_expected(&relative, &original, args) {
+                Ok(expected) => expected,
+                Err(message) => return FileObservationAdmission::Refused(message),
             }
         }
     };
@@ -311,6 +281,61 @@ async fn prepare_file_observation(
         precondition_digest,
         expected_postcondition_digest: bytes_digest(&expected),
     })
+}
+
+/// Expected post-edit bytes for `edit_file`, or the refusal message to hand back
+/// to the model. The M263 batch form is planned by the same helper the tool
+/// executes, so the admission digest and the real write cannot disagree.
+fn edit_file_expected(
+    relative: &str,
+    original: &str,
+    args: &serde_json::Value,
+) -> std::result::Result<Vec<u8>, String> {
+    if args.get("edits").is_some() {
+        let plan = crate::tools::edit::plan_from_args(args)
+            .map_err(|message| format!("`{relative}` 的 `edit_file` 参数无效：{message}"))?;
+        return crate::tools::edit::apply_plan(original, &plan)
+            .map(String::into_bytes)
+            .map_err(|message| format!("`{relative}`：{message}"));
+    }
+
+    let Some(old_string) = args.get("old_string").and_then(serde_json::Value::as_str) else {
+        return Err(
+            "`edit_file` 缺少字符串参数 `old_string`，未执行。请补上要替换的原文后再调用。\
+（同一文件有多处改动时，用 `edits` 数组一次提交。）"
+                .to_string(),
+        );
+    };
+    let Some(new_string) = args.get("new_string").and_then(serde_json::Value::as_str) else {
+        return Err(
+            "`edit_file` 缺少字符串参数 `new_string`，未执行。请补上替换后的内容后再调用。"
+                .to_string(),
+        );
+    };
+    let replace_all = args
+        .get("replace_all")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    if !replace_all {
+        let count = original.matches(old_string).count();
+        if count == 0 {
+            return Err(format!(
+                "`{relative}` 里没有找到 `old_string`（出现 0 次）。\
+请先 read_file 核对这段原文，包括缩进和空白，再调用。"
+            ));
+        }
+        if count > 1 {
+            return Err(format!(
+                "`old_string` 在 `{relative}` 里出现了 {count} 次。\
+请加长它使其唯一，或设 `replace_all: true`。"
+            ));
+        }
+    }
+    if replace_all {
+        Ok(original.replace(old_string, new_string).into_bytes())
+    } else {
+        Ok(original.replacen(old_string, new_string, 1).into_bytes())
+    }
 }
 
 async fn observe_file_contract(
@@ -4442,6 +4467,60 @@ mod tests {
             matches!(admission, MutationAdmission::Dispatch { .. }),
             "`replace_all: true` is the documented escape hatch and must stay admissible"
         );
+    }
+
+    /// M263: an `edits` batch is one admissible call, and the executor accepts
+    /// the same arguments the admission plan approved. Before this, several
+    /// changes to one file cost one approval each, so the model escaped to
+    /// `python3 - <<'PY'` scripts and paid 3-8 approvals a task.
+    #[tokio::test]
+    async fn batch_edits_are_admissible_in_one_call_and_the_executor_agrees() {
+        let backend = objective_backend(false).await;
+        let dir = tempfile::tempdir().unwrap();
+        tokio::fs::write(dir.path().join("target.rs"), "alpha\nbeta\n")
+            .await
+            .unwrap();
+        let args = serde_json::json!({
+            "path": "target.rs",
+            "edits": [
+                { "old_string": "alpha", "new_string": "ALPHA" },
+                { "old_string": "beta", "new_string": "BETA" },
+            ],
+        });
+        let call = call_with_args("edit-batch", "edit_file", &args);
+        register_tool_call(&backend, &call, &args).await;
+        let (command, kind) = backend.classify(&call, &args);
+
+        let admission = backend
+            .mutation_preflight(
+                &call,
+                &args,
+                &objective_ctx(dir.path()),
+                &command,
+                kind,
+                false,
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(admission, MutationAdmission::Dispatch { .. }),
+            "a batch of exact edits must be admissible as one call"
+        );
+
+        let output = crate::tools::edit::execute(
+            args.clone(),
+            &crate::tools::ExecCtx::new(dir.path().to_path_buf(), None),
+        )
+        .await
+        .unwrap();
+        let written = tokio::fs::read_to_string(dir.path().join("target.rs"))
+            .await
+            .unwrap();
+
+        assert!(!output.is_error, "{}", output.content);
+        assert_eq!(written, "ALPHA\nBETA\n");
+        assert!(output.content.contains("Applied 2 changes"));
     }
 
     #[tokio::test]
