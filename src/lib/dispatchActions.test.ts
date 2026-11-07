@@ -456,7 +456,7 @@ describe("CF-HDE-R8 · 插话与排队可选", () => {
       { sessionId: "A", message: "工具结束后调整", mode: "steer" },
       { steerAppliedTimeoutMs: 30 },
     );
-    expect(receipt.delivery).toMatchObject({ status: "queued", note: "当前步骤结束后读取" });
+    expect(receipt.delivery).toMatchObject({ status: "queued", note: DISPATCH_STEER_PENDING_NOTE });
     expect(invokeMock).toHaveBeenCalledWith("queue_interjection", expect.objectContaining({ sessionId: "A" }));
     expect(useChatStore.getState().runtime.B.messages).toEqual([]);
   });

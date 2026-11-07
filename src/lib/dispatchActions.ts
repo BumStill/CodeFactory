@@ -43,8 +43,16 @@ export const DISPATCH_DELIVERY_AHEAD_CURRENT_RUN = "current_run";
  */
 export const DISPATCH_STEER_APPLIED_TIMEOUT_MS = 4_000;
 
-/** 插话已交出、但这一轮还没读到时的如实说明。 */
-export const DISPATCH_STEER_PENDING_NOTE = "当前步骤结束后读取";
+/**
+ * 插话已交出、但这一轮还没读到时的如实说明（M261）。
+ *
+ * 它不再只是"内存里排着"：接受到的那一刻就已经落库（`pending_steer_messages`），
+ * 所以可以明确说清什么时候送达——本回合下一次模型调用之前；回合若先结束/被停止，
+ * 下一个回合的 inbox 会把它捡回来。旧文案只说"当前步骤结束后读取"，在回合一直
+ * 卡在审批或工具里时等于什么都没承诺。
+ */
+export const DISPATCH_STEER_PENDING_NOTE =
+  "已持久化，等当前步骤结束后读取（本回合下一次模型调用前送达）";
 
 export interface DispatchDeliveryReceipt {
   status: "delivered" | "queued";
