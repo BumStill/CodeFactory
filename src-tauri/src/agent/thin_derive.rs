@@ -969,8 +969,168 @@ async fn continue_state(db: &SqlitePool, session: &str, at: i64, why: &str) -> s
     }))
 }
 
-pub(crate) fn closeout_bounded_result(reason: &str, fires: i64) -> String {
-    format!("{reason}；合并后收尾唤醒已触发 {fires} 次，不再重复起回合；§8 收尾未核验项：squash commit、远端分支清理、本地未提交/未推送状态、构建产物与后台进程清理。详见本会话工具收据。")
+/// M259：结束原因只写当场查到的事实。查得到的写结果，查不到的写「未核验」和原因；
+/// 不再用固定的「未核验项」清单，因为那会把已经做完的收尾说成没做。
+pub(crate) async fn closeout_result(db: &SqlitePool, session: &str, reason: &str) -> String {
+    let facts = match closeout_target(db, session).await {
+        Ok(Some(target)) => {
+            match tokio::time::timeout(
+                CLOSEOUT_PROBE_BUDGET,
+                tokio::task::spawn_blocking(move || verify_closeout(&target)),
+            )
+            .await
+            {
+                Ok(Ok(items)) => items,
+                Ok(Err(_)) => vec!["收尾未核验：检查过程异常退出".to_string()],
+                Err(_) => vec!["收尾未核验：检查超时，远端状态未知".to_string()],
+            }
+        }
+        Ok(None) => vec!["收尾未核验：找不到本会话的工作区，无法核对合并提交、远端分支与本地改动".to_string()],
+        Err(error) => vec![format!("收尾未核验：{error}")],
+    };
+    format!("{reason}；{}。", facts.join("；"))
+}
+
+/// M259：核对收尾所需的仓库坐标，全部来自本会话自己的记录。
+pub(crate) struct CloseoutTarget {
+    pub(crate) root: std::path::PathBuf,
+    pub(crate) remote: String,
+    pub(crate) default_branch: String,
+    pub(crate) branch: String,
+    pub(crate) pr_number: i64,
+}
+
+const CLOSEOUT_GIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+const CLOSEOUT_PROBE_BUDGET: std::time::Duration = std::time::Duration::from_secs(45);
+
+fn closeout_git(root: &std::path::Path, args: &[&str]) -> Result<String, String> {
+    let mut command = std::process::Command::new("git").no_window();
+    command
+        .current_dir(root)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .args(args);
+    crate::agent::delivery::bounded_delivery_output_with_timeout(&mut command, CLOSEOUT_GIT_TIMEOUT)
+}
+
+/// M259/R1/R2/R3：逐项核对，返回按固定顺序排列的事实句。
+pub(crate) fn verify_closeout(target: &CloseoutTarget) -> Vec<String> {
+    let mut facts = Vec::new();
+    let tracked = format!("{}/{}", target.remote, target.default_branch);
+    // 1. 合并提交是否已经在默认分支上（需要先更新远端引用，否则看到的是旧历史）。
+    match closeout_git(&target.root, &["fetch", "--prune", &target.remote, &target.default_branch]) {
+        Err(error) => facts.push(format!("合并提交未核验：{error}")),
+        Ok(_) => match closeout_git(&target.root, &["log", "--format=%s", "-n", "500", &tracked]) {
+            Err(error) => facts.push(format!("合并提交未核验：{error}")),
+            Ok(log) => {
+                let needle = format!("(#{})", target.pr_number);
+                if log.lines().any(|line| line.contains(&needle)) {
+                    facts.push(format!("合并提交已在 {} 分支", target.default_branch));
+                } else {
+                    facts.push(format!("{} 分支上还没有这个 PR 的合并提交", target.default_branch));
+                }
+            }
+        },
+    }
+    // 2. 远端分支：仍在本会话自己的分支上才删除（M257 授权边界不变）。
+    let own_branch = !target.branch.is_empty()
+        && target.branch != target.default_branch
+        && target.branch != "HEAD";
+    if !own_branch {
+        facts.push("远端分支无需清理".to_string());
+    } else {
+        match closeout_git(&target.root, &["ls-remote", "--heads", &target.remote, &target.branch]) {
+            Ok(out) if out.trim().is_empty() => {
+                facts.push(format!("远端分支 {} 已清理", target.branch));
+            }
+            Ok(_) => {
+                match closeout_git(&target.root, &["push", &target.remote, "--delete", &target.branch]) {
+                    Ok(_) => facts.push(format!("远端分支 {} 还在，已由系统删除", target.branch)),
+                    Err(error) => facts.push(format!("远端分支 {} 还在，系统删除失败：{error}", target.branch)),
+                }
+            }
+            Err(error) => facts.push(format!("远端分支 {} 未核验：{error}", target.branch)),
+        }
+    }
+    // 3. 本地未提交 / 未推送改动：只报告，不清理。
+    match closeout_git(&target.root, &["status", "--porcelain=v1", "-uall"]) {
+        Err(error) => facts.push(format!("工作区状态未核验：{error}")),
+        Ok(status) => {
+            let dirty: Vec<&str> = status.lines().filter(|line| !line.trim().is_empty()).collect();
+            if dirty.is_empty() {
+                facts.push("工作区没有未提交改动".to_string());
+            } else {
+                let names: Vec<String> = dirty
+                    .iter()
+                    .take(3)
+                    .map(|line| line.get(3..).unwrap_or(line).trim().to_string())
+                    .collect();
+                let more = if dirty.len() > names.len() { " 等" } else { "" };
+                facts.push(format!(
+                    "工作区还有 {} 处未提交改动（{}{more}），已原样保留",
+                    dirty.len(),
+                    names.join("、")
+                ));
+            }
+            if closeout_git(&target.root, &["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"]).is_err() {
+                facts.push("未推送提交未核验：本地分支没有上游跟踪".to_string());
+            } else {
+                match closeout_git(&target.root, &["rev-list", "--count", "@{upstream}..HEAD"]) {
+                    Err(error) => facts.push(format!("未推送提交未核验：{error}")),
+                    Ok(count) => match count.trim().parse::<usize>() {
+                        Ok(0) => facts.push("没有未推送的提交".to_string()),
+                        Ok(ahead) => facts.push(format!("还有 {ahead} 个提交没有推送，已原样保留")),
+                        Err(_) => facts.push(format!("未推送提交未核验：git 返回了无法解析的计数")),
+                    },
+                }
+            }
+        }
+    }
+    facts
+}
+
+async fn closeout_target(db: &SqlitePool, session: &str) -> Result<Option<CloseoutTarget>, String> {
+    if !has_table(db, "thin_external_observations").await.map_err(|e| e.to_string())? {
+        return Ok(None);
+    }
+    let pr_number: Option<i64> = sqlx::query_scalar(
+        "SELECT pr_number FROM thin_external_observations WHERE session_id=? AND merged_at IS NOT NULL",
+    )
+    .bind(session)
+    .fetch_optional(db)
+    .await
+    .map_err(|e| e.to_string())?;
+    let Some(pr_number) = pr_number else { return Ok(None) };
+    if !has_table(db, "execution_workspaces").await.map_err(|e| e.to_string())?
+        || !has_column(db, "execution_workspaces", "worktree_path").await.map_err(|e| e.to_string())?
+    {
+        return Ok(None);
+    }
+    let workspace: Option<(String, String)> = sqlx::query_as(
+        "SELECT worktree_path,branch_name FROM execution_workspaces WHERE session_id=? ORDER BY updated_at DESC LIMIT 1",
+    )
+    .bind(session)
+    .fetch_optional(db)
+    .await
+    .map_err(|e| e.to_string())?;
+    let Some((path, workspace_branch)) = workspace else { return Ok(None) };
+    let recorded: Option<String> = if has_table(db, "thin_delivery_refs").await.map_err(|e| e.to_string())? {
+        sqlx::query_scalar("SELECT branch FROM thin_delivery_refs WHERE session_id=?")
+            .bind(session)
+            .fetch_optional(db)
+            .await
+            .map_err(|e| e.to_string())?
+    } else {
+        None
+    };
+    let repo = crate::agent::delivery::resolve_repo(std::path::Path::new(&path), None)
+        .map_err(|error| format!("无法读取工作区的 git 信息（{path}）：{error}"))?;
+    Ok(Some(CloseoutTarget {
+        root: repo.root,
+        remote: repo.remote,
+        default_branch: repo.default_branch,
+        branch: recorded.filter(|branch| !branch.trim().is_empty()).unwrap_or(workspace_branch),
+        pr_number,
+    }))
 }
 
 /// A successful tool receipt plus an explicit closeout final is stronger than
@@ -1322,8 +1482,8 @@ async fn derive_candidate(db: &SqlitePool, session: &str) -> sqlx::Result<ThinSt
     if let Some((reason, fires)) = merged_closeout_fact(db, session).await? {
         if fires > 0 {
             let result = if closeout_report(db, session).await?.is_some() {
-                format!("{reason}；§8 收尾完成，核验详情见本会话收尾报告与工具收据")
-            } else { closeout_bounded_result(&reason, fires) };
+                format!("{reason}；收尾已完成，明细见本会话工具记录")
+            } else { closeout_result(db, session, &reason).await };
             return Ok(ThinState::ended(&result, "本会话记录"));
         }
         // merged_at remains authoritative when a legacy through_release
@@ -4472,6 +4632,147 @@ mod m210_tests {
         let reason: Option<String> = sqlx::query_scalar("SELECT terminal_reason FROM chat_turn_state WHERE root_turn_id='m210-root'")
             .fetch_one(&db).await.unwrap();
         assert_eq!(reason.as_deref(), Some("orphaned_by_restart"));
+        db.close().await;
+    }
+
+    // ---- M259：结束原因是当场核对的事实，不是固定清单 ----
+
+    fn git_in(dir: &std::path::Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("git").no_window()
+            .current_dir(dir)
+            .env("GIT_AUTHOR_NAME", "m259")
+            .env("GIT_AUTHOR_EMAIL", "m259@example.com")
+            .env("GIT_COMMITTER_NAME", "m259")
+            .env("GIT_COMMITTER_EMAIL", "m259@example.com")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .args(args)
+            .output()
+            .expect("run git");
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// 真实仓库 + 真实远端：默认分支上已有 PR #42 的合并提交，特性分支在远端。
+    /// `branch_kept = false` 表示远端分支已被正常清理。
+    fn closeout_repo(branch_kept: bool) -> (tempfile::TempDir, std::path::PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let remote = tmp.path().join("remote.git");
+        std::fs::create_dir_all(&remote).unwrap();
+        git_in(&remote, &["init", "--bare", "--initial-branch=main"]);
+        let work = tmp.path().join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        git_in(&work, &["init", "--initial-branch=main"]);
+        std::fs::write(work.join("README.md"), "base\n").unwrap();
+        git_in(&work, &["add", "-A"]);
+        git_in(&work, &["commit", "-m", "base"]);
+        git_in(&work, &["remote", "add", "origin", remote.to_str().unwrap()]);
+        git_in(&work, &["push", "-u", "origin", "main"]);
+        git_in(&work, &["checkout", "-b", "feat-m259"]);
+        std::fs::write(work.join("feature.txt"), "feature\n").unwrap();
+        git_in(&work, &["add", "-A"]);
+        git_in(&work, &["commit", "-m", "feat: closeout probe"]);
+        git_in(&work, &["push", "-u", "origin", "feat-m259"]);
+        git_in(&work, &["checkout", "main"]);
+        git_in(&work, &["merge", "--squash", "feat-m259"]);
+        git_in(&work, &["commit", "-m", "feat: closeout probe (#42)"]);
+        git_in(&work, &["push", "origin", "main"]);
+        if !branch_kept {
+            git_in(&work, &["push", "origin", "--delete", "feat-m259"]);
+        }
+        (tmp, work)
+    }
+
+    fn closeout_target_for(work: &std::path::Path) -> CloseoutTarget {
+        CloseoutTarget {
+            root: work.to_path_buf(),
+            remote: "origin".into(),
+            default_branch: "main".into(),
+            branch: "feat-m259".into(),
+            pr_number: 42,
+        }
+    }
+
+    #[test]
+    fn m259_reports_verified_facts_when_closeout_is_done() {
+        let (_tmp, work) = closeout_repo(false);
+        let facts = verify_closeout(&closeout_target_for(&work)).join("；");
+        assert!(facts.contains("合并提交已在 main 分支"), "{facts}");
+        assert!(facts.contains("远端分支 feat-m259 已清理"), "{facts}");
+        assert!(facts.contains("工作区没有未提交改动"), "{facts}");
+        assert!(facts.contains("没有未推送的提交"), "{facts}");
+        assert!(!facts.contains("未核验"), "已核验的项不应写成未核验：{facts}");
+    }
+
+    #[test]
+    fn m259_deletes_the_sessions_own_remote_branch() {
+        let (_tmp, work) = closeout_repo(true);
+        assert!(!git_in(&work, &["ls-remote", "--heads", "origin", "feat-m259"]).is_empty());
+        let facts = verify_closeout(&closeout_target_for(&work)).join("；");
+        assert!(facts.contains("远端分支 feat-m259 还在，已由系统删除"), "{facts}");
+        assert!(git_in(&work, &["ls-remote", "--heads", "origin", "feat-m259"]).is_empty());
+        assert!(git_in(&work, &["ls-remote", "--heads", "origin", "main"]).contains("main"));
+    }
+
+    #[test]
+    fn m259_reports_local_changes_instead_of_cleaning_them() {
+        let (_tmp, work) = closeout_repo(false);
+        std::fs::write(work.join("dirty.txt"), "keep me\n").unwrap();
+        let facts = verify_closeout(&closeout_target_for(&work)).join("；");
+        assert!(facts.contains("工作区还有 1 处未提交改动"), "{facts}");
+        assert!(facts.contains("dirty.txt"), "{facts}");
+        assert!(work.join("dirty.txt").exists(), "本地改动必须原样保留");
+    }
+
+    #[test]
+    fn m259_names_unverified_items_with_a_reason() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = CloseoutTarget {
+            root: tmp.path().to_path_buf(),
+            remote: "origin".into(),
+            default_branch: "main".into(),
+            branch: "feat-m259".into(),
+            pr_number: 42,
+        };
+        let facts = verify_closeout(&target).join("；");
+        assert!(facts.contains("合并提交未核验："), "{facts}");
+        assert!(facts.contains("远端分支 feat-m259 未核验："), "{facts}");
+        assert!(facts.contains("工作区状态未核验："), "{facts}");
+        assert!(!facts.contains("已清理") && !facts.contains("没有未提交改动"), "{facts}");
+    }
+
+    #[tokio::test]
+    async fn m259_end_reason_is_grounded_in_the_real_workspace() {
+        let (_tmp, work) = closeout_repo(true);
+        let db = crate::storage::db::connect("sqlite::memory:").await.unwrap();
+        sqlx::query("CREATE TABLE IF NOT EXISTS thin_external_observations(session_id TEXT PRIMARY KEY,pr_number INTEGER NOT NULL,ceiling TEXT NOT NULL,merged_at INTEGER)").execute(&db).await.unwrap();
+        sqlx::query("CREATE TABLE IF NOT EXISTS execution_workspaces(id TEXT PRIMARY KEY,session_id TEXT,repo_root TEXT,worktree_path TEXT,branch_name TEXT,state TEXT,updated_at INTEGER)").execute(&db).await.ok();
+        sqlx::query("CREATE TABLE IF NOT EXISTS thin_delivery_refs(session_id TEXT PRIMARY KEY,branch TEXT NOT NULL,pr_number INTEGER NOT NULL,ceiling TEXT NOT NULL)").execute(&db).await.ok();
+        sqlx::query("INSERT INTO thin_external_observations(session_id,pr_number,ceiling,merged_at) VALUES ('m259',42,'through_release',1000)").execute(&db).await.unwrap();
+        sqlx::query("INSERT INTO objectives(id,kind,session_id,root_turn_id,status,decision_type,domain,requested_acceptance,created_at,updated_at) VALUES ('m259-objective','local_mutation','m259','m259','active','continue','chat','validated_change',1,1)").execute(&db).await.unwrap();
+        sqlx::query("INSERT INTO execution_workspaces(id,objective_id,session_id,repo_identity,repo_root,git_common_dir,worktree_path,worktree_identity,branch_name,base_ref,base_sha,head_sha,state,created_at,updated_at) VALUES ('ws','m259-objective','m259',?,?,?,?,?,'feat-m259','main','sha','sha','active',1,1)")
+            .bind(work.to_str().unwrap())
+            .bind(work.to_str().unwrap())
+            .bind(work.join(".git").to_str().unwrap())
+            .bind(work.to_str().unwrap())
+            .bind(work.to_str().unwrap())
+            .execute(&db).await.unwrap();
+        sqlx::query("INSERT INTO thin_delivery_refs VALUES ('m259','feat-m259',42,'through_release')").execute(&db).await.unwrap();
+
+        let reason = closeout_result(&db, "m259", "PR #42 已合并").await;
+        assert!(reason.contains("PR #42 已合并"), "{reason}");
+        assert!(reason.contains("合并提交已在 main 分支"), "{reason}");
+        assert!(reason.contains("远端分支 feat-m259 还在，已由系统删除"), "{reason}");
+        assert!(reason.contains("工作区没有未提交改动"), "{reason}");
+        for internal in ["§8", "squash", "唤醒", "未核验项"] {
+            assert!(!reason.contains(internal), "结束原因不能出现内部用语 {internal}：{reason}");
+        }
+        assert!(git_in(&work, &["ls-remote", "--heads", "origin", "feat-m259"]).is_empty());
         db.close().await;
     }
 }
