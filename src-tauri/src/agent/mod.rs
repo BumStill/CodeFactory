@@ -1571,6 +1571,9 @@ impl AgentLoop {
         // `steer_capability_override_with_authorization`.
         let delivery_authorized =
             fetch_session_delivery_authorized(&self.db, &self.session_id).await;
+        // M261: the same pool the loop persists into, so a steer that is still
+        // `pending` is recovered instead of dying with the round that stalled.
+        let steer_db = self.db.clone();
         let svc = codefactory_agent_loop::run::LoopServices {
             transport: std::sync::Arc::new(
                 self.model_transport(
@@ -1597,6 +1600,7 @@ impl AgentLoop {
                         queue,
                         session_id: self.session_id.clone(),
                         delivery_authorized,
+                        db: Some(steer_db.clone()),
                     })
                 }
                 None => std::sync::Arc::new(codefactory_agent_loop::services::NoSteering),

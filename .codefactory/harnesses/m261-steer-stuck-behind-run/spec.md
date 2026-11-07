@@ -1,0 +1,69 @@
+# M261 · 长回合里发给会话的消息送不到
+
+## 1. 现场（2026-11-07，v1.103.0，会话 4269df42）
+
+- 18:15–18:47，编排方用 dispatch `send`（`mode: steer` 与 `mode: queue` 都试过）给
+  一个**已经在跑**的会话发消息，5 条全部返回 `status: queued`、`ahead: current_run`、
+  `queue_position: N`，但会话里一条都没出现。
+- 18:47 编排方 `stop` 掉这个 run，再手发一条，**通了**。
+- 证据盘点：
+  - `messages` 表：5 条都没有。
+  - `queued_dispatch_messages` 表：只有更早一条 `delivered` 的，没有这 5 条。
+  - `chat_run_controls`：这段时间 1 条 `active`，中间多次等审批。
+  - App 日志无错误 —— 没有报错，也没有交付记录，属于**静默丢消息**。
+
+## 2. 根因（本次改动针对的部分）
+
+steer 走的是 `queue_interjection` → 内存 `InterjectionQueue`。agent loop 只在
+**回合顶部**（`run.rs` 每轮模型调用前）`steer.drain()`。当一个 run 整段都待在
+**同一个 round** 里（审批等待 + 工具执行，正是 18:15 那次），它永远走不到那个
+边界：
+
+- 消息只在 RAM 里，所以 `messages` 没有；
+- 它也不是 queued send，所以 `queued_dispatch_messages` 没有；
+- run 被 `stop` 时 HashMap 随之丢弃 —— 消息凭空消失。
+
+这解释了"停止后再发就通"：停止结束了那一轮，新消息进的是一个全新回合。
+
+## 3. 本次落地（R1/R3/R5 的最小可用切片）
+
+1. **持久化**：新增 `pending_steer_messages`
+   （`id, session_id, content, client_message_id, status, created_at, delivered_at`）。
+   `queue_interjection` 先写库、再进内存队列；写库失败就是接受失败，绝不返回
+   "已排队"而消息只存在 RAM 里。
+   - `status='pending'` = 已接受、还没有任何模型调用读到；
+   - `status='delivered'` = 已经进入该会话的模型历史。
+2. **恢复**：`SessionSteerInbox::drain()` 先取该会话所有 `pending` 行（上一个/卡住的
+   run 没读走的），再合并内存队列，按行 id 去重，交出去后标记 `delivered`。
+   于是"回合卡住 → stop → 下一回合"这条路径上，消息会被捡回来而不是消失。
+3. **如实回执（R3）**：steer 的 `queued` 回执改成
+   `已持久化，等当前步骤结束后读取（本回合下一次模型调用前送达）`，
+   不再用只描述内存排队的"当前步骤结束后读取"糊过去。
+
+## 4. Requirements
+
+| ID | 要求 | 状态 |
+| --- | --- | --- |
+| R1 | steer 在当前回合**下一次模型调用之前**送达，包括等审批/工具执行中 | 部分：loop 顶部 drain（已有）+ `pending` 行保证不丢；工具内部仍不可中断（见 §6） |
+| R2 | 回合结束后到达的消息，开新回合送达；不中途插进工具结果 | 已有（settle 后 drain queued send），本次未改 |
+| R3 | `queued` 回执必须说清"什么时候会送达"，不能只说"已排队" | 完成 |
+| R4 | 审批回执能带一句说明，写进工具结果给模型看 | 未做（见 §6） |
+| R5 | 这 5 条去哪了：`messages` 和 `queued_dispatch_messages` 都查不到，最终被 stop 丢掉 | 已定位 + 现在可查（`pending_steer_messages`） |
+
+## 5. 证据
+
+- `cargo test --lib commands::interjections`
+  - `a_steer_survives_the_round_that_never_read_it`：内存队列被丢弃后，新 inbox 仍能
+    取回这条 steer，第二次 drain 为空，库里 `pending` 归零。
+  - `an_accepted_steer_is_visible_as_pending_before_any_run_reads_it`：接受后、被读走前，
+    行留在库里是 `pending`，且不串会话。
+  - 原有幂等/承载授权测试保持通过。
+- `pnpm vitest run src/lib/dispatchActions.test.ts`：回执文案与该分支行为。
+
+## 6. 明确未做（后续任务，不夹带）
+
+- **R4 审批说明**：`resolve_approval` 还没有 `note` 字段。
+- **工具内部不可中断**：一个 30 分钟不返回的工具调用期间，steer 仍然只能等到它返回。
+  本次保证的是"不丢 + 可查 + 下一回合一定送到"，不是"当场打断工具"。
+- **`dispatch_message_status` 查 steer 行**：目前只能查 queued send 的行，steer 行状态
+  需要按 `pending_steer_messages.id` 查；对外回执尚未带上该 id。
