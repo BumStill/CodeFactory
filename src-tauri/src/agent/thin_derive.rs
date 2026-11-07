@@ -994,9 +994,13 @@ pub(crate) async fn closeout_result(db: &SqlitePool, session: &str, reason: &str
 /// M259：核对收尾所需的仓库坐标，全部来自本会话自己的记录。
 pub(crate) struct CloseoutTarget {
     pub(crate) root: std::path::PathBuf,
+    /// M264/R1：本单托管工作区。构建目录只在这里面清理，工作区外与共享缓存一律不碰。
+    pub(crate) worktree: std::path::PathBuf,
     pub(crate) remote: String,
     pub(crate) default_branch: String,
     pub(crate) branch: String,
+    /// M264/R1：分支名来自本会话 `thin_delivery_refs`（同一 pr_number）才允许删。
+    pub(crate) branch_recorded: bool,
     pub(crate) pr_number: i64,
 }
 
@@ -1054,7 +1058,7 @@ fn closeout_merge_commit_fact(
     target: &CloseoutTarget,
     tracked: &str,
     merge_commit: Result<String, String>,
-) -> String {
+) -> (String, bool) {
     let fallback_reason = match merge_commit {
         Ok(sha) => {
             let default_branch = &target.default_branch;
@@ -1071,12 +1075,18 @@ fn closeout_merge_commit_fact(
                         .map(str::trim)
                         .any(|line| line == wanted || line == local)
                     {
-                        return format!(
-                            "合并提交已在 {default_branch} 分支（{}）",
-                            &sha[..sha.len().min(8)]
+                        return (
+                            format!(
+                                "合并提交已在 {default_branch} 分支（{}）",
+                                &sha[..sha.len().min(8)]
+                            ),
+                            true,
                         );
                     }
-                    return format!("{default_branch} 分支上还没有这个 PR 的合并提交");
+                    return (
+                        format!("{default_branch} 分支上还没有这个 PR 的合并提交"),
+                        false,
+                    );
                 }
             }
         }
@@ -1088,16 +1098,125 @@ fn closeout_merge_commit_fact(
         &target.root,
         &["log", "--fixed-strings", "--format=%H", &grep_arg, tracked],
     ) {
-        Ok(hits) if !hits.trim().is_empty() => format!(
-            "合并提交已在 {} 分支（提交信息里的 PR 号）",
-            target.default_branch
+        Ok(hits) if !hits.trim().is_empty() => (
+            format!(
+                "合并提交已在 {} 分支（提交信息里的 PR 号）",
+                target.default_branch
+            ),
+            true,
         ),
-        Ok(_) => format!(
-            "合并提交未核验：{fallback_reason}；{} 的完整历史里也没有带 {needle} 的合并提交",
-            target.default_branch
+        Ok(_) => (
+            format!(
+                "合并提交未核验：{fallback_reason}；{} 的完整历史里也没有带 {needle} 的合并提交",
+                target.default_branch
+            ),
+            false,
         ),
-        Err(error) => format!("合并提交未核验：{fallback_reason}；完整历史检索失败（{error}）"),
+        Err(error) => (
+            format!("合并提交未核验：{fallback_reason}；完整历史检索失败（{error}）"),
+            false,
+        ),
     }
+}
+
+/// M264/R1：共享缓存由 CF-BUILD 预算管理，收尾只清理本单自己的构建目录。
+const SHARED_BUILD_DIR: &str = "cargo-target";
+const TASK_BUILD_DIR_PREFIX: &str = "cargo-target-";
+const WORKSPACE_BUILD_CACHE: &str = ".codefactory-cache";
+
+/// cargo 目标目录的指纹结构；`CACHEDIR.TAG` 是 cargo 自己写下的边界标记。
+fn looks_like_build_dir(dir: &std::path::Path) -> bool {
+    dir.join("CACHEDIR.TAG").is_file()
+        || dir.join(".rustc_info.json").is_file()
+        || dir.join(".fingerprint").is_dir()
+}
+
+/// M264/R1：本单该清理的构建目录。只扫工作区自己，符号链接一律跳过——
+/// `src-tauri/target` 通常是指向共享缓存的链接，跟随就会删到共享缓存。
+fn build_dirs_to_clean(worktree: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut dirs = Vec::new();
+    let cache = worktree.join(WORKSPACE_BUILD_CACHE);
+    if let Ok(entries) = std::fs::read_dir(&cache) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            let path = entry.path();
+            let is_dir = entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false);
+            if !is_dir || name == SHARED_BUILD_DIR {
+                continue;
+            }
+            if name.starts_with(TASK_BUILD_DIR_PREFIX) || looks_like_build_dir(&path) {
+                dirs.push(path);
+            }
+        }
+    }
+    if let Ok(entries) = std::fs::read_dir(worktree) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name == ".git" || name == WORKSPACE_BUILD_CACHE {
+                continue;
+            }
+            let path = entry.path();
+            let is_dir = entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false);
+            if is_dir && looks_like_build_dir(&path) {
+                dirs.push(path);
+            }
+        }
+    }
+    dirs.sort();
+    dirs
+}
+
+fn build_dir_label(worktree: &std::path::Path, path: &std::path::Path) -> String {
+    path.strip_prefix(worktree)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .replace(std::path::MAIN_SEPARATOR, "/")
+}
+
+/// M264/R2：清理结果就是一句事实——已删、未清理（含原因）、或未核验。
+fn clean_build_dirs(
+    worktree: &std::path::Path,
+    unverified: Option<&str>,
+    blocked: Option<&str>,
+) -> String {
+    let dirs = build_dirs_to_clean(worktree);
+    let labels: Vec<String> = dirs
+        .iter()
+        .map(|path| build_dir_label(worktree, path))
+        .collect();
+    if let Some(reason) = unverified {
+        return if labels.is_empty() {
+            format!("构建目录未核验：{reason}")
+        } else {
+            format!("构建目录 {} 未核验：{reason}", labels.join("、"))
+        };
+    }
+    if let Some(reason) = blocked {
+        return if labels.is_empty() {
+            "构建目录无需清理".to_string()
+        } else {
+            format!("构建目录 {} 未清理：{reason}", labels.join("、"))
+        };
+    }
+    if labels.is_empty() {
+        return "构建目录无需清理".to_string();
+    }
+    let mut removed = Vec::new();
+    let mut failed = Vec::new();
+    for (path, label) in dirs.iter().zip(labels) {
+        match std::fs::remove_dir_all(path) {
+            Ok(_) => removed.push(label),
+            Err(error) => failed.push(format!("{label} 未清理：{error}")),
+        }
+    }
+    let mut parts = Vec::new();
+    if !removed.is_empty() {
+        parts.push(format!("构建目录 {} 已由系统删除", removed.join("、")));
+    }
+    parts.extend(failed);
+    parts.join("；")
 }
 
 /// M259/R1/R2/R3：逐项核对，返回按固定顺序排列的事实句。
@@ -1111,38 +1230,37 @@ fn verify_closeout_with(
 ) -> Vec<String> {
     let mut facts = Vec::new();
     let tracked = format!("{}/{}", target.remote, target.default_branch);
+    // M264/R2：无法核对的项写「未核验」，核对了但不该删的写「未清理」，两者分开。
+    let mut unverified: Option<String> = None;
+    let mut blocked: Option<String> = None;
     // 1. 合并提交是否已经在默认分支上（需要先更新远端引用，否则看到的是旧历史）。
-    match closeout_git(&target.root, &["fetch", "--prune", &target.remote, &target.default_branch]) {
-        Err(error) => facts.push(format!("合并提交未核验：{error}")),
-        Ok(_) => facts.push(closeout_merge_commit_fact(
-            target,
-            &tracked,
-            merge_commit_of(target),
-        )),
-    }
-    // 2. 远端分支：仍在本会话自己的分支上才删除（M257 授权边界不变）。
-    let own_branch = !target.branch.is_empty()
-        && target.branch != target.default_branch
-        && target.branch != "HEAD";
-    if !own_branch {
-        facts.push("远端分支无需清理".to_string());
-    } else {
-        match closeout_git(&target.root, &["ls-remote", "--heads", &target.remote, &target.branch]) {
-            Ok(out) if out.trim().is_empty() => {
-                facts.push(format!("远端分支 {} 已清理", target.branch));
-            }
-            Ok(_) => {
-                match closeout_git(&target.root, &["push", &target.remote, "--delete", &target.branch]) {
-                    Ok(_) => facts.push(format!("远端分支 {} 还在，已由系统删除", target.branch)),
-                    Err(error) => facts.push(format!("远端分支 {} 还在，系统删除失败：{error}", target.branch)),
-                }
-            }
-            Err(error) => facts.push(format!("远端分支 {} 未核验：{error}", target.branch)),
+    let merged = match closeout_git(&target.root, &["fetch", "--prune", &target.remote, &target.default_branch]) {
+        Err(error) => {
+            facts.push(format!("合并提交未核验：{error}"));
+            unverified = Some(format!("合并提交未核验：{error}"));
+            false
         }
+        Ok(_) => {
+            let (fact, merged) = closeout_merge_commit_fact(
+                target,
+                &tracked,
+                merge_commit_of(target),
+            );
+            facts.push(fact);
+            merged
+        }
+    };
+    if !merged && blocked.is_none() {
+        blocked = Some(format!("合并提交未确认在 {} 分支上", target.default_branch));
     }
-    // 3. 本地未提交 / 未推送改动：只报告，不清理。
+    // 2. 本地未提交 / 未推送改动：只报告，不清理；有改动就让下面的清理一步都不走。
     match closeout_git(&target.root, &["status", "--porcelain=v1", "-uall"]) {
-        Err(error) => facts.push(format!("工作区状态未核验：{error}")),
+        Err(error) => {
+            facts.push(format!("工作区状态未核验：{error}"));
+            if unverified.is_none() {
+                unverified = Some(format!("工作区状态未核验：{error}"));
+            }
+        }
         Ok(status) => {
             let dirty: Vec<&str> = status.lines().filter(|line| !line.trim().is_empty()).collect();
             if dirty.is_empty() {
@@ -1159,6 +1277,9 @@ fn verify_closeout_with(
                     dirty.len(),
                     names.join("、")
                 ));
+                if blocked.is_none() {
+                    blocked = Some("工作区还有未提交改动".to_string());
+                }
             }
             if closeout_git(&target.root, &["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"]).is_err() {
                 facts.push("未推送提交未核验：本地分支没有上游跟踪".to_string());
@@ -1167,13 +1288,53 @@ fn verify_closeout_with(
                     Err(error) => facts.push(format!("未推送提交未核验：{error}")),
                     Ok(count) => match count.trim().parse::<usize>() {
                         Ok(0) => facts.push("没有未推送的提交".to_string()),
-                        Ok(ahead) => facts.push(format!("还有 {ahead} 个提交没有推送，已原样保留")),
+                        Ok(ahead) => {
+                            facts.push(format!("还有 {ahead} 个提交没有推送，已原样保留"));
+                            if blocked.is_none() {
+                                blocked = Some(format!("还有 {ahead} 个提交没有推送"));
+                            }
+                        }
                         Err(_) => facts.push(format!("未推送提交未核验：git 返回了无法解析的计数")),
                     },
                 }
             }
         }
     }
+    // 3. 远端分支：本会话自己的、且已在交付记录里的分支才删除（M257 授权边界不变）。
+    let own_branch = !target.branch.is_empty()
+        && target.branch != target.default_branch
+        && target.branch != "HEAD";
+    if !own_branch {
+        facts.push("远端分支无需清理".to_string());
+    } else if !target.branch_recorded {
+        facts.push(format!(
+            "远端分支 {} 未清理：本会话交付记录里没有这个分支",
+            target.branch
+        ));
+    } else if let Some(reason) = &unverified {
+        facts.push(format!("远端分支 {} 未核验：{reason}", target.branch));
+    } else if let Some(reason) = &blocked {
+        facts.push(format!("远端分支 {} 未清理：{reason}", target.branch));
+    } else {
+        match closeout_git(&target.root, &["ls-remote", "--heads", &target.remote, &target.branch]) {
+            Ok(out) if out.trim().is_empty() => {
+                facts.push(format!("远端分支 {} 已清理", target.branch));
+            }
+            Ok(_) => {
+                match closeout_git(&target.root, &["push", &target.remote, "--delete", &target.branch]) {
+                    Ok(_) => facts.push(format!("远端分支 {} 还在，已由系统删除", target.branch)),
+                    Err(error) => facts.push(format!("远端分支 {} 还在，系统删除失败：{error}", target.branch)),
+                }
+            }
+            Err(error) => facts.push(format!("远端分支 {} 未核验：{error}", target.branch)),
+        }
+    }
+    // 4. 本单构建目录：共享缓存归 CF-BUILD 预算，有阻塞项时一步都不动。
+    facts.push(clean_build_dirs(
+        &target.worktree,
+        unverified.as_deref(),
+        blocked.as_deref(),
+    ));
     facts
 }
 
@@ -1203,21 +1364,28 @@ async fn closeout_target(db: &SqlitePool, session: &str) -> Result<Option<Closeo
     .map_err(|e| e.to_string())?;
     let Some((path, workspace_branch)) = workspace else { return Ok(None) };
     let recorded: Option<String> = if has_table(db, "thin_delivery_refs").await.map_err(|e| e.to_string())? {
-        sqlx::query_scalar("SELECT branch FROM thin_delivery_refs WHERE session_id=?")
+        sqlx::query_scalar("SELECT branch FROM thin_delivery_refs WHERE session_id=? AND pr_number=?")
             .bind(session)
+            .bind(pr_number)
             .fetch_optional(db)
             .await
             .map_err(|e| e.to_string())?
     } else {
         None
     };
+    // M264/R1：只有交付记录里明确记着这个 PR 的分支名才允许删远端分支。
+    let branch_recorded = recorded
+        .as_deref()
+        .is_some_and(|branch| !branch.trim().is_empty());
     let repo = crate::agent::delivery::resolve_repo(std::path::Path::new(&path), None)
         .map_err(|error| format!("无法读取工作区的 git 信息（{path}）：{error}"))?;
     Ok(Some(CloseoutTarget {
+        worktree: std::path::PathBuf::from(&path),
         root: repo.root,
         remote: repo.remote,
         default_branch: repo.default_branch,
         branch: recorded.filter(|branch| !branch.trim().is_empty()).unwrap_or(workspace_branch),
+        branch_recorded,
         pr_number,
     }))
 }
@@ -4780,9 +4948,11 @@ mod m210_tests {
     fn closeout_target_for(work: &std::path::Path) -> CloseoutTarget {
         CloseoutTarget {
             root: work.to_path_buf(),
+            worktree: work.to_path_buf(),
             remote: "origin".into(),
             default_branch: "main".into(),
             branch: "feat-m259".into(),
+            branch_recorded: true,
             pr_number: 42,
         }
     }
@@ -4823,9 +4993,11 @@ mod m210_tests {
         let tmp = tempfile::tempdir().unwrap();
         let target = CloseoutTarget {
             root: tmp.path().to_path_buf(),
+            worktree: tmp.path().to_path_buf(),
             remote: "origin".into(),
             default_branch: "main".into(),
             branch: "feat-m259".into(),
+            branch_recorded: true,
             pr_number: 42,
         };
         let facts = verify_closeout(&target).join("；");
@@ -4922,5 +5094,107 @@ mod m210_tests {
         let facts = verify_closeout_with(&target, |_| Ok(sha.clone())).join("；");
         assert!(facts.contains("合并提交已在 main 分支"), "{facts}");
         assert!(!facts.contains("还没有这个 PR 的合并提交"), "{facts}");
+    }
+
+    // ---- M264：合并后的远端分支与构建目录由系统清理，会话不再为此审批 ----
+
+    /// 本单构建目录 + 共享缓存 + 工作区内带 CACHEDIR.TAG 的目录，三种形态都放进真实工作区。
+    fn m264_build_dirs(
+        work: &std::path::Path,
+    ) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
+        let cache = work.join(".codefactory-cache");
+        let task = cache.join("cargo-target-m264");
+        std::fs::create_dir_all(task.join("debug")).unwrap();
+        std::fs::write(task.join(".rustc_info.json"), "{}").unwrap();
+        let shared = cache.join("cargo-target");
+        std::fs::create_dir_all(shared.join("release")).unwrap();
+        std::fs::write(shared.join("CACHEDIR.TAG"), "Signature: shared-cache\n").unwrap();
+        let tagged = work.join("target");
+        std::fs::create_dir_all(tagged.join("debug")).unwrap();
+        std::fs::write(tagged.join("CACHEDIR.TAG"), "Signature: workspace-cargo-target\n").unwrap();
+        std::fs::write(work.join(".gitignore"), ".codefactory-cache/\ntarget/\n").unwrap();
+        git_in(work, &["add", ".gitignore"]);
+        git_in(work, &["commit", "-m", "chore: ignore build dirs"]);
+        git_in(work, &["push", "origin", "main"]);
+        (task, shared, tagged)
+    }
+
+    /// R1/R2：合并确认、工作区干净时，系统删本会话远端分支和本单构建目录。
+    #[test]
+    fn m264_system_closeout_removes_branch_and_task_build_dirs() {
+        let (_tmp, work) = closeout_repo(true);
+        let (task, shared, tagged) = m264_build_dirs(&work);
+        let facts = verify_closeout(&closeout_target_for(&work)).join("；");
+        assert!(facts.contains("远端分支 feat-m259 还在，已由系统删除"), "{facts}");
+        assert!(
+            facts.contains(".codefactory-cache/cargo-target-m264") && facts.contains("已由系统删除"),
+            "本单构建目录必须写进结束原因：{facts}"
+        );
+        assert!(facts.contains("target"), "工作区里带 CACHEDIR.TAG 的目录也要删：{facts}");
+        assert!(!task.exists(), "本单构建目录必须由系统删除：{facts}");
+        assert!(!tagged.exists(), "工作区里带 CACHEDIR.TAG 的构建目录也要删：{facts}");
+        assert!(shared.exists(), "共享缓存由 CF-BUILD 预算管理，收尾不能删：{facts}");
+        assert!(git_in(&work, &["ls-remote", "--heads", "origin", "feat-m259"]).is_empty());
+    }
+
+    /// R4：有未提交改动时分支和构建目录都不动，原因写清楚。
+    #[test]
+    fn m264_dirty_workspace_blocks_every_cleanup() {
+        let (_tmp, work) = closeout_repo(true);
+        let (task, _shared, tagged) = m264_build_dirs(&work);
+        std::fs::write(work.join("dirty.txt"), "keep me\n").unwrap();
+        let facts = verify_closeout(&closeout_target_for(&work)).join("；");
+        assert!(
+            facts.contains("远端分支 feat-m259 未清理：工作区还有未提交改动"),
+            "{facts}"
+        );
+        assert!(facts.contains("未清理：工作区还有未提交改动"), "{facts}");
+        assert!(task.exists(), "有未提交改动时不清理构建目录：{facts}");
+        assert!(tagged.exists(), "有未提交改动时不清理构建目录：{facts}");
+        assert!(!git_in(&work, &["ls-remote", "--heads", "origin", "feat-m259"]).is_empty());
+    }
+
+    /// R1：分支名不在本会话交付记录里就不删，授权边界不放宽。
+    #[test]
+    fn m264_branch_outside_delivery_record_is_kept() {
+        let (_tmp, work) = closeout_repo(true);
+        let target = CloseoutTarget { branch_recorded: false, ..closeout_target_for(&work) };
+        let facts = verify_closeout(&target).join("；");
+        assert!(
+            facts.contains("远端分支 feat-m259 未清理：本会话交付记录里没有这个分支"),
+            "{facts}"
+        );
+        assert!(!git_in(&work, &["ls-remote", "--heads", "origin", "feat-m259"]).is_empty());
+    }
+
+    /// R2：真实裸远端 + 真实 DB：结束原因重述系统已经做过的清理。
+    #[tokio::test]
+    async fn m264_end_reason_reports_system_cleanup() {
+        let (_tmp, work) = closeout_repo(true);
+        let (task, shared, tagged) = m264_build_dirs(&work);
+        let db = crate::storage::db::connect("sqlite::memory:").await.unwrap();
+        sqlx::query("CREATE TABLE IF NOT EXISTS thin_external_observations(session_id TEXT PRIMARY KEY,pr_number INTEGER NOT NULL,ceiling TEXT NOT NULL,merged_at INTEGER)").execute(&db).await.unwrap();
+        sqlx::query("CREATE TABLE IF NOT EXISTS execution_workspaces(id TEXT PRIMARY KEY,session_id TEXT,repo_root TEXT,worktree_path TEXT,branch_name TEXT,state TEXT,updated_at INTEGER)").execute(&db).await.ok();
+        sqlx::query("CREATE TABLE IF NOT EXISTS thin_delivery_refs(session_id TEXT PRIMARY KEY,branch TEXT NOT NULL,pr_number INTEGER NOT NULL,ceiling TEXT NOT NULL)").execute(&db).await.ok();
+        sqlx::query("INSERT INTO thin_external_observations(session_id,pr_number,ceiling,merged_at) VALUES ('m264',42,'through_release',1000)").execute(&db).await.unwrap();
+        sqlx::query("INSERT INTO objectives(id,kind,session_id,root_turn_id,status,decision_type,domain,requested_acceptance,created_at,updated_at) VALUES ('m264-objective','local_mutation','m264','m264','active','continue','chat','validated_change',1,1)").execute(&db).await.unwrap();
+        sqlx::query("INSERT INTO execution_workspaces(id,objective_id,session_id,repo_identity,repo_root,git_common_dir,worktree_path,worktree_identity,branch_name,base_ref,base_sha,head_sha,state,created_at,updated_at) VALUES ('ws-m264','m264-objective','m264',?,?,?,?,?,'feat-m259','main','sha','sha','active',1,1)")
+            .bind(work.to_str().unwrap())
+            .bind(work.to_str().unwrap())
+            .bind(work.join(".git").to_str().unwrap())
+            .bind(work.to_str().unwrap())
+            .bind(work.to_str().unwrap())
+            .execute(&db).await.unwrap();
+        sqlx::query("INSERT INTO thin_delivery_refs VALUES ('m264','feat-m259',42,'through_release')").execute(&db).await.unwrap();
+
+        let reason = closeout_result(&db, "m264", "PR #42 已合并").await;
+        assert!(reason.contains("远端分支 feat-m259 还在，已由系统删除"), "{reason}");
+        assert!(reason.contains("构建目录"), "{reason}");
+        assert!(reason.contains(".codefactory-cache/cargo-target-m264"), "{reason}");
+        assert!(!task.exists(), "结束原因说已删，就必须真的删掉了：{reason}");
+        assert!(!tagged.exists(), "{reason}");
+        assert!(shared.exists(), "共享缓存不能删：{reason}");
+        assert!(git_in(&work, &["ls-remote", "--heads", "origin", "feat-m259"]).is_empty());
+        db.close().await;
     }
 }
