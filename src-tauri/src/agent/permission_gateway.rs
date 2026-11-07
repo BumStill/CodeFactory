@@ -151,7 +151,7 @@ impl PermissionGateway for DesktopPermissionGateway {
                 // has always guarded it; a `git push` shape falls through to the
                 // remote-write path below, so a refusal still names the user
                 // decision and an approval still records the delivery grant.
-                if actions.iter().any(|action| matches!(action, super::trusted_git::OwnRemoteAction::PrMetadata(_))) {
+                if actions.iter().any(super::trusted_git::OwnRemoteAction::is_pr_metadata) {
                     return self.request_permission(tool_call, args.clone(), bash_command).await;
                 }
             }
@@ -460,7 +460,10 @@ impl DesktopPermissionGateway {
         if !super::fetch_session_delivery_authorized(&self.db, &self.session_id).await { return false; }
         for action in actions {
             let owned = match action {
-                super::trusted_git::OwnRemoteAction::PrMetadata(number) => sqlx::query_scalar::<_, i64>(
+                // M257: a description write counts as owned once the PR number is
+                // this session's own; `--body-file` containment was proved by the
+                // shape prover before this point.
+                super::trusted_git::OwnRemoteAction::PrMetadata { number, .. } => sqlx::query_scalar::<_, i64>(
                     "SELECT COUNT(*) FROM thin_delivery_refs r JOIN execution_workspaces w ON w.session_id=r.session_id AND w.branch_name=r.branch WHERE r.session_id=? AND r.pr_number=? AND w.state IN ('active','delivering')")
                     .bind(&self.session_id).bind(*number).fetch_one(&self.db).await.unwrap_or(0) > 0,
                 // `git push origin HEAD` names no branch: it is this session's own
@@ -1169,7 +1172,7 @@ mod tests {
         assert_eq!(std::fs::read_to_string(root.join("tracked.txt")).unwrap(), "node rewritten");
         std::fs::write(root.join("tracked.txt"), "base").unwrap();
         sqlx::raw_sql("CREATE TABLE IF NOT EXISTS thin_delivery_refs(session_id TEXT PRIMARY KEY,branch TEXT NOT NULL,pr_number INTEGER NOT NULL,ceiling TEXT NOT NULL); INSERT INTO thin_delivery_refs SELECT 'permission-test',branch_name,777,'through_merge' FROM execution_workspaces WHERE id='synthetic-workspace';").execute(&gateway.db).await.unwrap();
-        for command in ["gh pr edit 777 --remove-label 'merge-queue: armed'", "gh pr edit 777 --add-label 'synthetic'", "gh pr comment 777 --body 'synthetic comment'"] {
+        for command in ["gh pr edit 777 --title 'synthetic'", "gh pr edit 777 --body-file .git/PR_BODY.md", "gh pr comment 777 --body 'synthetic comment'"] {
             let args = serde_json::json!({"command":command});
             let call = ToolCall { id: "m198-owned-pr".into(), r#type: "function".into(), function: FunctionCall { name: "bash".into(), arguments: args.to_string() } };
             assert_eq!(gateway.authorize(&call, &args, Some(command)).await, PermissionOutcome::Allow);
@@ -1886,14 +1889,22 @@ mod tests {
     #[tokio::test]
     async fn m208_own_remote_writes_need_only_delivery_authority() {
         const OWNED: &[&str] = &[
-            "gh pr edit 929 --add-label 'merge-queue: armed'",
-            "gh pr view 933 --json state,mergeable,statusCheckRollup; gh pr edit 933 --remove-label 'merge-queue: blocked' --add-label 'merge-queue: armed'; gh pr comment 933 --body 'CI 全绿，已打 merge-queue: armed'",
-            "gh pr ready 929",
             "gh pr edit 929 --title 'fix: own PR' --body 'plain body'",
+            // M257: the description may come from a workspace file.
+            "gh pr edit 929 --body-file .git/PR_BODY.md",
+            "gh pr view 933 --json state,mergeable,statusCheckRollup; gh pr edit 933 --body-file .git/PR_BODY.md --title 'CI 绿'; gh pr comment 933 --body 'CI 全绿，待合并'",
+            "gh pr ready 929",
             "git push origin HEAD",
             "git push -u origin codefactory/objective-m208",
         ];
         const NOT_OWNED: &[&str] = &[
+            // M257 R3: the merge queue's switch, the target branch and the
+            // repository the ownership was proved in stay behind approval.
+            "gh pr edit 929 --add-label 'merge-queue: armed'",
+            "gh pr edit 929 --remove-label 'merge-queue: blocked'",
+            "gh pr edit 929 --base main",
+            "gh pr edit 929 --body-file /etc/hosts",
+            "gh pr edit 929 --body-file ../outside.md",
             "gh pr edit 778 --add-label 'merge-queue: armed'",
             "gh pr edit 778 --add-label 'merge-queue: armed'; gh pr edit 929 --add-label 'merge-queue: armed'",
             "gh pr edit 929 --add-label 'merge-queue: armed'; gh auth token",
@@ -1975,6 +1986,117 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(intents, 0, "an owned remote write must not create a prompt");
+    }
+
+    /// M257: rewriting the description of the PR this session itself opened is a
+    /// description change, not a merge decision — no prompt while delivery is
+    /// authorized. Every other shape keeps the M208 gate.
+    #[tokio::test]
+    async fn m257_own_pr_edit_body_file_needs_no_approval() {
+        const OWNED: &[&str] = &[
+            "gh pr edit 1001 --body-file PR_BODY.md",
+            "gh pr edit 1001 --body-file PR_BODY.md --title 'chore: refresh PR body'",
+            "gh pr edit 1001 --body-file=docs/PR_BODY.md",
+            "gh pr edit 1001 --title 'chore: refresh PR body'",
+            "git status --short && gh pr edit 1001 --body-file PR_BODY.md",
+        ];
+        const NOT_OWNED: &[&str] = &[
+            // R2: another PR, or an unowned remote write in the same command.
+            "gh pr edit 1002 --body-file PR_BODY.md",
+            "gh pr edit 1001 --body-file PR_BODY.md; gh pr edit 1002 --title 'x'",
+            "gh pr edit 1001 --body-file PR_BODY.md && git push --force origin HEAD",
+            // Reading outside the workspace is not a description edit.
+            "gh pr edit 1001 --body-file /etc/hosts",
+            "gh pr edit 1001 --body-file ../outside.md",
+            "gh pr edit 1001 --body-file ~/.ssh/id_rsa",
+            "gh pr edit 1001 --body-file -",
+            "gh pr edit 1001 --body-file PR_BODY.md --repo someone/else",
+            // R3: merge-queue labels, the target branch, merge and close stay.
+            "gh pr edit 1001 --add-label 'merge-queue: armed'",
+            "gh pr edit 1001 --remove-label 'merge-queue: armed'",
+            "gh pr edit 1001 --base main",
+            "gh pr merge 1001 --squash",
+            "gh pr close 1001",
+            // No PR number: current-branch inference is not an owned resource.
+            "gh pr edit --body-file PR_BODY.md",
+        ];
+
+        let gateway = test_gateway("trusted").await;
+        sqlx::raw_sql(
+            "ALTER TABLE sessions ADD COLUMN delivery_authorized INTEGER NOT NULL DEFAULT 0;
+             CREATE TABLE execution_workspaces(id TEXT PRIMARY KEY, session_id TEXT NOT NULL,
+               objective_id TEXT NOT NULL, worktree_path TEXT NOT NULL,
+               branch_name TEXT NOT NULL, state TEXT NOT NULL);
+             CREATE TABLE thin_delivery_refs(session_id TEXT NOT NULL, branch TEXT NOT NULL,
+               pr_number INTEGER NOT NULL, ceiling TEXT NOT NULL);
+             CREATE TABLE thin_external_observations(session_id TEXT PRIMARY KEY,
+               pr_number INTEGER NOT NULL, merged_at INTEGER);
+             CREATE TABLE permission_intents(prompt_key TEXT PRIMARY KEY);
+             INSERT INTO execution_workspaces VALUES ('m257-workspace','permission-test',
+               'm257-objective','/tmp/m257-worktree','codefactory/objective-m257','active');
+             INSERT INTO thin_delivery_refs VALUES ('permission-test',
+               'codefactory/objective-m257',1001,'through_merge');",
+        )
+        .execute(&gateway.db)
+        .await
+        .unwrap();
+
+        // R3: without delivery authority nothing on the remote is owned.
+        for command in OWNED {
+            assert!(
+                !gateway.own_remote_owned(command).await,
+                "unauthorized delivery must ask: {command}"
+            );
+        }
+
+        sqlx::query("UPDATE sessions SET delivery_authorized=1 WHERE id='permission-test'")
+            .execute(&gateway.db)
+            .await
+            .unwrap();
+
+        // R1: its own PR body edit runs with no prompt at all.
+        for command in OWNED {
+            assert!(gateway.own_remote_owned(command).await, "{command}");
+            let args = serde_json::json!({ "command": command });
+            let call = ToolCall {
+                id: "m257-owned".into(),
+                r#type: "function".into(),
+                function: FunctionCall { name: "bash".into(), arguments: args.to_string() },
+            };
+            assert_eq!(
+                gateway.authorize(&call, &args, Some(command)).await,
+                PermissionOutcome::Allow,
+                "{command}"
+            );
+        }
+        for command in NOT_OWNED {
+            assert!(!gateway.own_remote_owned(command).await, "{command}");
+        }
+        let intents: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM permission_intents")
+            .fetch_one(&gateway.db)
+            .await
+            .unwrap();
+        assert_eq!(intents, 0, "an owned PR body edit must not create a prompt");
+
+        // R4: no sandbox is enforced in this test process, so an edit that is not
+        // owned must still take the ordinary approval path — never a bare run.
+        let command = "gh pr edit 1001 --add-label 'merge-queue: armed'";
+        let args = serde_json::json!({ "command": command });
+        let task_gateway = gateway.clone();
+        let pending = tokio::spawn(async move {
+            let call = ToolCall {
+                id: "m257-gated".into(),
+                r#type: "function".into(),
+                function: FunctionCall { name: "bash".into(), arguments: args.to_string() },
+            };
+            task_gateway.authorize(&call, &args, Some(command)).await
+        });
+        drop(take_pending_sender(&gateway).await);
+        assert_ne!(
+            pending.await.expect("authorization task"),
+            PermissionOutcome::Allow,
+            "an unowned PR edit must ask even without a sandbox"
+        );
     }
 
     /// M221 R1/R2/R3: a commit message heredoc is data, not a program. In this
