@@ -1460,9 +1460,21 @@ fn fetch_args(rest: &[&str]) -> bool {
 /// the caller — this type only carries what the command itself names.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum OwnRemoteAction {
-    PrMetadata(i64),
+    /// A description-level write (`comment`, `ready`, `edit`). `body_files` are
+    /// the workspace-relative files read through `--body-file`; the shape prover
+    /// already refused anything that could leave the workspace, and the caller
+    /// keeps that containment as part of the ownership decision.
+    PrMetadata { number: i64, body_files: Vec<String> },
     PushBranch(String),
     DeleteBranch(String),
+}
+
+impl OwnRemoteAction {
+    /// M208/M257: a PR description write is answered by a plain confirmation when
+    /// it is not owned, never by the remote-write allowance.
+    pub(super) fn is_pr_metadata(&self) -> bool {
+        matches!(self, Self::PrMetadata { .. })
+    }
 }
 
 /// M208: the remote writes a command performs on the session's *own* resources.
@@ -1499,31 +1511,92 @@ fn own_remote_action(segment: &Segment) -> Option<OwnRemoteAction> {
     match words.as_slice() {
         ["gh", "pr", action, number, rest @ ..] => {
             let number = number.parse::<i64>().ok().filter(|n| *n > 0)?;
-            own_pr_metadata_args(action, rest).then_some(OwnRemoteAction::PrMetadata(number))
+            let body_files = own_pr_metadata_args(action, rest)?;
+            Some(OwnRemoteAction::PrMetadata { number, body_files })
         }
         ["git", "push", rest @ ..] => own_branch_push(rest),
         _ => None,
     }
 }
 
-/// Exact PR metadata mutation on an explicit PR number: label add/remove, a
-/// comment body, `ready`, and title/body updates. No other action, no implicit
-/// current-PR selection, no `--body-file`, no repository override.
-fn own_pr_metadata_args(action: &str, rest: &[&str]) -> bool {
+/// Exact PR metadata write on an explicit PR number: a comment body, `ready`,
+/// and `edit`.
+///
+/// M257: `edit` is accepted by default. The decision rests on the PR number and
+/// the session's delivery authority, not on an ever-growing flag vocabulary, so
+/// only the flags that retarget the write or decide the merge are refused —
+/// labels (the merge queue's own switch), base/head, and a repository override
+/// that would leave the repository the ownership was proved in. `--body-file`
+/// names a local file, so the path must stay inside the workspace and is
+/// returned for the caller to hold as a condition.
+fn own_pr_metadata_args(action: &str, rest: &[&str]) -> Option<Vec<String>> {
     match action {
-        "ready" => rest.is_empty(),
-        "edit" | "comment" => {
-            let allowed: &[&str] = if action == "edit" {
-                &["--add-label", "--remove-label", "--title", "--body"]
-            } else {
-                &["--body"]
-            };
-            !rest.is_empty()
-                && rest.len() % 2 == 0
-                && rest.chunks_exact(2).all(|pair| !pair[1].is_empty() && allowed.contains(&pair[0]))
-        }
-        _ => false,
+        "ready" => rest.is_empty().then(Vec::new),
+        "comment" => (rest.len() == 2 && rest[0] == "--body" && !rest[1].is_empty()).then(Vec::new),
+        "edit" => own_pr_edit_args(rest),
+        _ => None,
     }
+}
+
+fn own_pr_edit_args(rest: &[&str]) -> Option<Vec<String>> {
+    const REFUSED: &[&str] = &["--add-label", "--remove-label", "--base", "--head", "--repo", "-R"];
+    if rest.is_empty() {
+        return None;
+    }
+    let mut body_files = Vec::new();
+    let mut value_expected = false;
+    let mut index = 0;
+    while let Some(word) = rest.get(index) {
+        index += 1;
+        let (flag, inline) = match word.split_once('=') {
+            Some((flag, value)) if flag.starts_with('-') => (flag, Some(value.to_string())),
+            _ => (*word, None),
+        };
+        if flag == "--body-file" {
+            let path = match inline {
+                Some(value) => value,
+                None => {
+                    let value = rest.get(index)?.to_string();
+                    index += 1;
+                    value
+                }
+            };
+            if !workspace_relative(&path) {
+                return None;
+            }
+            body_files.push(path);
+            value_expected = false;
+            continue;
+        }
+        if REFUSED.contains(&flag) {
+            return None;
+        }
+        if flag.starts_with('-') && flag != "-" {
+            value_expected = true;
+            continue;
+        }
+        // A bare word is a flag's value; the `--body-file` value was consumed
+        // above, so a naked word here has no owner.
+        if !value_expected {
+            return None;
+        }
+        value_expected = false;
+    }
+    Some(body_files)
+}
+
+/// M257: `--body-file` publishes a local file, so the path must be provably
+/// inside the workspace: relative, no home expansion, no absolute prefix and no
+/// `..` climb. Anything else keeps the ordinary approval.
+fn workspace_relative(path: &str) -> bool {
+    !path.is_empty()
+        && path != "-"
+        && !path.starts_with('-')
+        && !path.starts_with('~')
+        && !path.starts_with('/')
+        && !path.starts_with('\\')
+        && !path.contains(':')
+        && !path.split(['/', '\\']).any(|part| part == "..")
 }
 
 /// `git push` of a plain branch ref: no force, no mirror/all/tags, no explicit
@@ -1842,10 +1915,20 @@ mod tests {
 mod m208_own_remote_actions {
     use super::{own_remote_actions, OwnRemoteAction};
 
-    const OWN_PR_LABEL: &str = "gh pr edit 929 --add-label 'merge-queue: armed'";
+    /// M257: label calls left the owned set — the merge queue's own switch stays
+    /// behind approval — so the owned description writes are title and body,
+    /// inline and from a workspace file.
+    const OWN_PR_BODY: &str = "gh pr edit 929 --title 'fix: own PR' --body 'plain'";
     const OWN_PR_EVIDENCE: &str = "gh pr view 933 --json state,mergeable,statusCheckRollup; \
-gh pr edit 933 --remove-label 'merge-queue: blocked' --add-label 'merge-queue: armed'; \
-gh pr comment 933 --body 'CI 全绿，已打 merge-queue: armed'";
+gh pr edit 933 --body-file .git/PR_BODY.md --title 'CI 绿'; \
+gh pr comment 933 --body 'CI 全绿，待合并'";
+
+    fn metadata(number: i64, body_files: &[&str]) -> OwnRemoteAction {
+        OwnRemoteAction::PrMetadata {
+            number,
+            body_files: body_files.iter().map(|file| file.to_string()).collect(),
+        }
+    }
 
     fn actions(command: &str) -> Vec<OwnRemoteAction> {
         own_remote_actions(command).unwrap_or_else(|| panic!("must be owned: {command}"))
@@ -1853,28 +1936,60 @@ gh pr comment 933 --body 'CI 全绿，已打 merge-queue: armed'";
 
     #[test]
     fn m208_single_own_pr_metadata_mutation_is_owned() {
-        assert_eq!(actions(OWN_PR_LABEL), vec![OwnRemoteAction::PrMetadata(929)]);
-        assert_eq!(actions("gh pr ready 929"), vec![OwnRemoteAction::PrMetadata(929)]);
+        assert_eq!(actions(OWN_PR_BODY), vec![metadata(929, &[])]);
+        assert_eq!(actions("gh pr ready 929"), vec![metadata(929, &[])]);
         assert_eq!(
             actions("gh pr edit 929 --title 'fix: x' --body 'plain'"),
-            vec![OwnRemoteAction::PrMetadata(929)]
+            vec![metadata(929, &[])]
+        );
+        // M257: the body may come from a workspace file, and the file it names is
+        // carried along so the caller keeps its containment.
+        assert_eq!(
+            actions("gh pr edit 929 --body-file .git/PR_BODY.md --title 'x'"),
+            vec![metadata(929, &[".git/PR_BODY.md"])]
+        );
+        assert_eq!(
+            actions("gh pr edit 929 --body-file=docs/PR_BODY.md"),
+            vec![metadata(929, &["docs/PR_BODY.md"])]
         );
     }
 
     #[test]
     fn m208_compound_segments_are_judged_one_by_one() {
         // The read-only `gh pr view` segment needs no allowance and contributes
-        // none; the two mutations on the same own PR do.
+        // none; the two writes on the same own PR do.
         assert_eq!(
             actions(OWN_PR_EVIDENCE),
-            vec![OwnRemoteAction::PrMetadata(933), OwnRemoteAction::PrMetadata(933)]
+            vec![metadata(933, &[".git/PR_BODY.md"]), metadata(933, &[])]
         );
         // A read-only segment beside an owned one is judged on its own and stays
         // owned; it neither launders nor is laundered by the write beside it.
         assert_eq!(
-            actions("git status --short && gh pr edit 929 --add-label 'merge-queue: armed'"),
-            vec![OwnRemoteAction::PrMetadata(929)]
+            actions("git status --short && gh pr edit 929 --title 'fix: x'"),
+            vec![metadata(929, &[])]
         );
+    }
+
+    /// M257 R3: the flags that decide the merge or retarget the write stay
+    /// outside the owned set, and a `--body-file` path may not leave the
+    /// workspace.
+    #[test]
+    fn m257_pr_edit_refuses_merge_and_retargeting_flags() {
+        for command in [
+            "gh pr edit 929 --add-label 'merge-queue: armed'",
+            "gh pr edit 929 --remove-label 'merge-queue: armed'",
+            "gh pr edit 929 --base main",
+            "gh pr edit 929 --head other-branch",
+            "gh pr edit 929 --repo someone/else --title 'x'",
+            "gh pr edit 929 --title 'x' --add-label 'merge-queue: armed'",
+            "gh pr edit 929 --body-file /etc/hosts",
+            "gh pr edit 929 --body-file ../outside.md",
+            "gh pr edit 929 --body-file ~/.ssh/id_rsa",
+            "gh pr edit 929 --body-file -",
+            "gh pr edit --body-file PR_BODY.md",
+        ] {
+            assert_eq!(own_remote_actions(command), None, "{command}");
+        }
     }
 
     #[test]
@@ -1902,7 +2017,8 @@ gh pr comment 933 --body 'CI 全绿，已打 merge-queue: armed'";
             "gh pr edit 929 --add-label 'merge-queue: armed'; gh pr merge 929 --squash",
             "gh pr merge 929 --squash",
             "gh pr close 929",
-            "gh pr edit 929 --body-file body.md",
+            "gh pr edit 929 --body-file /etc/hosts",
+            "gh pr edit 929 --base main",
             "gh release delete v1.0.0",
             "git push --force origin HEAD",
             "git push origin main",
