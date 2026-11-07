@@ -4638,7 +4638,7 @@ mod m210_tests {
     // ---- M259：结束原因是当场核对的事实，不是固定清单 ----
 
     fn git_in(dir: &std::path::Path, args: &[&str]) -> String {
-        let out = std::process::Command::new("git")
+        let out = std::process::Command::new("git").no_window()
             .current_dir(dir)
             .env("GIT_AUTHOR_NAME", "m259")
             .env("GIT_AUTHOR_EMAIL", "m259@example.com")
