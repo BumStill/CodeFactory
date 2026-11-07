@@ -1257,7 +1257,6 @@ export const useChatStore = create<ChatStore>((set, get) => ({
         message: text,
         clientMessageId,
       });
-      await persistSteerFallback(id, text);
       return;
     }
     const msg: UIMessage = {
@@ -1292,7 +1291,6 @@ export const useChatStore = create<ChatStore>((set, get) => ({
         message: text,
         clientMessageId,
       });
-      await persistSteerFallback(id, text);
     } catch (error) {
       // Never leave a bubble claiming to be on its way when it isn't — and
       // take the empty bubble the split opened for it with it.
@@ -1671,46 +1669,6 @@ function splitAssistantTurnAfterSteer(
   });
 }
 
-/**
- * M261 — 插话的持久副本。
- *
- * `queue_interjection` 只在内存里排队。若这一轮永远走不到下一个边界（被停掉、
- * 长工具卡住、切走会话），消息就随进程消失，用户看到的是"说完就没了"。
- * 因此插话被接受的同时再落一条持久副本：循环真的把它读走时会发
- * `steer_applied`，那一刻把副本记为已送达，避免它再作为新消息重复送出；
- * 没被读走的副本留在既有队列里，回合结束时按普通排队消息送出。
- */
-const steerFallbacks = new Map<string, string>();
-const steerFallbackKey = (sessionId: string, content: string) =>
-  `${sessionId}\u0000${content.trim()}`;
-
-async function persistSteerFallback(sessionId: string, content: string) {
-  try {
-    const record = await invoke<{ id: string }>("enqueue_queued_dispatch_message", {
-      sessionId,
-      content: content.trim(),
-      rootTurnId: null,
-    });
-    if (record?.id) {
-      steerFallbacks.set(steerFallbackKey(sessionId, content), record.id);
-    }
-  } catch {
-    // 持久副本写失败不改变插话本身的结果——内存路径仍然成立。
-  }
-}
-
-async function confirmSteerFallbackDelivered(sessionId: string, content: string) {
-  const key = steerFallbackKey(sessionId, content);
-  const id = steerFallbacks.get(key);
-  if (!id) return;
-  steerFallbacks.delete(key);
-  try {
-    await invoke("mark_queued_dispatch_message_delivered", { sessionId, id });
-  } catch {
-    // 记账失败不改变"已送达"的事实；副本最多让它再出现一次。
-  }
-}
-
 function handleStreamEvent(
   event: StreamEvent,
   sessionId: string,
@@ -1735,10 +1693,6 @@ function handleStreamEvent(
     };
   });
 
-  if (event.type === "steer_applied") {
-    // M261: 这一轮已经把插话读走了，持久副本不需要再作为新消息送出。
-    void confirmSteerFallbackDelivered(sessionId, event.content);
-  }
 
   // Queue drain is settlement-driven. Transport done/error can be followed by
   // durable recovery, so neither event is permission to start another run.
