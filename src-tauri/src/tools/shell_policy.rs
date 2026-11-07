@@ -2,9 +2,16 @@
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ShellCommandPolicy {
-    Allow { risk: ShellRisk },
-    Ask { risk: ShellRisk, reason: &'static str },
-    Deny { reason: &'static str },
+    Allow {
+        risk: ShellRisk,
+    },
+    Ask {
+        risk: ShellRisk,
+        reason: &'static str,
+    },
+    Deny {
+        reason: &'static str,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -33,6 +40,11 @@ impl ShellCommandPolicy {
 
 pub fn classify_command(command: &str) -> ShellCommandPolicy {
     let normalized = normalize(command);
+    // M266 R2: destructive phrases are judged where the shell would run them.
+    // Quoted data (a search pattern, a message, an argument that merely mentions
+    // `git reset --hard`) is not a statement; inline interpreter payloads
+    // (`bash -c "…"`, `python -c "…"`) are code and stay in the judged text.
+    let judged = shell_judged_text(&normalized);
 
     if is_direct_playwright_command(&normalized) {
         return deny("direct Playwright CLI is not allowed; use the native browser_session tool so CodeFactory can own and clean up the browser process");
@@ -60,41 +72,58 @@ pub fn classify_command(command: &str) -> ShellCommandPolicy {
     }
 
     if let Some(reason) = contains_any(
-        &normalized,
+        &judged,
         &[
             ("rm -rf /", "matches permanent deny 'rm -rf /'"),
             ("format ", "matches permanent deny 'format'"),
-            ("del /f /s /q c:\\", "matches permanent deny 'del /f /s /q c:\\'"),
+            (
+                "del /f /s /q c:\\",
+                "matches permanent deny 'del /f /s /q c:\\'",
+            ),
             ("rd /s /q c:\\", "matches permanent deny 'rd /s /q c:\\'"),
-            ("reg delete hklm", "matches permanent deny 'reg delete hklm'"),
+            (
+                "reg delete hklm",
+                "matches permanent deny 'reg delete hklm'",
+            ),
             ("shutdown", "matches permanent deny 'shutdown'"),
         ],
     ) {
         return deny(reason);
     }
 
-    if normalized.contains("remove-item")
-        && (normalized.contains("-recurse") || normalized.contains("-force"))
+    if judged.contains("remove-item") && (judged.contains("-recurse") || judged.contains("-force"))
     {
         return ask("high risk shell command: recursive or forced remove-item");
     }
 
     if let Some(reason) = contains_any(
-        &normalized,
+        &judged,
         &[
-            ("git reset --hard", "high risk shell command: git reset --hard"),
+            (
+                "git reset --hard",
+                "high risk shell command: git reset --hard",
+            ),
             ("git clean -", "high risk shell command: git clean"),
             ("rm -rf", "high risk shell command: recursive rm"),
             ("rd /s", "high risk shell command: recursive rd"),
             ("rmdir /s", "high risk shell command: recursive rmdir"),
             ("del /s", "high risk shell command: recursive del"),
             ("reg delete", "high risk shell command: registry delete"),
-            ("set-executionpolicy", "high risk shell command: execution policy change"),
-            ("invoke-expression", "high risk shell command: invoke-expression"),
+            (
+                "set-executionpolicy",
+                "high risk shell command: execution policy change",
+            ),
+            (
+                "invoke-expression",
+                "high risk shell command: invoke-expression",
+            ),
             ("| iex", "high risk shell command: pipe to iex"),
             ("|iex", "high risk shell command: pipe to iex"),
             ("diskpart", "high risk shell command: diskpart"),
-            ("bcdedit", "high risk shell command: boot configuration edit"),
+            (
+                "bcdedit",
+                "high risk shell command: boot configuration edit",
+            ),
         ],
     ) {
         return ask(reason);
@@ -106,13 +135,28 @@ pub fn classify_command(command: &str) -> ShellCommandPolicy {
     // gate; they stay listed here so a non-delivery session cannot slip a remote
     // write through as an ordinary shell command.
     if let Some(reason) = contains_any(
-        &normalized,
+        &judged,
         &[
-            ("--show-token", "credential exposure: `--show-token` prints the account token"),
-            ("gh auth token", "credential exposure: `gh auth token` prints the account token"),
-            ("gh auth login", "credential change: `gh auth login` replaces the stored credential"),
-            ("gh auth logout", "credential change: `gh auth logout` removes the stored credential"),
-            ("gh auth refresh", "credential change: `gh auth refresh` rewrites the stored credential"),
+            (
+                "--show-token",
+                "credential exposure: `--show-token` prints the account token",
+            ),
+            (
+                "gh auth token",
+                "credential exposure: `gh auth token` prints the account token",
+            ),
+            (
+                "gh auth login",
+                "credential change: `gh auth login` replaces the stored credential",
+            ),
+            (
+                "gh auth logout",
+                "credential change: `gh auth logout` removes the stored credential",
+            ),
+            (
+                "gh auth refresh",
+                "credential change: `gh auth refresh` rewrites the stored credential",
+            ),
             ("gh secret", "repository credential change: `gh secret`"),
             ("gh variable", "repository settings change: `gh variable`"),
             ("gh ruleset", "repository protection change: `gh ruleset`"),
@@ -269,6 +313,94 @@ fn normalize(command: &str) -> String {
     command.to_lowercase().replace('`', "")
 }
 
+/// M266 R2: the text the destructive-phrase scans may judge. Quoted spans are
+/// replaced by a placeholder because a shell never runs a quoted string — unless
+/// the span is the inline payload of an interpreter, which is code and is
+/// appended back so `bash -c "git reset --hard"` still asks.
+fn shell_judged_text(command: &str) -> String {
+    const PAYLOAD_OPTIONS: &[&str] = &[
+        "-c", "/c", "-lc", "-ec", "-ic", "-e", "-command", "--eval", "-p",
+    ];
+    const PAYLOAD_INTERPRETERS: &[&str] = &[
+        "bash",
+        "sh",
+        "zsh",
+        "dash",
+        "ksh",
+        "ash",
+        "powershell",
+        "pwsh",
+        "cmd",
+        "python",
+        "python3",
+        "node",
+        "nodejs",
+        "perl",
+        "ruby",
+    ];
+    let mut judged = String::with_capacity(command.len());
+    let mut payload = String::new();
+    let mut chars = command.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch != '"' && ch != '\'' {
+            judged.push(ch);
+            continue;
+        }
+        let quote = ch;
+        let mut inner = String::new();
+        let mut closed = false;
+        for next in chars.by_ref() {
+            if next == quote {
+                closed = true;
+                break;
+            }
+            inner.push(next);
+        }
+        if !closed {
+            // An unbalanced quote stays visible so the fail-closed scans see it.
+            judged.push_str(&inner);
+            break;
+        }
+        let tokens: Vec<String> = judged
+            .split_whitespace()
+            .map(|word| {
+                word.trim_matches(|c: char| matches!(c, ';' | '|' | '&' | '(' | ')'))
+                    .to_string()
+            })
+            .filter(|word| !word.is_empty())
+            .collect();
+        let payload_option = tokens
+            .last()
+            .is_some_and(|option| PAYLOAD_OPTIONS.contains(&option.as_str()));
+        // Loose on purpose: calling data "code" can only add an approval, never
+        // remove one, so an interpreter anywhere in the prefix is enough.
+        let interpreter = tokens
+            .iter()
+            .any(|word| PAYLOAD_INTERPRETERS.contains(&word.as_str()));
+        if payload_option && interpreter {
+            payload.push_str(&inner);
+            payload.push('\n');
+            continue;
+        }
+        // A quoted span with no whitespace is just an argument word, and a shell
+        // runs it exactly as if it were unquoted. Re-inline it so `rm "-rf" /`
+        // or `git "reset" --hard` cannot hide a destructive phrase; only a
+        // multi-word span (a search pattern, a message) is data.
+        if !inner.chars().any(char::is_whitespace) {
+            judged.push_str(&inner);
+            judged.push(' ');
+        }
+    }
+    let joined = if payload.is_empty() {
+        judged
+    } else {
+        format!("{judged}\n{payload}")
+    };
+    // The phrase lists assume single spaces (`git reset --hard`), so a quoted
+    // word that is re-inlined must not leave a doubled gap that hides the match.
+    joined.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 /// M172 regression tests: credential reads and remote writes keep confirmation.
 #[cfg(test)]
 mod m172_shell_policy_ask {
@@ -354,7 +486,9 @@ mod tests {
     #[test]
     fn rejects_direct_playwright_cli_in_favor_of_managed_sessions() {
         assert!(matches!(
-            classify_command("npx --package @playwright/cli playwright-cli open https://example.com"),
+            classify_command(
+                "npx --package @playwright/cli playwright-cli open https://example.com"
+            ),
             ShellCommandPolicy::Deny { .. }
         ));
     }
@@ -437,16 +571,25 @@ mod tests {
             cwd,
             Some(0),
             ShellRisk::Low,
-            Some(GithubQuota { remaining: 4800, limit: 5000 }),
+            Some(GithubQuota {
+                remaining: 4800,
+                limit: 5000,
+            }),
         );
         assert!(healthy.contains("4800/5000 remaining"));
-        assert!(!healthy.contains("running low"), "no false alarm: {healthy}");
+        assert!(
+            !healthy.contains("running low"),
+            "no false alarm: {healthy}"
+        );
 
         let low = audit_footer_with_quota(
             cwd,
             Some(0),
             ShellRisk::Low,
-            Some(GithubQuota { remaining: 400, limit: 5000 }),
+            Some(GithubQuota {
+                remaining: 400,
+                limit: 5000,
+            }),
         );
         assert!(low.contains("running low"));
         assert!(low.contains("deliver_changes"), "say what to do instead");
