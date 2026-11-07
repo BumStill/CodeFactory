@@ -1155,7 +1155,7 @@ export function WorkspacePage({
           request={pendingPermission}
           trusted={(activeSession?.permission_mode ?? "standard") === "trusted"}
           onAllow={() => respondPermission(true)}
-          onDeny={() => respondPermission(false)}
+          onDeny={(note) => respondPermission(false, { note })}
           onAllowFullAccess={() => respondPermission(true, { grantFullAccess: true })}
         />
       )}

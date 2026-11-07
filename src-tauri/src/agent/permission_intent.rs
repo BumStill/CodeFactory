@@ -214,6 +214,35 @@ pub(crate) enum PermissionPromptResponse {
     Deny,
 }
 
+/// M265: how long the optional explanation on a decision may be.
+///
+/// It is short on purpose: this is the sentence the user would have typed as a
+/// follow-up steer, not a document. Both the dispatch boundary and the
+/// `respond_to_permission` command share this limit so nobody can slip a long
+/// note in through the other entrance.
+pub(crate) const PERMISSION_NOTE_MAX_CHARS: usize = 1000;
+
+/// M265: trim an optional note and treat blank as absent.
+///
+/// The note is commentary for the model only. It never widens a decision, so
+/// this function deliberately returns nothing but text: no grants, no rules.
+pub(crate) fn normalize_permission_note(note: Option<String>) -> Result<Option<String>, String> {
+    let Some(raw) = note else {
+        return Ok(None);
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    let length = trimmed.chars().count();
+    if length > PERMISSION_NOTE_MAX_CHARS {
+        return Err(format!(
+            "note must be at most {PERMISSION_NOTE_MAX_CHARS} characters (got {length})"
+        ));
+    }
+    Ok(Some(trimmed.to_string()))
+}
+
 async fn grant_remote_delivery_in_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>, intent: &PermissionIntentSnapshot,
 ) -> anyhow::Result<()> {

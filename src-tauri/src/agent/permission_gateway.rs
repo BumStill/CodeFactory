@@ -296,7 +296,12 @@ impl PermissionGateway for DesktopPermissionGateway {
                 }
                 PermissionOutcome::Deny(mut denial) => {
                     if denial.reason == PermissionDenialReason::DeniedByUser {
-                        denial.content = "用户不允许推送，请在本地完成并说明".into();
+                        // M265: only the leading sentence is delivery-specific — the
+                        // user's own explanation must survive this rewrite.
+                        denial.content = match denial.content.split_once("\n\n") {
+                            Some((_, tail)) => format!("用户不允许推送，请在本地完成并说明\n\n{tail}"),
+                            None => "用户不允许推送，请在本地完成并说明".into(),
+                        };
                     }
                     PermissionOutcome::Deny(denial)
                 }
@@ -659,8 +664,8 @@ impl DesktopPermissionGateway {
                     PermissionOutcome::Allow
                 }
             }
-            PermissionResponse::DeniedByUser => PermissionOutcome::Deny(PermissionDenial {
-                content: "Tool call denied by the user. The requested action was not executed; do not bypass this decision with another tool.".to_string(),
+            PermissionResponse::DeniedByUser { note } => PermissionOutcome::Deny(PermissionDenial {
+                content: denial_content_with_note(DENIED_BY_USER_CONTENT, note.as_deref()),
                 reason: PermissionDenialReason::DeniedByUser,
                 duration_ms,
             }),
@@ -808,6 +813,27 @@ fn permission_recovery_rejected() -> PermissionOutcome {
     })
 }
 
+/// M265: the exact text the model sees when the user denies without explaining.
+///
+/// Without a note this string is byte-for-byte what M265 found; a test pins it so
+/// "no note" can never quietly become "a slightly different denial".
+pub(super) const DENIED_BY_USER_CONTENT: &str =
+    "Tool call denied by the user. The requested action was not executed; do not bypass this decision with another tool.";
+
+/// M265: attach the user's own explanation to the denial the model reads.
+///
+/// The note is labelled as the user's words so the model treats it as guidance
+/// about *this* refusal — not as a new instruction, and never as an
+/// authorization to do the same thing another way.
+fn denial_content_with_note(base: &str, note: Option<&str>) -> String {
+    match note.map(str::trim).filter(|note| !note.is_empty()) {
+        None => base.to_string(),
+        Some(note) => format!(
+            "{base}\n\nUser note (why the user denied this; it is guidance, not an authorization): {note}"
+        ),
+    }
+}
+
 async fn persist_interruption(
     store: &PermissionIntentStore,
     key: Option<&PermissionPromptKey>,
@@ -865,7 +891,7 @@ mod tests {
         let intent = wait_for_durable_intent(&gateway).await;
         assert_eq!(intent.scope.objective_revision, 8);
         PermissionIntentStore::new(gateway.db.clone()).record_user_response(&intent.prompt_key(), PermissionPromptResponse::Allow, chrono::Utc::now().timestamp_millis()).await.unwrap();
-        take_pending_sender(&gateway).await.send(true).unwrap();
+        take_pending_sender(&gateway).await.send(allow()).unwrap();
         assert_eq!(task.await.unwrap(), PermissionOutcome::Allow);
     }
 
@@ -899,7 +925,7 @@ mod tests {
         PermissionIntentStore::new(gateway.db.clone()).record_user_response(
             &intent.prompt_key(), PermissionPromptResponse::Allow, chrono::Utc::now().timestamp_millis(),
         ).await.unwrap();
-        take_pending_sender(&gateway).await.send(true).unwrap();
+        take_pending_sender(&gateway).await.send(allow()).unwrap();
         assert_eq!(authorization.await.unwrap(), PermissionOutcome::Allow);
         let state = super::super::thin_derive::refresh(&gateway.db, &gateway.session_id).await.unwrap();
         assert_eq!(state.state, super::super::thin_state::SessionState::Running);
@@ -1416,7 +1442,7 @@ mod tests {
             let intent = wait_for_durable_intent(&gateway).await;
             assert!(!task.is_finished());
             PermissionIntentStore::new(gateway.db.clone()).record_user_response(&intent.prompt_key(), PermissionPromptResponse::Deny, chrono::Utc::now().timestamp_millis()).await.unwrap();
-            take_pending_sender(&gateway).await.send(false).unwrap();
+            take_pending_sender(&gateway).await.send(deny()).unwrap();
             assert!(matches!(task.await.unwrap(), PermissionOutcome::Deny(_)));
         }
         // Another session's registered workspace never establishes ownership.
@@ -1473,8 +1499,85 @@ mod tests {
         let call = ToolCall { id: "m159-standard".into(), r#type: "function".into(), function: FunctionCall { name: "bash".into(), arguments: args.to_string() } };
         let other = gateway.clone();
         let task = tokio::spawn(async move { other.authorize(&call, &args, Some(command)).await });
-        take_pending_sender(&gateway).await.send(false).unwrap();
+        take_pending_sender(&gateway).await.send(deny()).unwrap();
         assert!(matches!(task.await.unwrap(), PermissionOutcome::Deny(_)));
+    }
+
+    /// M265: a denial the user explains is one decision, not a denial plus a
+    /// separate steer — the note rides inside the tool result the model reads.
+    #[tokio::test]
+    async fn m265_a_denial_note_reaches_the_model_with_the_denial() {
+        let gateway = test_gateway("standard").await;
+        let command = "git reset --hard HEAD";
+        let args = serde_json::json!({"command":command});
+        let call = ToolCall { id: "m265-note".into(), r#type: "function".into(), function: FunctionCall { name: "bash".into(), arguments: args.to_string() } };
+        let other = gateway.clone();
+        let task = tokio::spawn(async move { other.authorize(&call, &args, Some(command)).await });
+        take_pending_sender(&gateway)
+            .await
+            .send(crate::PermissionDecision {
+                allow: false,
+                note: Some("keep the stash, do not hard reset".into()),
+            })
+            .expect("permission receiver remains live");
+        match task.await.unwrap() {
+            PermissionOutcome::Deny(denial) => {
+                // R4: the note is commentary, never an authorization.
+                assert_eq!(denial.reason, PermissionDenialReason::DeniedByUser);
+                // R2: the reason the user typed is in the text the model sees.
+                assert!(
+                    denial.content.contains("keep the stash, do not hard reset"),
+                    "note missing from denied result: {}",
+                    denial.content
+                );
+                assert!(
+                    denial.content.contains("User note"),
+                    "the note must be labelled as the user's: {}",
+                    denial.content
+                );
+            }
+            other => panic!("expected a denial, got {other:?}"),
+        }
+    }
+
+    /// M265 R5: without a note the denial text stays exactly what it was.
+    #[tokio::test]
+    async fn m265_a_denial_without_a_note_keeps_the_existing_text_verbatim() {
+        let gateway = test_gateway("standard").await;
+        let command = "git reset --hard HEAD";
+        let args = serde_json::json!({"command":command});
+        let call = ToolCall { id: "m265-no-note".into(), r#type: "function".into(), function: FunctionCall { name: "bash".into(), arguments: args.to_string() } };
+        let other = gateway.clone();
+        let task = tokio::spawn(async move { other.authorize(&call, &args, Some(command)).await });
+        take_pending_sender(&gateway)
+            .await
+            .send(crate::PermissionDecision { allow: false, note: None })
+            .expect("permission receiver remains live");
+        match task.await.unwrap() {
+            PermissionOutcome::Deny(denial) => assert_eq!(
+                denial.content,
+                "Tool call denied by the user. The requested action was not executed; do not bypass this decision with another tool."
+            ),
+            other => panic!("expected a denial, got {other:?}"),
+        }
+    }
+
+    /// M265 R4: an approval carrying a note is still just an approval.
+    #[tokio::test]
+    async fn m265_an_approval_note_does_not_change_the_decision() {
+        let gateway = test_gateway("standard").await;
+        // Must be a command that actually prompts; `git status` is auto-allowed in
+        // standard mode and would never reach the card this test is about.
+        let command = "git reset --hard HEAD";
+        let args = serde_json::json!({"command":command});
+        let call = ToolCall { id: "m265-allow-note".into(), r#type: "function".into(), function: FunctionCall { name: "bash".into(), arguments: args.to_string() } };
+        let other = gateway.clone();
+        let task = tokio::spawn(async move { other.authorize(&call, &args, Some(command)).await });
+        take_pending_sender(&gateway)
+            .await
+            .send(crate::PermissionDecision { allow: true, note: Some("fine, read-only".into()) })
+            .expect("permission receiver remains live");
+        assert_eq!(task.await.unwrap(), PermissionOutcome::Allow);
     }
 
     async fn wait_for_durable_intent(
@@ -1507,9 +1610,24 @@ mod tests {
         .expect("durable permission intent was admitted")
     }
 
-    async fn take_pending_sender(gateway: &DesktopPermissionGateway) -> oneshot::Sender<bool> {
+    /// M265: the common case — a decision with no explanation.
+    fn allow() -> crate::PermissionDecision {
+        crate::PermissionDecision { allow: true, note: None }
+    }
+
+    fn deny() -> crate::PermissionDecision {
+        crate::PermissionDecision { allow: false, note: None }
+    }
+
+    async fn take_pending_sender(gateway: &DesktopPermissionGateway) -> oneshot::Sender<crate::PermissionDecision> {
         // Same liveness budget and cooperative sleep as wait_for_durable_intent.
-        tokio::time::timeout(Duration::from_secs(15), async {
+        // 15s was too tight on a loaded machine: one full-suite run reported
+        // "permission prompt was not emitted" after exactly 15.02s while the
+        // same revision passed the next 15 runs in 0.01s, i.e. the wait was
+        // starved rather than the prompt missing. This is a liveness wait, not
+        // a latency assertion, so the ceiling stays generous — a real missing
+        // prompt still fails here, just later.
+        tokio::time::timeout(Duration::from_secs(60), async {
             loop {
                 let mut pending = gateway.pending_permissions.lock().await;
                 if let Some(key) = pending.keys().next().cloned() {
@@ -1528,7 +1646,8 @@ mod tests {
         gateway: Arc<DesktopPermissionGateway>,
         id: &str,
         action: &str,
-        allow: bool,
+        // Not named `allow`: that would shadow the `allow()` decision helper.
+        allow_decision: bool,
     ) -> PermissionOutcome {
         let (tool_call, args) = browser_call(id, action);
         let task_gateway = gateway.clone();
@@ -1536,7 +1655,7 @@ mod tests {
             tokio::spawn(async move { task_gateway.authorize(&tool_call, &args, None).await });
         take_pending_sender(&gateway)
             .await
-            .send(allow)
+            .send(if allow_decision { allow() } else { deny() })
             .expect("permission receiver remains live");
         authorization.await.expect("authorization task")
     }
@@ -1580,7 +1699,7 @@ mod tests {
         assert_eq!(waiting.state, super::super::thin_state::SessionState::WaitingUser);
         assert!(waiting.question.unwrap().contains("允许"));
         assert!(git(&repo, &["ls-remote", "origin"]).is_empty(), "no remote mutation before approval");
-        sender.send(true).unwrap();
+        sender.send(allow()).unwrap();
         assert_eq!(handle.await.unwrap(), PermissionOutcome::Allow);
         git(&repo, &["push", "origin", "HEAD:refs/heads/synthetic"]);
         assert_eq!(git(&repo, &["ls-remote", "origin", "refs/heads/synthetic"]).split_whitespace().next(), Some(head.trim()));
@@ -1597,7 +1716,7 @@ mod tests {
         let cloned = gateway.clone();
         let handle = tokio::spawn(async move { cloned.authorize(&call, &args, Some("git push origin synthetic")).await });
         assert!(!super::super::fetch_session_delivery_authorized(&gateway.db, "permission-test").await);
-        take_pending_sender(&gateway).await.send(true).unwrap();
+        take_pending_sender(&gateway).await.send(allow()).unwrap();
         assert_eq!(handle.await.unwrap(), PermissionOutcome::Allow);
         assert!(super::super::fetch_session_delivery_authorized(&gateway.db, "permission-test").await);
     }
@@ -1612,7 +1731,7 @@ mod tests {
             function: FunctionCall { name: "deliver_changes".into(), arguments: args.to_string() } };
         let cloned = gateway.clone();
         let handle = tokio::spawn(async move { cloned.authorize(&call, &args, None).await });
-        take_pending_sender(&gateway).await.send(false).unwrap();
+        take_pending_sender(&gateway).await.send(deny()).unwrap();
         match handle.await.unwrap() {
             PermissionOutcome::Deny(denial) => assert_eq!(denial.content, "用户不允许推送，请在本地完成并说明"),
             other => panic!("expected denial, got {other:?}"),
@@ -1643,7 +1762,7 @@ mod tests {
             .await
             .remove(&intent.intent_id)
             .unwrap()
-            .send(true)
+            .send(allow())
             .unwrap();
         assert_eq!(
             authorization.await.unwrap(),
@@ -1815,7 +1934,7 @@ mod tests {
             .expect("a late approval is still an admissible decision");
         take_pending_sender(&gateway)
             .await
-            .send(true)
+            .send(allow())
             .expect("permission receiver remains live");
         assert_eq!(
             authorization.await.expect("authorization task"),

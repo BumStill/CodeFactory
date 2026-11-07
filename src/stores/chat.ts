@@ -202,7 +202,7 @@ interface ChatStore {
   cancelStream: (sessionId?: string) => Promise<boolean>;
   respondPermission: (
     allow: boolean,
-    opts?: { grantFullAccess?: boolean },
+    opts?: { grantFullAccess?: boolean; note?: string },
   ) => Promise<void>;
   addLocalAssistantMessage: (content: string) => void;
   /** Steer the in-flight run: the message reaches the model at its next round
@@ -1198,7 +1198,15 @@ export const useChatStore = create<ChatStore>((set, get) => ({
         console.error("Failed to persist trusted permission mode for session:", e);
       }
     }
-    await invoke("respond_to_permission", { intentId: pending.intentId, allow });
+    // M265: the refusal reason rides the same IPC call as the decision. An
+    // empty or whitespace-only note is dropped so an unexplained denial stays
+    // byte-identical to what it was before this feature.
+    const note = allow ? undefined : opts?.note?.trim();
+    await invoke("respond_to_permission", {
+      intentId: pending.intentId,
+      allow,
+      ...(note ? { note } : {}),
+    });
     set((s) => {
       const prev = s.runtime[id];
       if (!prev) return {};

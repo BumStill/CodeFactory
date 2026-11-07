@@ -44,9 +44,13 @@ export function useAppDispatchBridge(showWorkspace: () => void): void {
     stop: dispatchStop,
     cleanBuildCache: () => invoke("build_cache_cleanup"),
     listApprovals: async () => invoke<DispatchApproval[]>("list_pending_approvals"),
-    resolveApproval: async ({ approvalId, approve }) => {
-      await invoke("respond_to_permission", { intentId: approvalId, allow: approve });
-      return { approval_id: approvalId, approved: approve };
+    resolveApproval: async ({ approvalId, approve, note }) => {
+      // M265: 判定和说明走同一次调用 —— 拒绝的理由不需要再另发一条消息。
+      await invoke(
+        "respond_to_permission",
+        note ? { intentId: approvalId, allow: approve, note } : { intentId: approvalId, allow: approve },
+      );
+      return { approval_id: approvalId, approved: approve, note: note ?? null };
     },
     closeObjective: async ({ sessionId, outcome, objectiveId }) => {
       const result = await invoke("close_objective", { sessionId, outcome, objectiveId });

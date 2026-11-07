@@ -145,10 +145,11 @@ fn wall_budget_applies(mode: AgentMode) -> bool {
     matches!(mode, AgentMode::Autonomous)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum PermissionResponse {
     Allow,
-    DeniedByUser,
+    /// M265: a denial may carry the user's own one-line reason.
+    DeniedByUser { note: Option<String> },
     TimedOut,
     ChannelClosed,
     Cancelled,
@@ -183,14 +184,14 @@ where
 }
 
 async fn await_permission_response(
-    receiver: &mut tokio::sync::oneshot::Receiver<bool>,
+    receiver: &mut tokio::sync::oneshot::Receiver<crate::PermissionDecision>,
     cancel: Option<&Arc<AtomicBool>>,
     max_wait: Duration,
 ) -> PermissionResponse {
     tokio::select! {
         response = timeout(max_wait, &mut *receiver) => match response {
-            Ok(Ok(true)) => PermissionResponse::Allow,
-            Ok(Ok(false)) => PermissionResponse::DeniedByUser,
+            Ok(Ok(decision)) if decision.allow => PermissionResponse::Allow,
+            Ok(Ok(decision)) => PermissionResponse::DeniedByUser { note: decision.note },
             Ok(Err(_)) => PermissionResponse::ChannelClosed,
             Err(_) => PermissionResponse::TimedOut,
         },
@@ -3610,10 +3611,25 @@ mod tests {
     #[tokio::test]
     async fn permission_response_preserves_user_denial_timeout_and_closed_channel() {
         let (deny_sender, mut deny_receiver) = tokio::sync::oneshot::channel();
-        deny_sender.send(false).unwrap();
+        deny_sender
+            .send(crate::PermissionDecision {
+                allow: false,
+                note: Some("keep the stash".into()),
+            })
+            .unwrap();
         assert_eq!(
             await_permission_response(&mut deny_receiver, None, Duration::from_secs(1)).await,
-            PermissionResponse::DeniedByUser
+            PermissionResponse::DeniedByUser { note: Some("keep the stash".into()) }
+        );
+
+        // M265 R5: a decision without a note stays a plain denial.
+        let (plain_sender, mut plain_receiver) = tokio::sync::oneshot::channel();
+        plain_sender
+            .send(crate::PermissionDecision { allow: false, note: None })
+            .unwrap();
+        assert_eq!(
+            await_permission_response(&mut plain_receiver, None, Duration::from_secs(1)).await,
+            PermissionResponse::DeniedByUser { note: None }
         );
 
         let (_timeout_sender, mut timeout_receiver) = tokio::sync::oneshot::channel();

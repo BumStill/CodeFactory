@@ -71,7 +71,20 @@ use tauri::Manager;
 use tokio::sync::{oneshot, Mutex, RwLock};
 use util::no_window::NoWindow;
 
-pub type PendingPermissionMap = Arc<Mutex<HashMap<String, oneshot::Sender<bool>>>>;
+/// M265: one user decision on a pending permission request.
+///
+/// The note is the sentence the user attached to the decision ("don't hard
+/// reset, keep the stash"). It travels on the same channel as `allow` so the
+/// model reads one decision with its reason, instead of a bare denial followed
+/// by a separate steer. It is commentary only: nothing in the permission
+/// policy reads it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PermissionDecision {
+    pub allow: bool,
+    pub note: Option<String>,
+}
+
+pub type PendingPermissionMap = Arc<Mutex<HashMap<String, oneshot::Sender<PermissionDecision>>>>;
 
 /// M30: process-local stop flags keyed by `run_instance_id`.
 ///

@@ -45,6 +45,9 @@ export type DispatchSendMode = (typeof DISPATCH_SEND_MODES)[number];
  */
 export const DEFAULT_DISPATCH_SEND_MODE: DispatchSendMode = "steer";
 
+/** M265：拒绝说明的长度上限，与 Rust 侧 `PERMISSION_NOTE_MAX_CHARS` 同值。 */
+export const DISPATCH_PERMISSION_NOTE_MAX_CHARS = 1000;
+
 /** 原生侧发过来的请求负载。 */
 export interface DispatchRequestEvent {
   request_id: string;
@@ -101,7 +104,7 @@ export interface DispatchHandlers {
   switchSession: (input: { sessionId: string }) => Promise<unknown>;
   stop: (input: { sessionId?: string }) => Promise<unknown>;
   listApprovals: () => Promise<DispatchApproval[]>;
-  resolveApproval: (input: { approvalId: string; approve: boolean }) => Promise<unknown>;
+  resolveApproval: (input: { approvalId: string; approve: boolean; note?: string }) => Promise<unknown>;
   /** CF-BLD-R4: the panel's one-click cleanup, reachable from the background. */
   /** CF-QUOTA-R2: same reads and persistence as Settings. */
   getUsageWindows?: () => Promise<unknown> | unknown;
@@ -127,6 +130,21 @@ function requiredString(value: unknown, field: string): string {
 function optionalString(value: unknown, field: string): string | undefined {
   if (value === undefined || value === null) return undefined;
   return requiredString(value, field);
+}
+
+/**
+ * M265：审批时可选的说明。空白等于没写（不是请求错误），但超长、非字符串一律拒绝，
+ * 绝不静默截断 —— 用户写的话要么完整送到模型，要么明说没送。
+ */
+function optionalPermissionNote(value: unknown): string | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (typeof value !== "string") throw new Error("note must be a string");
+  const trimmed = value.trim();
+  if (!trimmed) return undefined;
+  if (trimmed.length > DISPATCH_PERMISSION_NOTE_MAX_CHARS) {
+    throw new Error(`note must be at most ${DISPATCH_PERMISSION_NOTE_MAX_CHARS} characters`);
+  }
+  return trimmed;
 }
 
 /**
@@ -307,14 +325,17 @@ export async function applyDispatchRequest(
         if (!handlers.cleanBuildCache) return invalid("clean_build_cache is not available");
         result = await handlers.cleanBuildCache();
         break;
-      case "resolve_approval":
+      case "resolve_approval": {
         result = await handlers.resolveApproval({
           approvalId: requiredString(body.approval_id, "approval_id"),
           // 审批永远是一条一条来的：这里只是把"批"或"拒"原样转达，
           // 从不做批量放行，也不把高危操作变成默认通过。
           approve: requiredDeliveryBoolean(body.approve, "approve"),
+          // M265：拒绝时附的那句理由跟判定一起走；空白等于没写。
+          note: optionalPermissionNote(body.note),
         });
         break;
+      }
       default:
         // 未知动作不是"尽力而为"的理由：猜错的代价是用户以为派了单其实没派。
         // `focus_main_display` 也在原生侧直接处理，不该发到前端。

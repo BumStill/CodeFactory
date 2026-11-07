@@ -39,6 +39,7 @@
     "test:turn-progress:headless": "node scripts/verify-turn-progress-headless.mjs",
     "test:streaming-markdown:headless": "node scripts/verify-streaming-markdown-headless.mjs",
     "test:permission-mode:headless": "node scripts/verify-permission-mode-headless.mjs",
+    "test:m265-reject-note:headless": "node scripts/verify-m265-reject-note-headless.mjs",
     "test:startup-session:headless": "node scripts/verify-startup-session-headless.mjs",
     "test:sidebar-expansion:headless": "node scripts/verify-sidebar-expansion-headless.mjs",
     "test:paste-attachments:headless": "node scripts/verify-paste-attachments-headless.mjs",

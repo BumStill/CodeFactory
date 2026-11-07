@@ -75,8 +75,18 @@ describe("PermissionDialog tool-args preview", () => {
     expect(trust).toHaveClass("min-h-11", "lg:min-h-9");
     await waitFor(() => expect(deny).toHaveFocus());
 
+    // M265 added one focusable element *before* the buttons: the optional
+    // refusal note. Stepping back from 拒绝 lands on it, and from there the
+    // trap wraps to the last control instead of leaving the dialog.
+    const note = screen.getByTestId("permission-note");
+    await userEvent.tab({ shift: true });
+    expect(note).toHaveFocus();
+
     await userEvent.tab({ shift: true });
     expect(trust).toHaveFocus();
+
+    await userEvent.tab();
+    expect(note).toHaveFocus();
 
     await userEvent.tab();
     expect(deny).toHaveFocus();
@@ -179,5 +189,44 @@ describe("PermissionDialog tool-args preview", () => {
 
     expect(screen.getByText(/"command"/)).toBeInTheDocument();
     expect(screen.getByText(/ls -la/)).toBeInTheDocument();
+  });
+});
+
+describe("M265 rejection note", () => {
+  it("sends the note the user typed with the denial, on one path", async () => {
+    const deny = vi.fn();
+    render(
+      <PermissionDialog
+        request={baseRequest({ toolName: "bash", args: { command: "git reset --hard HEAD" } })}
+        trusted={false}
+        {...noop}
+        onDeny={deny}
+      />,
+    );
+
+    const note = screen.getByTestId("permission-note");
+    expect(note).toBeInTheDocument();
+    await userEvent.type(note, "  keep the stash  ");
+    await userEvent.click(screen.getByRole("button", { name: "拒绝" }));
+
+    expect(deny).toHaveBeenCalledTimes(1);
+    expect(deny).toHaveBeenCalledWith("keep the stash");
+  });
+
+  it("denies without a note when the box is left empty", async () => {
+    const deny = vi.fn();
+    render(
+      <PermissionDialog request={baseRequest({ toolName: "bash" })} trusted={false} {...noop} onDeny={deny} />,
+    );
+
+    await userEvent.click(screen.getByRole("button", { name: "拒绝" }));
+
+    expect(deny).toHaveBeenCalledTimes(1);
+    expect(deny.mock.calls[0][0]).toBeUndefined();
+  });
+
+  it("caps what can be typed at the same limit the dispatch boundary enforces", () => {
+    render(<PermissionDialog request={baseRequest({ toolName: "bash" })} trusted={false} {...noop} />);
+    expect(screen.getByTestId("permission-note")).toHaveAttribute("maxlength", "1000");
   });
 });
