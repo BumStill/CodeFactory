@@ -1268,8 +1268,8 @@ pub(crate) async fn settle_objectiveless_wake(pool: &SqlitePool, session: &str, 
         let active: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM chat_run_controls WHERE session_id=? AND status IN ('active','cancel_requested')").bind(session).fetch_one(pool).await?;
         if active > 0 { return Ok(false); }
         let report = super::thin_derive::closeout_report(pool, session).await?;
-        let result = if report.is_some() { format!("{reason}；§8 收尾完成，核验详情见本会话收尾报告与工具收据") }
-            else { super::thin_derive::closeout_bounded_result(reason, *fires) };
+        let result = if report.is_some() { format!("{reason}；收尾已完成，明细见本会话工具记录") }
+            else { super::thin_derive::closeout_result(pool, session, reason).await };
         let state = super::thin_state::ThinState::ended(&result, "本会话记录");
         super::thin_state::save(pool, session, &state).await?;
         sqlx::query("UPDATE wakeup_schedules SET status='cancelled' WHERE session_id=? AND status='pending'").bind(session).execute(pool).await?;
