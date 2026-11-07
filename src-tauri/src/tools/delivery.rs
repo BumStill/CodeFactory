@@ -76,6 +76,10 @@ pub fn definition() -> ToolDefinition {
                         "type": "string",
                         "description": "Optional guard: the branch you believe you are delivering. This tool has no branch argument — it delivers whatever branch the working directory is on. When resuming a specific PR, pass its head branch here; if the working directory is somewhere else the call stops before touching anything instead of opening a second PR for unrelated work."
                     },
+                    "allow_large_change": {
+                        "type": "boolean",
+                        "description": "M258: explicit acknowledgement that this delivery is a genuinely large source change (e.g. a wide refactor) rather than a runaway build tree. Past 1000 files or 200000 changed lines the tool refuses by default; set true to proceed. It can never admit build output — build artifacts are always refused."
+                    },
                     "release_only": {
                         "type": "boolean",
                         "description": "Release the exact current default-branch head without staging, pushing, or opening a PR. Use only for an explicit release task with no changes of its own."
@@ -198,6 +202,10 @@ async fn execute_inner(args: Value, ctx: &ExecCtx) -> Result<ToolOutput> {
         release_urgency,
         requested_ceiling,
         extra_excludes: settings.delivery_exclude_globs.clone(),
+        allow_large_change: args
+            .get("allow_large_change")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
         expect_branch: args
             .get("expect_branch")
             .and_then(Value::as_str)

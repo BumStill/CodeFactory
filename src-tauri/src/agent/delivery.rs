@@ -629,6 +629,11 @@ pub struct DeliverOpts {
     /// A per-call ceiling; clamped to at most the user's configured ceiling.
     pub requested_ceiling: Option<DeliveryCeiling>,
     pub extra_excludes: Vec<String>,
+    /// M258: an explicit way through the oversized-change guard. The caller
+    /// states that a change set past the size thresholds is real source work
+    /// (a large refactor), not a runaway build tree. It can never admit build
+    /// output: artifact facts block regardless of this flag.
+    pub allow_large_change: bool,
     /// The branch the caller BELIEVES it is delivering. `deliver_changes` has no
     /// branch argument — it delivers whatever the working directory is on — so a
     /// caller resuming a specific delivery states its target here and the tool
@@ -1804,6 +1809,10 @@ fn retry_delivery_network<T>(step: &str, mut operation: impl FnMut() -> Result<T
                     "交付卡在 {step}：GitHub API 额度受限，本次不立即重试（后台观测按额度退避）；已有提交、分支和 PR 未删除；额度恢复后由系统续接。原因：{error}"
                 ));
             }
+            // M258/R4: a reachable remote whose push hit the bound because the
+            // payload is huge is NOT a network condition. Retrying it just burns
+            // the same bound three times and reads as a network wait.
+            Err(error) if error.contains("要推送的内容过大") => return Err(error),
             Err(error) if remote_error_is_retryable(&error) && attempt < 3 => {
                 tracing::warn!(step, attempt, "delivery network retry scheduled");
                 sleep(1 << (attempt - 1));
@@ -1822,7 +1831,29 @@ fn remote_error_is_rate_limited(detail: &str) -> bool {
     lower.contains("rate limit") || lower.contains("429")
 }
 
+/// M258: stable marker for "the command hit the bound", so a caller can tell a
+/// timeout apart from a command that ran and failed with its own stderr.
+const DELIVERY_TIMEOUT_MARKER: &str = "timeout：交付子进程超过";
+/// Bound for one delivery subprocess. A network rung that needs longer than
+/// this is not going to finish by waiting: push almost always means the payload
+/// is too big, which the caller must fix.
+const DELIVERY_COMMAND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// Bound for the reachability probe that follows a push timeout. It must be
+/// shorter than the push bound so diagnosing a stalled push stays cheap.
+const DELIVERY_REACHABILITY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+fn delivery_error_is_timeout(error: &str) -> bool {
+    error.contains(DELIVERY_TIMEOUT_MARKER)
+}
+
 pub(crate) fn bounded_delivery_output(command: &mut Command) -> Result<String, String> {
+    bounded_delivery_output_with_timeout(command, DELIVERY_COMMAND_TIMEOUT)
+}
+
+pub(crate) fn bounded_delivery_output_with_timeout(
+    command: &mut Command,
+    timeout: std::time::Duration,
+) -> Result<String, String> {
     use std::io::Read;
     command.stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
     let mut child = command.spawn().map_err(|error| format!("failed to spawn delivery command: {error}"))?;
@@ -1833,10 +1864,15 @@ pub(crate) fn bounded_delivery_output(command: &mut Command) -> Result<String, S
     let started = std::time::Instant::now();
     let status = loop {
         if let Some(status) = child.try_wait().map_err(|error| error.to_string())? { break status; }
-        if started.elapsed() >= std::time::Duration::from_secs(30) {
+        if started.elapsed() >= timeout {
             let _ = child.kill();
             let _ = child.wait();
-            return Err("timeout：交付子进程超过 30 秒；等待网络或代理恢复，由系统重试；远端结果未知".into());
+            // M258/R4: a bare timeout says nothing about WHY. The cause is
+            // classified by the caller (`git`), which knows the rung.
+            return Err(format!(
+                "{DELIVERY_TIMEOUT_MARKER} {} 秒；远端结果未知",
+                timeout.as_secs_f64()
+            ));
         }
         std::thread::sleep(std::time::Duration::from_millis(25));
     };
@@ -1846,11 +1882,83 @@ pub(crate) fn bounded_delivery_output(command: &mut Command) -> Result<String, S
     else { Err(String::from_utf8_lossy(&stderr).trim().into()) }
 }
 
+/// M258/R4: is the remote answering at all? One short, un-retried probe — this
+/// is diagnosis, not a delivery attempt, so it must never sleep through the
+/// network retry budget.
+fn remote_is_reachable(cwd: &Path, remote: &str) -> bool {
+    let mut probe = dev_command("git");
+    probe
+        .arg("-C")
+        .arg(cwd)
+        .args(["ls-remote", "--heads", remote]);
+    bounded_delivery_output_with_timeout(&mut probe, DELIVERY_REACHABILITY_TIMEOUT).is_ok()
+}
+
+/// The size of the commit a push is trying to send. Read locally so it is
+/// bounded by disk speed, not by the stalled network.
+fn head_commit_size(cwd: &Path) -> (usize, u64) {
+    let numstat = git(cwd, &["show", "--numstat", "--format=", "HEAD"]).unwrap_or_default();
+    let mut files = 0usize;
+    let mut lines = 0u64;
+    for line in numstat.lines() {
+        let mut columns = line.split('\t');
+        let (Some(added), Some(deleted), Some(_path)) =
+            (columns.next(), columns.next(), columns.next())
+        else {
+            continue;
+        };
+        files += 1;
+        for value in [added, deleted] {
+            if let Ok(value) = value.parse::<u64>() {
+                lines += value;
+            }
+        }
+    }
+    (files, lines)
+}
+
+/// M258/R4: the two causes of a push timeout are not interchangeable. Only a
+/// remote that does not answer is a network wait; a reachable remote with a
+/// huge payload is a content problem the caller must fix, and reporting it as a
+/// network wait is what parked the M257 session on a 3/3 retry loop.
+fn push_timeout_message(reachable: bool, files: usize, changed_lines: u64) -> String {
+    if reachable {
+        format!(
+            "交付卡在 push：远端可达（`git ls-remote` 立即响应），但本次要推送的内容过大——{files} 个文件、{changed_lines} 行改动，超过了 {} 秒的单次推送上限。这不是网络问题，系统不会再重试推送。处理：把构建产物移到 `.codefactory-cache/` 下，或从未推送的提交里移除（`git rm -r --cached <path>`）后重新交付。",
+            DELIVERY_COMMAND_TIMEOUT.as_secs()
+        )
+    } else {
+        format!(
+            "交付卡在 push：远端当前不可达（`git ls-remote` 无响应）；等待网络恢复，由系统续接。已有提交与分支保留，远端结果须重新核对。"
+        )
+    }
+}
+
+fn explain_push_timeout(cwd: &Path, remote: &str, timeout_error: &str) -> String {
+    if !remote_is_reachable(cwd, remote) {
+        return format!("{timeout_error}；{}", push_timeout_message(false, 0, 0));
+    }
+    let (files, lines) = head_commit_size(cwd);
+    push_timeout_message(true, files, lines)
+}
+
 pub(crate) fn git(cwd: &Path, args: &[&str]) -> Result<String, String> {
     let network = matches!(args.first(), Some(&"fetch" | &"push" | &"ls-remote"));
-    let mut operation = || bounded_delivery_output(dev_command("git").arg("-C").arg(cwd).args(args));
+    let step = args.first().copied().unwrap_or("git");
+    let remote = args.get(2).copied().unwrap_or("origin");
+    let mut operation = || {
+        let result = bounded_delivery_output(dev_command("git").arg("-C").arg(cwd).args(args));
+        match result {
+            // M258/R4: a push that hit the bound is diagnosed before anything
+            // calls it a network problem.
+            Err(error) if step == "push" && delivery_error_is_timeout(&error) => {
+                Err(explain_push_timeout(cwd, remote, &error))
+            }
+            other => other,
+        }
+    };
     if network {
-        retry_delivery_network(args[0], operation, |seconds| std::thread::sleep(std::time::Duration::from_secs(seconds)))
+        retry_delivery_network(step, operation, |seconds| std::thread::sleep(std::time::Duration::from_secs(seconds)))
     } else { operation() }
 }
 
@@ -3598,6 +3706,178 @@ fn worktree_source_manifest_digest(root: &Path) -> Result<String, String> {
         hasher.update([0]);
     }
     Ok(format!("sha256:{:x}", hasher.finalize()))
+}
+
+// ── M258: delivery content size guard ───────────────────────────────────────
+//
+// M257 regression (2026-11-07, v1.102.0): a session used `.m257-target` as its
+// cargo build directory. `deliver_changes` staged the whole tree (5008 files,
+// 65k lines) because the staging scope is "every untracked file that is not
+// noise", and every `git push` then blew the 30s command bound. The ladder had
+// no content check, so the only surviving signal was a timeout — reported as a
+// network wait, which made the session park and retry instead of fixing it.
+//
+// This guard inspects the planned change set BEFORE any real index, ref or
+// remote mutation. Artifact detection is by file fact (a directory carrying a
+// build-cache marker, cargo's `.fingerprint` layout, artifact extensions) — a
+// name list would miss `.m258-target`, `.m259-target`, …
+
+/// One legitimate delivery in this repository lands in the dozens-to-hundreds
+/// of files; the incident carried 5008. 1000 is several times the observed
+/// legitimate batch while still catching the accident class long before push.
+pub const DELIVERY_MAX_CHANGED_FILES: usize = 1000;
+/// Real source batches here rarely cross 100k changed lines; the incident's 65k
+/// was almost all generated. 200k leaves room for a genuine large refactor.
+pub const DELIVERY_MAX_CHANGED_LINES: u64 = 200_000;
+
+/// Files a build system drops at the root of a cache directory. Their presence
+/// is the file fact that a *directory* is a build tree, whatever it is called.
+const BUILD_CACHE_MARKERS: &[&str] = &["CACHEDIR.TAG", ".rustc_info.json"];
+/// Compiler/build outputs that are never hand-written source.
+const BUILD_OUTPUT_EXTENSIONS: &[&str] = &[
+    "o", "obj", "rlib", "rmeta", "d", "pdb", "dylib", "so", "a", "lib", "exe", "dll", "class",
+    "pyc", "pcm", "gcno", "gcda",
+];
+
+#[derive(Debug, Clone, Default)]
+pub struct DeliverySizeReport {
+    /// Files this delivery would commit.
+    pub files: usize,
+    /// Added + deleted lines across the planned change set.
+    pub changed_lines: u64,
+    /// Build output found among the staged paths, in staging order.
+    pub artifacts: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeliverySizeVerdict {
+    Clear,
+    /// Past the thresholds, but the caller explicitly acknowledged it.
+    Approved { note: String },
+    /// Build output is staged. Never deliverable, even with an acknowledgement.
+    BuildOutput { files: usize, artifacts: usize },
+    Oversized { files: usize, changed_lines: u64 },
+}
+
+fn delivery_size_verdict(
+    report: &DeliverySizeReport,
+    allow_large_change: bool,
+) -> DeliverySizeVerdict {
+    if !report.artifacts.is_empty() {
+        return DeliverySizeVerdict::BuildOutput {
+            files: report.files,
+            artifacts: report.artifacts.len(),
+        };
+    }
+    let oversized = report.files > DELIVERY_MAX_CHANGED_FILES
+        || report.changed_lines > DELIVERY_MAX_CHANGED_LINES;
+    if !oversized {
+        return DeliverySizeVerdict::Clear;
+    }
+    if !allow_large_change {
+        return DeliverySizeVerdict::Oversized {
+            files: report.files,
+            changed_lines: report.changed_lines,
+        };
+    }
+    DeliverySizeVerdict::Approved {
+        note: format!(
+            "调用方以 allow_large_change 明确认可本次大改动（{} 个文件、{} 行），守卫已放行；请确认其中没有构建产物。",
+            report.files, report.changed_lines
+        ),
+    }
+}
+
+/// A staged path is build output when its own shape says so, or when an
+/// ancestor directory inside the repository carries a build-cache marker.
+fn path_is_build_output(root: &Path, relative: &str) -> bool {
+    let name = relative.rsplit('/').next().unwrap_or(relative);
+    if BUILD_CACHE_MARKERS.contains(&name) {
+        return true;
+    }
+    let components: Vec<&str> = relative.split('/').collect();
+    if components.contains(&".fingerprint") || relative.contains(".dSYM/") {
+        return true;
+    }
+    if let Some((_, extension)) = name.rsplit_once('.') {
+        if !extension.is_empty()
+            && BUILD_OUTPUT_EXTENSIONS.contains(&extension.to_ascii_lowercase().as_str())
+        {
+            return true;
+        }
+    }
+    // Directory fact, not a directory name: walk the ancestors that exist on
+    // disk and stop at the first one that is a build cache.
+    let mut cursor = root.to_path_buf();
+    for component in &components[..components.len().saturating_sub(1)] {
+        cursor.push(component);
+        if !cursor.is_dir() {
+            break;
+        }
+        if BUILD_CACHE_MARKERS
+            .iter()
+            .any(|marker| cursor.join(marker).is_file())
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn inspect_delivery_size(
+    root: &Path,
+    plan: &ScopedCommitPlan,
+) -> Result<DeliverySizeReport, String> {
+    let artifacts: Vec<String> = plan
+        .staged_paths
+        .iter()
+        .filter(|path| path_is_build_output(root, path))
+        .cloned()
+        .collect();
+    let numstat = git(
+        root,
+        &[
+            "diff",
+            "--numstat",
+            &plan.original_index_tree_sha,
+            &plan.target_tree_sha,
+        ],
+    )?;
+    let mut changed_lines = 0u64;
+    for line in numstat.lines() {
+        let mut columns = line.split('\t');
+        for column in [columns.next(), columns.next()].into_iter().flatten() {
+            if let Ok(value) = column.parse::<u64>() {
+                changed_lines += value;
+            }
+        }
+    }
+    Ok(DeliverySizeReport {
+        files: plan.staged_paths.len(),
+        changed_lines,
+        artifacts,
+    })
+}
+
+fn delivery_size_block_message(report: &DeliverySizeReport) -> String {
+    let samples: Vec<&str> = report.artifacts.iter().take(5).map(String::as_str).collect();
+    const FIX: &str = "构建产物由构建生成、可从源码重建，提交它们只会污染历史并让推送变慢。系统自动排除这类文件：把构建目录放到 `.codefactory-cache/` 下（例如 `CARGO_TARGET_DIR=.codefactory-cache/cargo-target-<task>`），或把该目录加入 `.gitignore`、或用 `extra_excludes` 排除，下一次交付即自动恢复。";
+    if !report.artifacts.is_empty() {
+        return format!(
+            "交付被拦：本次提交包含 {} 个构建产物文件（待提交 {} 个文件、{} 行改动），示例：{}。{FIX}未执行提交、推送或 PR 动作，也没有进入等待状态。",
+            report.artifacts.len(),
+            report.files,
+            report.changed_lines,
+            samples.join("、")
+        );
+    }
+    format!(
+        "交付被拦：本次改动规模异常（{} 个文件、{} 行改动，阈值 {} 个文件 / {} 行，依据见 docs/specs/feature-specs/m258-delivery-size-guard.md），且没有构建产物事实。系统按体积守卫暂停投递，并在确认改动性质后自动恢复：如果这是真实的大改动（例如大规模重构），下一次交付调用携带 `allow_large_change: true` 即自动放行；如果是混入的生成物，把它移到 `.codefactory-cache/` 下或用 `extra_excludes` 排除，系统自动恢复投递。未执行提交、推送或 PR 动作。",
+        report.files,
+        report.changed_lines,
+        DELIVERY_MAX_CHANGED_FILES,
+        DELIVERY_MAX_CHANGED_LINES
+    )
 }
 
 /// Compute the exact scoped commit tree in an isolated copy of the current
@@ -5719,6 +5999,30 @@ pub async fn deliver<R: DeliveryRemote>(
             ))
         }
     };
+    // M258: look at WHAT would be committed before any index, ref or remote
+    // mutation. Build output or a runaway change set is refused here with the
+    // paths and a fix the model can apply — never as a network wait.
+    let size_report = match inspect_delivery_size(&repo.root, &commit_plan) {
+        Ok(report) => report,
+        Err(error) => {
+            return outcome.blocked_at(StepResult::blocked(
+                "size_guard",
+                format!("无法核对本次提交的内容（未执行提交、推送或 PR 动作）：{error}"),
+            ))
+        }
+    };
+    match delivery_size_verdict(&size_report, opts.allow_large_change) {
+        DeliverySizeVerdict::Clear => {}
+        DeliverySizeVerdict::Approved { note } => {
+            outcome.steps.push(StepResult::ok("size_guard", note));
+        }
+        DeliverySizeVerdict::BuildOutput { .. } | DeliverySizeVerdict::Oversized { .. } => {
+            return outcome.blocked_at(StepResult::blocked(
+                "size_guard",
+                delivery_size_block_message(&size_report),
+            ));
+        }
+    }
     let head_tree = git(&repo.root, &["rev-parse", "HEAD^{tree}"]).unwrap_or_default();
     // CF-TRUTH-R2: one canonical subject for the commit this delivery writes and
     // the PR title it opens — computed before the commit exists, so a placeholder
@@ -12949,6 +13253,238 @@ mod tests {
         let staged = stage_scoped(&root, &["scratch.tmp".to_string()]).unwrap();
         assert!(staged.contains(&"keep.rs".to_string()));
         assert!(!staged.contains(&"scratch.tmp".to_string()));
+        let _ = std::fs::remove_dir_all(root.parent().unwrap());
+    }
+
+    // ── M258 R1–R4: delivery content size guard ──────────────────────────────
+
+    /// Builds a cargo target directory under an ARBITRARY name — the regression
+    /// was a per-session name (`.m257-target`) that no name list would contain.
+    fn write_cargo_build_dir(root: &Path, name: &str, objects: usize) {
+        let target = root.join(name);
+        std::fs::create_dir_all(target.join("debug/.fingerprint/dep-0")).unwrap();
+        std::fs::create_dir_all(target.join("debug/deps")).unwrap();
+        std::fs::write(
+            target.join("CACHEDIR.TAG"),
+            "Signature: 8a477f597d28d172789f06886806bc55\n",
+        )
+        .unwrap();
+        std::fs::write(target.join(".rustc_info.json"), "{}").unwrap();
+        std::fs::write(target.join("debug/dep.d"), "src/lib.rs:\n").unwrap();
+        std::fs::write(
+            target.join("debug/.fingerprint/dep-0/invoked.timestamp"),
+            "t",
+        )
+        .unwrap();
+        for index in 0..objects {
+            std::fs::write(
+                target.join(format!("debug/deps/libdep-{index}.rlib")),
+                "binary",
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn m258_build_output_is_recognised_by_file_facts_not_by_directory_name() {
+        let root = make_repo("m258-facts");
+        write_cargo_build_dir(&root, ".m258-target", 3);
+        // A file whose extension says nothing at all still lives inside the
+        // build directory, so the directory fact — not the extension — decides.
+        std::fs::write(root.join(".m258-target/debug/notes.txt"), "generated").unwrap();
+        std::fs::write(root.join("real_source.rs"), "pub fn ok() {}\n").unwrap();
+
+        let plan = prepare_scoped_commit(&root, &[]).unwrap();
+        let report = inspect_delivery_size(&root, &plan).unwrap();
+
+        assert!(
+            report
+                .artifacts
+                .iter()
+                .any(|path| path == ".m258-target/CACHEDIR.TAG"),
+            "{:?}",
+            report.artifacts
+        );
+        assert!(
+            report
+                .artifacts
+                .iter()
+                .any(|path| path == ".m258-target/debug/notes.txt"),
+            "every file inside a cargo target directory is build output: {:?}",
+            report.artifacts
+        );
+        assert!(
+            !report
+                .artifacts
+                .iter()
+                .any(|path| path == "real_source.rs"),
+            "real source must never be misread as build output: {:?}",
+            report.artifacts
+        );
+        assert_eq!(
+            delivery_size_verdict(&report, false),
+            DeliverySizeVerdict::BuildOutput {
+                files: report.files,
+                artifacts: report.artifacts.len(),
+            }
+        );
+        let _ = std::fs::remove_dir_all(root.parent().unwrap());
+    }
+
+    #[test]
+    fn m258_build_output_block_message_gives_paths_count_and_a_fix_the_model_can_apply() {
+        let root = make_repo("m258-message");
+        write_cargo_build_dir(&root, ".m258-target", 2);
+
+        let plan = prepare_scoped_commit(&root, &[]).unwrap();
+        let report = inspect_delivery_size(&root, &plan).unwrap();
+        let message = delivery_size_block_message(&report);
+
+        assert!(message.contains("构建产物"), "{message}");
+        assert!(message.contains(".m258-target/"), "{message}");
+        assert!(
+            message.contains(&format!("{} 个", report.artifacts.len())),
+            "{message}"
+        );
+        assert!(message.contains(".codefactory-cache/"), "{message}");
+        assert!(message.contains("未执行提交"), "{message}");
+        assert!(
+            !message.contains("等待网络") && !message.contains("等待用户"),
+            "fixable-by-the-model problems must not enter a waiting state: {message}"
+        );
+        let _ = std::fs::remove_dir_all(root.parent().unwrap());
+    }
+
+    #[test]
+    fn m258_large_source_change_is_blocked_by_default_and_has_an_explicit_way_through() {
+        let root = make_repo("m258-large");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        for index in 0..(DELIVERY_MAX_CHANGED_FILES + 5) {
+            std::fs::write(
+                root.join(format!("src/module_{index}.rs")),
+                "pub fn f() {}\n",
+            )
+            .unwrap();
+        }
+
+        let plan = prepare_scoped_commit(&root, &[]).unwrap();
+        let report = inspect_delivery_size(&root, &plan).unwrap();
+        assert!(report.artifacts.is_empty(), "{:?}", report.artifacts);
+        assert!(report.files > DELIVERY_MAX_CHANGED_FILES, "{}", report.files);
+        assert!(
+            matches!(
+                delivery_size_verdict(&report, false),
+                DeliverySizeVerdict::Oversized { .. }
+            ),
+            "an unacknowledged oversized change is blocked"
+        );
+        let note = match delivery_size_verdict(&report, true) {
+            DeliverySizeVerdict::Approved { note } => note,
+            other => panic!("allow_large_change must provide a way through, got {other:?}"),
+        };
+        assert!(note.contains("allow_large_change"), "{note}");
+        let _ = std::fs::remove_dir_all(root.parent().unwrap());
+    }
+
+    #[test]
+    fn m258_push_timeout_reports_content_size_when_the_remote_is_reachable() {
+        let reachable = push_timeout_message(true, 5008, 65_000);
+        assert!(reachable.contains("内容过大"), "{reachable}");
+        assert!(reachable.contains("5008"), "{reachable}");
+        assert!(
+            !reachable.contains("等待网络"),
+            "a reachable remote is never a network wait: {reachable}"
+        );
+        assert!(reachable.contains(".codefactory-cache/"), "{reachable}");
+
+        let unreachable = push_timeout_message(false, 3, 12);
+        assert!(unreachable.contains("等待网络"), "{unreachable}");
+        assert!(
+            !unreachable.contains("内容过大"),
+            "an unreachable remote is a network wait, not a size problem: {unreachable}"
+        );
+    }
+
+    #[test]
+    fn m258_a_stalled_delivery_command_is_recognised_as_a_timeout() {
+        let started = std::time::Instant::now();
+        let mut stalled = dev_command("sleep");
+        stalled.arg("5");
+        let error = bounded_delivery_output_with_timeout(
+            &mut stalled,
+            std::time::Duration::from_millis(300),
+        )
+        .unwrap_err();
+        assert!(delivery_error_is_timeout(&error), "{error}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(4));
+    }
+
+    #[tokio::test]
+    async fn m258_delivery_refuses_to_commit_a_cargo_build_directory() {
+        let root = feature_branch_repo("m258-deliver-block");
+        write_cargo_build_dir(&root, ".m258-target", 4);
+        let before_head = git(&root, &["rev-parse", "HEAD"]).unwrap();
+        let before_status = git(
+            &root,
+            &["status", "--porcelain=v1", "--untracked-files=all"],
+        )
+        .unwrap();
+        let calls = stub_calls();
+        let remote = StubRemote {
+            ci: CiStatus::Success,
+            existing_pr: None,
+            merge_queues: true,
+            merge_ok: true,
+            caps: every_capability(),
+            calls: calls.clone(),
+        };
+
+        let out = deliver::<StubRemote>(
+            &root,
+            DeliveryCeiling::PrOnly,
+            MergeMethod::Squash,
+            1,
+            &DeliverOpts::default(),
+            Some(&remote),
+            Some("main"),
+        )
+        .await;
+
+        assert_eq!(out.final_state, "blocked", "{:?}", out.steps);
+        assert_eq!(
+            git(&root, &["rev-parse", "HEAD"]).unwrap(),
+            before_head,
+            "the guard must refuse BEFORE any commit moves the branch"
+        );
+        assert_eq!(
+            git(
+                &root,
+                &["status", "--porcelain=v1", "--untracked-files=all"],
+            )
+            .unwrap(),
+            before_status,
+            "the guard must not touch the worktree"
+        );
+        assert!(
+            out.steps
+                .iter()
+                .all(|step| !matches!(step.step.as_str(), "commit" | "push")),
+            "{:?}",
+            out.steps
+        );
+        assert_eq!(calls.open_pr.load(Ordering::SeqCst), 0);
+        assert!(
+            out.summary.contains(".m258-target/")
+                && out.summary.contains(".codefactory-cache/")
+                && out.summary.contains("构建产物"),
+            "{}",
+            out.summary
+        );
+        assert_eq!(
+            out.recovery_class,
+            RecoveryClass::AgentActionRequired,
+            "a fixable content problem is the agent's action, not a wait"
+        );
         let _ = std::fs::remove_dir_all(root.parent().unwrap());
     }
 
