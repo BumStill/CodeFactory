@@ -40,3 +40,5 @@ pub mod terminal;
 pub mod update_safety;
 #[cfg(test)]
 mod usage_acceptance_tests;
+
+pub mod specialist_observations;

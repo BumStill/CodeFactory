@@ -114,6 +114,10 @@ pub async fn save_settings(
         new_settings.delivery_ceiling_explicit = true;
     }
     settings::persist_git_remote_inline_tokens(&mut new_settings)?;
+    // Invalidate read-observe grants even if a connection is later changed back.
+    let _observation_fence = if serde_json::to_value(&current.git_remotes)? != serde_json::to_value(&new_settings.git_remotes)? {
+        Some(crate::specialist_credential_fence::mutation().map_err(|e| AppError::Other(e.to_string()))?)
+    } else { None };
     settings::save(&new_settings)?;
     *current = new_settings.clone();
     Ok(new_settings)

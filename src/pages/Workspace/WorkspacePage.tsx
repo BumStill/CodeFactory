@@ -1,4 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
+import { SpecialistProjectObservations } from "../../components/SpecialistProjectObservations";
+import { SpecialistEvidencePanel } from "../../components/SpecialistEvidencePanel";
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode, type RefObject, type PointerEvent as ReactPointerEvent } from "react";
 import {
   AlertTriangle,
@@ -57,7 +59,7 @@ type WorkspaceBrowserSession = BrowserSession & {
   page_title?: string | null;
 };
 
-type AuxiliaryPaneKind = "browser" | "document" | "git" | "tasks" | "delivery" | "evidence";
+type AuxiliaryPaneKind = "browser" | "document" | "git" | "tasks" | "delivery" | "evidence" | "specialists";
 type AuxiliaryLayout = "dock" | "drawer" | "overlay";
 
 const AUXILIARY_PANE_DEFAULT_WIDTH = 520;
@@ -89,6 +91,7 @@ function auxiliaryPaneLabel(kind: AuxiliaryPaneKind): string {
     case "tasks": return "任务活动";
     case "delivery": return "交付详情";
     case "evidence": return "回合证据";
+    case "specialists": return "QA/PM 证据";
   }
 }
 
@@ -814,6 +817,7 @@ export function WorkspacePage({
           </button>
         )}
         <div className="flex items-center gap-1.5">
+          {activeCwd && <button type="button" className="min-h-11 rounded px-2 text-caption text-gray-300 hover:bg-surface-2 lg:min-h-9" aria-expanded={auxiliaryPaneOpen && auxiliaryPaneKind === "specialists"} onClick={(event) => openAuxiliaryPane("specialists", event.currentTarget)}>QA/PM 证据</button>}
           <SessionBackgroundTasks sessionId={sessionId} />
           <GitStatusBar
             cwd={activeCwd}
@@ -1078,7 +1082,9 @@ export function WorkspacePage({
             onCloseSession={(browserSessionId) => void closeBrowserPaneSession(browserSessionId)}
             onResize={setAuxiliaryPaneWidth}
             content={
-              auxiliaryPaneKind === "git" ? (
+              auxiliaryPaneKind === "specialists" ? (
+                activeCwd ? <div key={activeCwd} className="min-h-0 flex-1 overflow-y-auto"><div className="p-4"><SpecialistProjectObservations project={activeCwd} /></div><SpecialistEvidencePanel project={activeCwd} /></div> : null
+              ) : auxiliaryPaneKind === "git" ? (
                 gitPanel === "history" ? (
                   <GitHistoryPanel embedded onClose={() => {
                     setGitPanel("changes");

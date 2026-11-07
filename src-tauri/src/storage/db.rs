@@ -1697,6 +1697,8 @@ async fn ensure_schema_inner(pool: &SqlitePool, startup: bool) -> crate::errors:
         crate::knowledge::ensure_schema(pool).await?;
     }
     crate::benchmark::ensure_schema(pool).await?;
+    crate::specialist_observations::ensure_schema(pool).await
+        .map_err(|error| crate::errors::AppError::Other(error.to_string()))?;
 
     Ok(())
 }

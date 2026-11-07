@@ -1,0 +1,79 @@
+name: Specialist read-only browser evidence
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened]
+    paths:
+      - '.github/workflows/specialist-readonly-acceptance.yml'
+      - 'scripts/verify-specialistbots-headless.mjs'
+      - 'scripts/headless-acceptance-support.mjs'
+      - 'specialistbots-acceptance.html'
+      - 'src/acceptance/specialistbots.tsx'
+      - 'src/components/Specialist*'
+      - 'src/pages/Workspace/**'
+      - 'src/styles/**'
+      - 'package.json'
+      - 'pnpm-lock.yaml'
+      - 'docs/acceptance/specialistbots-dm993-projection.json'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: specialist-readonly-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+env:
+  PYTHONUTF8: "1"
+  PYTHONIOENCODING: utf-8
+
+jobs:
+  specialist-browser-supplement:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    env:
+      EXPECTED_HEAD: ${{ github.event.pull_request.head.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - name: Install candidate frontend dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Run real browser with synthetic read-only IPC
+        env:
+          SPECIALIST_ARTIFACT_DIR: ${{ runner.temp }}/specialist-readonly-browser
+        shell: pwsh
+        run: |
+          $actualHead = (git rev-parse HEAD).Trim()
+          if ($actualHead -ne $env:EXPECTED_HEAD) { throw "Candidate head mismatch" }
+          New-Item -ItemType Directory -Force -Path $env:SPECIALIST_ARTIFACT_DIR | Out-Null
+          & pnpm test:specialistbots:headless 2>&1 | Tee-Object -FilePath (Join-Path $env:SPECIALIST_ARTIFACT_DIR 'browser.log')
+          $browserExit = $LASTEXITCODE
+          @{
+            head_sha = $actualHead
+            run_id = $env:GITHUB_RUN_ID
+            run_attempt = $env:GITHUB_RUN_ATTEMPT
+            command = 'pnpm test:specialistbots:headless'
+            exit_code = $browserExit
+            evidence = 'real-browser-synthetic-ipc'
+            native_tauri_verified = $false
+            canonical_target_registered = $false
+          } | ConvertTo-Json | Set-Content -Encoding utf8 (Join-Path $env:SPECIALIST_ARTIFACT_DIR 'receipt.json')
+          exit $browserExit
+      - name: Upload supplemental evidence, including failures
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: specialist-browser-${{ github.event.pull_request.head.sha }}-attempt-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/specialist-readonly-browser
+          if-no-files-found: warn
+          retention-days: 14

@@ -217,6 +217,7 @@ fn get_key_normal(account: &str) -> crate::errors::Result<Option<String>> {
 }
 
 pub fn set_key(account: &str, value: &str) -> crate::errors::Result<()> {
+    let _fence = crate::specialist_credential_fence::mutation().map_err(|e| crate::errors::AppError::Other(e.to_string()))?;
     crate::desktop_context::write_secret(|| set_key_normal(account, value))
 }
 
@@ -260,6 +261,7 @@ fn set_key_normal(account: &str, value: &str) -> crate::errors::Result<()> {
 }
 
 pub fn delete_key(account: &str) -> crate::errors::Result<()> {
+    let _fence = crate::specialist_credential_fence::mutation().map_err(|e| crate::errors::AppError::Other(e.to_string()))?;
     crate::desktop_context::write_secret(|| delete_key_normal(account))
 }
 
