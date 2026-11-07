@@ -79,3 +79,8 @@
 - `node scripts/verify-m265-reject-note-headless.mjs`：该会话沙箱不允许 Chrome 启动（Mach port 被拒），
   本地未取到截图；脚本与验收页已入库，由 CI 执行。
 - `validate_repo_governance_baseline.py`：pass；`validate_scenario_test_governance.py --ci --base-ref origin/main`：OK（33 scenarios）。
+- 一次全量运行里 `m265_an_approval_note_does_not_change_the_decision` 报
+  `permission prompt was not emitted`，耗时恰好 15.02s：那是用例内等待审批弹窗的 15 秒
+  liveness 上限，同一提交随后连跑 15 次均 0.01s 通过，判定为繁忙机器上的等待饥饿而不是
+  弹窗缺失。已把该等待上限改为 60s（仍是失败即红的断言，只是不再把加载抖动当缺陷），
+  改后 `cargo test --lib agent::permission_gateway`：31 passed / 0 failed。

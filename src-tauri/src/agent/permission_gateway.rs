@@ -1621,7 +1621,13 @@ mod tests {
 
     async fn take_pending_sender(gateway: &DesktopPermissionGateway) -> oneshot::Sender<crate::PermissionDecision> {
         // Same liveness budget and cooperative sleep as wait_for_durable_intent.
-        tokio::time::timeout(Duration::from_secs(15), async {
+        // 15s was too tight on a loaded machine: one full-suite run reported
+        // "permission prompt was not emitted" after exactly 15.02s while the
+        // same revision passed the next 15 runs in 0.01s, i.e. the wait was
+        // starved rather than the prompt missing. This is a liveness wait, not
+        // a latency assertion, so the ceiling stays generous — a real missing
+        // prompt still fails here, just later.
+        tokio::time::timeout(Duration::from_secs(60), async {
             loop {
                 let mut pending = gateway.pending_permissions.lock().await;
                 if let Some(key) = pending.keys().next().cloned() {
