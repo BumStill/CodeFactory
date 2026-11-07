@@ -462,6 +462,67 @@ fn deny(reason: &'static str) -> ShellCommandPolicy {
 mod tests {
     use super::*;
 
+    /// R2/R5 for the shell entry: the scan judges executable positions, so a
+    /// destructive phrase inside a search pattern is data while the real
+    /// command keeps asking. Lives here (not in `trusted_git`) because
+    /// `trusted_git.rs` is compiled inside the integration tests, where this
+    /// module is not reachable.
+    #[test]
+    fn m266_shell_safety_ignores_quoted_data_but_keeps_real_commands() {
+        let data_samples = [
+            r#"grep -rn "git reset --hard HEAD" src-tauri/src | head"#,
+            r#"grep -rn "rm -rf /" docs | head"#,
+            r#"rg -n 'git clean -fdx' src-tauri/src"#,
+        ];
+        let mut failures = Vec::new();
+        for command in data_samples {
+            if let ShellCommandPolicy::Ask { reason, .. } | ShellCommandPolicy::Deny { reason } =
+                classify_command(command)
+            {
+                failures.push(format!("quoted data still asks ({reason}): {command}"));
+            }
+        }
+        let real_samples = [
+            "git reset --hard HEAD",
+            "git clean -fdx",
+            "rm -rf .codefactory-cache",
+        ];
+        for command in real_samples {
+            if matches!(classify_command(command), ShellCommandPolicy::Allow { .. }) {
+                failures.push(format!(
+                    "real destructive command no longer asks: {command}"
+                ));
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "M266/R2 shell safety:\n{}",
+            failures.join("\n")
+        );
+    }
+
+    /// R2 fail-closed control: a single quoted word is still an argument word,
+    /// so quoting must not be usable to split a destructive phrase apart.
+    #[test]
+    fn m266_quoted_single_word_does_not_hide_a_destructive_command() {
+        let mut failures = Vec::new();
+        for command in [
+            r#"rm "-rf" /"#,
+            r#"rm -rf "/""#,
+            r#"git "reset" --hard HEAD"#,
+            r#"rm '-rf' .codefactory-cache"#,
+        ] {
+            if matches!(classify_command(command), ShellCommandPolicy::Allow { .. }) {
+                failures.push(format!("quoting split a destructive phrase: {command}"));
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "M266/R2 quoted-word bypasses:\n{}",
+            failures.join("\n")
+        );
+    }
+
     #[test]
     fn classifies_recursive_remove_item_as_high_risk_ask() {
         assert_eq!(

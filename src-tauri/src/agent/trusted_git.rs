@@ -4201,225 +4201,124 @@ mod trusted_shell_structure {
 /// executable positions, never by a substring anywhere in the command text.
 #[cfg(test)]
 mod m266_tests {
-    use crate::agent::trusted_git;
+    // This file is included verbatim by the integration tests under
+    // `src-tauri/tests/` (`#[path = "../src/agent/trusted_git.rs"]`), where
+    // neither `crate::agent` nor `crate::tools` exists and a nested `#[path]`
+    // resolves against the including file's directory. So `super` is the git
+    // module in both builds, and the shell half of the approval decision is
+    // asserted in `src/tools/shell_policy.rs` instead of here.
+    use super as trusted_git;
 
-/// M266 regression table: "is this a git operation?" is decided by the parsed
-/// executable positions, never by a substring anywhere in the command text.
-///
-/// Every row is a real command from the field (v1.105–v1.109, after M248,
-/// M248b and M260) plus one row that must keep asking, so a looser entry can
-/// never pass by widening the gate.
-
-
-/// Field samples that were refused with `trusted.git.unproved` although no git
-/// operation runs in an executable position. `sensitive` must be false, which
-/// is what keeps them out of the Git proof + approval path.
-const NOT_GIT_OPERATIONS: &[(&str, &str)] = &[
-    (
-        "R2/quoted-search-pattern",
-        r#"grep -o "path:src-tauri/tests/[^\"]*" docs/testing/scenario-registry.json | sort -u | head; echo; grep -c "rust:" docs/testing/scenario-registry.json"#,
-    ),
-    (
-        "R2/for-loop-with-command-substitution",
-        r#"for i in 1 2 3 4 5 6; do out=$(CARGO_TARGET_DIR=$PWD/.codefactory-cache/cargo-target-m266 cargo test --manifest-path src-tauri/Cargo.toml 2>&1); echo "run $i: done"; done"#,
-    ),
-    (
-        "R3/read-only-git-in-substitution",
-        r#"BASE=$(git rev-parse origin/main) && SCENARIO_TEST_BASE_SHA=$BASE python3 tools/governance/validate_scenario_test_governance.py --ci --base-ref origin/main"#,
-    ),
-    ("baseline/read-only-git", "git log --oneline -5 | head"),
-    (
-        "baseline/git-word-inside-a-search-pattern",
-        r#"grep -rn "git push origin main" src-tauri/src | head"#,
-    ),
-    (
-        "baseline/git-word-inside-a-path",
-        "ls .codefactory-cache/git-target-m266 && wc -l src-tauri/src/agent/trusted_git.rs",
-    ),
-];
-
-/// Real git operations. These must stay behind approval (R5): a stricter parser
-/// may not turn a write, a force-push or an unprovable command into an allow.
-/// Plain `git push` is owned by the delivery-authorization gate rather than the
-/// Git proof, so the predicate below covers both owners.
-const ASKS_FOR_APPROVAL: &[(&str, &str)] = &[
-    ("R5/push", "git push origin main"),
-    ("R5/force-push", "git push --force origin main"),
-    ("R5/reset-hard", "git reset --hard HEAD"),
-    ("R5/clean", "git clean -fdx"),
-    (
-        "R5/push-inside-shell-payload",
-        r#"bash -c "git reset --hard""#,
-    ),
-    (
-        "R5/unenumerable-command",
-        "git push origin main; echo \"unterminated",
-    ),
-    ("R5/unenumerable-backticks", "echo `git status`"),
-    ("safety/shell-destructive", "rm -rf .codefactory-cache"),
-];
-
-/// The whole approval decision, whichever gate owns the command.
-fn asks_for_approval(command: &str) -> bool {
-    trusted_git::sensitive(command)
-        || codefactory_agent_loop::policy::is_delivery_command(command)
-        || !matches!(
-            crate::tools::shell_policy::classify_command(command),
-            crate::tools::shell_policy::ShellCommandPolicy::Allow { .. }
-        )
-}
-
-#[test]
-fn m266_not_git_operations_are_not_sensitive() {
-    let mut failures = Vec::new();
-    for (name, command) in NOT_GIT_OPERATIONS {
-        if asks_for_approval(command) {
-            failures.push(format!(
-                "{name}: still needs approval ({:?}, sensitive={}, shell={:?}) -> {command}",
-                trusted_git::git_entry(command),
-                trusted_git::sensitive(command),
-                crate::tools::shell_policy::classify_command(command),
-            ));
-        }
-    }
-    assert!(
-        failures.is_empty(),
-        "M266/R2 false positives remain:\n{}",
-        failures.join("\n")
-    );
-}
-
-#[test]
-fn m266_real_git_operations_stay_sensitive() {
-    let mut failures = Vec::new();
-    for (name, command) in ASKS_FOR_APPROVAL {
-        if !asks_for_approval(command) {
-            failures.push(format!("{name}: no longer asks -> {command}"));
-        }
-    }
-    assert!(
-        failures.is_empty(),
-        "M266/R5 regressions:\n{}",
-        failures.join("\n")
-    );
-}
-
-/// R4: the message heredoc keeps its proof when the same line sends `2>&1`
-/// through a read-only output filter (`... <<'EOF' 2>&1 | tail -25`).
-#[test]
-fn m266_message_heredoc_survives_output_pipeline() {
-    let command = "git commit -q -F - <<'EOF' 2>&1 | tail -25\nfeat(m266): entry review\nEOF";
-    assert!(
-        trusted_git::python_heredoc_proved(Some(&std::env::temp_dir()), command),
-        "M266/R4: message heredoc behind a read-only output pipeline should be proved as data"
-    );
-}
-
-/// R4 negative control: interpreter input is not message data.
-#[test]
-fn m266_interpreter_heredoc_is_still_unproved() {
-    let command = "python3 - <<'EOF'\nimport os\nos.system('git reset --hard')\nEOF";
-    assert!(
-        !trusted_git::python_heredoc_proved(Some(&std::env::temp_dir()), command),
-        "M266/R4: an interpreter heredoc must stay unproved"
-    );
-}
-
-/// R2/R5 for the other entry: the shell safety scan judges executable
-/// positions, so a destructive phrase inside a search pattern is data.
-#[test]
-fn m266_shell_safety_ignores_quoted_data_but_keeps_real_commands() {
-    use crate::tools::shell_policy::{classify_command, ShellCommandPolicy};
-
-    let data_samples = [
-        r#"grep -rn "git reset --hard HEAD" src-tauri/src | head"#,
-        r#"grep -rn "rm -rf /" docs | head"#,
-        r#"rg -n 'git clean -fdx' src-tauri/src"#,
+    /// Field samples that were refused with `trusted.git.unproved` although no git
+    /// operation runs in an executable position. `sensitive` must be false, which
+    /// is what keeps them out of the Git proof + approval path.
+    const NOT_GIT_OPERATIONS: &[(&str, &str)] = &[
+        (
+            "R2/quoted-search-pattern",
+            r#"grep -o "path:src-tauri/tests/[^\"]*" docs/testing/scenario-registry.json | sort -u | head; echo; grep -c "rust:" docs/testing/scenario-registry.json"#,
+        ),
+        (
+            "R2/for-loop-with-command-substitution",
+            r#"for i in 1 2 3 4 5 6; do out=$(CARGO_TARGET_DIR=$PWD/.codefactory-cache/cargo-target-m266 cargo test --manifest-path src-tauri/Cargo.toml 2>&1); echo "run $i: done"; done"#,
+        ),
+        (
+            "R3/read-only-git-in-substitution",
+            r#"BASE=$(git rev-parse origin/main) && SCENARIO_TEST_BASE_SHA=$BASE python3 tools/governance/validate_scenario_test_governance.py --ci --base-ref origin/main"#,
+        ),
+        ("baseline/read-only-git", "git log --oneline -5 | head"),
+        (
+            "baseline/git-word-inside-a-search-pattern",
+            r#"grep -rn "git push origin main" src-tauri/src | head"#,
+        ),
+        (
+            "baseline/git-word-inside-a-path",
+            "ls .codefactory-cache/git-target-m266 && wc -l src-tauri/src/agent/trusted_git.rs",
+        ),
     ];
-    let mut failures = Vec::new();
-    for command in data_samples {
-        if let ShellCommandPolicy::Ask { reason, .. } | ShellCommandPolicy::Deny { reason } =
-            classify_command(command)
-        {
-            failures.push(format!("quoted data still asks ({reason}): {command}"));
-        }
-    }
-    let real_samples = [
-        "git reset --hard HEAD",
-        "git clean -fdx",
-        "rm -rf .codefactory-cache",
+
+    /// Real git operations. These must stay behind approval (R5): a stricter parser
+    /// may not turn a write, a force-push or an unprovable command into an allow.
+    /// Plain `git push` is owned by the delivery-authorization gate rather than the
+    /// Git proof, so the predicate below covers both owners.
+    const ASKS_FOR_APPROVAL: &[(&str, &str)] = &[
+        ("R5/push", "git push origin main"),
+        ("R5/force-push", "git push --force origin main"),
+        ("R5/reset-hard", "git reset --hard HEAD"),
+        ("R5/clean", "git clean -fdx"),
+        (
+            "R5/push-inside-shell-payload",
+            r#"bash -c "git reset --hard""#,
+        ),
+        (
+            "R5/unenumerable-command",
+            "git push origin main; echo \"unterminated",
+        ),
+        // A backtick substitution runs at run time, so its content cannot be
+        // unfolded into simple commands. It stays behind approval even though the
+        // word it sits in is only an argument.
+        ("R5/unenumerable-backticks", "echo `git status`"),
     ];
-    for command in real_samples {
-        if matches!(classify_command(command), ShellCommandPolicy::Allow { .. }) {
-            failures.push(format!(
-                "real destructive command no longer asks: {command}"
-            ));
-        }
+
+    /// The Git half of the approval decision. The shell-safety half is asserted
+    /// where it lives (`tools::shell_policy`), because this file is compiled inside
+    /// the integration tests and cannot reach that module.
+    fn asks_for_approval(command: &str) -> bool {
+        trusted_git::sensitive(command)
+            || codefactory_agent_loop::policy::is_delivery_command(command)
     }
-    assert!(
-        failures.is_empty(),
-        "M266/R2 shell safety:\n{}",
-        failures.join("\n")
-    );
-}
 
-/// R2 fail-closed control: a single quoted word is still an argument word, so
-/// quoting must not be usable to split a destructive phrase apart.
-#[test]
-fn m266_quoted_single_word_does_not_hide_a_destructive_command() {
-    use crate::tools::shell_policy::{classify_command, ShellCommandPolicy};
-
-    let mut failures = Vec::new();
-    for command in [
-        r#"rm "-rf" /"#,
-        r#"rm -rf "/""#,
-        r#"git "reset" --hard HEAD"#,
-        r#"rm '-rf' .codefactory-cache"#,
-    ] {
-        if matches!(classify_command(command), ShellCommandPolicy::Allow { .. }) {
-            failures.push(format!("quoting split a destructive phrase: {command}"));
+    #[test]
+    fn m266_not_git_operations_are_not_sensitive() {
+        let mut failures = Vec::new();
+        for (name, command) in NOT_GIT_OPERATIONS {
+            if asks_for_approval(command) {
+                failures.push(format!(
+                    "{name}: still needs approval ({:?}, sensitive={}) -> {command}",
+                    trusted_git::git_entry(command),
+                    trusted_git::sensitive(command),
+                ));
+            }
         }
+        assert!(
+            failures.is_empty(),
+            "M266/R2 false positives remain:\n{}",
+            failures.join("\n")
+        );
     }
-    assert!(
-        failures.is_empty(),
-        "M266/R2 quoted-word bypasses:\n{}",
-        failures.join("\n")
-    );
-}
 
-/// R1: the two causes must reach the user as different rules, so a refusal we
-/// caused by not being able to unfold a command stops claiming a Git write was
-/// found. Both the classification and the wording are asserted, because a
-/// distinct rule id printed next to Git wording still misleads.
-#[test]
-fn m266_unproved_reasons_stay_distinct() {
-    let (git_rule, git_reason) =
-        crate::agent::permission_gateway::unproved_git_reason(trusted_git::GitEntry::GitWrite);
-    let (shell_rule, shell_reason) =
-        crate::agent::permission_gateway::unproved_git_reason(trusted_git::GitEntry::Unprovable);
-    assert_eq!(
-        git_rule, "trusted.git.unproved",
-        "M266/R1: a real git write keeps the git rule"
-    );
-    assert_eq!(
-        shell_rule, "trusted.shell.unproved",
-        "M266/R1: an unfolded command must not claim a git write"
-    );
-    assert!(
-        git_reason.contains("Git"),
-        "M266/R1: the git wording must name Git: {git_reason}"
-    );
-    assert!(
-        !shell_reason.contains("Git"),
-        "M266/R1: the unfold wording must not name Git: {shell_reason}"
-    );
-    // The classification that feeds those rules never lets a loop borrow the git
-    // rule: no executable git write is found there, so the wording above is the
-    // only thing the user can read.
-    assert_ne!(
-        trusted_git::git_entry("for i in 1 2; do echo $i; done"),
-        trusted_git::GitEntry::GitWrite,
-        "M266/R1: an unfolded loop is not a git write"
-    );
-}
+    #[test]
+    fn m266_real_git_operations_stay_sensitive() {
+        let mut failures = Vec::new();
+        for (name, command) in ASKS_FOR_APPROVAL {
+            if !asks_for_approval(command) {
+                failures.push(format!("{name}: no longer asks -> {command}"));
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "M266/R5 regressions:\n{}",
+            failures.join("\n")
+        );
+    }
+
+    /// R4: the message heredoc keeps its proof when the same line sends `2>&1`
+    /// through a read-only output filter (`... <<'EOF' 2>&1 | tail -25`).
+    #[test]
+    fn m266_message_heredoc_survives_output_pipeline() {
+        let command = "git commit -q -F - <<'EOF' 2>&1 | tail -25\nfeat(m266): entry review\nEOF";
+        assert!(
+            trusted_git::python_heredoc_proved(Some(&std::env::temp_dir()), command),
+            "M266/R4: message heredoc behind a read-only output pipeline should be proved as data"
+        );
+    }
+
+    /// R4 negative control: interpreter input is not message data.
+    #[test]
+    fn m266_interpreter_heredoc_is_still_unproved() {
+        let command = "python3 - <<'EOF'\nimport os\nos.system('git reset --hard')\nEOF";
+        assert!(
+            !trusted_git::python_heredoc_proved(Some(&std::env::temp_dir()), command),
+            "M266/R4: an interpreter heredoc must stay unproved"
+        );
+    }
 }

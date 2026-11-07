@@ -232,19 +232,21 @@ impl PermissionGateway for DesktopPermissionGateway {
                         match proof {
                             Ok(()) if !remote => return PermissionOutcome::Allow,
                             Ok(()) => heredoc_proved = true,
-                            Err(reason) => return self
-                                .request_permission_with_reason(
-                                    tool_call,
-                                    args.clone(),
-                                    bash_command,
-                                    Some((
-                                        "trusted.heredoc.unproved",
-                                        format!(
+                            Err(reason) => {
+                                return self
+                                    .request_permission_with_reason(
+                                        tool_call,
+                                        args.clone(),
+                                        bash_command,
+                                        Some((
+                                            "trusted.heredoc.unproved",
+                                            format!(
                                             "无法证明解释器仅访问本会话工作区内的文件：{reason}"
                                         ),
-                                    )),
-                                )
-                                .await,
+                                        )),
+                                    )
+                                    .await
+                            }
                         }
                     }
                 }
@@ -1025,6 +1027,47 @@ async fn persist_interruption(
 mod tests {
     use crate::util::no_window::NoWindow;
     use std::collections::HashMap;
+
+    /// M266/R1: the rule id and the wording both have to say which cause fired.
+    ///
+    /// A refusal we caused by not being able to unfold a command must stop
+    /// claiming a Git write was found, because a distinct rule id printed next
+    /// to Git wording still misleads. The git rule must stay untouched for a
+    /// real git write. Lives here (not in `trusted_git`) because `trusted_git`
+    /// is included verbatim by the integration tests, which cannot reach
+    /// `crate::agent`.
+    #[test]
+    fn m266_unproved_reasons_stay_distinct() {
+        use crate::agent::trusted_git;
+
+        let (git_rule, git_reason) = super::unproved_git_reason(trusted_git::GitEntry::GitWrite);
+        let (shell_rule, shell_reason) =
+            super::unproved_git_reason(trusted_git::GitEntry::Unprovable);
+        assert_eq!(
+            git_rule, "trusted.git.unproved",
+            "M266/R1: a real git write keeps the git rule"
+        );
+        assert_eq!(
+            shell_rule, "trusted.shell.unproved",
+            "M266/R1: an unfolded command must not claim a git write"
+        );
+        assert!(
+            git_reason.contains("Git"),
+            "M266/R1: the git wording must name Git: {git_reason}"
+        );
+        assert!(
+            !shell_reason.contains("Git"),
+            "M266/R1: the unfold wording must not name Git: {shell_reason}"
+        );
+        // The classification that feeds those rules never lets a loop borrow the
+        // git rule: no executable git write is found there, so the wording above
+        // is the only thing the user can read.
+        assert_ne!(
+            trusted_git::git_entry("for i in 1 2; do echo $i; done"),
+            trusted_git::GitEntry::GitWrite,
+            "M266/R1: an unfolded loop is not a git write"
+        );
+    }
 
     use sqlx::sqlite::SqlitePoolOptions;
     use tokio::sync::oneshot;
