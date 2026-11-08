@@ -2,8 +2,8 @@
 use crate::util::no_window::NoWindow;
 pub mod anthropic_client;
 pub mod attachments;
-pub mod background_tasks;
 pub(crate) mod auth_recovery;
+pub mod background_tasks;
 pub(crate) mod browser_recovery;
 pub mod checkpoint;
 pub(crate) mod closeout;
@@ -12,19 +12,21 @@ pub mod context_budget;
 mod context_policy;
 pub(crate) mod context_recovery;
 pub mod delivery;
-pub(crate) mod thin;
-pub(crate) mod thin_derive;
-pub(crate) mod thin_restart;
-pub(crate) mod thin_state;
 #[cfg(not(test))]
 pub(crate) mod delivery_recovery_smoke;
 pub mod delivery_run;
 pub mod dispatch;
 pub mod events;
 pub(crate) mod execution_workspace;
+pub(crate) mod thin;
+pub(crate) mod thin_derive;
+pub(crate) mod thin_restart;
+pub(crate) mod thin_state;
 pub(crate) use execution_workspace::workspace_recovery_budget;
+pub mod daily_spend_live;
 mod fact_checker;
 pub mod failover;
+pub mod failure_summary;
 pub(crate) mod first_request_latency;
 #[cfg(not(test))]
 pub(crate) mod history_session_smoke;
@@ -34,32 +36,31 @@ pub mod journal;
 mod lifecycle_hooks;
 pub mod memory_manifest;
 pub mod model_transport;
-pub mod failure_summary;
 pub mod objective;
+/// M151：会话级诊断与状态重置（存量会话卡「正在做 · 等待中」）。
+pub mod objective_diagnostics;
 pub mod objective_supervisor;
-mod power_assertion;
 pub(crate) mod permission_gateway;
 pub(crate) mod permission_intent;
 pub mod persistence;
+mod power_assertion;
 pub(crate) mod provider_recovery;
 pub mod quota_cap;
 pub mod quota_live;
-pub mod daily_spend_live;
-pub mod usage_windows;
 pub mod scheduler;
-/// M151：会话级诊断与状态重置（存量会话卡「正在做 · 等待中」）。
-pub mod objective_diagnostics;
+pub mod sse_buffer;
 /// CF-STOP：停止栅栏（「停止」真的停下）与 PR 侧的如实收尾。
 pub mod stop_fence;
-pub mod sse_buffer;
 pub mod subagent;
 mod tool_backend;
 pub(crate) mod tool_recovery;
-mod trusted_workspace;
 mod trusted_git;
+mod trusted_workspace;
+pub mod usage_windows;
+
+pub mod long_term_memory;
 pub(crate) mod trusted_sandbox;
 pub(crate) mod update_recovery;
-pub mod long_term_memory;
 pub mod user_context;
 pub mod verification;
 pub mod worktree;
@@ -68,8 +69,9 @@ pub use dispatch::{
     constraint_audit_payload, constraint_instruction_block, decide_chat_contract,
     decide_chat_contract_with_intent, decide_chat_mode, declared_delivery_ceiling,
     is_contextual_approval, is_delivery_revocation, is_explicit_delivery_authorization,
-    proposal_capability, resolve_turn_delivery_authorization, steer_capability_override_with_authorization,
-    with_persisted_delivery_authorization, DeliveryAuthorizationUpdate, TurnGrants, TurnIntent,
+    proposal_capability, resolve_turn_delivery_authorization,
+    steer_capability_override_with_authorization, with_persisted_delivery_authorization,
+    DeliveryAuthorizationUpdate, TurnGrants, TurnIntent,
 };
 pub(crate) use internal_text::{generate_bounded_text, InternalTextOutput};
 
@@ -149,7 +151,9 @@ fn wall_budget_applies(mode: AgentMode) -> bool {
 enum PermissionResponse {
     Allow,
     /// M265: a denial may carry the user's own one-line reason.
-    DeniedByUser { note: Option<String> },
+    DeniedByUser {
+        note: Option<String>,
+    },
     TimedOut,
     ChannelClosed,
     Cancelled,
@@ -1760,7 +1764,8 @@ impl AgentLoop {
         root_turn_id: Option<String>,
         mutation_permit: Option<codefactory_agent_loop::tool::MutationPermit>,
     ) -> model_transport::RoutedDesktopModelTransport {
-        self.route_state.attach_usage_settings(self.settings.clone());
+        self.route_state
+            .attach_usage_settings(self.settings.clone());
         model_transport::RoutedDesktopModelTransport {
             http: self.http.clone(),
             events: self.events.clone(),
@@ -3383,14 +3388,14 @@ mod tests {
     }
 
     /// One GUI turn: read the row, resolve, write back — the `send_message` shape.
-    async fn m48_apply_gui_turn(db: &SqlitePool, session_id: &str, message: &str) -> TurnCapability {
+    async fn m48_apply_gui_turn(
+        db: &SqlitePool,
+        session_id: &str,
+        message: &str,
+    ) -> TurnCapability {
         let persisted = fetch_session_delivery_authorized(db, session_id).await;
-        let (contract, update) = resolve_turn_delivery_authorization(
-            None,
-            message,
-            TurnIntent::default(),
-            persisted,
-        );
+        let (contract, update) =
+            resolve_turn_delivery_authorization(None, message, TurnIntent::default(), persisted);
         match update {
             DeliveryAuthorizationUpdate::Revoked => {
                 set_session_delivery_authorized(db, session_id, false).await;
@@ -3421,8 +3426,11 @@ mod tests {
         let message = "开始实施：按任务文件修复。授权交付，ceiling: merged。\
                        先核实个人账户仓库能否用 merge queue，再分析一下风险。";
         let capability = m48_apply_gui_turn(&db, session, message).await;
-        assert_eq!(capability, TurnCapability::Implement,
-            "wording must not turn on session delivery");
+        assert_eq!(
+            capability,
+            TurnCapability::Implement,
+            "wording must not turn on session delivery"
+        );
         assert!(!m48_delivery_row(&db, session).await);
         // The session switch, not a phrase, enables delivery.
         set_session_delivery_authorized(&db, session, true).await;
@@ -3619,13 +3627,18 @@ mod tests {
             .unwrap();
         assert_eq!(
             await_permission_response(&mut deny_receiver, None, Duration::from_secs(1)).await,
-            PermissionResponse::DeniedByUser { note: Some("keep the stash".into()) }
+            PermissionResponse::DeniedByUser {
+                note: Some("keep the stash".into())
+            }
         );
 
         // M265 R5: a decision without a note stays a plain denial.
         let (plain_sender, mut plain_receiver) = tokio::sync::oneshot::channel();
         plain_sender
-            .send(crate::PermissionDecision { allow: false, note: None })
+            .send(crate::PermissionDecision {
+                allow: false,
+                note: None,
+            })
             .unwrap();
         assert_eq!(
             await_permission_response(&mut plain_receiver, None, Duration::from_secs(1)).await,
@@ -4787,10 +4800,22 @@ mod tests {
     fn m227_gpt_and_deepseek_prompts_allow_local_commits() {
         // Both provider routes use the same mode-selected prompt builder.
         for provider in ["gpt", "deepseek"] {
-            for mode in [AgentMode::Interactive, AgentMode::Autonomous, AgentMode::Execute] {
+            for mode in [
+                AgentMode::Interactive,
+                AgentMode::Autonomous,
+                AgentMode::Execute,
+            ] {
                 let prompt = base_system_prompt(mode, Path::new("/synthetic/project"));
-                assert!(prompt.contains("git add") && prompt.contains("git commit") && prompt.contains("local-only"), "{provider}: missing local commit route");
-                assert!(!prompt.contains("Do NOT hand-run git in bash"), "{provider}: contradictory blanket prohibition");
+                assert!(
+                    prompt.contains("git add")
+                        && prompt.contains("git commit")
+                        && prompt.contains("local-only"),
+                    "{provider}: missing local commit route"
+                );
+                assert!(
+                    !prompt.contains("Do NOT hand-run git in bash"),
+                    "{provider}: contradictory blanket prohibition"
+                );
             }
         }
     }
@@ -6135,7 +6160,8 @@ pub mod prefix_stability {
     /// [`volatile_time_block`] for the current instant and the system IANA zone.
     pub fn volatile_time_context() -> String {
         let now = chrono::Local::now();
-        let zone = iana_time_zone::get_timezone().unwrap_or_else(|_| "system local time zone".into());
+        let zone =
+            iana_time_zone::get_timezone().unwrap_or_else(|_| "system local time zone".into());
         volatile_time_block(now, &zone)
     }
 
@@ -6163,7 +6189,10 @@ pub mod prefix_stability {
     /// [`CacheDiagnostics`] / [`UsageSample::cache_hit_ratio`], fed from
     /// `model_usage_events`.
     #[allow(dead_code)]
-    pub fn shared_message_prefix(previous: &[codefactory_agent_loop::types::ChatMessage], next: &[codefactory_agent_loop::types::ChatMessage]) -> usize {
+    pub fn shared_message_prefix(
+        previous: &[codefactory_agent_loop::types::ChatMessage],
+        next: &[codefactory_agent_loop::types::ChatMessage],
+    ) -> usize {
         let mut shared = 0;
         for (before, after) in previous.iter().zip(next.iter()) {
             let same = match (serde_json::to_string(before), serde_json::to_string(after)) {
@@ -6267,7 +6296,8 @@ pub mod prefix_stability {
     mod tests {
         use super::super::{render_system_prompt_at, stable_system_prompt_for, AgentMode};
         use super::{
-            breaks_prefix, shared_message_prefix, CacheDiagnostics, UsageSample, VOLATILE_TIME_MARKER,
+            breaks_prefix, shared_message_prefix, CacheDiagnostics, UsageSample,
+            VOLATILE_TIME_MARKER,
         };
         use chrono::{Local, TimeZone};
         use codefactory_agent_loop::types::{ChatMessage, MessageContent};
@@ -6338,7 +6368,10 @@ pub mod prefix_stability {
             let start = prompt
                 .find(VOLATILE_TIME_MARKER)
                 .expect("system prompt must end with the volatile date block");
-            let headings_after = prompt[start..].lines().filter(|l| l.starts_with("# ")).count();
+            let headings_after = prompt[start..]
+                .lines()
+                .filter(|l| l.starts_with("# "))
+                .count();
             assert_eq!(
                 headings_after, 1,
                 "the volatile block must be the final section; {headings_after} headings follow it, \
@@ -6462,7 +6495,10 @@ pub mod prefix_stability {
             ]);
             assert_eq!(broken.calls, 4);
             assert_eq!(broken.breaks, 3, "the first call cannot break anything");
-            assert!(broken.exceeds_alert_threshold(), "0% cache reuse must alert");
+            assert!(
+                broken.exceeds_alert_threshold(),
+                "0% cache reuse must alert"
+            );
             assert!(
                 broken.cache_hit_ratio() < 0.05,
                 "a run that cached almost nothing must report a near-zero hit ratio, got {}",
@@ -6500,5 +6536,4 @@ pub mod prefix_stability {
             }
         }
     }
-
 }

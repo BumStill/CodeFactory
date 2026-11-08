@@ -1,7 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 //! M159: conservative proof + durable, non-destructive Git snapshot.
-use std::{path::{Component, Path}, process::{Command, Stdio}, io::Write};
 use crate::util::no_window::NoWindow;
+use std::{
+    io::Write,
+    path::{Component, Path},
+    process::{Command, Stdio},
+};
 
 // The very same policy source used by standalone shell calls; also available
 // to the standalone integration harnesses that include this proof module.
@@ -28,8 +32,75 @@ pub(super) fn sensitive(command: &str) -> bool {
     if has_unquoted_heredoc(command) {
         return !python_heredoc_proved(None, command);
     }
-    let Some(segments) = executable_segments(command) else { return true };
+    let Some(segments) = executable_segments(command) else {
+        return true;
+    };
     segments.iter().any(|words| segment_is_sensitive(words))
+}
+
+/// M266 R1: what the *executable positions* of a command say about Git. The
+/// approval text has to name the real cause: a command with no git executable
+/// anywhere is not "a Git operation we could not prove", and a command we could
+/// not unfold is not a Git write we found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum GitEntry {
+    /// No git executable in any command position.
+    NotGit,
+    /// Git runs, but only as read-only queries.
+    ReadOnlyGit,
+    /// Git runs and a segment writes history or leaves this machine.
+    GitWrite,
+    /// The command could not be unfolded into simple commands.
+    Unprovable,
+}
+
+/// M266 R1/R2: judge Git-ness from parsed command positions only. Argument text,
+/// a search pattern, a variable name or a path that merely contains `git` is
+/// data and never makes this a Git operation.
+pub(super) fn git_entry(command: &str) -> GitEntry {
+    let Some(segments) = executable_segments(command) else {
+        return GitEntry::Unprovable;
+    };
+    let mut entry = GitEntry::NotGit;
+    for words in &segments {
+        match segment_git_entry(words) {
+            GitEntry::GitWrite => return GitEntry::GitWrite,
+            GitEntry::Unprovable => entry = GitEntry::Unprovable,
+            GitEntry::ReadOnlyGit if entry == GitEntry::NotGit => entry = GitEntry::ReadOnlyGit,
+            _ => {}
+        }
+    }
+    entry
+}
+
+fn segment_git_entry(words: &[String]) -> GitEntry {
+    let Some((binary, args)) = segment_command_words(words) else {
+        return GitEntry::NotGit;
+    };
+    // A command word that expands at run time can become any program.
+    if binary.contains('$') || binary.contains('`') {
+        return GitEntry::Unprovable;
+    }
+    let name = command_name(&binary);
+    if name == "git" {
+        return if git_segment_is_sensitive(args) {
+            GitEntry::GitWrite
+        } else {
+            GitEntry::ReadOnlyGit
+        };
+    }
+    if SHELL_INTERPRETERS.contains(&name.as_str()) {
+        if let Some(payload) = inline_payload(args, &["-c", "-lc", "-ec", "-ic"]) {
+            return git_entry(&payload);
+        }
+    }
+    if INLINE_CODE_INTERPRETERS.contains(&name.as_str())
+        && inline_payload(args, &["-e", "-c", "-p", "--eval", "--print"])
+            .is_some_and(|payload| payload_shells_out_to_destructive_git(&payload))
+    {
+        return GitEntry::GitWrite;
+    }
+    GitEntry::NotGit
 }
 
 /// M221b: byte offset of the first `<<` that sits outside shell quotes. A grep
@@ -47,7 +118,9 @@ fn unquoted_double_angle(text: &str) -> Option<usize> {
                     index += 2;
                     continue;
                 }
-                if byte == opening { quote = None; }
+                if byte == opening {
+                    quote = None;
+                }
                 index += 1;
             }
             None => {
@@ -60,7 +133,9 @@ fn unquoted_double_angle(text: &str) -> Option<usize> {
                     index += 1;
                     continue;
                 }
-                if byte == b'<' && bytes.get(index + 1) == Some(&b'<') { return Some(index); }
+                if byte == b'<' && bytes.get(index + 1) == Some(&b'<') {
+                    return Some(index);
+                }
                 index += 1;
             }
         }
@@ -69,7 +144,9 @@ fn unquoted_double_angle(text: &str) -> Option<usize> {
 }
 
 /// M221b: does this command open a heredoc at all? Only an unquoted `<<` does.
-pub(super) fn has_unquoted_heredoc(command: &str) -> bool { unquoted_double_angle(command).is_some() }
+pub(super) fn has_unquoted_heredoc(command: &str) -> bool {
+    unquoted_double_angle(command).is_some()
+}
 
 /// M198: recognize one complete, expansion-disabled Python stdin program.
 /// No shell suffix, custom executable, wrapper, substitution or redirection is
@@ -91,8 +168,14 @@ pub(super) fn sandboxed_heredoc_proof(root: &Path, command: &str) -> Result<(), 
     python_heredoc_proof_with_sandbox(Some(root), command, true)
 }
 
-fn python_heredoc_proof_with_sandbox(root: Option<&Path>, command: &str, sandboxed: bool) -> Result<(), String> {
-    if command.len() > 256 * 1024 { return Err("脚本超过 256 KiB".into()); }
+fn python_heredoc_proof_with_sandbox(
+    root: Option<&Path>,
+    command: &str,
+    sandboxed: bool,
+) -> Result<(), String> {
+    if command.len() > 256 * 1024 {
+        return Err("脚本超过 256 KiB".into());
+    }
     // M221: the heredoc may start on a later line (`git add -A` then
     // `git commit -F - <<'MSG'`), so the header is every line up to and
     // including the first one that opens a heredoc.
@@ -100,9 +183,14 @@ fn python_heredoc_proof_with_sandbox(root: Option<&Path>, command: &str, sandbox
     let mut scanned = 0;
     for line in command.split_inclusive('\n') {
         scanned += line.len();
-        if unquoted_double_angle(line).is_some() { header_end = Some(scanned); break; }
+        if unquoted_double_angle(line).is_some() {
+            header_end = Some(scanned);
+            break;
+        }
     }
-    let Some(header_end) = header_end else { return Err("heredoc 缺少换行".into()); };
+    let Some(header_end) = header_end else {
+        return Err("heredoc 缺少换行".into());
+    };
     let (header, rest) = command.split_at(header_end);
     // M215 R1: resolve the `cd` prefix to a physical path (relative, `..`, `~`,
     // spaces, backslash escapes, macOS `/private` aliasing) and accept it when
@@ -113,19 +201,36 @@ fn python_heredoc_proof_with_sandbox(root: Option<&Path>, command: &str, sandbox
     // echo ===; python3 - <<'PY'`). Each earlier segment must be read-only —
     // otherwise the whole command stays unproved. `2>&1` is a redirection, not a
     // command separator, so it is folded away before splitting.
-    let header = header.replace("2>&1", " ").replace("2>&2", " ").replace(">&1", " ").replace(">&2", " ");
+    let header = header
+        .replace("2>&1", " ")
+        .replace("2>&2", " ")
+        .replace(">&1", " ")
+        .replace(">&2", " ");
     let segments = split_top_level(&header, &[';', '|', '&', '\n']);
-    let Some(heredoc_at) = segments.iter().position(|segment| unquoted_double_angle(segment).is_some()) else {
+    let Some(heredoc_at) = segments
+        .iter()
+        .position(|segment| unquoted_double_angle(segment).is_some())
+    else {
         return Err("缺少 `<<` heredoc 起始符".into());
     };
     let (prefix, consumers) = (&segments[..heredoc_at], &segments[heredoc_at + 1..]);
-    let Some(open) = unquoted_double_angle(segments[heredoc_at]) else { return Err("缺少 `<<` heredoc 起始符".into()); };
+    let Some(open) = unquoted_double_angle(segments[heredoc_at]) else {
+        return Err("缺少 `<<` heredoc 起始符".into());
+    };
     let runner = segments[heredoc_at][..open].trim();
     let delimiter = &segments[heredoc_at][open + 2..];
-    let Some(delimiter) = delimiter.trim().strip_prefix('\'').and_then(|s| s.strip_suffix('\'')) else {
+    let Some(delimiter) = delimiter
+        .trim()
+        .strip_prefix('\'')
+        .and_then(|s| s.strip_suffix('\''))
+    else {
         return Err("heredoc 分隔符必须用单引号关闭展开".into());
     };
-    if delimiter.is_empty() || !delimiter.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+    if delimiter.is_empty()
+        || !delimiter
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_')
+    {
         return Err("heredoc 分隔符不合法".into());
     }
     let mut body = String::new();
@@ -141,11 +246,15 @@ fn python_heredoc_proof_with_sandbox(root: Option<&Path>, command: &str, sandbox
         body.push_str(line);
         body.push('\n');
     }
-    if !closed { return Err("heredoc 分隔符未闭合".into()); }
+    if !closed {
+        return Err("heredoc 分隔符未闭合".into());
+    }
     // M221: the lines after the closing delimiter are ordinary shell, so they
     // must stay read-only. The field command ended with `git log --oneline -1`,
     // which used to be refused as "still shell content after the heredoc".
-    let trailer = trailer.join("\n");
+    // M266 R4: descriptor plumbing (`EOF 2>&1 | tail -25`) is folded away first,
+    // exactly like the header already does, so it is not read as a command.
+    let trailer = strip_fd_duplications(&trailer.join("\n"));
     for segment in split_top_level(&trailer, &[';', '|', '&', '\n']) {
         trailer_segment_is_allowed(base, segment)?;
     }
@@ -156,22 +265,33 @@ fn python_heredoc_proof_with_sandbox(root: Option<&Path>, command: &str, sandbox
     let pipeline_consumer = match consumers {
         [] => None,
         [only] => Some(*only),
-        _ => return Err(format!("heredoc 之后不是可证明的单一消费者：{}", consumers.join(" | "))),
+        _ => {
+            return Err(format!(
+                "heredoc 之后不是可证明的单一消费者：{}",
+                consumers.join(" | ")
+            ))
+        }
     };
     if let Some(verb) = git_data_heredoc_consumer(base, runner, pipeline_consumer)? {
         if base.is_none() {
             return Err(format!("没有工作区根目录，无法证明 {verb} 的数据 heredoc"));
         }
-        for segment in prefix { prefix_segment_is_local(base, segment)?; }
+        for segment in prefix {
+            prefix_segment_is_local(base, segment)?;
+        }
         return Ok(());
     }
-    for segment in prefix { prefix_segment_is_read_only(base, segment)?; }
+    for segment in prefix {
+        prefix_segment_is_read_only(base, segment)?;
+    }
     // M215 R2: a body naming no outside path, no network, no subprocess and no
     // delete call is workspace-contained. A `cat` body is data written into this
     // workspace, so only the paths it mentions are judged.
     if let Some(result) = cat_heredoc_runner(base, runner) {
         result?;
-        if let Some(base) = base { heredoc_body_contained(base, &body, true)?; }
+        if let Some(base) = base {
+            heredoc_body_contained(base, &body, true)?;
+        }
         return Ok(());
     }
     let node = matches!(runner, "node" | "node -");
@@ -181,26 +301,61 @@ fn python_heredoc_proof_with_sandbox(root: Option<&Path>, command: &str, sandbox
     // The static AST proof stays the strong path; containment is only the
     // fallback for bodies that proof cannot model (e.g. `json.load`).
     let contained = match base {
-        Some(base) if !sandboxed => { heredoc_body_contained(base, &body, false)?; true }
+        Some(base) if !sandboxed => {
+            heredoc_body_contained(base, &body, false)?;
+            true
+        }
         _ => false,
     };
-    let mut cmd = Command::new(if cfg!(windows) { "python" } else { "python3" });
+    let mut cmd = Command::new(if cfg!(windows) { "python" } else { "python3" }).no_window();
     cmd.args(["-I", "-c", include_str!("trusted_python_ast.py")]);
-    if let Some(root) = base { cmd.arg(root); } else { cmd.arg(""); }
-    if node { cmd.arg("node"); } else { cmd.arg("python"); }
-    if sandboxed { cmd.arg("sandboxed"); }
-    let Ok(mut child) = cmd.no_window().stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::piped()).spawn() else {
-        return Err(format!("无法启动{}证明进程", if node { " node " } else { " python " }));
+    if let Some(root) = base {
+        cmd.arg(root);
+    } else {
+        cmd.arg("");
+    }
+    if node {
+        cmd.arg("node");
+    } else {
+        cmd.arg("python");
+    }
+    if sandboxed {
+        cmd.arg("sandboxed");
+    }
+    let Ok(mut child) = cmd
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+    else {
+        return Err(format!(
+            "无法启动{}证明进程",
+            if node { " node " } else { " python " }
+        ));
     };
-    let Some(mut input) = child.stdin.take() else { return Err("无法写入证明脚本".into()); };
-    if input.write_all(body.as_bytes()).is_err() { return Err("证明脚本写入失败".into()); }
+    let Some(mut input) = child.stdin.take() else {
+        return Err("无法写入证明脚本".into());
+    };
+    if input.write_all(body.as_bytes()).is_err() {
+        return Err("证明脚本写入失败".into());
+    }
     drop(input);
-    let Ok(output) = child.wait_with_output() else { return Err("证明进程异常退出".into()); };
-    if output.status.success() { return Ok(()); }
+    let Ok(output) = child.wait_with_output() else {
+        return Err("证明进程异常退出".into());
+    };
+    if output.status.success() {
+        return Ok(());
+    }
     // M215 R2: strict AST proof could not model this body, but containment held.
-    if contained { return Ok(()); }
+    if contained {
+        return Ok(());
+    }
     let reason = decode_prover_escapes(String::from_utf8_lossy(&output.stderr).trim());
-    Err(if reason.is_empty() { "脚本包含无法静态证明的结构".into() } else { reason })
+    Err(if reason.is_empty() {
+        "脚本包含无法静态证明的结构".into()
+    } else {
+        reason
+    })
 }
 
 /// M215: prover diagnostics travel through the host console, and a Windows code
@@ -211,8 +366,10 @@ fn python_heredoc_proof_with_sandbox(root: Option<&Path>, command: &str, sandbox
 /// No credential/path/command-word denylist is maintained in this layer.
 pub(crate) fn outside_write_sandbox_scope(command: &str) -> bool {
     codefactory_agent_loop::policy::is_delivery_command(command)
-        || !matches!(standalone_shell_policy::classify_command(command),
-            standalone_shell_policy::ShellCommandPolicy::Allow { .. })
+        || !matches!(
+            standalone_shell_policy::classify_command(command),
+            standalone_shell_policy::ShellCommandPolicy::Allow { .. }
+        )
 }
 
 pub(crate) fn decode_prover_escapes(text: &str) -> String {
@@ -227,13 +384,23 @@ pub(crate) fn decode_prover_escapes(text: &str) -> String {
         let mut digits = String::with_capacity(4);
         while digits.len() < 4 {
             match chars.peek() {
-                Some(&d) if d.is_ascii_hexdigit() => { digits.push(d); chars.next(); }
+                Some(&d) if d.is_ascii_hexdigit() => {
+                    digits.push(d);
+                    chars.next();
+                }
                 _ => break,
             }
         }
-        match u32::from_str_radix(&digits, 16).ok().and_then(char::from_u32) {
+        match u32::from_str_radix(&digits, 16)
+            .ok()
+            .and_then(char::from_u32)
+        {
             Some(decoded) if digits.len() == 4 => out.push(decoded),
-            _ => { out.push('\\'); out.push('u'); out.push_str(&digits); }
+            _ => {
+                out.push('\\');
+                out.push('u');
+                out.push_str(&digits);
+            }
         }
     }
     out
@@ -243,25 +410,42 @@ pub(crate) fn decode_prover_escapes(text: &str) -> String {
 /// and accept it when it is the workspace root or any directory inside it.
 /// `~`, `$HOME`, relative paths, `..`, quotes and backslash escapes are
 /// resolved; anything unresolvable or escaping the workspace stays unproved.
-fn heredoc_header_prefix<'a>(header: &'a str, root: Option<&Path>) -> Result<(Option<std::path::PathBuf>, &'a str), String> {
+fn heredoc_header_prefix<'a>(
+    header: &'a str,
+    root: Option<&Path>,
+) -> Result<(Option<std::path::PathBuf>, &'a str), String> {
     let root = root.map(canonical);
-    let Some(rest) = header.strip_prefix("cd ") else { return Ok((root, header)) };
+    let Some(rest) = header.strip_prefix("cd ") else {
+        return Ok((root, header));
+    };
     let mut split = None;
     for separator in [" && ", "; ", "\n"] {
-        if let Some(parts) = rest.split_once(separator) { split = Some(parts); break; }
+        if let Some(parts) = rest.split_once(separator) {
+            split = Some(parts);
+            break;
+        }
     }
-    let Some((target, tail)) = split else { return Err("heredoc 头部的 cd 没有可证明的分隔符".into()); };
+    let Some((target, tail)) = split else {
+        return Err("heredoc 头部的 cd 没有可证明的分隔符".into());
+    };
     let target = target.trim();
     // `cd "$(pwd)"` re-enters the directory this session already runs in, so it
     // needs no root to prove: whatever the root is, it stays inside it.
-    if matches!(target.trim_matches('"').trim_matches('\''), "$(pwd)" | "${PWD}" | "$PWD" | "`pwd`") {
+    if matches!(
+        target.trim_matches('"').trim_matches('\''),
+        "$(pwd)" | "${PWD}" | "$PWD" | "`pwd`"
+    ) {
         return Ok((root, tail.trim()));
     }
-    let Some(root) = root else { return Err("没有工作区根目录，无法证明 heredoc 头部的 cd".into()); };
+    let Some(root) = root else {
+        return Err("没有工作区根目录，无法证明 heredoc 头部的 cd".into());
+    };
     let Some(resolved) = physical(&root, target) else {
         return Err(format!("无法解析 heredoc 头部 cd 目标：{target}"));
     };
-    if !within(&root, &resolved) { return Err(format!("heredoc 头部 cd 目标不是本工作区：{target}")); }
+    if !within(&root, &resolved) {
+        return Err(format!("heredoc 头部 cd 目标不是本工作区：{target}"));
+    }
     Ok((Some(resolved), tail.trim()))
 }
 
@@ -302,26 +486,42 @@ fn within(root: &Path, path: &Path) -> bool {
 /// parent (a heredoc may create the file). Anything dynamic is refused.
 fn physical(base: &Path, raw: &str) -> Option<std::path::PathBuf> {
     let quoted = raw.trim().trim_matches('"').trim_matches('\'');
-    if matches!(quoted, "$(pwd)" | "${PWD}" | "$PWD" | "`pwd`") { return Some(base.to_path_buf()); }
+    if matches!(quoted, "$(pwd)" | "${PWD}" | "$PWD" | "`pwd`") {
+        return Some(base.to_path_buf());
+    }
     let text = shell_text(raw)?;
-    let home = || std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")).ok().map(std::path::PathBuf::from);
+    let home = || {
+        std::env::var("HOME")
+            .or_else(|_| std::env::var("USERPROFILE"))
+            .ok()
+            .map(std::path::PathBuf::from)
+    };
     let expanded = if text == "~" || text == "$HOME" || text == "${HOME}" {
         home()?
-    } else if let Some(rest) = text.strip_prefix("~/").or_else(|| text.strip_prefix("$HOME/")).or_else(|| text.strip_prefix("${HOME}/")) {
+    } else if let Some(rest) = text
+        .strip_prefix("~/")
+        .or_else(|| text.strip_prefix("$HOME/"))
+        .or_else(|| text.strip_prefix("${HOME}/"))
+    {
         home()?.join(rest)
     } else if text.starts_with('/') || windows_absolute(&text) {
         std::path::PathBuf::from(&text)
     } else {
         base.join(&text)
     };
-    if let Ok(real) = expanded.canonicalize() { return Some(strip_verbatim_prefix(&real)); }
+    if let Ok(real) = expanded.canonicalize() {
+        return Some(strip_verbatim_prefix(&real));
+    }
     let parent = expanded.parent()?.canonicalize().ok()?;
     Some(strip_verbatim_prefix(&parent).join(expanded.file_name()?))
 }
 
 fn has_drive(text: &str) -> bool {
     let bytes = text.as_bytes();
-    bytes.len() > 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && (bytes[2] == b'\\' || bytes[2] == b'/')
+    bytes.len() > 2
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && (bytes[2] == b'\\' || bytes[2] == b'/')
 }
 
 /// `C:\...` (drive) and `\\?\...` / `\\server\share` (verbatim, UNC) are
@@ -335,7 +535,8 @@ fn windows_absolute(text: &str) -> bool {
 fn shell_text(raw: &str) -> Option<String> {
     let raw = raw.trim();
     let inner = if raw.len() >= 2
-        && ((raw.starts_with('"') && raw.ends_with('"')) || (raw.starts_with('\'') && raw.ends_with('\'')))
+        && ((raw.starts_with('"') && raw.ends_with('"'))
+            || (raw.starts_with('\'') && raw.ends_with('\'')))
     {
         &raw[1..raw.len() - 1]
     } else {
@@ -349,16 +550,33 @@ fn shell_text(raw: &str) -> Option<String> {
     } else {
         let mut chars = inner.chars();
         while let Some(c) = chars.next() {
-            if c == '\\' { out.push(chars.next()?); } else { out.push(c); }
+            if c == '\\' {
+                out.push(chars.next()?);
+            } else {
+                out.push(c);
+            }
         }
     }
     let mut rest = out.clone();
-    for token in ["${HOME}", "$HOME", "${PWD}", "$PWD"] { rest = rest.replace(token, ""); }
-    if rest.contains('$') || rest.contains('`') { return None; }
+    for token in ["${HOME}", "$HOME", "${PWD}", "$PWD"] {
+        rest = rest.replace(token, "");
+    }
+    if rest.contains('$') || rest.contains('`') {
+        return None;
+    }
     Some(out)
 }
 
-const PROTECTED_PARTS: &[&str] = &[".git", ".ssh", ".aws", ".gnupg", ".netrc", "credentials", "id_rsa", "id_ed25519"];
+const PROTECTED_PARTS: &[&str] = &[
+    ".git",
+    ".ssh",
+    ".aws",
+    ".gnupg",
+    ".netrc",
+    "credentials",
+    "id_rsa",
+    "id_ed25519",
+];
 
 fn protected_path(path: &Path) -> bool {
     path.components().any(|component| match component {
@@ -378,12 +596,20 @@ fn protected_path(path: &Path) -> bool {
 /// the shape stays exactly what it looks like.
 fn cat_heredoc_runner(base: Option<&Path>, runner: &str) -> Option<Result<(), String>> {
     let words: Vec<&str> = runner.split_whitespace().collect();
-    let name = words.first()?.rsplit(['/', '\\']).next()?.trim_end_matches(".exe");
-    if name != "cat" { return None; }
+    let name = words
+        .first()?
+        .rsplit(['/', '\\'])
+        .next()?
+        .trim_end_matches(".exe");
+    if name != "cat" {
+        return None;
+    }
     match &words[1..] {
         [] => Some(Ok(())),
         [op, path] if matches!(*op, ">" | ">>") => {
-            let Some(base) = base else { return Some(Err("没有工作区根目录，无法证明 cat heredoc 目标".into())); };
+            let Some(base) = base else {
+                return Some(Err("没有工作区根目录，无法证明 cat heredoc 目标".into()));
+            };
             match physical(base, path) {
                 Some(target) if within(base, &target) && !protected_path(&target) => Some(Ok(())),
                 _ => Some(Err(format!("cat heredoc 目标不在本工作区：{path}"))),
@@ -396,11 +622,43 @@ fn cat_heredoc_runner(base: Option<&Path>, runner: &str) -> Option<Result<(), St
 /// Capabilities a heredoc program may not hold: network, subprocess, deletion,
 /// dynamic environment or reflection.
 const HEREDOC_DANGER: &[&str] = &[
-    "subprocess", "os.system", "os.popen", "os.exec", "os.spawn", "socket", "urllib",
-    "requests", "httpx", "ftplib", "http://", "https://", "shutil", "rmtree", "os.remove",
-    "os.unlink", "unlink(", "remove(", "child_process", "execsync", "spawnsync", "system(",
-    "eval(", "exec(", "__import__", "ctypes", "environ", "getenv", "sys.argv", "globals(",
-    "locals(", "rm -rf", "rm -fr", "git push", "git reset", "import os", "import sys",
+    "subprocess",
+    "os.system",
+    "os.popen",
+    "os.exec",
+    "os.spawn",
+    "socket",
+    "urllib",
+    "requests",
+    "httpx",
+    "ftplib",
+    "http://",
+    "https://",
+    "shutil",
+    "rmtree",
+    "os.remove",
+    "os.unlink",
+    "unlink(",
+    "remove(",
+    "child_process",
+    "execsync",
+    "spawnsync",
+    "system(",
+    "eval(",
+    "exec(",
+    "__import__",
+    "ctypes",
+    "environ",
+    "getenv",
+    "sys.argv",
+    "globals(",
+    "locals(",
+    "rm -rf",
+    "rm -fr",
+    "git push",
+    "git reset",
+    "import os",
+    "import sys",
 ];
 
 /// M215 R2: a body that names no path outside the workspace and holds no
@@ -409,34 +667,89 @@ const HEREDOC_DANGER: &[&str] = &[
 /// still asks for approval.
 fn heredoc_body_contained(base: &Path, body: &str, data_only: bool) -> Result<(), String> {
     let lower = body.to_ascii_lowercase();
-    let line_of = |needle: &str| body.to_ascii_lowercase().lines().position(|l| l.contains(needle)).map_or(1, |i| i + 1);
+    let line_of = |needle: &str| {
+        body.to_ascii_lowercase()
+            .lines()
+            .position(|l| l.contains(needle))
+            .map_or(1, |i| i + 1)
+    };
     if !data_only {
-        if let Some(needle) = HEREDOC_DANGER.iter().find(|needle| lower.contains(**needle)) {
-            return Err(format!("heredoc 正文第 {} 行无法证明：包含越界能力 {needle}", line_of(*needle)));
+        if let Some(needle) = HEREDOC_DANGER
+            .iter()
+            .find(|needle| lower.contains(**needle))
+        {
+            return Err(format!(
+                "heredoc 正文第 {} 行无法证明：包含越界能力 {needle}",
+                line_of(*needle)
+            ));
         }
     }
     for token in path_tokens(body) {
         let token = token.trim_matches('"').trim_matches('\'').to_string();
-        if token.is_empty() || token.contains("://") { continue; }
+        if token.is_empty() || token.contains("://") {
+            continue;
+        }
         // `//`, `..` and punctuation runs are prose, not paths.
-        if !token.chars().any(|c| c.is_ascii_alphanumeric()) { continue; }
-        if !(token.contains('/') || token.contains('\\') || token.starts_with('~')) { continue; }
+        if !token.chars().any(|c| c.is_ascii_alphanumeric()) {
+            continue;
+        }
+        if !(token.contains('/') || token.contains('\\') || token.starts_with('~')) {
+            continue;
+        }
         let line = line_of(&token);
         match physical(base, &token) {
             Some(resolved) => {
-                if protected_path(&resolved) { return Err(format!("heredoc 正文第 {line} 行无法证明：涉及受保护路径 {token}")); }
-                if !within(base, &resolved) { return Err(format!("heredoc 正文第 {line} 行无法证明：路径在工作区外 {token}")); }
+                if protected_path(&resolved) {
+                    return Err(format!(
+                        "heredoc 正文第 {line} 行无法证明：涉及受保护路径 {token}"
+                    ));
+                }
+                if !within(base, &resolved) {
+                    return Err(format!(
+                        "heredoc 正文第 {line} 行无法证明：路径在工作区外 {token}"
+                    ));
+                }
             }
             /* A relative path that does not exist yet cannot escape; anything
-               absolute, expanding or climbing (`..`) must resolve or it stays
-               unproved. */
-            None if token.starts_with('/') || token.starts_with('~') || token.contains("..") || has_drive(&token) => {
-                return Err(format!("heredoc 正文第 {line} 行无法证明：路径无法解析 {token}"));
+            absolute, expanding or climbing (`..`) must resolve or it stays
+            unproved. */
+            None if token.starts_with('/')
+                || token.starts_with('~')
+                || token.contains("..")
+                || has_drive(&token) =>
+            {
+                return Err(format!(
+                    "heredoc 正文第 {line} 行无法证明：路径无法解析 {token}"
+                ));
             }
             None => {}
         }
     }
     Ok(())
+}
+
+/// M266 R4: `2>&1` and its relatives are descriptor plumbing, not commands. The
+/// header folds them away already; the same tokens can follow the closing
+/// delimiter (`EOF 2>&1 | tail -25`), where they used to be judged as a command
+/// literally named `2>`. Only whole `[fd]>&[fd|-]` tokens are dropped, and lines
+/// stay separate so a trailer never merges into one fake segment.
+fn strip_fd_duplications(text: &str) -> String {
+    text.lines()
+        .map(|line| {
+            line.split_whitespace()
+                .filter(|token| {
+                    let Some((left, right)) = token.split_once(">&") else {
+                        return true;
+                    };
+                    !(left.chars().all(|c| c.is_ascii_digit())
+                        && !right.is_empty()
+                        && right.chars().all(|c| c.is_ascii_digit() || c == '-'))
+                })
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// M215 R1: split a header on top-level `;`/`|`/`&`/newline. Quotes keep their
@@ -447,45 +760,60 @@ fn split_top_level<'a>(input: &'a str, separators: &[char]) -> Vec<&'a str> {
     let mut start = 0usize;
     for (offset, ch) in input.char_indices() {
         if let Some(opening) = quote {
-            if ch == opening { quote = None; }
+            if ch == opening {
+                quote = None;
+            }
             continue;
         }
-        if ch == '\'' || ch == '"' { quote = Some(ch); continue; }
+        if ch == '\'' || ch == '"' {
+            quote = Some(ch);
+            continue;
+        }
         if separators.contains(&ch) {
             let part = input[start..offset].trim();
-            if !part.is_empty() { parts.push(part); }
+            if !part.is_empty() {
+                parts.push(part);
+            }
             start = offset + ch.len_utf8();
         }
     }
     let tail = input[start..].trim();
-    if !tail.is_empty() { parts.push(tail); }
+    if !tail.is_empty() {
+        parts.push(tail);
+    }
     parts
 }
 
 /// Commands that may run before a heredoc without changing the proof: they only
 /// read. Anything else keeps the whole command unproved.
 const READ_ONLY_PREFIX: &[&str] = &[
-    "echo", "printf", "pwd", "ls", "cat", "head", "tail", "wc", "grep", "egrep", "fgrep",
-    "sed", "cut", "sort", "uniq", "tr", "nl", "basename", "dirname", "realpath", "stat",
-    "file", "du", "df", "date", "diff", "comm", "test", "[", "true", "false", "column", "jq",
+    "echo", "printf", "pwd", "ls", "cat", "head", "tail", "wc", "grep", "egrep", "fgrep", "sed",
+    "cut", "sort", "uniq", "tr", "nl", "basename", "dirname", "realpath", "stat", "file", "du",
+    "df", "date", "diff", "comm", "test", "[", "true", "false", "column", "jq",
 ];
 
 /// M215 R1: one command placed before the heredoc. It may read files, query Git
 /// or re-enter this workspace; anything that writes, deletes or leaves the
 /// workspace keeps the approval gate.
 fn prefix_segment_is_read_only(base: Option<&Path>, segment: &str) -> Result<(), String> {
-    let Some((name, args)) = segment_command(segment) else { return Ok(()) };
+    let Some((name, args)) = segment_command(segment) else {
+        return Ok(());
+    };
     let args = args.as_slice();
     if args.iter().any(|arg| arg.starts_with('>')) {
         return Err(format!("heredoc 之前的命令带有输出重定向：{segment}"));
     }
     if name == "cd" {
-        let Some(target) = args.first() else { return Err(format!("heredoc 之前的 cd 没有目标：{segment}")); };
+        let Some(target) = args.first() else {
+            return Err(format!("heredoc 之前的 cd 没有目标：{segment}"));
+        };
         let inside = match base {
             Some(base) => physical(base, target).is_some_and(|resolved| within(base, &resolved)),
             None => matches!(*target, "$(pwd)" | "${PWD}" | "$PWD" | "`pwd`"),
         };
-        return inside.then_some(()).ok_or_else(|| format!("heredoc 之前的 cd 目标不可证明：{segment}"));
+        return inside
+            .then_some(())
+            .ok_or_else(|| format!("heredoc 之前的 cd 目标不可证明：{segment}"));
     }
     if name == "git" {
         let subcommand = args.iter().position(|arg| !arg.starts_with('-'));
@@ -493,12 +821,20 @@ fn prefix_segment_is_read_only(base: Option<&Path>, segment: &str) -> Result<(),
             let rest: Vec<String> = args[at + 1..].iter().map(|arg| arg.to_string()).collect();
             read_only_git_verb(&args[at].to_ascii_lowercase(), &rest)
         });
-        return read_only.then_some(()).ok_or_else(|| format!("heredoc 之前的 Git 不是只读：{segment}"));
+        return read_only
+            .then_some(())
+            .ok_or_else(|| format!("heredoc 之前的 Git 不是只读：{segment}"));
     }
-    if name == "sed" && args.iter().any(|arg| arg.starts_with("-i") || arg.starts_with("--in-place")) {
+    if name == "sed"
+        && args
+            .iter()
+            .any(|arg| arg.starts_with("-i") || arg.starts_with("--in-place"))
+    {
         return Err(format!("heredoc 之前的 sed 会写文件：{segment}"));
     }
-    if READ_ONLY_PREFIX.contains(&name.as_str()) { return Ok(()); }
+    if READ_ONLY_PREFIX.contains(&name.as_str()) {
+        return Ok(());
+    }
     Err(format!("heredoc 之前不是只读命令：{segment}"))
 }
 
@@ -509,7 +845,8 @@ fn segment_command(segment: &str) -> Option<(String, Vec<&str>)> {
     let mut index = 0;
     while index < words.len() {
         let (name, _) = words[index].split_once('=').unwrap_or((words[index], ""));
-        if words[index].contains('=') && !name.is_empty()
+        if words[index].contains('=')
+            && !name.is_empty()
             && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
         {
             index += 1;
@@ -530,14 +867,21 @@ fn segment_command(segment: &str) -> Option<(String, Vec<&str>)> {
 /// M221: parse Git's global arguments down to the subcommand. A `-C` target has
 /// to stay inside this workspace; `--git-dir` / `--work-tree` / `--namespace` /
 /// `--exec-path` can point the command at another repository and stay unproved.
-fn git_subcommand<'a>(base: Option<&Path>, args: &[&'a str]) -> Result<(&'a str, Vec<&'a str>), String> {
+fn git_subcommand<'a>(
+    base: Option<&Path>,
+    args: &[&'a str],
+) -> Result<(&'a str, Vec<&'a str>), String> {
     let mut index = 0;
     while index < args.len() {
         let arg = args[index];
         match arg {
             "-C" => {
-                let Some(target) = args.get(index + 1) else { return Err("Git -C 缺少目录".into()); };
-                let Some(base) = base else { return Err("没有工作区根目录，无法证明 Git -C 目标".into()); };
+                let Some(target) = args.get(index + 1) else {
+                    return Err("Git -C 缺少目录".into());
+                };
+                let Some(base) = base else {
+                    return Err("没有工作区根目录，无法证明 Git -C 目标".into());
+                };
                 match physical(base, target) {
                     Some(resolved) if within(base, &resolved) => {}
                     _ => return Err(format!("Git -C 目标不在本工作区：{target}")),
@@ -545,11 +889,15 @@ fn git_subcommand<'a>(base: Option<&Path>, args: &[&'a str]) -> Result<(&'a str,
                 index += 2;
             }
             "-c" => {
-                if args.get(index + 1).is_none() { return Err("Git -c 缺少配置项".into()); }
+                if args.get(index + 1).is_none() {
+                    return Err("Git -c 缺少配置项".into());
+                }
                 index += 2;
             }
-            _ if arg.starts_with("--git-dir") || arg.starts_with("--work-tree")
-                || arg.starts_with("--namespace") || arg.starts_with("--exec-path") =>
+            _ if arg.starts_with("--git-dir")
+                || arg.starts_with("--work-tree")
+                || arg.starts_with("--namespace")
+                || arg.starts_with("--exec-path") =>
             {
                 return Err(format!("不允许的 Git 全局参数：{arg}"));
             }
@@ -579,8 +927,12 @@ fn reads_message_from_stdin(args: &[&str]) -> bool {
 }
 
 fn data_heredoc_verb(base: Option<&Path>, segment: &str) -> Result<Option<String>, String> {
-    let Some((name, args)) = segment_command(segment) else { return Ok(None) };
-    if name != "git" { return Ok(None); }
+    let Some((name, args)) = segment_command(segment) else {
+        return Ok(None);
+    };
+    if name != "git" {
+        return Ok(None);
+    }
     let (verb, rest) = git_subcommand(base, &args)?;
     let verb = verb.to_ascii_lowercase();
     if !matches!(verb.as_str(), "commit" | "tag") || !reads_message_from_stdin(&rest) {
@@ -599,7 +951,14 @@ fn git_data_heredoc_consumer(
 ) -> Result<Option<String>, String> {
     match (data_heredoc_verb(base, runner)?, pipeline) {
         (Some(verb), None) => Ok(Some(verb)),
-        (Some(_), Some(_)) => Err("heredoc 前后各有一个数据消费者".into()),
+        // M266 R4: `git commit -F - <<'EOF' 2>&1 | tail -25` pipes the command's
+        // *output* through a read-only filter. The heredoc still owns the input,
+        // so this is not a second data consumer — but anything that writes or
+        // leaves the workspace is still refused.
+        (Some(verb), Some(segment)) => match prefix_segment_is_read_only(base, segment) {
+            Ok(()) => Ok(Some(verb)),
+            Err(_) => Err("heredoc 前后各有一个数据消费者".into()),
+        },
         (None, Some(segment)) => match cat_heredoc_runner(base, runner) {
             Some(Ok(())) => data_heredoc_verb(base, segment)?
                 .map(Some)
@@ -617,8 +976,12 @@ fn git_data_heredoc_consumer(
 /// Destructive remote shapes (force, mirror, `--tags`, a `src:dst` refspec to
 /// main) are not recognised by `own_remote_actions`, so they still ask.
 fn trailer_segment_is_allowed(base: Option<&Path>, segment: &str) -> Result<(), String> {
-    if segment.trim().is_empty() { return Ok(()); }
-    if own_remote_actions(segment).is_some() { return Ok(()); }
+    if segment.trim().is_empty() {
+        return Ok(());
+    }
+    if own_remote_actions(segment).is_some() {
+        return Ok(());
+    }
     prefix_segment_is_local(base, segment).map_err(|reason| format!("heredoc 之后：{reason}"))
 }
 
@@ -626,16 +989,25 @@ fn trailer_segment_is_allowed(base: Option<&Path>, segment: &str) -> Result<(), 
 /// (`git add -A && git commit -F - <<'MSG'`). Reading a message from standard
 /// input there is refused: only the heredoc owns that input.
 fn prefix_segment_is_local(base: Option<&Path>, segment: &str) -> Result<(), String> {
-    let Some((name, args)) = segment_command(segment) else { return Ok(()) };
+    let Some((name, args)) = segment_command(segment) else {
+        return Ok(());
+    };
     if name == "git" {
         if let Ok((verb, rest)) = git_subcommand(base, &args) {
             let verb = verb.to_ascii_lowercase();
             if LOCAL_GIT_WRITE.contains(&verb.as_str()) {
-                if rest.iter().any(|arg| matches!(*arg, "-F" | "-F-" | "--file" | "--file=-")) {
-                    return Err(format!("heredoc 之前的 Git 也从标准输入读取说明：{segment}"));
+                if rest
+                    .iter()
+                    .any(|arg| matches!(*arg, "-F" | "-F-" | "--file" | "--file=-"))
+                {
+                    return Err(format!(
+                        "heredoc 之前的 Git 也从标准输入读取说明：{segment}"
+                    ));
                 }
                 if base.is_none() {
-                    return Err(format!("没有工作区根目录，无法证明本地 Git 写入：{segment}"));
+                    return Err(format!(
+                        "没有工作区根目录，无法证明本地 Git 写入：{segment}"
+                    ));
                 }
                 return Ok(());
             }
@@ -650,21 +1022,56 @@ fn path_tokens(body: &str) -> Vec<String> {
     let mut tokens = Vec::new();
     let mut current = String::new();
     for ch in body.chars() {
-        let keep = ch.is_ascii_alphanumeric() || matches!(ch, '/' | '\\' | '.' | '-' | '_' | '~' | '$' | '{' | '}' | ':' | '"' | '\'' | '@' | '+' | '%');
+        let keep = ch.is_ascii_alphanumeric()
+            || matches!(
+                ch,
+                '/' | '\\'
+                    | '.'
+                    | '-'
+                    | '_'
+                    | '~'
+                    | '$'
+                    | '{'
+                    | '}'
+                    | ':'
+                    | '"'
+                    | '\''
+                    | '@'
+                    | '+'
+                    | '%'
+            );
         if keep {
             current.push(ch);
         } else if !current.is_empty() {
             tokens.push(std::mem::take(&mut current));
         }
     }
-    if !current.is_empty() { tokens.push(current); }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
     tokens
 }
 
 /// Git subcommands that move the working tree, the index or a local branch.
 const DESTRUCTIVE_GIT_SUBCOMMANDS: &[&str] = &[
-    "reset", "restore", "checkout", "clean", "stash", "rebase", "merge", "switch", "add", "commit", "config",
-    "filter-branch", "filter-repo", "worktree", "cherry-pick", "revert", "am", "apply",
+    "reset",
+    "restore",
+    "checkout",
+    "clean",
+    "stash",
+    "rebase",
+    "merge",
+    "switch",
+    "add",
+    "commit",
+    "config",
+    "filter-branch",
+    "filter-repo",
+    "worktree",
+    "cherry-pick",
+    "revert",
+    "am",
+    "apply",
 ];
 
 /// Words that only wrap another command.
@@ -675,7 +1082,9 @@ const SHELL_INTERPRETERS: &[&str] = &["bash", "sh", "zsh", "dash", "ksh", "ash"]
 
 /// Interpreters that take inline code in another language: their payload is
 /// data unless it visibly shells out to a destructive Git command.
-const INLINE_CODE_INTERPRETERS: &[&str] = &["node", "nodejs", "deno", "bun", "python", "python3", "perl", "ruby"];
+const INLINE_CODE_INTERPRETERS: &[&str] = &[
+    "node", "nodejs", "deno", "bun", "python", "python3", "perl", "ruby",
+];
 
 /// M260: structures are unfolded first (`trusted_shell_structure`), then every
 /// simple command is judged on its own. `None` means "cannot be enumerated",
@@ -685,54 +1094,60 @@ fn executable_segments(command: &str) -> Option<Vec<Vec<String>>> {
 }
 
 fn segment_is_sensitive(words: &[String]) -> bool {
+    let Some((binary, args)) = segment_command_words(words) else {
+        return false;
+    };
+    // M266 R2: only the command word can expand into a program. A `$` inside an
+    // argument — a search pattern, a path, a variable name — is data, and a word
+    // holding an already-unfolded `$(...)` is a placeholder, not a live expansion.
+    if binary.contains('$') || binary.contains('`') {
+        return true;
+    }
+    let name = command_name(&binary);
+    if name == "git" {
+        return git_segment_is_sensitive(args);
+    }
+    if SHELL_INTERPRETERS.contains(&name.as_str()) {
+        return inline_payload(args, &["-c", "-lc", "-ec", "-ic"])
+            .is_some_and(|payload| sensitive(&payload));
+    }
+    if INLINE_CODE_INTERPRETERS.contains(&name.as_str()) {
+        return inline_payload(args, &["-e", "-c", "-p", "--eval", "--print"])
+            .is_some_and(|payload| payload_shells_out_to_destructive_git(&payload));
+    }
+    // `cargo clean` deletes build output: previously caught by the "clean"
+    // substring, so keep it explicit rather than losing the coverage.
+    name == "cargo" && args.iter().any(|arg| arg.eq_ignore_ascii_case("clean"))
+}
+
+/// M266 R2: the command word of a segment, after the leading `NAME=value`
+/// assignments and wrapper words (`sudo`, `env`, …). Everything after it is an
+/// argument, never a program.
+fn segment_command_words(words: &[String]) -> Option<(String, &[String])> {
     let mut start = 0;
     while start < words.len() {
         let word = words[start].as_str();
-        let assignment = word
-            .split_once('=')
-            .is_some_and(|(name, _)| !name.is_empty()
-                && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'));
+        let assignment = word.split_once('=').is_some_and(|(name, _)| {
+            !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        });
         if assignment || WRAPPER_WORDS.contains(&word.to_ascii_lowercase().as_str()) {
             start += 1;
         } else {
             break;
         }
     }
-    let rest = &words[start..];
-    let Some(binary) = rest.first() else { return false };
-    let lowered = rest.iter().map(|w| w.to_ascii_lowercase()).collect::<Vec<_>>();
-    // A dynamic command word or argument can expand into anything: keep the
-    // snapshot when the segment visibly names Git or a destructive verb.
-    let dynamic = rest.iter().any(|w| w.contains('$') || w.contains('`'));
-    if dynamic
-        && lowered.iter().any(|w| {
-            w == "git"
-                || w.contains("push")
-                || DESTRUCTIVE_GIT_SUBCOMMANDS.contains(&w.as_str())
-        })
-    {
-        return true;
-    }
-    let name = binary
+    words
+        .get(start)
+        .map(|binary| (binary.clone(), &words[start + 1..]))
+}
+
+fn command_name(binary: &str) -> String {
+    binary
         .rsplit(['/', '\\'])
         .next()
         .unwrap_or(binary)
         .trim_end_matches(".exe")
-        .to_ascii_lowercase();
-    let args = &rest[1..];
-    if name == "git" {
-        return git_segment_is_sensitive(args);
-    }
-    if SHELL_INTERPRETERS.contains(&name.as_str()) {
-        return inline_payload(args, &["-c", "-lc", "-ec", "-ic"]).is_some_and(|p| sensitive(&p));
-    }
-    if INLINE_CODE_INTERPRETERS.contains(&name.as_str()) {
-        return inline_payload(args, &["-e", "-c", "-p", "--eval", "--print"])
-            .is_some_and(|p| payload_shells_out_to_destructive_git(&p));
-    }
-    // `cargo clean` deletes build output: previously caught by the "clean"
-    // substring, so keep it explicit rather than losing the coverage.
-    name == "cargo" && args.iter().any(|a| a.eq_ignore_ascii_case("clean"))
+        .to_ascii_lowercase()
 }
 
 fn git_segment_is_sensitive(args: &[String]) -> bool {
@@ -752,7 +1167,10 @@ fn git_segment_is_sensitive(args: &[String]) -> bool {
             index += 1;
             continue;
         }
-        if matches!(lower.as_str(), "--git-dir" | "--work-tree" | "--namespace" | "--exec-path") {
+        if matches!(
+            lower.as_str(),
+            "--git-dir" | "--work-tree" | "--namespace" | "--exec-path"
+        ) {
             index += 2;
             continue;
         }
@@ -766,15 +1184,21 @@ fn git_segment_is_sensitive(args: &[String]) -> bool {
     if rewrites_config {
         return true;
     }
-    let Some(subcommand) = subcommand else { return false };
+    let Some(subcommand) = subcommand else {
+        return false;
+    };
     let lower = subcommand.to_ascii_lowercase();
     // M215 R3: a query verb that can execute a program or write a file is a
     // write, not a read.
-    if git_runs_program(&args[index + 1..]) { return true; }
+    if git_runs_program(&args[index + 1..]) {
+        return true;
+    }
     // M215 R3: a pure read-only Git invocation needs no workspace-root proof,
     // no registration and no snapshot — wherever it runs. A write verb in the
     // same segment still falls through to the original rules below.
-    if read_only_git_verb(&lower, &args[index + 1..]) { return false; }
+    if read_only_git_verb(&lower, &args[index + 1..]) {
+        return false;
+    }
     // M180: `worktree list` reads registrations; it does not move or discard
     // work. Only the listing verb is exempt: remove/prune/add/move/lock still
     // require the session-owned proof and snapshot.
@@ -783,19 +1207,29 @@ fn git_segment_is_sensitive(args: &[String]) -> bool {
     }
     if lower == "branch" {
         return !codefactory_agent_core::command_segment_is_read_only_probe(
-            &std::iter::once("git").chain(args[index..].iter().map(String::as_str)).collect::<Vec<_>>().join(" "),
+            &std::iter::once("git")
+                .chain(args[index..].iter().map(String::as_str))
+                .collect::<Vec<_>>()
+                .join(" "),
         );
     }
     if lower == "fetch" {
-        return !fetch_args(&args[index + 1..].iter().map(String::as_str).collect::<Vec<_>>());
+        return !fetch_args(
+            &args[index + 1..]
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+        );
     }
     if DESTRUCTIVE_GIT_SUBCOMMANDS.contains(&lower.as_str()) {
         return true;
     }
     if lower == "push" {
         return args[index + 1..].iter().any(|arg| {
-            arg.starts_with("--force") || ["--delete", "--mirror", "--prune", "-f", "-d"].contains(&arg.as_str())
-                || arg.starts_with('+') || arg.starts_with(':')
+            arg.starts_with("--force")
+                || ["--delete", "--mirror", "--prune", "-f", "-d"].contains(&arg.as_str())
+                || arg.starts_with('+')
+                || arg.starts_with(':')
         });
     }
     false
@@ -806,8 +1240,15 @@ fn git_segment_is_sensitive(args: &[String]) -> bool {
 fn git_runs_program(rest: &[String]) -> bool {
     rest.iter().any(|arg| {
         let option = arg.split('=').next().unwrap_or(arg);
-        ["--ext-diff", "--textconv", "--upload-pack", "--receive-pack", "--exec", "--exec-path"]
-            .contains(&option)
+        [
+            "--ext-diff",
+            "--textconv",
+            "--upload-pack",
+            "--receive-pack",
+            "--exec",
+            "--exec-path",
+        ]
+        .contains(&option)
     })
 }
 
@@ -818,8 +1259,17 @@ fn read_only_git_verb(subcommand: &str, rest: &[String]) -> bool {
     let lower: Vec<String> = rest.iter().map(|arg| arg.to_ascii_lowercase()).collect();
     if lower.iter().any(|arg| {
         let option = arg.split('=').next().unwrap_or(arg);
-        ["--ext-diff", "--textconv", "--output", "--output-directory", "--upload-pack", "--receive-pack", "--exec", "--exec-path"]
-            .contains(&option)
+        [
+            "--ext-diff",
+            "--textconv",
+            "--output",
+            "--output-directory",
+            "--upload-pack",
+            "--receive-pack",
+            "--exec",
+            "--exec-path",
+        ]
+        .contains(&option)
     }) {
         return false;
     }
@@ -831,10 +1281,15 @@ fn read_only_git_verb(subcommand: &str, rest: &[String]) -> bool {
         | "whatchanged" | "cherry" | "merge-tree" => true,
         "fetch" => fetch_args(&rest.iter().map(String::as_str).collect::<Vec<_>>()),
         "branch" => branch_is_read_only(&lower),
-        "remote" => lower.iter().all(|arg| matches!(arg.as_str(), "-v" | "--verbose" | "show")),
+        "remote" => lower
+            .iter()
+            .all(|arg| matches!(arg.as_str(), "-v" | "--verbose" | "show")),
         "stash" => matches!(lower.first().map(String::as_str), Some("list" | "show")),
         "worktree" => matches!(lower.first().map(String::as_str), Some("list")),
-        "reflog" => matches!(lower.first().map(String::as_str), Some("show" | "list" | "exists")),
+        "reflog" => matches!(
+            lower.first().map(String::as_str),
+            Some("show" | "list" | "exists")
+        ),
         "config" => {
             lower.iter().any(|arg| arg == "core.hookspath")
                 && lower.iter().filter(|arg| !arg.starts_with('-')).count() == 1
@@ -847,11 +1302,28 @@ fn read_only_git_verb(subcommand: &str, rest: &[String]) -> bool {
 /// a bare positional argument names a branch to create, which is a write.
 fn branch_is_read_only(args: &[String]) -> bool {
     const WRITE_FLAGS: &[&str] = &[
-        "-d", "-D", "-m", "-M", "-c", "-C", "-f", "--force", "-u", "--set-upstream-to",
-        "--unset-upstream", "--edit-description", "--delete", "--move", "--copy", "--create",
-        "--track", "--no-track",
+        "-d",
+        "-D",
+        "-m",
+        "-M",
+        "-c",
+        "-C",
+        "-f",
+        "--force",
+        "-u",
+        "--set-upstream-to",
+        "--unset-upstream",
+        "--edit-description",
+        "--delete",
+        "--move",
+        "--copy",
+        "--create",
+        "--track",
+        "--no-track",
     ];
-    if args.iter().any(|arg| WRITE_FLAGS.contains(&arg.as_str())) { return false; }
+    if args.iter().any(|arg| WRITE_FLAGS.contains(&arg.as_str())) {
+        return false;
+    }
     args.is_empty() || args.iter().any(|arg| arg.starts_with('-'))
 }
 
@@ -869,15 +1341,30 @@ fn inline_payload(args: &[String], flags: &[&str]) -> Option<String> {
 fn payload_shells_out_to_destructive_git(payload: &str) -> bool {
     let lower = payload.to_ascii_lowercase();
     let shells_out = [
-        "execsync", "spawnsync", "exec(", "spawn(", "subprocess", "os.system", "popen",
-        "child_process", "system(",
+        "execsync",
+        "spawnsync",
+        "exec(",
+        "spawn(",
+        "subprocess",
+        "os.system",
+        "popen",
+        "child_process",
+        "system(",
     ]
     .iter()
     .any(|needle| lower.contains(needle));
     shells_out
         && [
-            "git reset", "git clean", "git checkout", "git restore", "git stash", "git rebase",
-            "git merge", "git worktree", "git push", "git -c",
+            "git reset",
+            "git clean",
+            "git checkout",
+            "git restore",
+            "git stash",
+            "git rebase",
+            "git merge",
+            "git worktree",
+            "git push",
+            "git -c",
         ]
         .iter()
         .any(|needle| lower.contains(needle))
@@ -900,7 +1387,10 @@ gh auth status";
 
     #[test]
     fn m172_read_only_git_queries_are_not_sensitive() {
-        assert!(!sensitive(READ_ONLY_EVIDENCE_COMMAND), "read-only evidence command must not ask");
+        assert!(
+            !sensitive(READ_ONLY_EVIDENCE_COMMAND),
+            "read-only evidence command must not ask"
+        );
         assert!(!sensitive("git fetch --prune origin main"));
         assert!(!sensitive("git merge-base --is-ancestor origin/main HEAD"));
         assert!(!sensitive("git log --oneline -5"));
@@ -913,16 +1403,24 @@ gh auth status";
         // mentions the words the old substring scan treated as destructive.
         let script = "node -e 'const reg=require(\"./docs/testing/scenario-registry.json\");\
 console.log(reg.scenarios.map(s=>[s.id,s.change_patterns,s.restore,s.cleanup,s.worktree]).join(\"\\n\"))' | head -20";
-        assert!(!sensitive(script), "quoted script data must not trigger the git snapshot");
+        assert!(
+            !sensitive(script),
+            "quoted script data must not trigger the git snapshot"
+        );
     }
 
     #[test]
     fn m172_local_interpreter_and_build_commands_are_not_sensitive() {
         assert!(!sensitive("python3 -"));
-        assert!(!sensitive("cargo test --manifest-path src-tauri/Cargo.toml"));
+        assert!(!sensitive(
+            "cargo test --manifest-path src-tauri/Cargo.toml"
+        ));
         assert!(!sensitive("pnpm test"));
         assert!(!sensitive("node scripts/run.mjs --dry-run"));
-        assert!(!sensitive("git push origin main"), "ordinary push uses the separate session delivery approval, never local proof");
+        assert!(
+            !sensitive("git push origin main"),
+            "ordinary push uses the separate session delivery approval, never local proof"
+        );
     }
 
     #[test]
@@ -949,12 +1447,22 @@ console.log(reg.scenarios.map(s=>[s.id,s.change_patterns,s.restore,s.cleanup,s.w
 }
 
 fn git(root: &Path, args: &[&str]) -> Option<String> {
-    let out = Command::new("git").no_window().current_dir(root).args(args).stdin(Stdio::null()).output().ok()?;
-    out.status.success().then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+    let out = Command::new("git")
+        .no_window()
+        .current_dir(root)
+        .args(args)
+        .stdin(Stdio::null())
+        .output()
+        .ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 fn inside(root: &Path, raw: &str) -> bool {
     let path = Path::new(raw);
-    if raw.is_empty() || raw.contains(':') || path.is_absolute() { return false; }
+    if raw.is_empty() || raw.contains(':') || path.is_absolute() {
+        return false;
+    }
     for c in path.components() {
         match c {
             Component::CurDir => (),
@@ -964,51 +1472,123 @@ fn inside(root: &Path, raw: &str) -> bool {
     }
     let mut probe = root.join(path);
     loop {
-        if let Ok(real) = probe.canonicalize() { return real.starts_with(root); }
-        if std::fs::symlink_metadata(&probe).is_ok() { return false; }
-        match probe.parent() { Some(p) if p.starts_with(root) => probe = p.into(), _ => return false }
+        if let Ok(real) = probe.canonicalize() {
+            return real.starts_with(root);
+        }
+        if std::fs::symlink_metadata(&probe).is_ok() {
+            return false;
+        }
+        match probe.parent() {
+            Some(p) if p.starts_with(root) => probe = p.into(),
+            _ => return false,
+        }
     }
 }
 fn parts(command: &str) -> Option<Vec<Vec<&str>>> {
-    if command.contains(['\n', '\r']) { return None; }
-    let parts: Vec<Vec<&str>> = command.split("&&").map(|s| s.split_whitespace().collect()).collect();
-    if parts.iter().any(|p| p.is_empty()) { return None; }
+    if command.contains(['\n', '\r']) {
+        return None;
+    }
+    let parts: Vec<Vec<&str>> = command
+        .split("&&")
+        .map(|s| s.split_whitespace().collect())
+        .collect();
+    if parts.iter().any(|p| p.is_empty()) {
+        return None;
+    }
     for p in &parts {
         for word in p {
-            if word.chars().any(|c| !(c.is_ascii_alphanumeric() || "-_/ .".contains(c))) { return None; }
+            if word
+                .chars()
+                .any(|c| !(c.is_ascii_alphanumeric() || "-_/ .".contains(c)))
+            {
+                return None;
+            }
         }
     }
     Some(parts)
 }
 fn legacy_rewrite(root: &Path, command: &str) -> bool {
-    let Some(root) = root.canonicalize().ok() else { return false };
+    let Some(root) = root.canonicalize().ok() else {
+        return false;
+    };
     // No parent repository discovery, submodule effects, or unmerged index.
-    if git(&root, &["rev-parse", "--show-toplevel"]).and_then(|p| Path::new(&p).canonicalize().ok()).as_ref() != Some(&root) { return false; }
-    if git(&root, &["ls-files", "--stage"]).is_none_or(|s| s.lines().any(|l| l.starts_with("160000 "))) { return false; }
-    let Some(parts) = parts(command) else { return false };
+    if git(&root, &["rev-parse", "--show-toplevel"])
+        .and_then(|p| Path::new(&p).canonicalize().ok())
+        .as_ref()
+        != Some(&root)
+    {
+        return false;
+    }
+    if git(&root, &["ls-files", "--stage"])
+        .is_none_or(|s| s.lines().any(|l| l.starts_with("160000 ")))
+    {
+        return false;
+    }
+    let Some(parts) = parts(command) else {
+        return false;
+    };
     let mut has_git = false;
     for argv in parts {
         let paths: &[&str] = match argv.as_slice() {
             ["git", "reset", "--hard", revision] => {
                 has_git = true;
-                if revision.starts_with('-') || revision.contains('/') { return false; }
-                let Some(target) = git(&root, &["rev-parse", "--verify", &format!("{revision}^{{commit}}")]) else { return false };
-                let Some(removed) = git(&root, &["rev-list", &format!("{target}..HEAD")]) else { return false };
+                if revision.starts_with('-') || revision.contains('/') {
+                    return false;
+                }
+                let Some(target) = git(
+                    &root,
+                    &["rev-parse", "--verify", &format!("{revision}^{{commit}}")],
+                ) else {
+                    return false;
+                };
+                let Some(removed) = git(&root, &["rev-list", &format!("{target}..HEAD")]) else {
+                    return false;
+                };
                 for commit in removed.lines() {
-                    if git(&root, &["branch", "-r", "--contains", commit]).is_none_or(|s| !s.is_empty()) { return false; }
+                    if git(&root, &["branch", "-r", "--contains", commit])
+                        .is_none_or(|s| !s.is_empty())
+                    {
+                        return false;
+                    }
                 }
                 continue;
             }
-            ["git", "checkout", "--", rest @ ..] => { has_git = true; rest }
-            ["git", "restore", "--staged", rest @ ..] | ["git", "restore", "--", rest @ ..] => { has_git = true; rest }
-            ["git", "clean", flags, rest @ ..] if ["-f", "-fq", "-qf", "-fd", "-fdq"].contains(flags) => { has_git = true; rest }
-            ["git", "stash"] | ["git", "stash", "push"] => { has_git = true; continue; }
+            ["git", "checkout", "--", rest @ ..] => {
+                has_git = true;
+                rest
+            }
+            ["git", "restore", "--staged", rest @ ..] | ["git", "restore", "--", rest @ ..] => {
+                has_git = true;
+                rest
+            }
+            ["git", "clean", flags, rest @ ..]
+                if ["-f", "-fq", "-qf", "-fd", "-fdq"].contains(flags) =>
+            {
+                has_git = true;
+                rest
+            }
+            ["git", "stash"] | ["git", "stash", "push"] => {
+                has_git = true;
+                continue;
+            }
             ["rm", "-rf", rest @ ..] => rest,
             _ => return false,
         };
-        if paths.is_empty() || paths.iter().any(|p| p.starts_with('-') || !inside(&root, p)) { return false; }
+        if paths.is_empty()
+            || paths
+                .iter()
+                .any(|p| p.starts_with('-') || !inside(&root, p))
+        {
+            return false;
+        }
         // Do not allow shell deletion of the workspace root itself.
-        if argv[0] == "rm" && paths.iter().any(|p| root.join(p).canonicalize().ok().as_ref() == Some(&root)) { return false; }
+        if argv[0] == "rm"
+            && paths
+                .iter()
+                .any(|p| root.join(p).canonicalize().ok().as_ref() == Some(&root))
+        {
+            return false;
+        }
     }
     has_git
 }
@@ -1016,13 +1596,26 @@ fn legacy_rewrite(root: &Path, command: &str) -> bool {
 /// A deliberately small shell grammar: no evaluation, globbing, redirection,
 /// subshells or inherited variables. Quotes retain literal vs expansion meaning.
 #[derive(Default)]
-struct Word { text: String, expanded: bool, redirect: bool }
-struct Segment { words: Vec<Word>, separator: char, raw: String }
+struct Word {
+    text: String,
+    expanded: bool,
+    redirect: bool,
+}
+struct Segment {
+    words: Vec<Word>,
+    separator: char,
+    raw: String,
+}
 
 /// Lossless segment text for the permission gateway: quoted script data is
 /// never reconstructed or reinterpreted as shell operators.
 pub(super) fn command_segments(command: &str) -> Option<Vec<String>> {
-    Some(segments(command)?.into_iter().map(|segment| segment.raw).collect())
+    Some(
+        segments(command)?
+            .into_iter()
+            .map(|segment| segment.raw)
+            .collect(),
+    )
 }
 fn segments(command: &str) -> Option<Vec<Segment>> {
     let mut chars = command.chars().peekable();
@@ -1034,14 +1627,22 @@ fn segments(command: &str) -> Option<Vec<Segment>> {
     let mut variables = std::collections::HashMap::<String, String>::new();
     let mut raw_start = 0;
     while let Some(c) = chars.next() {
-        if matches!(c, '\n' | '\r' | '`') { return None; }
+        if matches!(c, '\n' | '\r' | '`') {
+            return None;
+        }
         if c == '\\' {
             // A backslash is a path separator on Windows and survives inside
             // quotes, so a quoted Windows worktree path must stay literal.
             // Outside quotes it is an escape or line continuation; inside double
             // quotes the escapes a shell would still act on are refused.
-            if quote.is_none() { return None; }
-            if quote == Some('"') && matches!(chars.peek(), Some('"') | Some('\\') | Some('$') | Some('`')) { return None; }
+            if quote.is_none() {
+                return None;
+            }
+            if quote == Some('"')
+                && matches!(chars.peek(), Some('"') | Some('\\') | Some('$') | Some('`'))
+            {
+                return None;
+            }
             word.text.push(c);
             started = true;
             continue;
@@ -1053,68 +1654,141 @@ fn segments(command: &str) -> Option<Vec<Segment>> {
         }
         if c == '$' && quote != Some('\'') {
             let mut name = String::new();
-            while chars.peek().is_some_and(|c| c.is_ascii_alphanumeric() || *c == '_') {
+            while chars
+                .peek()
+                .is_some_and(|c| c.is_ascii_alphanumeric() || *c == '_')
+            {
                 name.push(chars.next()?);
             }
             let value = variables.get(&name)?;
-            if quote.is_none() && value.chars().any(|c| c.is_whitespace() || "*?[]".contains(c)) { return None; }
+            if quote.is_none()
+                && value
+                    .chars()
+                    .any(|c| c.is_whitespace() || "*?[]".contains(c))
+            {
+                return None;
+            }
             word.text.push_str(value);
             word.expanded = true;
             started = true;
             continue;
         }
         if quote.is_none() && (c.is_whitespace() || matches!(c, ';' | '&' | '|')) {
-            if started { words.push(std::mem::take(&mut word)); started = false; }
-            if c.is_whitespace() { continue; }
+            if started {
+                words.push(std::mem::take(&mut word));
+                started = false;
+            }
+            if c.is_whitespace() {
+                continue;
+            }
             let separator = match c {
                 '&' if chars.next() == Some('&') => '&',
                 '&' => return None,
-                '|' if chars.peek() == Some(&'|') => { chars.next(); 'o' },
+                '|' if chars.peek() == Some(&'|') => {
+                    chars.next();
+                    'o'
+                }
                 other => other,
             };
-            if words.is_empty() { return None; }
+            if words.is_empty() {
+                return None;
+            }
             record_assignment(&words, &mut variables)?;
             let end = command.len() - chars.clone().map(char::len_utf8).sum::<usize>();
             let delimiter_len = if matches!(separator, '&' | 'o') { 2 } else { 1 };
-            result.push(Segment { words: std::mem::take(&mut words), separator, raw: command[raw_start..end - delimiter_len].trim().into() });
+            result.push(Segment {
+                words: std::mem::take(&mut words),
+                separator,
+                raw: command[raw_start..end - delimiter_len].trim().into(),
+            });
             raw_start = end;
             continue;
         }
         if quote.is_none() && c == '>' {
             // Keep redirects as explicit tokens; never execute or erase their target.
             if started {
-                if word.text == "2" || word.text == "1" { word = Word::default(); }
-                else { words.push(std::mem::take(&mut word)); }
+                if word.text == "2" || word.text == "1" {
+                    word = Word::default();
+                } else {
+                    words.push(std::mem::take(&mut word));
+                }
                 started = false;
             }
             if chars.peek() == Some(&'&') {
                 chars.next();
-                if chars.next() != Some('1') { return None; }
-                words.push(Word { text: "@stderr-to-stdout".into(), expanded: false, redirect: true });
+                if chars.next() != Some('1') {
+                    return None;
+                }
+                words.push(Word {
+                    text: "@stderr-to-stdout".into(),
+                    expanded: false,
+                    redirect: true,
+                });
             } else {
-                if chars.peek() == Some(&'>') { chars.next(); }
-                words.push(Word { text: "@output".into(), expanded: false, redirect: true });
+                if chars.peek() == Some(&'>') {
+                    chars.next();
+                }
+                words.push(Word {
+                    text: "@output".into(),
+                    expanded: false,
+                    redirect: true,
+                });
             }
             continue;
         }
-        if quote.is_none() && "<()[{}]*?!#~".contains(c) { return None; }
+        if quote.is_none() && "<()[{}]*?!#~".contains(c) {
+            return None;
+        }
         word.text.push(c);
         started = true;
     }
-    if quote.is_some() { return None; }
-    if started { words.push(word); }
-    if words.is_empty() { return None; }
+    if quote.is_some() {
+        return None;
+    }
+    if started {
+        words.push(word);
+    }
+    if words.is_empty() {
+        return None;
+    }
     record_assignment(&words, &mut variables)?;
-    result.push(Segment { words, separator: ';', raw: command[raw_start..].trim().into() });
+    result.push(Segment {
+        words,
+        separator: ';',
+        raw: command[raw_start..].trim().into(),
+    });
     Some(result)
 }
-fn record_assignment(words: &[Word], variables: &mut std::collections::HashMap<String, String>) -> Option<()> {
+fn record_assignment(
+    words: &[Word],
+    variables: &mut std::collections::HashMap<String, String>,
+) -> Option<()> {
     if words.len() == 1 {
         if let Some((name, value)) = words[0].text.split_once('=') {
             // Never let a literal assignment change shell/Git execution semantics.
-            if words[0].expanded || name.is_empty() || name.starts_with("GIT_")
-                || ["PATH", "IFS", "ENV", "BASH_ENV", "CDPATH", "HOME", "SHELLOPTS", "BASHOPTS", "GLOBIGNORE", "PROMPT_COMMAND", "PS4"].contains(&name)
-                || !name.chars().enumerate().all(|(i,c)| c == '_' || c.is_ascii_alphabetic() || i > 0 && c.is_ascii_digit()) { return None; }
+            if words[0].expanded
+                || name.is_empty()
+                || name.starts_with("GIT_")
+                || [
+                    "PATH",
+                    "IFS",
+                    "ENV",
+                    "BASH_ENV",
+                    "CDPATH",
+                    "HOME",
+                    "SHELLOPTS",
+                    "BASHOPTS",
+                    "GLOBIGNORE",
+                    "PROMPT_COMMAND",
+                    "PS4",
+                ]
+                .contains(&name)
+                || !name.chars().enumerate().all(|(i, c)| {
+                    c == '_' || c.is_ascii_alphabetic() || i > 0 && c.is_ascii_digit()
+                })
+            {
+                return None;
+            }
             variables.insert(name.into(), value.into());
         }
     }
@@ -1126,7 +1800,9 @@ fn revision(word: &str) -> bool {
     !word.is_empty()
         && !word.starts_with('-')
         && !word.contains([':', '\\', '*', '?', '['])
-        && word.chars().all(|c| c.is_ascii_alphanumeric() || "-_./@{}^~=".contains(c))
+        && word
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "-_./@{}^~=".contains(c))
 }
 fn inside_or_here(root: &Path, word: &str) -> bool {
     word == "." && root.is_dir() || inside(root, word)
@@ -1136,11 +1812,22 @@ fn inside_or_here(root: &Path, word: &str) -> bool {
 /// M159 snapshot meaningful: reachable from the workspace, non-interactive and
 /// recoverable from the private-index backup.
 fn local_rewrite_args(root: &Path, args: &[&str]) -> bool {
-    let Some((verb, rest)) = args.split_first() else { return false };
+    let Some((verb, rest)) = args.split_first() else {
+        return false;
+    };
     match *verb {
         // Network read: updates remote-tracking refs only.
         "fetch" => rest.iter().all(|w| {
-            ["--prune", "--all", "--tags", "--no-tags", "-q", "--quiet", "--force"].contains(w)
+            [
+                "--prune",
+                "--all",
+                "--tags",
+                "--no-tags",
+                "-q",
+                "--quiet",
+                "--force",
+            ]
+            .contains(w)
                 || revision(w)
         }),
         "stash" => stash_args(root, rest),
@@ -1156,14 +1843,16 @@ fn local_rewrite_args(root: &Path, args: &[&str]) -> bool {
 }
 
 fn stash_args(root: &Path, rest: &[&str]) -> bool {
-    let Some((sub, tail)) = rest.split_first() else { return true }; // bare `git stash` lists
+    let Some((sub, tail)) = rest.split_first() else {
+        return true;
+    }; // bare `git stash` lists
     match *sub {
         "list" | "show" => true,
         // `push`/`save` keep the work: the snapshot plus the stash itself.
         "push" | "save" => stash_push_args(root, tail),
-        "pop" | "apply" => tail.iter().all(|w| {
-            ["-q", "--quiet", "--index"].contains(w) || revision(w)
-        }),
+        "pop" | "apply" => tail
+            .iter()
+            .all(|w| ["-q", "--quiet", "--index"].contains(w) || revision(w)),
         // `drop`, `clear`, `branch` and `create` discard the only remaining copy.
         _ => false,
     }
@@ -1174,11 +1863,20 @@ fn stash_push_args(root: &Path, tail: &[&str]) -> bool {
     while index < tail.len() {
         let word = tail[index];
         match word {
-            "-u" | "--include-untracked" | "-a" | "--all" | "-q" | "--quiet" | "--keep-index"
-            | "--no-keep-index" | "--" => (),
+            "-u"
+            | "--include-untracked"
+            | "-a"
+            | "--all"
+            | "-q"
+            | "--quiet"
+            | "--keep-index"
+            | "--no-keep-index"
+            | "--" => (),
             "-m" | "--message" => {
                 index += 1;
-                if index >= tail.len() { return false; }
+                if index >= tail.len() {
+                    return false;
+                }
             }
             _ if word.starts_with('-') => return false,
             _ if !inside_or_here(root, word) => return false,
@@ -1198,12 +1896,22 @@ fn merge_args(rest: &[&str]) -> bool {
         let word = rest[index];
         match word {
             "--abort" | "--continue" | "--quit" => state = true,
-            "--no-edit" | "--no-ff" | "--ff-only" | "--squash" | "--no-commit"
-            | "--allow-unrelated-histories" | "--autostash" | "--no-stat" | "--no-autostash"
-            | "-q" | "--quiet" => (),
+            "--no-edit"
+            | "--no-ff"
+            | "--ff-only"
+            | "--squash"
+            | "--no-commit"
+            | "--allow-unrelated-histories"
+            | "--autostash"
+            | "--no-stat"
+            | "--no-autostash"
+            | "-q"
+            | "--quiet" => (),
             "-m" | "--message" => {
                 index += 1;
-                if index >= rest.len() { return false; }
+                if index >= rest.len() {
+                    return false;
+                }
             }
             _ if word.starts_with('-') => return false,
             _ if revision(word) => target = true,
@@ -1223,8 +1931,14 @@ fn rebase_args(rest: &[&str]) -> bool {
             "--autostash" | "--no-autostash" | "--no-edit" | "--keep-empty" | "--no-verify"
             | "-q" | "--quiet" => (),
             // Interactive and exec rebases run arbitrary commands per commit.
-            _ if word.starts_with("-i") || *word == "--interactive" || word.starts_with("--exec")
-                || *word == "-x" || word.starts_with("-x") => return false,
+            _ if word.starts_with("-i")
+                || *word == "--interactive"
+                || word.starts_with("--exec")
+                || *word == "-x"
+                || word.starts_with("-x") =>
+            {
+                return false
+            }
             _ if word.starts_with('-') => return false,
             _ if revision(word) => target = true,
             _ => return false,
@@ -1248,13 +1962,17 @@ fn switch_args(root: &Path, rest: &[&str]) -> bool {
         match word {
             "-b" | "-B" | "-c" | "-C" | "--create" | "--force-create" => {
                 index += 1;
-                if index >= rest.len() || !revision(rest[index]) { return false; }
+                if index >= rest.len() || !revision(rest[index]) {
+                    return false;
+                }
                 named = true;
             }
             "-q" | "--quiet" | "-f" | "--force" | "-m" | "--merge" => (),
             _ if word.starts_with('-') => return false,
             _ if pathspec => {
-                if !inside_or_here(root, word) { return false; }
+                if !inside_or_here(root, word) {
+                    return false;
+                }
                 paths = true;
             }
             _ if revision(word) => named = true,
@@ -1275,7 +1993,9 @@ fn restore_args(root: &Path, rest: &[&str]) -> bool {
             "--" | "--staged" | "--worktree" | "-q" | "--quiet" => (),
             "-s" | "--source" => {
                 index += 1;
-                if index >= rest.len() || !revision(rest[index]) { return false; }
+                if index >= rest.len() || !revision(rest[index]) {
+                    return false;
+                }
             }
             _ if word.starts_with('-') => return false,
             _ if inside_or_here(root, word) => paths = true,
@@ -1298,12 +2018,18 @@ fn clean_args(root: &Path, rest: &[&str]) -> bool {
             _ if word.starts_with('-') && word.len() > 1 => {
                 // `-x`/`-X` delete ignored files (build caches, local state) that
                 // the snapshot cannot restore, so they stay an approval.
-                if !word.chars().skip(1).all(|c| "fdnq".contains(c)) { return false; }
+                if !word.chars().skip(1).all(|c| "fdnq".contains(c)) {
+                    return false;
+                }
                 forced |= word.contains('f');
             }
             _ => {
-                if root.join(word).canonicalize().is_ok_and(|p| p == root) { return false; }
-                if !inside_or_here(root, word) { return false; }
+                if root.join(word).canonicalize().is_ok_and(|p| p == root) {
+                    return false;
+                }
+                if !inside_or_here(root, word) {
+                    return false;
+                }
                 paths = true;
             }
         }
@@ -1332,11 +2058,21 @@ fn commit_args(rest: &[&str]) -> bool {
     while index < rest.len() {
         let word = rest[index];
         match word {
-            "-a" | "--all" | "--amend" | "--no-edit" | "--allow-empty"
-            | "--allow-empty-message" | "--no-verify" | "-q" | "--quiet" | "-n" => (),
+            "-a"
+            | "--all"
+            | "--amend"
+            | "--no-edit"
+            | "--allow-empty"
+            | "--allow-empty-message"
+            | "--no-verify"
+            | "-q"
+            | "--quiet"
+            | "-n" => (),
             "-m" | "--message" | "-am" | "-ma" => {
                 index += 1;
-                if index >= rest.len() { return false; }
+                if index >= rest.len() {
+                    return false;
+                }
             }
             _ if word.starts_with('-') => return false,
             // Every non-flag word of a commit is either consumed as a message
@@ -1352,51 +2088,129 @@ fn commit_args(rest: &[&str]) -> bool {
 fn safe_path(root: &Path, raw: &str) -> bool {
     let normalized = raw.replace('\\', "/");
     let lower = normalized.to_ascii_lowercase();
-    if lower.split('/').any(|p| p == ".git" || p == ".ssh" || p == ".aws" || p == ".gnupg"
-        || p == ".env" || p.starts_with(".env.") || p == "credentials" || p == "id_rsa" || p == "id_ed25519"
-        || p.ends_with(".pem") || p.ends_with(".key")) { return false; }
+    if lower.split('/').any(|p| {
+        p == ".git"
+            || p == ".ssh"
+            || p == ".aws"
+            || p == ".gnupg"
+            || p == ".env"
+            || p.starts_with(".env.")
+            || p == "credentials"
+            || p == "id_rsa"
+            || p == "id_ed25519"
+            || p.ends_with(".pem")
+            || p.ends_with(".key")
+    }) {
+        return false;
+    }
     inside(root, &normalized)
 }
 
 fn bounded_args(root: &Path, args: &[&str]) -> bool {
     args.iter().all(|word| {
         let value = word.split_once('=').map_or(*word, |(_, value)| value);
-        if value.contains("..") || value.contains(':') || value.starts_with('/') || value.starts_with('\\') { return false; }
+        if value.contains("..")
+            || value.contains(':')
+            || value.starts_with('/')
+            || value.starts_with('\\')
+        {
+            return false;
+        }
         if !word.starts_with('-') || word.contains('=') {
-            if !safe_path(root, value) { return false; }
+            if !safe_path(root, value) {
+                return false;
+            }
         }
         if value.contains('/') || value.contains('\\') || root.join(value).exists() {
             safe_path(root, value)
-        } else { true }
+        } else {
+            true
+        }
     })
 }
 
 fn local_denylist(root: &Path, args: &[&str]) -> bool {
-    let Some((verb, rest)) = args.split_first() else { return false };
+    let Some((verb, rest)) = args.split_first() else {
+        return false;
+    };
     // These verbs affect remote authority, command execution or configuration.
     // M198: repository-mandated workspace-local hook setup is not a remote
     // credential/protection rewrite. Exact shape only; --global stays fenced.
     if *verb == "config" {
-        return matches!(rest, ["core.hooksPath", ".githooks"] | ["--local", "core.hooksPath", ".githooks"]);
+        return matches!(
+            rest,
+            ["core.hooksPath", ".githooks"] | ["--local", "core.hooksPath", ".githooks"]
+        );
     }
-    if ["push", "filter-branch", "filter-repo", "submodule", "send-email", "credential"].contains(verb) { return false; }
+    if [
+        "push",
+        "filter-branch",
+        "filter-repo",
+        "submodule",
+        "send-email",
+        "credential",
+    ]
+    .contains(verb)
+    {
+        return false;
+    }
     if rest.iter().any(|w| {
         let option = w.split('=').next().unwrap_or(w);
-        ["--interactive", "--patch", "--edit", "--exec", "--editor", "--upload-pack", "--receive-pack", "--ext-diff", "--textconv", "--output", "--output-directory", "--git-dir", "--work-tree", "--unsafe-paths", "--pathspec-from-file", "--recurse-submodules", "--separate-git-dir", "--reference", "--alternate-refs-command"].contains(&option)
-            || option.starts_with("--inter") || option.starts_with("--exe")
+        [
+            "--interactive",
+            "--patch",
+            "--edit",
+            "--exec",
+            "--editor",
+            "--upload-pack",
+            "--receive-pack",
+            "--ext-diff",
+            "--textconv",
+            "--output",
+            "--output-directory",
+            "--git-dir",
+            "--work-tree",
+            "--unsafe-paths",
+            "--pathspec-from-file",
+            "--recurse-submodules",
+            "--separate-git-dir",
+            "--reference",
+            "--alternate-refs-command",
+        ]
+        .contains(&option)
+            || option.starts_with("--inter")
+            || option.starts_with("--exe")
             || ["-i", "-p", "-e"].contains(&option)
             || *verb == "rebase" && (w.starts_with("-i") || w.starts_with("-x"))
-    }) { return false; }
-    if *verb == "clean" && rest.iter().any(|w| w.starts_with('-') && (w.contains('x') || w.contains('X') || w.contains('i'))) { return false; }
+    }) {
+        return false;
+    }
+    if *verb == "clean"
+        && rest
+            .iter()
+            .any(|w| w.starts_with('-') && (w.contains('x') || w.contains('X') || w.contains('i')))
+    {
+        return false;
+    }
     // Preserve older extra-cautious stash policy: dropping the sole stash is
     // not recoverable by a working-tree snapshot.
-    if *verb == "stash" && rest.first().is_some_and(|w| ["drop", "clear"].contains(w)) { return false; }
+    if *verb == "stash" && rest.first().is_some_and(|w| ["drop", "clear"].contains(w)) {
+        return false;
+    }
     let mut message = false;
     let mut checked = Vec::new();
     for word in rest {
-        if message { message = false; continue; }
-        if ["-m", "--message", "-am", "-ma"].contains(word) { message = true; continue; }
-        if word.starts_with("--message=") { continue; }
+        if message {
+            message = false;
+            continue;
+        }
+        if ["-m", "--message", "-am", "-ma"].contains(word) {
+            message = true;
+            continue;
+        }
+        if word.starts_with("--message=") {
+            continue;
+        }
         checked.push(*word);
     }
     !message && bounded_args(root, &checked)
@@ -1407,9 +2221,26 @@ fn local_denylist(root: &Path, args: &[&str]) -> bool {
 fn fetch_args(rest: &[&str]) -> bool {
     rest.iter().all(|word| {
         if word.starts_with('-') {
-            ["--prune", "--all", "--tags", "--no-tags", "--prune-tags", "--no-recurse-submodules", "--force", "-f", "--quiet", "-q", "--verbose", "-v", "--dry-run"].contains(word)
+            [
+                "--prune",
+                "--all",
+                "--tags",
+                "--no-tags",
+                "--prune-tags",
+                "--no-recurse-submodules",
+                "--force",
+                "-f",
+                "--quiet",
+                "-q",
+                "--verbose",
+                "-v",
+                "--dry-run",
+            ]
+            .contains(word)
         } else {
-            !word.is_empty() && !word.contains("::") && !word.starts_with('|')
+            !word.is_empty()
+                && !word.contains("::")
+                && !word.starts_with('|')
                 && !word.chars().any(|c| c.is_control() || c.is_whitespace())
         }
     })
@@ -1424,7 +2255,10 @@ pub(super) enum OwnRemoteAction {
     /// the workspace-relative files read through `--body-file`; the shape prover
     /// already refused anything that could leave the workspace, and the caller
     /// keeps that containment as part of the ownership decision.
-    PrMetadata { number: i64, body_files: Vec<String> },
+    PrMetadata {
+        number: i64,
+        body_files: Vec<String>,
+    },
     PushBranch(String),
     DeleteBranch(String),
 }
@@ -1448,7 +2282,9 @@ pub(super) fn own_remote_actions(command: &str) -> Option<Vec<OwnRemoteAction>> 
     let segments = segments(command)?;
     let mut actions = Vec::new();
     for segment in &segments {
-        if segment.words.iter().any(|word| word.redirect) { return None; }
+        if segment.words.iter().any(|word| word.redirect) {
+            return None;
+        }
         match own_remote_action(segment) {
             Some(action) => actions.push(action),
             None if ordinary_segment(&segment.raw) => {}
@@ -1461,8 +2297,10 @@ pub(super) fn own_remote_actions(command: &str) -> Option<Vec<OwnRemoteAction>> 
 /// A segment needing no allowance of its own: the same decision a standalone
 /// trusted call would get, minus anything remote or destructive.
 fn ordinary_segment(raw: &str) -> bool {
-    matches!(standalone_shell_policy::classify_command(raw), standalone_shell_policy::ShellCommandPolicy::Allow { .. })
-        && !codefactory_agent_loop::policy::is_delivery_command(raw)
+    matches!(
+        standalone_shell_policy::classify_command(raw),
+        standalone_shell_policy::ShellCommandPolicy::Allow { .. }
+    ) && !codefactory_agent_loop::policy::is_delivery_command(raw)
         && !sensitive(raw)
 }
 
@@ -1499,7 +2337,14 @@ fn own_pr_metadata_args(action: &str, rest: &[&str]) -> Option<Vec<String>> {
 }
 
 fn own_pr_edit_args(rest: &[&str]) -> Option<Vec<String>> {
-    const REFUSED: &[&str] = &["--add-label", "--remove-label", "--base", "--head", "--repo", "-R"];
+    const REFUSED: &[&str] = &[
+        "--add-label",
+        "--remove-label",
+        "--base",
+        "--head",
+        "--repo",
+        "-R",
+    ];
     if rest.is_empty() {
         return None;
     }
@@ -1568,20 +2413,36 @@ fn own_branch_push(rest: &[&str]) -> Option<OwnRemoteAction> {
     let mut refspec: Option<&str> = None;
     for word in rest {
         match *word {
-            "--delete" | "-d" => { delete = true; continue; }
+            "--delete" | "-d" => {
+                delete = true;
+                continue;
+            }
             "-u" | "--set-upstream" | "--quiet" | "-q" | "--no-verify" => continue,
             _ => {}
         }
-        if word.starts_with('-') || word.is_empty() { return None; }
-        if remote.is_none() { remote = Some(word); continue; }
-        if refspec.is_some() { return None; }
+        if word.starts_with('-') || word.is_empty() {
+            return None;
+        }
+        if remote.is_none() {
+            remote = Some(word);
+            continue;
+        }
+        if refspec.is_some() {
+            return None;
+        }
         refspec = Some(word);
     }
-    if remote != Some("origin") { return None; }
+    if remote != Some("origin") {
+        return None;
+    }
     let refspec = refspec?;
-    if refspec.contains(':') || refspec.contains('+') || refspec.starts_with("refs/tags/") { return None; }
+    if refspec.contains(':') || refspec.contains('+') || refspec.starts_with("refs/tags/") {
+        return None;
+    }
     let branch = refspec.strip_prefix("refs/heads/").unwrap_or(refspec);
-    if matches!(branch, "main" | "master") || branch.is_empty() { return None; }
+    if matches!(branch, "main" | "master") || branch.is_empty() {
+        return None;
+    }
     Some(if delete {
         OwnRemoteAction::DeleteBranch(branch.to_string())
     } else {
@@ -1589,7 +2450,11 @@ fn own_branch_push(rest: &[&str]) -> Option<OwnRemoteAction> {
     })
 }
 
-fn workspace_at(roots: &[std::path::PathBuf], cwd: &Path, path: &str) -> Option<std::path::PathBuf> {
+fn workspace_at(
+    roots: &[std::path::PathBuf],
+    cwd: &Path,
+    path: &str,
+) -> Option<std::path::PathBuf> {
     let real = cwd.join(path).canonicalize().ok()?;
     roots.iter().find(|root| **root == real).cloned()
 }
@@ -1602,19 +2467,36 @@ fn workspace_at(roots: &[std::path::PathBuf], cwd: &Path, path: &str) -> Option<
 fn strip_identity_cd(command: &str) -> &str {
     let command = command.trim_start();
     for prefix in ["cd \"$(pwd)\" && ", "cd \"$(pwd)\"; ", "cd \"$(pwd)\"\n"] {
-        if let Some(rest) = command.strip_prefix(prefix) { return rest.trim_start(); }
+        if let Some(rest) = command.strip_prefix(prefix) {
+            return rest.trim_start();
+        }
     }
     command
 }
 
 /// Returns the exact roots needing snapshots and explicit rm paths. The caller
 /// supplies only session-owned, identity-verified registrations, never a prefix.
-fn prove(roots: &[std::path::PathBuf], cwd: &Path, command: &str) -> Option<Vec<(std::path::PathBuf, Vec<String>)>> {
-    let roots: Vec<_> = roots.iter().map(|p| p.canonicalize()).collect::<Result<_, _>>().ok()?;
+fn prove(
+    roots: &[std::path::PathBuf],
+    cwd: &Path,
+    command: &str,
+) -> Option<Vec<(std::path::PathBuf, Vec<String>)>> {
+    let roots: Vec<_> = roots
+        .iter()
+        .map(|p| p.canonicalize())
+        .collect::<Result<_, _>>()
+        .ok()?;
     let mut cwd = workspace_at(&roots, cwd, ".")?;
     for root in &roots {
-        if git(root, &["rev-parse", "--show-toplevel"]).and_then(|p| Path::new(&p).canonicalize().ok()).as_ref() != Some(root)
-            || git(root, &["ls-files", "--stage"]).is_none_or(|s| s.lines().any(|l| l.starts_with("160000 "))) { return None; }
+        if git(root, &["rev-parse", "--show-toplevel"])
+            .and_then(|p| Path::new(&p).canonicalize().ok())
+            .as_ref()
+            != Some(root)
+            || git(root, &["ls-files", "--stage"])
+                .is_none_or(|s| s.lines().any(|l| l.starts_with("160000 ")))
+        {
+            return None;
+        }
     }
     let segments = segments(strip_identity_cd(command))?;
     let mut touched = std::collections::BTreeMap::<std::path::PathBuf, Vec<String>>::new();
@@ -1631,78 +2513,157 @@ fn prove(roots: &[std::path::PathBuf], cwd: &Path, command: &str) -> Option<Vec<
             if word.redirect {
                 if word.text == "@output" {
                     let target = words.next()?;
-                    if target.redirect || !safe_path(&cwd, &target.text) { return None; }
+                    if target.redirect || !safe_path(&cwd, &target.text) {
+                        return None;
+                    }
                     touched.entry(cwd.clone()).or_default();
                 }
-            } else { argv.push(word.text.as_str()); }
+            } else {
+                argv.push(word.text.as_str());
+            }
         }
         if argv.len() == 1 && argv[0].contains('=') {
-            if piped || segment.separator != ';' { return None; }
+            if piped || segment.separator != ';' {
+                return None;
+            }
             continue;
         }
         if let ["cd", path] = argv.as_slice() {
             // A failing cd followed by ';' would leave an unknown cwd. Only
             // existing exact registered roots are accepted, never subdirectories.
-            if piped { return None; }
+            if piped {
+                return None;
+            }
             cwd = workspace_at(&roots, &cwd, path)?;
-            if removed.contains(&cwd) { return None; }
+            if removed.contains(&cwd) {
+                return None;
+            }
             continue;
         }
         // M207: non-Git commands use the same shell safety decision as a
         // standalone trusted call. Do not impose a second path/runner whitelist.
         if argv.first() != Some(&"git") && argv.first() != Some(&"rm") {
             let standalone = segment.raw.as_str();
-            if matches!(standalone_shell_policy::classify_command(standalone), standalone_shell_policy::ShellCommandPolicy::Allow { .. })
-                && !codefactory_agent_loop::policy::is_delivery_command(standalone)
+            if matches!(
+                standalone_shell_policy::classify_command(standalone),
+                standalone_shell_policy::ShellCommandPolicy::Allow { .. }
+            ) && !codefactory_agent_loop::policy::is_delivery_command(standalone)
                 && !sensitive(standalone)
-            { continue; }
+            {
+                continue;
+            }
             return None;
         }
         let (root, args) = match argv.as_slice() {
             ["git", "-C", path, rest @ ..] => (workspace_at(&roots, &cwd, path)?, rest),
             ["git", rest @ ..] => (cwd.clone(), rest),
             ["rm", "-rf", paths @ ..] if !piped && !paths.is_empty() => {
-                if paths.iter().any(|p| p.starts_with('-') || !inside(&cwd, p) || cwd.join(p).canonicalize().ok().as_ref() == Some(&cwd)) { return None; }
-                touched.entry(cwd.clone()).or_default().extend(paths.iter().map(|p| p.to_string()));
+                if paths.iter().any(|p| {
+                    p.starts_with('-')
+                        || !inside(&cwd, p)
+                        || cwd.join(p).canonicalize().ok().as_ref() == Some(&cwd)
+                }) {
+                    return None;
+                }
+                touched
+                    .entry(cwd.clone())
+                    .or_default()
+                    .extend(paths.iter().map(|p| p.to_string()));
                 continue;
             }
             _ => return None,
         };
-        if removed.contains(&root) { return None; }
+        if removed.contains(&root) {
+            return None;
+        }
         has_git = true;
         // Queries do not need path confinement or a snapshot. Reject execution
         // and output overrides before using the shared Git query classifier.
         let readonly = (codefactory_agent_core::command_segment_is_read_only_probe(&segment.raw)
-            || matches!(args, ["stash", "list", ..] | ["stash", "show", ..] | ["worktree", "list", ..])
-            || matches!(args, ["config", "core.hooksPath"] | ["config", "--get", "core.hooksPath"] | ["config", "--local", "--get", "core.hooksPath"]))
+            || matches!(
+                args,
+                ["stash", "list", ..] | ["stash", "show", ..] | ["worktree", "list", ..]
+            )
+            || matches!(
+                args,
+                ["config", "core.hooksPath"]
+                    | ["config", "--get", "core.hooksPath"]
+                    | ["config", "--local", "--get", "core.hooksPath"]
+            ))
             && args.first() != Some(&"fetch")
             && !args.iter().any(|word| {
                 let option = word.split('=').next().unwrap_or(word);
-                ["--ext-diff", "--textconv", "--output", "--output-directory", "--upload-pack", "--receive-pack"].contains(&option)
+                [
+                    "--ext-diff",
+                    "--textconv",
+                    "--output",
+                    "--output-directory",
+                    "--upload-pack",
+                    "--receive-pack",
+                ]
+                .contains(&option)
             });
-        if readonly { continue; }
+        if readonly {
+            continue;
+        }
         if args.first() == Some(&"reset") && args.iter().any(|word| *word == "--hard") {
-            let revisions: Vec<_> = args[1..].iter().filter(|word| !word.starts_with('-')).copied().collect();
-            if revisions.len() > 1 { return None; }
+            let revisions: Vec<_> = args[1..]
+                .iter()
+                .filter(|word| !word.starts_with('-'))
+                .copied()
+                .collect();
+            if revisions.len() > 1 {
+                return None;
+            }
             let revision = revisions.first().copied().unwrap_or("HEAD");
-            if !legacy_rewrite(&root, &format!("git reset --hard {revision}")) { return None; }
+            if !legacy_rewrite(&root, &format!("git reset --hard {revision}")) {
+                return None;
+            }
         }
         if args.first() == Some(&"worktree") {
             match args {
                 ["worktree", "remove", flags @ ..] | ["worktree", "add", flags @ ..] => {
-                    if piped { return None; }
+                    if piped {
+                        return None;
+                    }
                     let path_index = flags.iter().position(|w| !w.starts_with('-'))?;
                     let path = flags[path_index];
-                    if !flags.iter().enumerate().all(|(index, word)| index == path_index || bounded_args(&root, &[*word])) { return None; }
-                    if flags.iter().any(|word| word.starts_with("--orphan") || word.starts_with("--detach=") || word.starts_with("--reason")) { return None; }
+                    if !flags
+                        .iter()
+                        .enumerate()
+                        .all(|(index, word)| index == path_index || bounded_args(&root, &[*word]))
+                    {
+                        return None;
+                    }
+                    if flags.iter().any(|word| {
+                        word.starts_with("--orphan")
+                            || word.starts_with("--detach=")
+                            || word.starts_with("--reason")
+                    }) {
+                        return None;
+                    }
                     let target = workspace_at(&roots, &root, path)?;
-                    if target == root || target == cwd { return None; }
-                    let common = |r: &Path| git(r, &["rev-parse", "--path-format=absolute", "--git-common-dir"]).and_then(|p| Path::new(&p).canonicalize().ok());
-                    if common(&root).is_none() || common(&root) != common(&target) { return None; }
+                    if target == root || target == cwd {
+                        return None;
+                    }
+                    let common = |r: &Path| {
+                        git(
+                            r,
+                            &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+                        )
+                        .and_then(|p| Path::new(&p).canonicalize().ok())
+                    };
+                    if common(&root).is_none() || common(&root) != common(&target) {
+                        return None;
+                    }
                     if args[1] == "remove" {
-                        if !removed.insert(target.clone()) { return None; }
+                        if !removed.insert(target.clone()) {
+                            return None;
+                        }
                         touched.entry(target).or_default().push(".".into());
-                    } else { touched.entry(target).or_default(); }
+                    } else {
+                        touched.entry(target).or_default();
+                    }
                     touched.entry(root).or_default();
                     continue;
                 }
@@ -1710,39 +2671,89 @@ fn prove(roots: &[std::path::PathBuf], cwd: &Path, command: &str) -> Option<Vec<
             }
         }
         if let ["fetch", rest @ ..] = args {
-            if input_pipe || !fetch_args(rest) { return None; }
+            if input_pipe || !fetch_args(rest) {
+                return None;
+            }
             touched.entry(root).or_default();
             continue;
         }
-        if !local_denylist(&root, args) { return None; }
-        if readonly { continue; }
-        if input_pipe { return None; }
+        if !local_denylist(&root, args) {
+            return None;
+        }
+        if readonly {
+            continue;
+        }
+        if input_pipe {
+            return None;
+        }
         // M182: option ordering is not authority. Confined non-interactive
         // local verbs use the shared denylist and the same durable snapshot.
-        if args.first().is_some_and(|verb| ["fetch", "stash", "merge", "rebase", "switch", "checkout", "restore", "clean", "add", "commit", "reset", "cherry-pick", "revert", "am", "apply", "config"].contains(verb)) {
+        if args.first().is_some_and(|verb| {
+            [
+                "fetch",
+                "stash",
+                "merge",
+                "rebase",
+                "switch",
+                "checkout",
+                "restore",
+                "clean",
+                "add",
+                "commit",
+                "reset",
+                "cherry-pick",
+                "revert",
+                "am",
+                "apply",
+                "config",
+            ]
+            .contains(verb)
+        }) {
             touched.entry(root).or_default();
             continue;
         }
         match args {
-            ["fetch", "--prune", "origin", "main"] | ["fetch", "origin", "main"]
+            ["fetch", "--prune", "origin", "main"]
+            | ["fetch", "origin", "main"]
             | ["merge", "origin/main", "--no-edit"]
-            | ["stash"] | ["stash", "push"] | ["stash", "pop"] => (),
+            | ["stash"]
+            | ["stash", "push"]
+            | ["stash", "pop"] => (),
             ["stash", "push", "-m", message] if !message.is_empty() => (),
             ["checkout", branch] if argv.get(1) == Some(&"-C") && !branch.starts_with('-') => {
                 // Only the current session workspace branch, not arbitrary refs.
-                if git(&root, &["branch", "--show-current"]).as_deref() != Some(branch) { return None; }
+                if git(&root, &["branch", "--show-current"]).as_deref() != Some(branch) {
+                    return None;
+                }
             }
             ["worktree", "remove", "--force", path] => {
                 let target = workspace_at(&roots, &root, path)?;
-                if target == root || target == cwd { return None; }
-                let common = |r: &Path| git(r, &["rev-parse", "--path-format=absolute", "--git-common-dir"]).and_then(|p| Path::new(&p).canonicalize().ok());
-                if common(&root).is_none() || common(&root) != common(&target) { return None; }
-                if !removed.insert(target.clone()) { return None; }
+                if target == root || target == cwd {
+                    return None;
+                }
+                let common = |r: &Path| {
+                    git(
+                        r,
+                        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+                    )
+                    .and_then(|p| Path::new(&p).canonicalize().ok())
+                };
+                if common(&root).is_none() || common(&root) != common(&target) {
+                    return None;
+                }
+                if !removed.insert(target.clone()) {
+                    return None;
+                }
                 touched.entry(target).or_default().push(".".into());
             }
             _ => {
-                let simple = std::iter::once("git").chain(args.iter().copied()).collect::<Vec<_>>().join(" ");
-                if !legacy_rewrite(&root, &simple) { return None; }
+                let simple = std::iter::once("git")
+                    .chain(args.iter().copied())
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                if !legacy_rewrite(&root, &simple) {
+                    return None;
+                }
             }
         }
         touched.entry(root).or_default();
@@ -1757,9 +2768,13 @@ pub(super) fn local_rewrite(root: &Path, command: &str) -> bool {
 /// M248: registration proves confinement, not destructive intent. Ordinary
 /// synchronization is kernel-confined; all other sensitive actions keep M159.
 pub(super) fn destructive_intent(command: &str) -> bool {
-    let Some(segments) = executable_segments(command) else { return true };
+    let Some(segments) = executable_segments(command) else {
+        return true;
+    };
     segments.iter().any(|words| {
-        if !segment_is_sensitive(words) { return false; }
+        if !segment_is_sensitive(words) {
+            return false;
+        }
         let args: Vec<_> = words.iter().map(String::as_str).collect();
         match args.as_slice() {
             ["git", "fetch", rest @ ..] => !fetch_args(rest),
@@ -1779,13 +2794,23 @@ pub(super) fn registered_rewrite(roots: &[std::path::PathBuf], cwd: &Path, comma
     prove(roots, cwd, command).is_some()
 }
 
-pub(super) fn backup_registered(roots: &[std::path::PathBuf], cwd: &Path, command: &str) -> Option<String> {
+pub(super) fn backup_registered(
+    roots: &[std::path::PathBuf],
+    cwd: &Path,
+    command: &str,
+) -> Option<String> {
     let targets = prove(roots, cwd, command)?;
     let mut refs = Vec::new();
-    for (root, paths) in targets { refs.push(snapshot(&root, &paths)?); }
+    for (root, paths) in targets {
+        refs.push(snapshot(&root, &paths)?);
+    }
     // An empty target set means the command contains only proved queries.
     // Do not turn an unrelated conflicted index into a read-only approval.
-    Some(if refs.is_empty() { "read-only".into() } else { refs.join(",") })
+    Some(if refs.is_empty() {
+        "read-only".into()
+    } else {
+        refs.join(",")
+    })
 }
 
 /// Snapshot via a private index; never stash away or rewrite the live index.
@@ -1796,31 +2821,68 @@ pub(super) fn backup(root: &Path, command: &str) -> Option<String> {
 fn snapshot(root: &Path, paths: &[String]) -> Option<String> {
     let head = git(root, &["rev-parse", "HEAD"])?;
     let index_tree = git(root, &["write-tree"])?;
-    let nonce = format!("{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).ok()?.as_nanos());
+    let nonce = format!(
+        "{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_nanos()
+    );
     let dir = std::env::temp_dir().join(format!("cf-git-backup-{nonce}"));
     std::fs::create_dir(&dir).ok()?;
     let index = dir.join("index");
     let result = (|| {
         let run = |args: &[&str], input: Option<&str>| -> Option<String> {
-            let mut child = Command::new("git").no_window().current_dir(root).env("GIT_INDEX_FILE", &index)
-                .env("GIT_AUTHOR_NAME", "CodeFactory backup").env("GIT_AUTHOR_EMAIL", "backup@codefactory.invalid")
-                .env("GIT_COMMITTER_NAME", "CodeFactory backup").env("GIT_COMMITTER_EMAIL", "backup@codefactory.invalid")
-                .args(args).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().ok()?;
-            if let Some(input) = input { child.stdin.take()?.write_all(input.as_bytes()).ok()?; }
+            let mut child = Command::new("git")
+                .no_window()
+                .current_dir(root)
+                .env("GIT_INDEX_FILE", &index)
+                .env("GIT_AUTHOR_NAME", "CodeFactory backup")
+                .env("GIT_AUTHOR_EMAIL", "backup@codefactory.invalid")
+                .env("GIT_COMMITTER_NAME", "CodeFactory backup")
+                .env("GIT_COMMITTER_EMAIL", "backup@codefactory.invalid")
+                .args(args)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .ok()?;
+            if let Some(input) = input {
+                child.stdin.take()?.write_all(input.as_bytes()).ok()?;
+            }
             let out = child.wait_with_output().ok()?;
-            out.status.success().then(|| String::from_utf8_lossy(&out.stdout).trim().into())
+            out.status
+                .success()
+                .then(|| String::from_utf8_lossy(&out.stdout).trim().into())
         };
         run(&["read-tree", &head], None)?;
         run(&["add", "-A", "--", "."], None)?;
         // Include ignored files explicitly targeted by rm (clean -x is not allowed).
         for path in paths {
-            if root.join(path).exists() { run(&["add", "-f", "--", path], None)?; }
+            if root.join(path).exists() {
+                run(&["add", "-f", "--", path], None)?;
+            }
         }
         let tree = run(&["write-tree"], None)?;
-        let staged = run(&["commit-tree", &index_tree, "-p", &head], Some("M159 staged backup\n"))?;
-        let commit = run(&["commit-tree", &tree, "-p", &head, "-p", &staged], Some("M159 workspace backup\n"))?;
+        let staged = run(
+            &["commit-tree", &index_tree, "-p", &head],
+            Some("M159 staged backup\n"),
+        )?;
+        let commit = run(
+            &["commit-tree", &tree, "-p", &head, "-p", &staged],
+            Some("M159 workspace backup\n"),
+        )?;
         let reference = format!("refs/codefactory/backup/{nonce}");
-        run(&["update-ref", &reference, &commit, "0000000000000000000000000000000000000000"], None)?;
+        run(
+            &[
+                "update-ref",
+                &reference,
+                &commit,
+                "0000000000000000000000000000000000000000",
+            ],
+            None,
+        )?;
         (git(root, &["rev-parse", &reference])? == commit).then_some(reference)
     })();
     let _ = std::fs::remove_dir_all(dir);
@@ -1831,7 +2893,10 @@ fn snapshot(root: &Path, paths: &[String]) -> Option<String> {
 mod tests {
     fn words(command: &str) -> Option<Vec<Vec<String>>> {
         super::segments(command).map(|segments| {
-            segments.into_iter().map(|s| s.words.into_iter().map(|w| w.text).collect()).collect()
+            segments
+                .into_iter()
+                .map(|s| s.words.into_iter().map(|w| w.text).collect())
+                .collect()
         })
     }
 
@@ -1842,14 +2907,28 @@ mod tests {
         // composition to an approval prompt.
         let command = r#"cd "C:\Users\runneradmin\AppData\Local\Temp\ws"; git stash push -m prefill; git status --porcelain | head"#;
         let parsed = words(command).expect("quoted Windows path must parse");
-        assert_eq!(parsed[0], vec!["cd", r"C:\Users\runneradmin\AppData\Local\Temp\ws"]);
+        assert_eq!(
+            parsed[0],
+            vec!["cd", r"C:\Users\runneradmin\AppData\Local\Temp\ws"]
+        );
         assert_eq!(parsed[1], vec!["git", "stash", "push", "-m", "prefill"]);
         assert_eq!(parsed[2], vec!["git", "status", "--porcelain"]);
         assert_eq!(parsed[3], vec!["head"]);
         let assigned = words(r#"S="C:\ws\two"; git -C "$S" worktree remove --force "C:\ws\one""#)
             .expect("quoted assignment must parse");
         assert_eq!(assigned[0], vec![r"S=C:\ws\two"]);
-        assert_eq!(assigned[1], vec!["git", "-C", r"C:\ws\two", "worktree", "remove", "--force", r"C:\ws\one"]);
+        assert_eq!(
+            assigned[1],
+            vec![
+                "git",
+                "-C",
+                r"C:\ws\two",
+                "worktree",
+                "remove",
+                "--force",
+                r"C:\ws\one"
+            ]
+        );
     }
 
     #[test]
@@ -1960,11 +3039,15 @@ gh pr comment 933 --body 'CI 全绿，待合并'";
         );
         assert_eq!(
             actions("git push -u origin codefactory/objective-m208"),
-            vec![OwnRemoteAction::PushBranch("codefactory/objective-m208".into())]
+            vec![OwnRemoteAction::PushBranch(
+                "codefactory/objective-m208".into()
+            )]
         );
         assert_eq!(
             actions("git push origin --delete codefactory/objective-m208"),
-            vec![OwnRemoteAction::DeleteBranch("codefactory/objective-m208".into())]
+            vec![OwnRemoteAction::DeleteBranch(
+                "codefactory/objective-m208".into()
+            )]
         );
     }
 
@@ -2003,17 +3086,32 @@ mod m215_windows_path_forms {
 
     #[test]
     fn verbatim_prefixes_reduce_to_the_plain_form() {
-        assert_eq!(plain_windows_text(r"\\?\C:\Users\a\state"), r"C:\Users\a\state");
-        assert_eq!(plain_windows_text(r"\\?\UNC\server\share\ws"), r"\\server\share\ws");
+        assert_eq!(
+            plain_windows_text(r"\\?\C:\Users\a\state"),
+            r"C:\Users\a\state"
+        );
+        assert_eq!(
+            plain_windows_text(r"\\?\UNC\server\share\ws"),
+            r"\\server\share\ws"
+        );
         assert_eq!(plain_windows_text("/Users/leo/ws"), "/Users/leo/ws");
         assert_eq!(plain_windows_text(r"C:\Users\a\state"), r"C:\Users\a\state");
     }
 
     #[test]
     fn windows_paths_keep_their_backslashes() {
-        assert_eq!(shell_text(r"\\?\C:\Users\a\state").as_deref(), Some(r"\\?\C:\Users\a\state"));
-        assert_eq!(shell_text(r"C:\Users\a\state").as_deref(), Some(r"C:\Users\a\state"));
-        assert_eq!(shell_text(r#""\\?\C:\Users\a\state""#).as_deref(), Some(r"\\?\C:\Users\a\state"));
+        assert_eq!(
+            shell_text(r"\\?\C:\Users\a\state").as_deref(),
+            Some(r"\\?\C:\Users\a\state")
+        );
+        assert_eq!(
+            shell_text(r"C:\Users\a\state").as_deref(),
+            Some(r"C:\Users\a\state")
+        );
+        assert_eq!(
+            shell_text(r#""\\?\C:\Users\a\state""#).as_deref(),
+            Some(r"\\?\C:\Users\a\state")
+        );
         // A plain POSIX word still undoes backslash escapes.
         assert_eq!(shell_text(r"my\ dir").as_deref(), Some("my dir"));
     }
@@ -2038,8 +3136,16 @@ mod m215_trusted_heredoc_and_read_only_git {
         let root = temp.path().canonicalize().unwrap();
         std::fs::create_dir_all(root.join("src-tauri/src/agent")).unwrap();
         std::fs::create_dir_all(root.join("state")).unwrap();
-        std::fs::write(root.join("src-tauri/src/agent/trusted_git.rs"), "// existing\n").unwrap();
-        std::fs::write(root.join("src-tauri/Cargo.toml"), "[package]\nname = \"synthetic\"\n").unwrap();
+        std::fs::write(
+            root.join("src-tauri/src/agent/trusted_git.rs"),
+            "// existing\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("src-tauri/Cargo.toml"),
+            "[package]\nname = \"synthetic\"\n",
+        )
+        .unwrap();
         std::fs::write(root.join("state/session.json"), "{\"state\":\"active\"}\n").unwrap();
         (temp, root)
     }
@@ -2056,7 +3162,11 @@ mod m215_trusted_heredoc_and_read_only_git {
             "cd src-tauri/.. && cat >> src-tauri/src/agent/trusted_git.rs <<'EOF'\n// parent-relative cd\nEOF".to_string(),
         ];
         for shape in shapes {
-            assert!(python_heredoc_proof(Some(&root), &shape).is_ok(), "{shape}\n{:?}", python_heredoc_proof(Some(&root), &shape));
+            assert!(
+                python_heredoc_proof(Some(&root), &shape).is_ok(),
+                "{shape}\n{:?}",
+                python_heredoc_proof(Some(&root), &shape)
+            );
         }
     }
 
@@ -2068,12 +3178,18 @@ mod m215_trusted_heredoc_and_read_only_git {
         for shape in [
             "cd /etc && cat > hosts <<'EOF'\ndata\nEOF".to_string(),
             "cd .. && python3 - <<'PY'\nprint('escape')\nPY".to_string(),
-            format!("cat >> {}/state/new.txt <<'EOF'\nsee /Users/leo/.ssh/id_rsa\nEOF", root.display()),
+            format!(
+                "cat >> {}/state/new.txt <<'EOF'\nsee /Users/leo/.ssh/id_rsa\nEOF",
+                root.display()
+            ),
             "python3 - <<'PY'\nopen('/Users/leo/.ssh/id_rsa').read()\nPY".to_string(),
             "python3 - <<'PY'\nimport subprocess\nsubprocess.run(['git', 'push'])\nPY".to_string(),
             "python3 - <<'PY'\nopen('../outside.txt', 'w').write('bad')\nPY".to_string(),
         ] {
-            assert!(python_heredoc_proof(Some(&root), &shape).is_err(), "{shape}");
+            assert!(
+                python_heredoc_proof(Some(&root), &shape).is_err(),
+                "{shape}"
+            );
         }
     }
 
@@ -2093,14 +3209,21 @@ mod m215_trusted_heredoc_and_read_only_git {
             "git log --oneline 2>&1 | head -3; python3 - <<'PY'\nprint('ok')\nPY".to_string(),
         ];
         for shape in shapes {
-            assert!(python_heredoc_proof(Some(&root), &shape).is_ok(), "{shape}\n{:?}", python_heredoc_proof(Some(&root), &shape));
+            assert!(
+                python_heredoc_proof(Some(&root), &shape).is_ok(),
+                "{shape}\n{:?}",
+                python_heredoc_proof(Some(&root), &shape)
+            );
         }
         for shape in [
             "rm -rf src; python3 - <<'PY'\nprint('ok')\nPY".to_string(),
             "git reset --hard HEAD~1; python3 - <<'PY'\nprint('ok')\nPY".to_string(),
             "cd /etc && grep -rl root . | head; python3 - <<'PY'\nprint('ok')\nPY".to_string(),
         ] {
-            assert!(python_heredoc_proof(Some(&root), &shape).is_err(), "{shape}");
+            assert!(
+                python_heredoc_proof(Some(&root), &shape).is_err(),
+                "{shape}"
+            );
         }
     }
 
@@ -2127,7 +3250,10 @@ mod m215_trusted_heredoc_and_read_only_git {
             assert!(sensitive(command), "{command}");
         }
         let mixed = "git status --short; git push origin main";
-        assert!(sensitive(mixed) || codefactory_agent_loop::policy::is_delivery_command(mixed), "{mixed}");
+        assert!(
+            sensitive(mixed) || codefactory_agent_loop::policy::is_delivery_command(mixed),
+            "{mixed}"
+        );
     }
 }
 
@@ -2154,24 +3280,39 @@ mod m221_git_data_heredoc {
         let (_temp, root) = workspace();
         let shapes = [
             "git add -A && git commit -q -F - <<'MSG'\nM221: local commit message\nMSG".to_string(),
-            "git add -A\ngit commit -q -F - <<'MSG'\nM221: message after a newline separator\nMSG".to_string(),
-            "git add -A && git commit -q -F - <<'MSG'\nM221: message\nMSG\ngit log --oneline -1".to_string(),
+            "git add -A\ngit commit -q -F - <<'MSG'\nM221: message after a newline separator\nMSG"
+                .to_string(),
+            "git add -A && git commit -q -F - <<'MSG'\nM221: message\nMSG\ngit log --oneline -1"
+                .to_string(),
             "cat <<'MSG' | git commit -F -\nM221: piped message\nMSG".to_string(),
             "git commit --file=- <<'MSG'\nM221: long option\nMSG".to_string(),
             "git add -A && git tag -a v9 -F - <<'MSG'\nM221: tag message\nMSG".to_string(),
-            format!("cd {} && git add -A && git commit -F - <<'MSG'\nM221: absolute workspace cd\nMSG", root.display()),
+            format!(
+                "cd {} && git add -A && git commit -F - <<'MSG'\nM221: absolute workspace cd\nMSG",
+                root.display()
+            ),
             // A message naming an outside path is still just text: it is never
             // resolved as a path and never executed.
             "git commit -F - <<'MSG'\nsee /Users/leo/.ssh/id_rsa for the incident\nMSG".to_string(),
         ];
         for shape in shapes {
-            assert!(python_heredoc_proof(Some(&root), &shape).is_ok(), "{shape}\n{:?}", python_heredoc_proof(Some(&root), &shape));
+            assert!(
+                python_heredoc_proof(Some(&root), &shape).is_ok(),
+                "{shape}\n{:?}",
+                python_heredoc_proof(Some(&root), &shape)
+            );
         }
         // R3: the original command no longer needs a local-rewrite snapshot.
         // The proof itself stays fail-closed without a workspace premise: the
         // gateway passes the registered root, a bare predicate does not.
-        assert!(python_heredoc_proof(None, "git add -A && git commit -F - <<'MSG'\nM221: message\nMSG").is_err());
-        assert!(sensitive("git add -A && git commit -q -F - <<'MSG'\nM221: message\nMSG"));
+        assert!(python_heredoc_proof(
+            None,
+            "git add -A && git commit -F - <<'MSG'\nM221: message\nMSG"
+        )
+        .is_err());
+        assert!(sensitive(
+            "git add -A && git commit -q -F - <<'MSG'\nM221: message\nMSG"
+        ));
     }
 
     /// R3: the boundary did not move. Another repository, a rewriting prefix,
@@ -2192,7 +3333,10 @@ mod m221_git_data_heredoc {
             "cat <<'MSG' | sh\nmessage\nMSG".to_string(),
         ];
         for shape in shapes {
-            assert!(python_heredoc_proof(Some(&root), &shape).is_err(), "{shape}");
+            assert!(
+                python_heredoc_proof(Some(&root), &shape).is_err(),
+                "{shape}"
+            );
         }
     }
 }
@@ -2218,8 +3362,12 @@ mod m221b_quoted_double_angle {
             assert!(!sensitive(command), "{command}");
         }
         assert!(has_unquoted_heredoc("cat <<'EOF'\nbody\nEOF"));
-        assert!(has_unquoted_heredoc("git commit -F - <<'MSG'\nmessage\nMSG"));
-        assert!(has_unquoted_heredoc("grep \"quoted\" ; cat <<'EOF'\nbody\nEOF"));
+        assert!(has_unquoted_heredoc(
+            "git commit -F - <<'MSG'\nmessage\nMSG"
+        ));
+        assert!(has_unquoted_heredoc(
+            "grep \"quoted\" ; cat <<'EOF'\nbody\nEOF"
+        ));
         assert!(!has_unquoted_heredoc("echo 'unterminated"));
     }
 
@@ -2234,7 +3382,10 @@ mod m221b_quoted_double_angle {
         );
         assert!(!has_unquoted_heredoc(&command), "{command}");
         assert!(!sensitive(&command), "{command}");
-        assert!(python_heredoc_proof(Some(&root), &command).is_err(), "not a heredoc, so the interpreter proof has nothing to prove: {command}");
+        assert!(
+            python_heredoc_proof(Some(&root), &command).is_err(),
+            "not a heredoc, so the interpreter proof has nothing to prove: {command}"
+        );
     }
 }
 
@@ -2246,30 +3397,33 @@ mod trusted_shell_structure {
     //! flat sequence of simple commands they would run. It is structure-only: no
     //! command text is whitelisted here, and everything that cannot be enumerated
     //! statically returns `None` so the caller keeps its fail-closed behaviour.
-    
+
     /// Placeholder for the output of a `$(...)` we did enumerate. It is no longer a
     /// live expansion, so the dynamic-word rule must not fire on it.
     const SUBSTITUTION_MARK: char = '\u{1}';
-    
+
     /// Deepest structure nesting we are willing to unfold.
     const MAX_STRUCTURE_DEPTH: usize = 16;
-    
+
     /// Most literal `for` iterations we unroll.
     const MAX_UNROLLED_ITERATIONS: usize = 64;
-    
+
     #[derive(Clone, Debug)]
     enum ShellToken {
-        Word { text: String, substitutions: Vec<Vec<ShellToken>> },
+        Word {
+            text: String,
+            substitutions: Vec<Vec<ShellToken>>,
+        },
         Sep,
         OpenParen,
         CloseParen,
     }
-    
+
     enum Dollar {
         Text(String),
         Substitution(Vec<ShellToken>),
     }
-    
+
     #[derive(Clone, Debug)]
     enum ShellBinding {
         /// Known literal iteration value (`for c in a b`).
@@ -2278,16 +3432,16 @@ mod trusted_shell_structure {
         /// (`for c in $(git rev-list ...)`).
         Bounded,
     }
-    
+
     type ShellVars = std::collections::BTreeMap<String, ShellBinding>;
-    
+
     /// One entry of a `for ... in ...` list.
     enum ShellValue {
         Literal(String),
         Bounded,
         Unknown,
     }
-    
+
     /// M260 entry point: `None` means "cannot be enumerated, stay sensitive".
     pub(super) fn executable_segments(command: &str) -> Option<Vec<Vec<String>>> {
         let tokens = shell_tokens(command)?;
@@ -2299,11 +3453,11 @@ mod trusted_shell_structure {
         }
         Some(segments)
     }
-    
+
     fn shell_tokens(command: &str) -> Option<Vec<ShellToken>> {
         shell_tokens_at_depth(command, 0)
     }
-    
+
     fn shell_tokens_at_depth(command: &str, depth: usize) -> Option<Vec<ShellToken>> {
         if depth > MAX_STRUCTURE_DEPTH {
             return None;
@@ -2420,7 +3574,7 @@ mod trusted_shell_structure {
         close_shell_word(&mut tokens, &mut word, &mut substitutions, &mut in_word);
         Some(tokens)
     }
-    
+
     fn close_shell_word(
         tokens: &mut Vec<ShellToken>,
         word: &mut String,
@@ -2438,9 +3592,12 @@ mod trusted_shell_structure {
             tokens.push(ShellToken::Sep);
             return;
         }
-        tokens.push(ShellToken::Word { text, substitutions: substitution_tokens });
+        tokens.push(ShellToken::Word {
+            text,
+            substitutions: substitution_tokens,
+        });
     }
-    
+
     fn lex_dollar(chars: &[char], start: usize, depth: usize) -> Option<(usize, Dollar)> {
         let Some(next) = chars.get(start + 1).copied() else {
             return Some((1, Dollar::Text("$".into())));
@@ -2466,19 +3623,25 @@ mod trusted_shell_structure {
                 while matches!(chars.get(end), Some(c) if c.is_ascii_alphanumeric() || *c == '_') {
                     end += 1;
                 }
-                Some((end - start, Dollar::Text(chars[start..end].iter().collect())))
+                Some((
+                    end - start,
+                    Dollar::Text(chars[start..end].iter().collect()),
+                ))
             }
             c if c.is_ascii_digit() => {
                 let mut end = start + 1;
                 while matches!(chars.get(end), Some(c) if c.is_ascii_digit()) {
                     end += 1;
                 }
-                Some((end - start, Dollar::Text(chars[start..end].iter().collect())))
+                Some((
+                    end - start,
+                    Dollar::Text(chars[start..end].iter().collect()),
+                ))
             }
             _ => Some((1, Dollar::Text("$".into()))),
         }
     }
-    
+
     fn matching_paren(chars: &[char], start: usize) -> Option<usize> {
         let mut depth = 0usize;
         let mut quote: Option<char> = None;
@@ -2518,7 +3681,7 @@ mod trusted_shell_structure {
         }
         None
     }
-    
+
     fn matching_token(tokens: &[ShellToken], start: usize) -> Option<usize> {
         let mut depth = 0usize;
         for (offset, token) in tokens[start..].iter().enumerate() {
@@ -2535,13 +3698,13 @@ mod trusted_shell_structure {
         }
         None
     }
-    
+
     fn flush_shell_segment(current: &mut Vec<String>, out: &mut Vec<Vec<String>>) {
         if !current.is_empty() {
             out.push(std::mem::take(current));
         }
     }
-    
+
     fn parse_shell_block(
         tokens: &[ShellToken],
         vars: &ShellVars,
@@ -2573,7 +3736,10 @@ mod trusted_shell_structure {
                     }
                     index = close + 1;
                 }
-                ShellToken::Word { text, substitutions } => {
+                ShellToken::Word {
+                    text,
+                    substitutions,
+                } => {
                     for inner in substitutions {
                         let (inner_stop, inner_used) =
                             parse_shell_block(inner, vars, out, &[], depth + 1)?;
@@ -2605,16 +3771,23 @@ mod trusted_shell_structure {
                             }
                             // Structures we deliberately do not model, and keywords
                             // that only make sense inside one: fail closed.
-                            "case" | "select" | "function" | "coproc" | "eval" | "source" | "trap"
-                            | "esac" | "then" | "else" | "elif" | "fi" | "do" | "done" | "in" => {
+                            "case" | "select" | "function" | "coproc" | "eval" | "source"
+                            | "trap" | "esac" | "then" | "else" | "elif" | "fi" | "do" | "done"
+                            | "in" => {
                                 return None;
                             }
                             _ => {}
                         }
                     }
                     let resolved = resolve_shell_word(text, vars);
-                    if current.is_empty() && resolved.contains(SUBSTITUTION_MARK) {
-                        // A command word that is itself a substitution cannot be named.
+                    // M266 R3: `BASE=$(git rev-parse …) cmd` is an *assignment* whose
+                    // value is a substitution — the command word is the next word, so
+                    // the segment can still be named. Only a substitution standing in
+                    // the command position itself is unnameable.
+                    if current.is_empty()
+                        && resolved.contains(SUBSTITUTION_MARK)
+                        && !is_shell_assignment(&resolved)
+                    {
                         return None;
                     }
                     current.push(resolved);
@@ -2625,7 +3798,7 @@ mod trusted_shell_structure {
         flush_shell_segment(&mut current, out);
         Some((None, index))
     }
-    
+
     fn parse_for_loop(
         tokens: &[ShellToken],
         index: usize,
@@ -2635,17 +3808,19 @@ mod trusted_shell_structure {
     ) -> Option<usize> {
         let mut cursor = index + 1;
         let name = match tokens.get(cursor) {
-            Some(ShellToken::Word { text, substitutions })
-                if substitutions.is_empty() && is_shell_name(text) =>
-            {
-                text.clone()
-            }
+            Some(ShellToken::Word {
+                text,
+                substitutions,
+            }) if substitutions.is_empty() && is_shell_name(text) => text.clone(),
             _ => return None,
         };
         cursor += 1;
         let mut values: Vec<ShellValue> = Vec::new();
         match tokens.get(cursor) {
-            Some(ShellToken::Word { text, substitutions }) if substitutions.is_empty() && text == "in" => {
+            Some(ShellToken::Word {
+                text,
+                substitutions,
+            }) if substitutions.is_empty() && text == "in" => {
                 cursor += 1;
                 loop {
                     match tokens.get(cursor) {
@@ -2654,7 +3829,10 @@ mod trusted_shell_structure {
                             cursor += 1;
                             break;
                         }
-                        Some(ShellToken::Word { text, substitutions }) => {
+                        Some(ShellToken::Word {
+                            text,
+                            substitutions,
+                        }) => {
                             if substitutions.is_empty() {
                                 if is_shell_literal(text) {
                                     values.push(ShellValue::Literal(text.clone()));
@@ -2689,9 +3867,10 @@ mod trusted_shell_structure {
             _ => return None,
         }
         match tokens.get(cursor) {
-            Some(ShellToken::Word { text, substitutions })
-                if substitutions.is_empty() && text == "do" =>
-            {
+            Some(ShellToken::Word {
+                text,
+                substitutions,
+            }) if substitutions.is_empty() && text == "do" => {
                 cursor += 1;
             }
             _ => return None,
@@ -2699,15 +3878,20 @@ mod trusted_shell_structure {
         let body = &tokens[cursor..];
         let unrollable = !values.is_empty()
             && values.len() <= MAX_UNROLLED_ITERATIONS
-            && values.iter().all(|value| matches!(value, ShellValue::Literal(_)));
+            && values
+                .iter()
+                .all(|value| matches!(value, ShellValue::Literal(_)));
         if unrollable {
             let mut done_at: Option<usize> = None;
             for value in &values {
-                let ShellValue::Literal(value) = value else { return None };
+                let ShellValue::Literal(value) = value else {
+                    return None;
+                };
                 let mut scoped = vars.clone();
                 scoped.insert(name.clone(), ShellBinding::Literal(value.clone()));
                 let mut iteration = Vec::new();
-                let (stop, used) = parse_shell_block(body, &scoped, &mut iteration, &["done"], depth + 1)?;
+                let (stop, used) =
+                    parse_shell_block(body, &scoped, &mut iteration, &["done"], depth + 1)?;
                 if stop.as_deref() != Some("done") {
                     return None;
                 }
@@ -2720,8 +3904,12 @@ mod trusted_shell_structure {
             }
             return done_at.map(|used| cursor + used + 1);
         }
-        let bounded = values.iter().any(|value| matches!(value, ShellValue::Bounded));
-        let unknown = values.iter().any(|value| matches!(value, ShellValue::Unknown));
+        let bounded = values
+            .iter()
+            .any(|value| matches!(value, ShellValue::Bounded));
+        let unknown = values
+            .iter()
+            .any(|value| matches!(value, ShellValue::Unknown));
         let mut scoped = vars.clone();
         if bounded && !unknown {
             scoped.insert(name, ShellBinding::Bounded);
@@ -2732,7 +3920,7 @@ mod trusted_shell_structure {
         }
         Some(cursor + used + 1)
     }
-    
+
     fn parse_while_loop(
         tokens: &[ShellToken],
         index: usize,
@@ -2746,13 +3934,14 @@ mod trusted_shell_structure {
             return None;
         }
         let body_start = cursor + used + 1;
-        let (stop, used) = parse_shell_block(&tokens[body_start..], vars, out, &["done"], depth + 1)?;
+        let (stop, used) =
+            parse_shell_block(&tokens[body_start..], vars, out, &["done"], depth + 1)?;
         if stop.as_deref() != Some("done") {
             return None;
         }
         Some(body_start + used + 1)
     }
-    
+
     fn parse_if_block(
         tokens: &[ShellToken],
         index: usize,
@@ -2762,13 +3951,19 @@ mod trusted_shell_structure {
     ) -> Option<usize> {
         let mut cursor = index + 1;
         loop {
-            let (stop, used) = parse_shell_block(&tokens[cursor..], vars, out, &["then"], depth + 1)?;
+            let (stop, used) =
+                parse_shell_block(&tokens[cursor..], vars, out, &["then"], depth + 1)?;
             if stop.as_deref() != Some("then") {
                 return None;
             }
             cursor += used + 1;
-            let (stop, used) =
-                parse_shell_block(&tokens[cursor..], vars, out, &["elif", "else", "fi"], depth + 1)?;
+            let (stop, used) = parse_shell_block(
+                &tokens[cursor..],
+                vars,
+                out,
+                &["elif", "else", "fi"],
+                depth + 1,
+            )?;
             match stop.as_deref() {
                 Some("fi") => return Some(cursor + used + 1),
                 Some("elif") => {
@@ -2776,7 +3971,8 @@ mod trusted_shell_structure {
                 }
                 Some("else") => {
                     cursor += used + 1;
-                    let (stop, used) = parse_shell_block(&tokens[cursor..], vars, out, &["fi"], depth + 1)?;
+                    let (stop, used) =
+                        parse_shell_block(&tokens[cursor..], vars, out, &["fi"], depth + 1)?;
                     if stop.as_deref() != Some("fi") {
                         return None;
                     }
@@ -2786,7 +3982,7 @@ mod trusted_shell_structure {
             }
         }
     }
-    
+
     fn resolve_shell_word(text: &str, vars: &ShellVars) -> String {
         if !text.contains('$') {
             return text.to_string();
@@ -2818,7 +4014,8 @@ mod trusted_shell_structure {
                 }
                 Some(c) if c.is_ascii_alphabetic() || *c == '_' => {
                     let mut end = index + 1;
-                    while matches!(chars.get(end), Some(c) if c.is_ascii_alphanumeric() || *c == '_') {
+                    while matches!(chars.get(end), Some(c) if c.is_ascii_alphanumeric() || *c == '_')
+                    {
                         end += 1;
                     }
                     let name: String = chars[index + 1..end].iter().collect();
@@ -2837,7 +4034,15 @@ mod trusted_shell_structure {
         }
         out
     }
-    
+
+    /// M266 R3: `NAME=value` shapes that bind a shell variable rather than name a
+    /// command. Such a prefix may carry a substitution and still leave a command
+    /// word behind it.
+    fn is_shell_assignment(word: &str) -> bool {
+        word.split_once('=')
+            .is_some_and(|(name, _)| is_shell_name(name))
+    }
+
     fn is_shell_name(text: &str) -> bool {
         let mut chars = text.chars();
         match chars.next() {
@@ -2846,11 +4051,14 @@ mod trusted_shell_structure {
         }
         chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
     }
-    
+
     fn is_shell_literal(text: &str) -> bool {
-        !text.is_empty() && text.chars().all(|c| c.is_ascii_alphanumeric() || "._/:@%+=,-".contains(c))
+        !text.is_empty()
+            && text
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || "._/:@%+=,-".contains(c))
     }
-    
+
     /// M260：循环 / 子 shell / `$(...)` / `if` 里的纯本地命令，不再因为「结构解析不了」
     /// 整条进审批；含远端写、破坏性改写、解释器 heredoc 的仍走既有判定。
     ///
@@ -2861,10 +4069,10 @@ mod trusted_shell_structure {
     mod m260_structures {
         use super::super::{destructive_intent, outside_write_sandbox_scope, sensitive};
         use codefactory_agent_loop::policy::is_delivery_command;
-    
+
         /// R2 样本：现场原样（会话 00b00066 被拦下的那条）。
         const FIELD_SAMPLE: &str = "for c in c9eb5089c a00d7c16f; do echo \"--- $c ---\"; git log -1 --format='%B' $c | tail -8; done && grep -rn \"Release-Urgency\" .github/workflows/*.yml | head -10";
-    
+
         /// R2：结构里只有本地 git 读写和普通命令。
         const LOCAL_STRUCTURES: [&str; 6] = [
             "for f in docs/a.md docs/b.md; do git add $f; done",
@@ -2874,37 +4082,58 @@ mod trusted_shell_structure {
             "cd \"$(git rev-parse --show-toplevel)\" && git status --short",
             "for c in $(git rev-list -n 2 HEAD); do git show --stat $c; done",
         ];
-    
+
         fn local_exemption_applies(command: &str) -> bool {
             !destructive_intent(command)
                 && !is_delivery_command(command)
                 && !outside_write_sandbox_scope(command)
         }
-    
+
         #[test]
         fn m260_field_sample_produces_no_approval() {
-            assert!(!sensitive(FIELD_SAMPLE), "field sample must not enter the unproved-git prompt: {FIELD_SAMPLE}");
-            assert!(!destructive_intent(FIELD_SAMPLE), "destructive: {FIELD_SAMPLE}");
+            assert!(
+                !sensitive(FIELD_SAMPLE),
+                "field sample must not enter the unproved-git prompt: {FIELD_SAMPLE}"
+            );
+            assert!(
+                !destructive_intent(FIELD_SAMPLE),
+                "destructive: {FIELD_SAMPLE}"
+            );
             assert!(!is_delivery_command(FIELD_SAMPLE), "remote: {FIELD_SAMPLE}");
-            assert!(!outside_write_sandbox_scope(FIELD_SAMPLE), "outside_scope: {FIELD_SAMPLE}");
+            assert!(
+                !outside_write_sandbox_scope(FIELD_SAMPLE),
+                "outside_scope: {FIELD_SAMPLE}"
+            );
             assert!(local_exemption_applies(FIELD_SAMPLE));
         }
-    
+
         #[test]
         fn m260_local_structures_need_no_approval() {
             for command in LOCAL_STRUCTURES {
-                assert!(local_exemption_applies(command), "local structure must stay inside the sandbox exemption: {command}");
+                assert!(
+                    local_exemption_applies(command),
+                    "local structure must stay inside the sandbox exemption: {command}"
+                );
             }
         }
-    
+
         #[test]
         fn m260_loop_with_remote_write_still_asks() {
-            for command in ["for c in main dev; do git push origin $c; done", "while read b; do gh pr merge $b; done"] {
-                assert!(is_delivery_command(command), "remote write must stay remote: {command}");
-                assert!(!local_exemption_applies(command), "remote write must not be exempted by the sandbox: {command}");
+            for command in [
+                "for c in main dev; do git push origin $c; done",
+                "while read b; do gh pr merge $b; done",
+            ] {
+                assert!(
+                    is_delivery_command(command),
+                    "remote write must stay remote: {command}"
+                );
+                assert!(
+                    !local_exemption_applies(command),
+                    "remote write must not be exempted by the sandbox: {command}"
+                );
             }
         }
-    
+
         #[test]
         fn m260_subshell_destructive_rewrite_still_asks() {
             for command in [
@@ -2912,11 +4141,17 @@ mod trusted_shell_structure {
                 "if git status --porcelain | grep -q .; then (git reset --hard origin/main); fi",
                 "for c in origin/main; do git reset --hard $c; done",
             ] {
-                assert!(destructive_intent(command), "destructive rewrite must stay destructive: {command}");
-                assert!(!local_exemption_applies(command), "destructive rewrite must not be exempted by the sandbox: {command}");
+                assert!(
+                    destructive_intent(command),
+                    "destructive rewrite must stay destructive: {command}"
+                );
+                assert!(
+                    !local_exemption_applies(command),
+                    "destructive rewrite must not be exempted by the sandbox: {command}"
+                );
             }
         }
-    
+
         #[test]
         fn m260_loop_with_python_heredoc_still_asks() {
             let commands = [
@@ -2924,11 +4159,17 @@ mod trusted_shell_structure {
                 "while read f; do python3 - <<'PY'\nopen(f).read()\nPY\ndone",
             ];
             for command in commands {
-                assert!(sensitive(command), "interpreter heredoc must stay unproved: {command}");
-                assert!(!local_exemption_applies(command), "interpreter heredoc must not be exempted: {command}");
+                assert!(
+                    sensitive(command),
+                    "interpreter heredoc must stay unproved: {command}"
+                );
+                assert!(
+                    !local_exemption_applies(command),
+                    "interpreter heredoc must not be exempted: {command}"
+                );
             }
         }
-    
+
         #[test]
         fn m260_unparseable_structure_fails_closed() {
             for command in [
@@ -2937,10 +4178,13 @@ mod trusted_shell_structure {
                 "for c in a b; do echo $((1+2)); done",
                 "for c in a b; do $(echo git) log -1; done",
             ] {
-                assert!(sensitive(command) || destructive_intent(command), "unmodelled structure must fail closed: {command}");
+                assert!(
+                    sensitive(command) || destructive_intent(command),
+                    "unmodelled structure must fail closed: {command}"
+                );
             }
         }
-    
+
         #[test]
         fn m260_plain_git_judgements_unchanged() {
             assert!(!sensitive("git log -1 --format='%B'"));
@@ -2949,5 +4193,131 @@ mod trusted_shell_structure {
             assert!(destructive_intent("git reset --hard origin/main"));
             assert!(is_delivery_command("git push origin main"));
         }
+    }
+}
+
+/// M266 regression table: "is this a git operation?" is decided by the parsed
+/// executable positions, never by a substring anywhere in the command text.
+#[cfg(test)]
+mod m266_tests {
+    // This file is included verbatim by the integration tests under
+    // `src-tauri/tests/` (`#[path = "../src/agent/trusted_git.rs"]`), where
+    // neither `crate::agent` nor `crate::tools` exists and a nested `#[path]`
+    // resolves against the including file's directory. So `super` is the git
+    // module in both builds, and the shell half of the approval decision is
+    // asserted in `src/tools/shell_policy.rs` instead of here.
+    use super as trusted_git;
+
+    /// Field samples that were refused with `trusted.git.unproved` although no git
+    /// operation runs in an executable position. `sensitive` must be false, which
+    /// is what keeps them out of the Git proof + approval path.
+    const NOT_GIT_OPERATIONS: &[(&str, &str)] = &[
+        (
+            "R2/quoted-search-pattern",
+            r#"grep -o "path:src-tauri/tests/[^\"]*" docs/testing/scenario-registry.json | sort -u | head; echo; grep -c "rust:" docs/testing/scenario-registry.json"#,
+        ),
+        (
+            "R2/for-loop-with-command-substitution",
+            r#"for i in 1 2 3 4 5 6; do out=$(CARGO_TARGET_DIR=$PWD/.codefactory-cache/cargo-target-m266 cargo test --manifest-path src-tauri/Cargo.toml 2>&1); echo "run $i: done"; done"#,
+        ),
+        (
+            "R3/read-only-git-in-substitution",
+            r#"BASE=$(git rev-parse origin/main) && SCENARIO_TEST_BASE_SHA=$BASE python3 tools/governance/validate_scenario_test_governance.py --ci --base-ref origin/main"#,
+        ),
+        ("baseline/read-only-git", "git log --oneline -5 | head"),
+        (
+            "baseline/git-word-inside-a-search-pattern",
+            r#"grep -rn "git push origin main" src-tauri/src | head"#,
+        ),
+        (
+            "baseline/git-word-inside-a-path",
+            "ls .codefactory-cache/git-target-m266 && wc -l src-tauri/src/agent/trusted_git.rs",
+        ),
+    ];
+
+    /// Real git operations. These must stay behind approval (R5): a stricter parser
+    /// may not turn a write, a force-push or an unprovable command into an allow.
+    /// Plain `git push` is owned by the delivery-authorization gate rather than the
+    /// Git proof, so the predicate below covers both owners.
+    const ASKS_FOR_APPROVAL: &[(&str, &str)] = &[
+        ("R5/push", "git push origin main"),
+        ("R5/force-push", "git push --force origin main"),
+        ("R5/reset-hard", "git reset --hard HEAD"),
+        ("R5/clean", "git clean -fdx"),
+        (
+            "R5/push-inside-shell-payload",
+            r#"bash -c "git reset --hard""#,
+        ),
+        (
+            "R5/unenumerable-command",
+            "git push origin main; echo \"unterminated",
+        ),
+        // A backtick substitution runs at run time, so its content cannot be
+        // unfolded into simple commands. It stays behind approval even though the
+        // word it sits in is only an argument.
+        ("R5/unenumerable-backticks", "echo `git status`"),
+    ];
+
+    /// The Git half of the approval decision. The shell-safety half is asserted
+    /// where it lives (`tools::shell_policy`), because this file is compiled inside
+    /// the integration tests and cannot reach that module.
+    fn asks_for_approval(command: &str) -> bool {
+        trusted_git::sensitive(command)
+            || codefactory_agent_loop::policy::is_delivery_command(command)
+    }
+
+    #[test]
+    fn m266_not_git_operations_are_not_sensitive() {
+        let mut failures = Vec::new();
+        for (name, command) in NOT_GIT_OPERATIONS {
+            if asks_for_approval(command) {
+                failures.push(format!(
+                    "{name}: still needs approval ({:?}, sensitive={}) -> {command}",
+                    trusted_git::git_entry(command),
+                    trusted_git::sensitive(command),
+                ));
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "M266/R2 false positives remain:\n{}",
+            failures.join("\n")
+        );
+    }
+
+    #[test]
+    fn m266_real_git_operations_stay_sensitive() {
+        let mut failures = Vec::new();
+        for (name, command) in ASKS_FOR_APPROVAL {
+            if !asks_for_approval(command) {
+                failures.push(format!("{name}: no longer asks -> {command}"));
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "M266/R5 regressions:\n{}",
+            failures.join("\n")
+        );
+    }
+
+    /// R4: the message heredoc keeps its proof when the same line sends `2>&1`
+    /// through a read-only output filter (`... <<'EOF' 2>&1 | tail -25`).
+    #[test]
+    fn m266_message_heredoc_survives_output_pipeline() {
+        let command = "git commit -q -F - <<'EOF' 2>&1 | tail -25\nfeat(m266): entry review\nEOF";
+        assert!(
+            trusted_git::python_heredoc_proved(Some(&std::env::temp_dir()), command),
+            "M266/R4: message heredoc behind a read-only output pipeline should be proved as data"
+        );
+    }
+
+    /// R4 negative control: interpreter input is not message data.
+    #[test]
+    fn m266_interpreter_heredoc_is_still_unproved() {
+        let command = "python3 - <<'EOF'\nimport os\nos.system('git reset --hard')\nEOF";
+        assert!(
+            !trusted_git::python_heredoc_proved(Some(&std::env::temp_dir()), command),
+            "M266/R4: an interpreter heredoc must stay unproved"
+        );
     }
 }
