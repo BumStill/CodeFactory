@@ -92,7 +92,10 @@ fn m177_sync_compositions_from_the_incident_family_are_provable() {
 fn m177_previously_blocked_read_only_commands_do_not_ask() {
     // 10-23 .. 10-26 recorded false positives: read-only, no rewrite at all.
     let script = "node -e 'const r=require(\"./docs/testing/scenario-registry.json\");console.log(r.scenarios.length)' | head -5";
-    assert!(!trusted_git::sensitive(script), "quoted script data must not ask");
+    // CF-IAB: require executes a program outside the bounded literal proof;
+    // keep this historical sample as an approval regression, not inert data.
+    assert!(trusted_git::sensitive(script), "unproved inline program must ask");
+    assert!(!trusted_git::sensitive("node -e 'console.log(5)'"), "literal output stays unprompted");
     assert!(!trusted_git::sensitive("cat src/main.rs"));
     assert!(!trusted_git::sensitive("cat tracked.txt && git status --short"));
     assert!(trusted_git::sensitive("git add -A && git commit -m \"m177 sync\""), "M182 requires snapshots for local index/history writes");

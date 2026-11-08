@@ -1,5 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 
+#[path = "inline_interpreter.rs"]
+pub(crate) mod inline_interpreter;
+
+/// Unknown inline code requires approval before any executor or sandbox shortcut.
+pub fn unproved_inline_code(command: &str) -> bool {
+    inline_interpreter::unproved(command)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ShellCommandPolicy {
     Allow {
@@ -44,7 +52,7 @@ pub fn classify_command(command: &str) -> ShellCommandPolicy {
     // Quoted data (a search pattern, a message, an argument that merely mentions
     // `git reset --hard`) is not a statement; inline interpreter payloads
     // (`bash -c "…"`, `python -c "…"`) are code and stay in the judged text.
-    let judged = shell_judged_text(&normalized);
+    let judged = normalize(&shell_judged_text(command));
 
     if is_direct_playwright_command(&normalized) {
         return deny("direct Playwright CLI is not allowed; use the native browser_session tool so CodeFactory can own and clean up the browser process");
@@ -174,6 +182,9 @@ pub fn classify_command(command: &str) -> ShellCommandPolicy {
         return ask(reason);
     }
 
+    if unproved_inline_code(command) {
+        return ask("command executable input is not statically proved; approval is required");
+    }
     ShellCommandPolicy::Allow {
         risk: ShellRisk::Low,
     }
@@ -318,25 +329,15 @@ fn normalize(command: &str) -> String {
 /// the span is the inline payload of an interpreter, which is code and is
 /// appended back so `bash -c "git reset --hard"` still asks.
 fn shell_judged_text(command: &str) -> String {
+    shell_judged_text_at(command, 0)
+}
+
+fn shell_judged_text_at(command: &str, depth: usize) -> String {
+    if depth > 8 {
+        return command.to_string();
+    }
     const PAYLOAD_OPTIONS: &[&str] = &[
         "-c", "/c", "-lc", "-ec", "-ic", "-e", "-command", "--eval", "-p",
-    ];
-    const PAYLOAD_INTERPRETERS: &[&str] = &[
-        "bash",
-        "sh",
-        "zsh",
-        "dash",
-        "ksh",
-        "ash",
-        "powershell",
-        "pwsh",
-        "cmd",
-        "python",
-        "python3",
-        "node",
-        "nodejs",
-        "perl",
-        "ruby",
     ];
     let mut judged = String::with_capacity(command.len());
     let mut payload = String::new();
@@ -349,7 +350,16 @@ fn shell_judged_text(command: &str) -> String {
         let quote = ch;
         let mut inner = String::new();
         let mut closed = false;
-        for next in chars.by_ref() {
+        while let Some(next) = chars.next() {
+            if next == '\\' && quote == '"' {
+                if let Some(&escaped) = chars.peek() {
+                    if matches!(escaped, '"' | '\\' | '$' | '`' | '\n') {
+                        chars.next();
+                        inner.push(escaped);
+                        continue;
+                    }
+                }
+            }
             if next == quote {
                 closed = true;
                 break;
@@ -376,10 +386,19 @@ fn shell_judged_text(command: &str) -> String {
         // remove one, so an interpreter anywhere in the prefix is enough.
         let interpreter = tokens
             .iter()
-            .any(|word| PAYLOAD_INTERPRETERS.contains(&word.as_str()));
-        if payload_option && interpreter {
-            payload.push_str(&inner);
-            payload.push('\n');
+            .rev()
+            .find_map(|word| inline_interpreter::interpreter_name(word));
+        if let Some(kind) = interpreter.filter(|_| payload_option) {
+            // A proved literal output program contains data, not executable
+            // destructive phrases. Unknown programs keep all risk checks.
+            if !inline_interpreter::literal_output_program(&inner, kind) {
+                if kind == "shell" {
+                    payload.push_str(&shell_judged_text_at(&inner, depth + 1));
+                } else {
+                    payload.push_str(&inner);
+                }
+                payload.push('\n');
+            }
             continue;
         }
         // A quoted span with no whitespace is just an argument word, and a shell
@@ -721,6 +740,165 @@ mod tests {
             assert!(
                 matches!(classify_command(command), ShellCommandPolicy::Allow { .. }),
                 "{command:?} is a single observation and must stay allowed"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod interpreter_boundary_regressions {
+    use super::*;
+    #[test]
+    fn literal_data_and_interpreter_boundaries() {
+        for command in [
+            r#"python3.11 -I -c 'print("git reset --hard")'"#,
+            r#"/usr/bin/python3 -c 'print(1); pass # safe'"#,
+            r#"node -e 'console.log("git reset --hard")'"#,
+            r#"grep 'python3 -c evil()' file"#,
+            "bash -c 'git status --short'",
+        ] {
+            assert!(
+                matches!(classify_command(command), ShellCommandPolicy::Allow { .. }),
+                "{command}"
+            );
+        }
+        for command in [
+            "python3 -c '# comment\revil()'",
+            "node -e 'console.log(1)' --require ./module.js",
+            "node -e 'console.log(1)' -e 'evil()'",
+            "deno eval 'Deno.removeSync(path)'",
+            "deno eval 'console.log(1)' --import ./module.js",
+            "python3 -I",
+            "python3 -I -S",
+            "bash --norc",
+            r#"bash -c 'git "reset" --hard'"#,
+            r#"/bin/bash -c "git \"reset\" --hard""#,
+            "python3 -m module",
+            "python3 -",
+            "python3 -c",
+            "python3 -X unknown -c 'print(1)'",
+            "pwsh -EncodedCommand encoded",
+            "bash -c 'eval unknown'",
+            "env -i python3 -c 'evil()'",
+            "sudo -u root python3 -c 'evil()'",
+            r#"python3 -c "print('$PAYLOAD')""#,
+            r#"deno eval "console.log('$PAYLOAD')""#,
+            r#"python3 "$MODE" "$CODE""#,
+            r#"node "$MODE" "$CODE""#,
+            "/usr/bin/timeout 1 python3 -c 'evil()'",
+            "nice python3 -c 'evil()'",
+            "/usr/bin/env.exe python3 -c 'evil()'",
+            "ENV python3 -c 'evil()'",
+            "setsid python3 -c 'evil()'",
+            "busybox sh -c 'evil'",
+            "python3 *",
+            "PowerShell 'Remove-Item dangerous'",
+            "pytho?3 -c 'evil()'",
+            "/usr/bin/python[3] -c 'evil()'",
+            "powershell 'Remove-Item dangerous'",
+            "pwsh 'Invoke-Expression unknown'",
+            r#"pyth\on3 -c 'evil()'"#,
+            "python3 -c 'unterminated",
+        ] {
+            assert!(
+                !matches!(classify_command(command), ShellCommandPolicy::Allow { .. }),
+                "{command}"
+            );
+        }
+        assert!(!matches!(
+            classify_command(&" ".repeat(32769)),
+            ShellCommandPolicy::Allow { .. }
+        ));
+    }
+    #[test]
+    fn inline_invocation_environment_requires_proof() {
+        for command in [
+            "NODE_OPTIONS='--require ./payload.js' node -e 'console.log(1)'",
+            "BASH_ENV=./payload.sh bash -c 'echo ok'",
+            "env NODE_OPTIONS='--require ./payload.js' node -e 'console.log(1)'",
+            "NODE_OPTIONS='--require ./payload.js'; node -e 'console.log(1)'",
+            "export NODE_OPTIONS='--require ./payload.js'; node -e 'console.log(1)'",
+            "for BASH_ENV in ./payload.sh; do bash -c 'echo ok'; done",
+            "builtin export BASH_ENV=./payload.sh; bash -c 'echo ok'",
+        ] {
+            assert!(
+                !matches!(classify_command(command), ShellCommandPolicy::Allow { .. }),
+                "{command}"
+            );
+        }
+        for command in [
+            "LANG=C grep 'pattern' file",
+            "echo 'NODE_OPTIONS=x'",
+            "python3 -c 'print(\"a=b\")'",
+            "grep export file; python3 -c 'print(1)'",
+        ] {
+            assert!(
+                matches!(classify_command(command), ShellCommandPolicy::Allow { .. }),
+                "{command}"
+            );
+        }
+    }
+    #[test]
+    fn augmented_environment_and_opaque_shell_code_require_approval() {
+        for command in [
+            "NODE_OPTIONS+='--require ./payload.js' node -e 'console.log(1)'",
+            "BASH_ENV+=./payload.sh bash -c 'echo ok'",
+            "NODE_OPTIONS+='--require ./payload.js'; node -e 'console.log(1)'",
+            "eval 'python3 -c unknown'",
+            "builtin eval 'python3 -c unknown'",
+            "trap 'evil()' EXIT",
+            "builtin trap 'evil()' EXIT",
+        ] {
+            assert!(
+                !matches!(classify_command(command), ShellCommandPolicy::Allow { .. }),
+                "{command}"
+            );
+        }
+    }
+    #[test]
+    fn inline_companion_environment_is_positively_proved() {
+        for command in [
+            "printf -v BASH_ENV ./payload.sh; bash -c 'echo ok'",
+            "readarray BASH_ENV < payload.txt; bash -c 'echo ok'",
+            "mapfile BASH_ENV < payload.txt; bash -c 'echo ok'",
+            "getopts a BASH_ENV; bash -c 'echo ok'",
+            "unknown_helper; node -e 'console.log(1)'",
+        ] {
+            assert!(
+                !matches!(classify_command(command), ShellCommandPolicy::Allow { .. }),
+                "{command}"
+            );
+        }
+        for command in [
+            "git status; python3 -c 'print(1)'",
+            "printf '%s' ok; node -e 'console.log(1)'",
+            "python3 -c 'print(1)' | head -1",
+            "LANG=C grep 'pattern' file",
+        ] {
+            assert!(
+                matches!(classify_command(command), ShellCommandPolicy::Allow { .. }),
+                "{command}"
+            );
+        }
+    }
+    #[test]
+    fn unknown_inline_code_never_receives_low_risk_allow() {
+        for command in [
+            r#"python3 -c 'import subprocess; subprocess.run(["git","reset","--hard"],check=True)'"#,
+            r#"python3 -c 'import subprocess; subprocess.run(["g"+"it","re"+"set","--hard"])'"#,
+            r#"python3 -c 'from subprocess import run as r; r(["git","reset","--hard"])'"#,
+            r#"python3 -c 'getattr(__import__("subprocess"),"run")(["git","reset","--hard"])'"#,
+            r#"python3 -c 'm=__import__("sub"+"process");getattr(m,"r"+"un")(["g"+"it","re"+"set","--hard"])'"#,
+            r#"python3 -c 'import os; os.system("g"+"it re"+"set --hard")'"#,
+            r#"python3 -c 'import subprocess; a="git"; b="reset"; subprocess.run([a,b,"--hard"])'"#,
+            r#"python3 -c 'import subprocess; subprocess.run("git "+"reset --hard",shell=True)'"#,
+            r#"python3.11 -c 'import os; os.system("git reset --hard")'"#,
+            r#"/usr/bin/python3 -c 'import os; os.system("git reset --hard")'"#,
+            r#"/bin/bash -c "git reset --hard""#,
+        ] {
+            assert!(
+                !matches!(classify_command(command), ShellCommandPolicy::Allow { .. }),
+                "{command}"
             );
         }
     }

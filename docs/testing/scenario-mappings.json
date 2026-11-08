@@ -54,6 +54,8 @@
     { "pattern": "src/lib/thinState.ts", "scenario_id": "UI-008" },
     { "pattern": "src-tauri/src/commands/interjections.rs", "scenario_id": "HLT-004" },
     { "pattern": "src-tauri/src/agent/delivery_scenario_repair.rs", "scenario_id": "CXD-002" },
-    { "pattern": "src-tauri/src/tools/edit.rs", "scenario_id": "HLT-001" }
+    { "pattern": "src-tauri/src/tools/edit.rs", "scenario_id": "HLT-001" },
+    { "pattern": "src-tauri/src/tools/inline_interpreter.rs", "scenario_id": "UI-009" },
+    { "pattern": "src-tauri/src/tools/shell_structure.rs", "scenario_id": "UI-009" }
   ]
 }

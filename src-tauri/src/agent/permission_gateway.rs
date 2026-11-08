@@ -257,6 +257,29 @@ impl PermissionGateway for DesktopPermissionGateway {
                     .await;
             }
         }
+        // M267: an OS write sandbox is not a proof that opaque interpreter
+        // code is non-destructive or local. Keep unknown inline code at the
+        // approval boundary BEFORE any workspace/sandbox auto-allow. Existing
+        // registered heredoc proofs above retain their separate authority.
+        if !heredoc_proved && tool_call.function.name == "bash" {
+            if let Some(command) = bash_command.filter(|command| {
+                crate::tools::shell_policy::unproved_inline_code(command)
+            }) {
+                if let PermissionDecision::Deny(reason) = decide_permission_for_call(
+                    &policy, "bash", args, Some(command), self.browser_read_granted, None,
+                ) {
+                    return PermissionOutcome::Deny(PermissionDenial {
+                        content: format!("Tool call denied by policy: {reason}"),
+                        reason: PermissionDenialReason::PolicyDenied,
+                        duration_ms: 0,
+                    });
+                }
+                return self.request_permission_with_reason(
+                    tool_call, args.clone(), Some(command),
+                    Some(("shell.execution.unproved", "无法证明命令中的可执行代码或结构；动态调用、无法解析或超出证明范围的代码需要逐次审批。".into())),
+                ).await;
+            }
+        }
         // M159: delivery authority is not authority to force-push, delete a
         // remote ref, or discard local work. Prove and snapshot first.
         // M221: a proved heredoc already answered this for its read-only and
@@ -1195,6 +1218,388 @@ mod tests {
         crate::unregister_session_executor(&gateway.session_id, &control);
     }
 
+    // These are adversarial INPUT STRINGS. No test may send them to a shell.
+    const M267_INLINE_PAYLOADS: &[&str] = &[
+        r#"python3 -c 'import subprocess; subprocess.run(["git","reset","--hard"],check=True)'"#,
+        r#"python3 -c 'import subprocess; subprocess.run(["g"+"it","re"+"set","--hard"])'"#,
+        r#"python3 -c 'from subprocess import run as r; r(["git","reset","--hard"])'"#,
+        r#"python3 -c 'getattr(__import__("subprocess"),"run")(["git","reset","--hard"])'"#,
+        r#"python3 -c 'm=__import__("sub"+"process");getattr(m,"r"+"un")(["g"+"it","re"+"set","--hard"])'"#,
+        r#"python3 -c 'import os; os.system("g"+"it re"+"set --hard")'"#,
+        r#"python3 -c 'import subprocess; a="git"; b="reset"; subprocess.run([a,b,"--hard"])'"#,
+        r#"python3 -c 'import subprocess; subprocess.run("git "+"reset --hard",shell=True)'"#,
+        r#"python3.11 -c 'import os; os.system("git reset --hard")'"#,
+        r#"/usr/bin/python3 -c 'import os; os.system("git reset --hard")'"#,
+        r#"/bin/bash -c "git reset --hard""#,
+        r#"python3 -c 'import subprocess; subprocess.run(["git","push","--force","origin","HEAD"])'"#,
+        r#"python3 -c "print('$PAYLOAD')""#,
+        r#"pyth\on3 -c 'evil()'"#,
+        r#"/usr/bin/python[3] -c 'evil()'"#,
+        r#"python3 "$MODE" "$CODE""#,
+        r#"powershell 'Remove-Item victim'"#,
+        r#"deno eval 'Deno.removeSync("victim")'"#,
+        r#"node -e 'console.log(1)' --require ./module.js"#,
+        "python3 -c '# comment\revil()'",
+        "printf 'evil()' | python3 -I -S",
+        "NODE_OPTIONS='--require ./payload.js' node -e 'console.log(1)'",
+        "BASH_ENV=./payload.sh bash -c 'echo safe'",
+        "env NODE_OPTIONS='--require ./payload.js' node -e 'console.log(1)'",
+        "export NODE_OPTIONS='--require ./payload.js'; node -e 'console.log(1)'",
+        "NODE_OPTIONS='--require ./payload.js'; node -e 'console.log(1)'",
+        "for BASH_ENV in ./payload.sh; do bash -c 'echo ok'; done",
+        "builtin export BASH_ENV=./payload.sh; bash -c 'echo ok'",
+        "NODE_OPTIONS+='--require ./payload.js' node -e 'console.log(1)'",
+        "printf -v BASH_ENV ./payload.sh; bash -c 'echo ok'",
+        "readarray BASH_ENV < payload.txt; bash -c 'echo ok'",
+        "eval 'git reset --hard'",
+        "trap 'git reset --hard' EXIT",
+    ];
+
+    #[tokio::test]
+    async fn m267_inline_gateway_waits_before_any_execution() {
+        for mode in ["safe", "standard", "trusted"] {
+            for command in M267_INLINE_PAYLOADS {
+                let gateway = test_gateway(mode).await;
+                let args = serde_json::json!({"command":command});
+                let call = ToolCall {
+                    id: "m267-inline".into(), r#type: "function".into(),
+                    function: FunctionCall { name: "bash".into(), arguments: args.to_string() },
+                };
+                let task_gateway = gateway.clone();
+                let task = tokio::spawn(async move {
+                    task_gateway.authorize(&call, &args, Some(command)).await
+                });
+                // Observe the actual desktop gateway's pending approval, rather
+                // than accepting a classifier's Ask as proof of admission.
+                tokio::time::timeout(Duration::from_secs(15), async {
+                    loop {
+                        if !gateway.pending_permissions.lock().await.is_empty() { break; }
+                        assert!(!task.is_finished(), "{mode}: returned before approval: {command}");
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                }).await.expect("inline code must reach approval");
+                assert!(!task.is_finished(), "must be suspended before user decision");
+                take_pending_sender(&gateway).await.send(deny()).unwrap();
+                assert_denied_for(task.await.unwrap(), PermissionDenialReason::DeniedByUser);
+            }
+        }
+    }
+
+    // No executable backend is installed: this fixture traverses the REAL shared
+    // loop and DesktopPermissionGateway, but its only side effect is a counter.
+    #[derive(Default)]
+    struct M267RecordingTools(std::sync::atomic::AtomicUsize);
+
+    #[async_trait::async_trait]
+    impl codefactory_agent_loop::tool::ToolBackend for M267RecordingTools {
+        async fn list_schemas(&self) -> Vec<codefactory_agent_loop::types::ToolDefinition> { vec![] }
+        async fn execute(
+            &self, call: &ToolCall, args: &serde_json::Value,
+            _: &codefactory_agent_loop::tool::ToolCtx,
+        ) -> Result<codefactory_agent_loop::tool::ToolInvocationResult, codefactory_agent_loop::tool::ToolError> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let (command, kind) = self.classify(call, args);
+            Ok(codefactory_agent_loop::tool::ToolInvocationResult {
+                content: "synthetic executor reached; no command executed".into(),
+                is_error: false, status: codefactory_agent_loop::tool::ToolExecutionStatus::Done,
+                command, kind, return_code: Some(0), stdout: String::new(), stderr: String::new(),
+                error: None, metadata: None, next_working_directory: None, duration_ms: 0,
+            })
+        }
+    }
+
+    struct M267Transport(std::sync::Mutex<Option<ToolCall>>);
+    #[async_trait::async_trait]
+    impl codefactory_agent_loop::transport::ModelTransport for M267Transport {
+        async fn complete(
+            &self, _: &[codefactory_agent_loop::types::ChatMessage],
+            _: &[codefactory_agent_loop::types::ToolDefinition],
+            _: &codefactory_agent_loop::transport::RoundOptions,
+        ) -> Result<codefactory_agent_loop::transport::ModelResponse, codefactory_agent_loop::transport::TransportError> {
+            Ok(codefactory_agent_loop::transport::ModelResponse {
+                tool_calls: self.0.lock().unwrap().take().into_iter().collect(),
+                text: "synthetic fixture".into(), ..Default::default()
+            })
+        }
+    }
+    struct M267Context;
+    #[async_trait::async_trait]
+    impl codefactory_agent_loop::services::ContextPolicy for M267Context {
+        async fn context_window(&self, _: u32) -> (u32, u32) { (100_000, 100_000) }
+        async fn supports_vision(&self) -> bool { false }
+        async fn round_reasoning_effort(&self) -> String { String::new() }
+    }
+
+    async fn m267_run_fixture(
+        gateway: Arc<DesktopPermissionGateway>, tools: Arc<M267RecordingTools>,
+        command: &str, capability: codefactory_agent_loop::run::TurnCapability,
+    ) -> codefactory_agent_loop::run::RunOutcome {
+        use codefactory_agent_loop::{run::*, services::*, journal::*};
+        let args = serde_json::json!({"command":command});
+        let call = ToolCall { id: "m267-inline".into(), r#type: "function".into(),
+            function: FunctionCall { name: "bash".into(), arguments: args.to_string() } };
+        let config = RunConfig {
+            finalization: FinalizationPolicy::ReleaseWithWarning, turn_capability: capability,
+            gate_benchmark: false, progress_window: 8, recovery_limit: 0, max_iterations: 2,
+            wall_budget_applies: false, context_compression: false, overload_backoff: false,
+            overload_retry_delays: [Duration::ZERO; 2], inspection_budget: false,
+            replay_rejected_draft: false, tool_heartbeat_interval: None,
+            long_tool_wait_threshold: Duration::from_secs(60), tool_amplification_threshold: None,
+            session_id: "permission-test".into(), endpoint_name: "synthetic".into(),
+            model_id: "synthetic".into(), base_url: "https://example.invalid".into(),
+            usage_run_id: "m267-fixture".into(), surface: "interactive".into(), task_id: None,
+            anonymous: true, is_chatgpt: false, cwd: std::env::temp_dir(),
+        };
+        let inputs = LoopInputs {
+            messages: vec![], system_prompt: "synthetic security fixture".into(),
+            tool_defs: vec![serde_json::from_value(serde_json::json!({
+                "type":"function", "function":{"name":"bash", "description":"synthetic only",
+                    "parameters":{"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}}
+            })).unwrap()],
+            completion_instruction: "inspect synthetic input".into(), fact_check_instruction: String::new(),
+            audit_session_id: "permission-test".into(), root_turn_id: None, mutation_permit: None,
+            knowledge_library_ids: None, cancel: None,
+        };
+        let services = LoopServices {
+            transport: Arc::new(M267Transport(std::sync::Mutex::new(Some(call)))), tools,
+            persistence: Arc::new(NullPersistence), events: gateway.events.clone(), budget: Arc::new(NullBudget),
+            compactor: Arc::new(NoOpCompactor), context_compaction_gate: Arc::new(AllowAllContextCompaction),
+            permission: gateway, hooks: Arc::new(NoOpHooks), context_policy: Arc::new(M267Context),
+            fact_checker: Arc::new(NoOpFactChecker), steer: Arc::new(NoSteering),
+        };
+        run_agent_loop(inputs, config, services).await.expect("synthetic loop")
+    }
+
+    #[tokio::test]
+    async fn m267_inline_loop_stops_before_fake_executor() {
+        use codefactory_agent_loop::run::TurnCapability;
+        use std::sync::atomic::Ordering;
+        for mode in ["safe", "standard", "trusted"] {
+            for command in M267_INLINE_PAYLOADS {
+                let gateway = test_gateway(mode).await;
+                let tools = Arc::new(M267RecordingTools::default());
+                let other = gateway.clone(); let backend = tools.clone();
+                let task = tokio::spawn(async move {
+                    m267_run_fixture(other, backend, command, TurnCapability::Implement).await
+                });
+                tokio::time::timeout(Duration::from_secs(15), async {
+                    loop {
+                        if !gateway.pending_permissions.lock().await.is_empty() { break; }
+                        assert!(!task.is_finished(), "{mode}: loop ended without approval: {command}");
+                        assert_eq!(tools.0.load(Ordering::SeqCst), 0, "{mode}: executor crossed admission: {command}");
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                }).await.expect("loop must wait for actual desktop approval");
+                assert_eq!(tools.0.load(Ordering::SeqCst), 0);
+                take_pending_sender(&gateway).await.send(deny()).unwrap();
+                task.await.unwrap();
+                assert_eq!(tools.0.load(Ordering::SeqCst), 0, "denied payload must never reach backend");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn m267_inline_loop_approval_and_capability_controls() {
+        use codefactory_agent_loop::run::TurnCapability;
+        use std::sync::atomic::Ordering;
+        // A real successful control prevents a fixture that never dispatches
+        // any tools from making all rejection assertions vacuously pass.
+        for mode in ["standard", "trusted"] {
+            let gateway = test_gateway(mode).await;
+            let tools = Arc::new(M267RecordingTools::default());
+            m267_run_fixture(gateway.clone(), tools.clone(), "python3 -c 'print(1)'", TurnCapability::Implement).await;
+            assert_eq!(tools.0.load(Ordering::SeqCst), 1, "{mode}: safe control");
+            assert!(gateway.pending_permissions.lock().await.is_empty());
+        }
+        // Grant only this exact synthetic input. The backend still never runs a shell.
+        let gateway = test_gateway("trusted").await;
+        let tools = Arc::new(M267RecordingTools::default());
+        let other = gateway.clone(); let backend = tools.clone();
+        let task = tokio::spawn(async move {
+            m267_run_fixture(other, backend, M267_INLINE_PAYLOADS[0], TurnCapability::Implement).await
+        });
+        tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                if !gateway.pending_permissions.lock().await.is_empty() { break; }
+                assert!(!task.is_finished(), "unapproved synthetic payload returned before approval");
+                assert_eq!(tools.0.load(Ordering::SeqCst), 0);
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }).await.expect("approval control must prompt");
+        let sender = take_pending_sender(&gateway).await;
+        assert_eq!(tools.0.load(Ordering::SeqCst), 0);
+        sender.send(allow()).unwrap(); task.await.unwrap();
+        assert_eq!(tools.0.load(Ordering::SeqCst), 1);
+        // A permission grant cannot widen ReviewOnly to a mutation.
+        let gateway = test_gateway("trusted").await;
+        let tools = Arc::new(M267RecordingTools::default());
+        m267_run_fixture(gateway.clone(), tools.clone(), "git reset --hard", TurnCapability::ReviewOnly).await;
+        assert_eq!(tools.0.load(Ordering::SeqCst), 0);
+        assert!(gateway.pending_permissions.lock().await.is_empty());
+        // Permanent deny is enforced without prompting or invoking the executor.
+        m267_run_fixture(gateway.clone(), tools.clone(), "rm -rf /", TurnCapability::Implement).await;
+        assert_eq!(tools.0.load(Ordering::SeqCst), 0);
+        assert!(gateway.pending_permissions.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn m267_inline_owned_remote_companion_cannot_allow_opaque_code() {
+        use codefactory_agent_loop::run::TurnCapability;
+        use std::sync::atomic::Ordering;
+        let gateway = test_gateway("trusted").await;
+        sqlx::raw_sql(
+            "ALTER TABLE sessions ADD COLUMN delivery_authorized INTEGER NOT NULL DEFAULT 1;
+             CREATE TABLE execution_workspaces(session_id TEXT, branch_name TEXT, state TEXT);
+             CREATE TABLE thin_delivery_refs(session_id TEXT, branch TEXT, pr_number INTEGER);
+             INSERT INTO execution_workspaces VALUES ('permission-test','synthetic-branch','active');
+             INSERT INTO thin_delivery_refs VALUES ('permission-test','synthetic-branch',929);"
+        ).execute(&gateway.db).await.unwrap();
+        let owned = "gh pr edit 929 --title synthetic";
+        assert!(gateway.own_remote_owned(owned).await);
+        let positive = Arc::new(M267RecordingTools::default());
+        m267_run_fixture(gateway.clone(), positive.clone(), owned, TurnCapability::Deliver).await;
+        assert_eq!(positive.0.load(Ordering::SeqCst), 1, "owned remote control must really reach fake executor");
+        assert!(gateway.pending_permissions.lock().await.is_empty());
+        let command = format!("{owned}; {}", M267_INLINE_PAYLOADS[0]);
+        let tools = Arc::new(M267RecordingTools::default());
+        let other = gateway.clone(); let backend = tools.clone();
+        let task = tokio::spawn(async move {
+            m267_run_fixture(other, backend, &command, TurnCapability::Deliver).await
+        });
+        tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                if !gateway.pending_permissions.lock().await.is_empty() { break; }
+                assert!(!task.is_finished(), "owned remote must not authorize opaque companion code");
+                assert_eq!(tools.0.load(Ordering::SeqCst), 0);
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }).await.expect("mixed owned remote call must ask");
+        assert_eq!(tools.0.load(Ordering::SeqCst), 0);
+        take_pending_sender(&gateway).await.send(deny()).unwrap();
+        task.await.unwrap();
+        assert_eq!(tools.0.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn m267_inline_registered_workspace_does_not_exempt_unknown_code() {
+        use codefactory_agent_loop::run::TurnCapability;
+        use std::sync::atomic::Ordering;
+        let gateway = durable_test_gateway().await;
+        sqlx::query("UPDATE sessions SET permission_mode='trusted'").execute(&gateway.db).await.unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("workspace");
+        std::fs::create_dir(&root).unwrap();
+        m159_git(&root, &["init", "-q"]);
+        m159_git(&root, &["config", "user.name", "Synthetic"]);
+        m159_git(
+            &root,
+            &["config", "user.email", "synthetic@example.invalid"],
+        );
+        // Synthetic byte assertions must not inherit runner-global CRLF conversion.
+        m159_git(&root, &["config", "core.autocrlf", "false"]);
+        std::fs::write(root.join("tracked.txt"), "base").unwrap();
+        m159_git(&root, &["add", "."]);
+        m159_git(&root, &["commit", "-qm", "synthetic"]);
+        let remote = temp.path().join("remote.git");
+        m159_git(
+            temp.path(),
+            &["init", "--bare", "-q", remote.to_str().unwrap()],
+        );
+        m159_git(
+            &root,
+            &["remote", "add", "origin", remote.to_str().unwrap()],
+        );
+        super::super::execution_workspace::ensure_schema(&gateway.db)
+            .await
+            .unwrap();
+        // Register exact synthetic Git identity without invoking network allocation.
+        let common = m159_git(
+            &root,
+            &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        );
+        let gitdir = m159_git(&root, &["rev-parse", "--absolute-git-dir"]);
+        let branch = m159_git(&root, &["branch", "--show-current"]);
+        let head = m159_git(&root, &["rev-parse", "HEAD"]);
+        // The identity implementation is exercised through the public verifier;
+        // obtain its ordinary digest inputs exactly as workspace allocation does.
+        let repo = super::super::delivery::resolve_repo(&root, None).unwrap();
+        let identity = super::super::delivery::capture_delivery_identity(&repo).unwrap();
+        let (repo_identity, worktree_identity) =
+            (identity.repo_identity, identity.worktree_identity);
+        sqlx::query("INSERT INTO execution_workspaces(id,objective_id,session_id,repo_identity,repo_root,git_common_dir,worktree_path,worktree_identity,branch_name,base_ref,base_sha,head_sha,state,created_at,updated_at) VALUES ('synthetic-workspace','5eea633e-59f9-42bc-91f8-0a19a5c49711','permission-test',?,?,?,?,?,?, 'HEAD',?,?,'active',1,1)")
+            .bind(repo_identity).bind(root.to_string_lossy().as_ref()).bind(common).bind(root.to_string_lossy().as_ref()).bind(worktree_identity).bind(branch).bind(&head).bind(&head).execute(&gateway.db).await.unwrap();
+        assert!(!gitdir.is_empty());
+        assert_eq!(gateway.managed_workspace_root().await.unwrap().canonicalize().unwrap(), root.canonicalize().unwrap());
+        assert!(registered_git_roots(&gateway.db, &gateway.session_id).await.is_some());
+        let head_before = m159_git(&root, &["rev-parse", "HEAD"]);
+        let contents_before = std::fs::read(root.join("tracked.txt")).unwrap();
+        let command = M267_INLINE_PAYLOADS[0];
+        // This logical probe locks the enforced=true branch independently of
+        // the OS available to CI. The full real gateway below separately uses
+        // its actual sandbox availability; this is not an OS enforcement claim.
+        assert!(!super::super::trusted_sandbox::covers_local_command(
+            true, super::super::trusted_git::destructive_intent(command), false,
+            super::super::trusted_git::outside_write_sandbox_scope(command),
+        ));
+        let tools = Arc::new(M267RecordingTools::default());
+        let other = gateway.clone(); let backend = tools.clone();
+        let task = tokio::spawn(async move {
+            m267_run_fixture(other, backend, command, TurnCapability::Implement).await
+        });
+        let intent = wait_for_durable_intent(&gateway).await;
+        assert_eq!(tools.0.load(Ordering::SeqCst), 0);
+        assert!(!task.is_finished());
+        PermissionIntentStore::new(gateway.db.clone()).record_user_response(
+            &intent.prompt_key(), PermissionPromptResponse::Deny, chrono::Utc::now().timestamp_millis(),
+        ).await.unwrap();
+        take_pending_sender(&gateway).await.send(deny()).unwrap();
+        task.await.unwrap();
+        assert_eq!(tools.0.load(Ordering::SeqCst), 0);
+        assert_eq!(m159_git(&root, &["rev-parse", "HEAD"]), head_before);
+        assert_eq!(std::fs::read(root.join("tracked.txt")).unwrap(), contents_before);
+    }
+
+    #[test]
+    fn m267_inline_custom_deny_precedes_shell_ask() {
+        let policy = crate::config::settings::PermissionPolicy {
+            allow: vec!["*".into()], ask: vec!["*".into()], deny: vec!["bash".into()], full_access: true,
+        };
+        for command in ["git reset --hard", M267_INLINE_PAYLOADS[9]] {
+            assert!(matches!(super::super::decide_permission_for_call(
+                &policy, "bash", &serde_json::json!({"command":command}), Some(command), false, None,
+            ), super::super::PermissionDecision::Deny(_)), "explicit deny must not become an approval: {command}");
+        }
+    }
+
+    #[test]
+    fn m267_inline_custom_policy_cannot_override_proof_or_explicit_deny() {
+        for command in M267_INLINE_PAYLOADS {
+            for full_access in [false, true] {
+                for action in ["allow", "ask", "deny"] {
+                    let mut policy = crate::config::settings::PermissionPolicy {
+                        allow: vec![], ask: vec![], deny: vec![], full_access,
+                    };
+                    match action {
+                        "allow" => policy.allow.push("bash".into()),
+                        "ask" => policy.ask.push("bash".into()),
+                        _ => policy.deny.push("bash".into()),
+                    }
+                    let result = super::super::decide_permission_for_call(
+                        &policy, "bash", &serde_json::json!({"command":command}),
+                        Some(command), false, None,
+                    );
+                    if action == "deny" {
+                        assert!(matches!(result, super::super::PermissionDecision::Deny(_)),
+                            "explicit deny wins: full={full_access} {command}: {result:?}");
+                    } else {
+                        assert!(matches!(result, super::super::PermissionDecision::Ask),
+                            "unproved code must ask: {action} full={full_access} {command}: {result:?}");
+                    }
+                }
+            }
+        }
+    }
+
     async fn test_gateway(mode: &str) -> Arc<DesktopPermissionGateway> {
         let db = SqlitePoolOptions::new()
             .max_connections(1)
@@ -1971,15 +2376,37 @@ mod tests {
             "git fetch --prune origin main && git stash push -u -m x && git merge origin/main && git stash pop",
             "git checkout origin/main -- tracked.txt && git diff --stat && git status --short && sed -n '1,10p' tracked.txt",
             "git add -A && git commit -m synthetic",
-            "node -e 'console.log(require(\"./docs/testing/scenario-registry.json\"))' | head -20",
             "git fetch --prune origin main; find src -name '*.rs'; grep -R settings src | head -90; ls src; command -v pnpm; gh auth status",
-            "node -e 'console.log(2 + 3)'",
+            "node -e 'console.log(5)'",
         ] {
             let args = serde_json::json!({"command":command});
             let call = ToolCall { id: "m180-local".into(), r#type: "function".into(), function: FunctionCall { name: "bash".into(), arguments: args.to_string() } };
             let outcome = gateway.authorize(&call, &args, Some(command)).await;
             assert_eq!(outcome, PermissionOutcome::Allow, "M180 trusted command: {command}");
             assert!(gateway.pending_permissions.lock().await.is_empty());
+        }
+        // M267: requiring a local module may execute code, and arbitrary
+        // expressions are outside the deliberately small literal-only proof.
+        // Preserve these exact historical inputs as approval regressions;
+        // console.log(5) above remains the no-prompt positive control.
+        for (index, command) in [
+            "node -e 'console.log(require(\"./docs/testing/scenario-registry.json\"))' | head -20",
+            "node -e 'console.log(2 + 3)'",
+        ].into_iter().enumerate() {
+            let args = serde_json::json!({"command":command});
+            let call = ToolCall {
+                id: format!("m267-m180-inline-{index}"), r#type: "function".into(),
+                function: FunctionCall { name: "bash".into(), arguments: args.to_string() },
+            };
+            let other = gateway.clone();
+            let task = tokio::spawn(async move { other.authorize(&call, &args, Some(command)).await });
+            let intent = wait_for_durable_intent(&gateway).await;
+            assert!(!task.is_finished(), "opaque inline input must wait: {command}");
+            PermissionIntentStore::new(gateway.db.clone()).record_user_response(
+                &intent.prompt_key(), PermissionPromptResponse::Deny, chrono::Utc::now().timestamp_millis(),
+            ).await.unwrap();
+            take_pending_sender(&gateway).await.send(deny()).unwrap();
+            assert_denied_for(task.await.unwrap(), PermissionDenialReason::DeniedByUser);
         }
         // M182 R1/R5: exact redirect/pipeline incidents must traverse the
         // production gateway, create durable backups and leave no prompt.
