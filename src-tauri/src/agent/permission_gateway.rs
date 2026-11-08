@@ -1285,7 +1285,9 @@ mod tests {
     }
 
     fn m159_git(root: &std::path::Path, args: &[&str]) -> String {
+        use crate::util::no_window::NoWindow;
         let output = std::process::Command::new("git")
+            .no_window()
             .current_dir(root)
             .args(args)
             .output()

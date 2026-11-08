@@ -307,7 +307,7 @@ fn python_heredoc_proof_with_sandbox(
         }
         _ => false,
     };
-    let mut cmd = Command::new(if cfg!(windows) { "python" } else { "python3" });
+    let mut cmd = Command::new(if cfg!(windows) { "python" } else { "python3" }).no_window();
     cmd.args(["-I", "-c", include_str!("trusted_python_ast.py")]);
     if let Some(root) = base {
         cmd.arg(root);
@@ -323,7 +323,6 @@ fn python_heredoc_proof_with_sandbox(
         cmd.arg("sandboxed");
     }
     let Ok(mut child) = cmd
-        .no_window()
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
