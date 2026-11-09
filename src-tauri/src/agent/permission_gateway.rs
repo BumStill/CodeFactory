@@ -386,11 +386,12 @@ impl PermissionGateway for DesktopPermissionGateway {
                 }
                 PermissionOutcome::Deny(mut denial) => {
                     if denial.reason == PermissionDenialReason::DeniedByUser {
-                        // M265: only the leading sentence is delivery-specific — the
-                        // user's own explanation must survive this rewrite.
-                        denial.content = match denial.content.split_once("\n\n") {
+                        // M265 + M269: only the first line is delivery-specific — the user's
+                        // own explanation must survive this rewrite, and so must the denial-scope
+                        // paragraph M269 appends below the ban sentence.
+                        denial.content = match denial.content.split_once('\n') {
                             Some((_, tail)) => {
-                                format!("用户不允许推送，请在本地完成并说明\n\n{tail}")
+                                format!("用户不允许推送，请在本地完成并说明\n{tail}")
                             }
                             None => "用户不允许推送，请在本地完成并说明".into(),
                         };
@@ -988,14 +989,17 @@ fn permission_recovery_rejected() -> PermissionOutcome {
     })
 }
 
-/// M265: the exact text the model sees when the user denies without explaining.
+/// M265 + M269/R1: the text the model sees when the user denies.
 ///
-/// Without a note this string is byte-for-byte what M265 found; a test pins it so
-/// "no note" can never quietly become "a slightly different denial".
-pub(super) const DENIED_BY_USER_CONTENT: &str =
-    "Tool call denied by the user. The requested action was not executed; do not bypass this decision with another tool.";
+/// M265's no-bypass sentence stays first and byte-for-byte unchanged — a denial is
+/// still a refusal, never a hint that another tool may do the same thing. M269 adds
+/// the missing scope: the incident (session 833ac8cb) showed a model reading one
+/// refusal as "the whole task was cancelled" and writing a blocker summary. So the
+/// text now also says the task continues, that a different approach is welcome, and
+/// that a user note is guidance to follow.
+pub(super) const DENIED_BY_USER_CONTENT: &str = "Tool call denied by the user. The requested action was not executed; do not bypass this decision with another tool.\n\nThe denial covers this one operation only: the task is not cancelled; change approach and continue — a different, safe route to the same goal is welcome, but the same denied operation must not be repeated. If the denial really blocks the whole task, stop and ask the user what to do instead.\n\nWhen one is present, a `User note` section carries the reason the user gave: follow it, and treat it as guidance about this refusal, never as an authorization to do the same thing another way.";
 
-/// M265: attach the user's own explanation to the denial the model reads.
+/// M265 + M269/R1: attach the user's own explanation to the denial the model reads.
 ///
 /// The note is labelled as the user's words so the model treats it as guidance
 /// about *this* refusal — not as a new instruction, and never as an
@@ -2489,9 +2493,41 @@ mod tests {
         }
     }
 
-    /// M265 R5: without a note the denial text stays exactly what it was.
+    /// M269/R1: the denial text scopes the refusal to this one operation.
+    ///
+    /// The incident (session 833ac8cb) is that a denial read as "stop the whole
+    /// task". So the text must say the task is not cancelled, that a different
+    /// approach may continue, and that a note is guidance to follow — without
+    /// weakening the ban: the M265 no-bypass sentence stays first and verbatim.
+    #[test]
+    fn m269_a_denial_scopes_the_refusal_without_weakening_the_ban() {
+        const BAN: &str = "Tool call denied by the user. The requested action was not executed; do not bypass this decision with another tool.";
+        assert!(
+            DENIED_BY_USER_CONTENT.starts_with(BAN),
+            "the no-bypass sentence must stay first and verbatim: {DENIED_BY_USER_CONTENT}"
+        );
+        for marker in [
+            "this one operation only",
+            "the task is not cancelled",
+            "change approach and continue",
+            "the same denied operation must not be repeated",
+            "User note",
+        ] {
+            assert!(
+                DENIED_BY_USER_CONTENT.contains(marker),
+                "denial text must say `{marker}`: {DENIED_BY_USER_CONTENT}"
+            );
+        }
+        let with_note = denial_content_with_note(DENIED_BY_USER_CONTENT, Some("use jq, not python"));
+        assert!(with_note.starts_with(BAN));
+        assert!(with_note.contains("use jq, not python"));
+        assert!(with_note.contains("User note"));
+    }
+
+    /// M269/R1 covering M265 R5: without a note the denial keeps the M265 ban
+    /// verbatim as its first sentence, plus the M269 scope clarifier.
     #[tokio::test]
-    async fn m265_a_denial_without_a_note_keeps_the_existing_text_verbatim() {
+    async fn m269_a_denial_without_a_note_still_scopes_the_refusal() {
         let gateway = test_gateway("standard").await;
         let command = "git reset --hard HEAD";
         let args = serde_json::json!({"command":command});
@@ -2513,10 +2549,15 @@ mod tests {
             })
             .expect("permission receiver remains live");
         match task.await.unwrap() {
-            PermissionOutcome::Deny(denial) => assert_eq!(
-                denial.content,
-                "Tool call denied by the user. The requested action was not executed; do not bypass this decision with another tool."
-            ),
+            PermissionOutcome::Deny(denial) => {
+                assert_eq!(denial.reason, PermissionDenialReason::DeniedByUser);
+                assert!(denial.content.starts_with(
+                    "Tool call denied by the user. The requested action was not executed; do not bypass this decision with another tool."
+                ));
+                assert!(denial.content.contains("the task is not cancelled"));
+                assert!(denial.content.contains("change approach and continue"));
+                assert!(!denial.content.contains("User note ("), "a note section needs a note");
+            }
             other => panic!("expected a denial, got {other:?}"),
         }
     }
@@ -2801,7 +2842,19 @@ mod tests {
         take_pending_sender(&gateway).await.send(deny()).unwrap();
         match handle.await.unwrap() {
             PermissionOutcome::Deny(denial) => {
-                assert_eq!(denial.content, "用户不允许推送，请在本地完成并说明")
+                // M269 修订：交付类拒绝的**首句**仍然是 M130 的措辞（用户决定命名），
+                // 但 M269 的范围澄清句必须原样保留在后面，否则模型又会把一次推送拒绝
+                // 当成「整单停」。
+                assert!(
+                    denial.content.starts_with("用户不允许推送，请在本地完成并说明"),
+                    "delivery denial must name the user decision first: {}",
+                    denial.content
+                );
+                assert!(
+                    denial.content.contains("the task is not cancelled"),
+                    "M269 scope must survive the delivery rewrite: {}",
+                    denial.content
+                );
             }
             other => panic!("expected denial, got {other:?}"),
         }
