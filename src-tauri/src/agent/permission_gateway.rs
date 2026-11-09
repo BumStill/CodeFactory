@@ -85,10 +85,19 @@ pub(super) async fn registered_git_roots(
     let mut roots = Vec::new();
     for (objective, path) in rows {
         let path = std::path::PathBuf::from(path);
-        super::execution_workspace::verify_objective_workspace(db, &objective, &path)
+        // M271: one registration that no longer verifies — a renamed branch, a
+        // removed worktree, a finished objective — must not revoke the proof for
+        // a sibling worktree that is still intact. In the field session
+        // (38c27637) a stale row turned every provable heredoc/git command into
+        // an approval prompt with no reason naming the skipped proof. Only rows
+        // that verify become roots; a row that fails is not a root, and an
+        // empty set still refuses to prove anything.
+        if super::execution_workspace::verify_objective_workspace(db, &objective, &path)
             .await
-            .ok()?;
-        roots.push(path);
+            .is_ok()
+        {
+            roots.push(path);
+        }
     }
     (!roots.is_empty()).then_some(roots)
 }
@@ -214,8 +223,24 @@ impl PermissionGateway for DesktopPermissionGateway {
             {
                 return permission_recovery_rejected();
             }
-            if let Some(root) = self.managed_workspace_root().await {
-                if let Some(roots) = registered_git_roots(&self.db, &self.session_id).await {
+            // M271: the field incident (session 38c27637, v1.113.0) shows the
+            // proof being *skipped*, not refused: `managed_workspace_root()`
+            // could not resolve while this session's worktree was still
+            // registered, so the command fell through to the generic
+            // "unproved" prompt. The reason then never named the skipped step,
+            // and a data heredoc read as an unexplainable approval request.
+            // Take the root from this session's own registration when the
+            // scope lookup fails, and only when it is unambiguous.
+            let roots = registered_git_roots(&self.db, &self.session_id).await;
+            let root = match self.managed_workspace_root().await {
+                Some(root) => Some(root),
+                None => roots
+                    .as_ref()
+                    .filter(|roots| roots.len() == 1)
+                    .map(|roots| roots[0].clone()),
+            };
+            if let (Some(root), Some(roots)) = (root, roots) {
+                {
                     if roots
                         .iter()
                         .any(|r| r.canonicalize().ok() == root.canonicalize().ok())
@@ -252,8 +277,18 @@ impl PermissionGateway for DesktopPermissionGateway {
                 }
             }
             if !heredoc_proved {
+                // M271: name the skipped step. "Unproved" is the wrong word
+                // when no root was resolved at all — nothing was disproved.
                 return self
-                    .request_permission(tool_call, args.clone(), bash_command)
+                    .request_permission_with_reason(
+                        tool_call,
+                        args.clone(),
+                        bash_command,
+                        Some((
+                            "trusted.heredoc.unproved",
+                            "无法定位本会话已登记且身份一致的工作区根目录，因此这条 heredoc 的数据/解释器边界没有经过证明（不是内容被证伪）。".to_string(),
+                        )),
+                    )
                     .await;
             }
         }
@@ -3595,6 +3630,180 @@ mod tests {
             prompts_after,
             prompts_before + 1,
             "the outside repository must produce exactly one prompt"
+        );
+    }
+
+    /// M271: the field spelling the user reported from a trusted session —
+    /// `git commit -F - <<'EOF' 2>&1 | tail -20` plus the resume instruction.
+    /// M266 proved this as data at the judgement layer; the real gateway must
+    /// also allow it, and the commit must really happen without a prompt.
+    #[tokio::test]
+    async fn m271_message_heredoc_behind_output_pipeline_is_allowed() {
+        let gateway = durable_test_gateway().await;
+        sqlx::query("UPDATE sessions SET permission_mode='trusted'")
+            .execute(&gateway.db)
+            .await
+            .unwrap();
+        sqlx::query(
+            "ALTER TABLE sessions ADD COLUMN delivery_authorized INTEGER NOT NULL DEFAULT 0",
+        )
+        .execute(&gateway.db)
+        .await
+        .unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("workspace");
+        std::fs::create_dir(&root).unwrap();
+        m159_git(&root, &["init", "-q"]);
+        m159_git(&root, &["config", "user.name", "Synthetic"]);
+        m159_git(
+            &root,
+            &["config", "user.email", "synthetic@example.invalid"],
+        );
+        m159_git(&root, &["config", "core.autocrlf", "false"]);
+        std::fs::write(root.join("tracked.txt"), "base").unwrap();
+        m159_git(&root, &["add", "."]);
+        m159_git(&root, &["commit", "-qm", "synthetic"]);
+        super::super::execution_workspace::ensure_schema(&gateway.db)
+            .await
+            .unwrap();
+        let common = m159_git(
+            &root,
+            &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        );
+        let branch = m159_git(&root, &["branch", "--show-current"]);
+        let head = m159_git(&root, &["rev-parse", "HEAD"]);
+        let repo = super::super::delivery::resolve_repo(&root, None).unwrap();
+        let identity = super::super::delivery::capture_delivery_identity(&repo).unwrap();
+        let (repo_identity, worktree_identity) =
+            (identity.repo_identity, identity.worktree_identity);
+        sqlx::query("INSERT INTO execution_workspaces(id,objective_id,session_id,repo_identity,repo_root,git_common_dir,worktree_path,worktree_identity,branch_name,base_ref,base_sha,head_sha,state,created_at,updated_at) VALUES ('synthetic-workspace','5eea633e-59f9-42bc-91f8-0a19a5c49711','permission-test',?,?,?,?,?,?, 'HEAD',?,?,'active',1,1)")
+            .bind(repo_identity).bind(root.to_string_lossy().as_ref()).bind(common).bind(root.to_string_lossy().as_ref()).bind(worktree_identity).bind(branch).bind(&head).bind(&head).execute(&gateway.db).await.unwrap();
+        let authorize = |command: &str| {
+            let gateway = gateway.clone();
+            let command = command.to_string();
+            async move {
+                let args = serde_json::json!({ "command": command });
+                let call = ToolCall {
+                    id: format!("m271-{command}"),
+                    r#type: "function".into(),
+                    function: FunctionCall {
+                        name: "bash".into(),
+                        arguments: args.to_string(),
+                    },
+                };
+                gateway.authorize(&call, &args, Some(&command)).await
+            }
+        };
+        // R1: the exact field spellings, and the wider pipeline form.
+        let commands = [
+            "git add -A && git commit -q -F - <<'EOF' 2>&1 | tail -20\nM271: field spelling\nEOF",
+            "git add -A && git commit -q -F - <<'EOF' | tail -20\nM271: pipe without redirect\nEOF",
+        ];
+        for command in commands {
+            std::fs::write(root.join("tracked.txt"), format!("{command}")).unwrap();
+            let head_before = m159_git(&root, &["rev-parse", "HEAD"]);
+            let outcome = authorize(command).await;
+            if outcome != PermissionOutcome::Allow {
+                let prompt: Option<String> = sqlx::query_scalar(
+                    "SELECT prompt_args_json FROM permission_intents ORDER BY created_at DESC, rowid DESC LIMIT 1",
+                )
+                .fetch_optional(&gateway.db)
+                .await
+                .unwrap();
+                panic!(
+                    "M271/R1: a message heredoc behind a read-only output pipeline must not ask: {command}\nlast prompt: {prompt:?}"
+                );
+            }
+            // R2: the same command really commits when it runs.
+            let output = std::process::Command::new("sh")
+                .no_window()
+                .current_dir(&root)
+                .args(["-c", command])
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{command}\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_ne!(
+                m159_git(&root, &["rev-parse", "HEAD"]),
+                head_before,
+                "M271/R2: the approved commit must change HEAD: {command}"
+            );
+        }
+        // R1: the failing precondition from the field session. A sibling
+        // registration for this session is stale (its branch was renamed away)
+        // and it is the most recently touched row, so the scope lookup picks it
+        // and the registered-root loop hits a row that no longer verifies.
+        // Today both lookups collapse and the proof is skipped silently.
+        sqlx::raw_sql(
+            "CREATE TEMP TABLE m271_objective AS SELECT * FROM objectives WHERE id='5eea633e-59f9-42bc-91f8-0a19a5c49711';\
+             UPDATE m271_objective SET id='objective-stale';\
+             INSERT INTO objectives SELECT * FROM m271_objective;",
+        )
+        .execute(&gateway.db)
+        .await
+        .unwrap();
+        let stale_common = m159_git(
+            &root,
+            &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        );
+        let stale_identity = super::super::delivery::capture_delivery_identity(&repo).unwrap();
+        let stale_path = root.join("gone-worktree").to_string_lossy().to_string();
+        sqlx::query("INSERT INTO execution_workspaces(id,objective_id,session_id,repo_identity,repo_root,git_common_dir,worktree_path,worktree_identity,branch_name,base_ref,base_sha,head_sha,state,created_at,updated_at) VALUES ('synthetic-stale','objective-stale','permission-test',?,?,?,?,?,?,'HEAD',?,?,'active',1,9)")
+            .bind(stale_identity.repo_identity).bind(root.to_string_lossy().as_ref()).bind(stale_common).bind(stale_path).bind("stale-worktree-identity").bind("branch-that-was-renamed-away").bind(&head).bind(&head).execute(&gateway.db).await.unwrap();
+        let moved = "cd \"$(pwd)\" && git add -A && git commit -q -F - <<'EOF' 2>&1 | tail -20\nM271: scope moved\nEOF";
+        std::fs::write(root.join("tracked.txt"), "after scope move").unwrap();
+        let head_before = m159_git(&root, &["rev-parse", "HEAD"]);
+        let outcome = authorize(moved).await;
+        if outcome != PermissionOutcome::Allow {
+            let prompt: Option<String> = sqlx::query_scalar(
+                "SELECT prompt_args_json FROM permission_intents ORDER BY created_at DESC, rowid DESC LIMIT 1",
+            )
+            .fetch_optional(&gateway.db)
+            .await
+            .unwrap();
+            panic!(
+                "M271/R1: a registered worktree must still prove its message heredoc after the active scope moves: {moved}\noutcome: {outcome:?}\nlast prompt: {prompt:?}"
+            );
+        }
+        let output = std::process::Command::new("sh")
+            .no_window()
+            .current_dir(&root)
+            .args(["-c", moved])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{moved}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_ne!(
+            m159_git(&root, &["rev-parse", "HEAD"]),
+            head_before,
+            "M271/R2: the approved commit must change HEAD even after the scope moved"
+        );
+        let intents: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM permission_intents")
+            .fetch_one(&gateway.db)
+            .await
+            .unwrap();
+        assert_eq!(
+            intents, 0,
+            "M271: a message heredoc with a read-only output pipe must not prompt"
+        );
+        // R3: no verified root left at all -> the gate must still ask. A stale
+        // sibling is skipped, but an empty set proves nothing and never widens.
+        sqlx::query("UPDATE execution_workspaces SET branch_name='renamed-away-again' WHERE id='synthetic-workspace'")
+            .execute(&gateway.db)
+            .await
+            .unwrap();
+        std::fs::write(root.join("tracked.txt"), "no verified root").unwrap();
+        let denied = authorize("git add -A && git commit -q -F - <<'EOF' 2>&1 | tail -20\nM271: no root\nEOF").await;
+        assert_ne!(
+            denied,
+            PermissionOutcome::Allow,
+            "M271/R3: without a verified registered worktree a message heredoc must still ask"
         );
     }
 
