@@ -36,7 +36,7 @@
 | R2 | 拒绝带 note 时，模型拿到的被拒工具结果包含这段说明，并标明是用户给的说明 | `src-tauri/src/agent/permission_gateway.rs` 单元测试：拒绝内容含 note 原文与说明标记 |
 | R3 | 界面审批卡片拒绝时可填说明，走同一路径；通过 Viewport Harness | `src/components/PermissionDialog.test.tsx`；`src/stores/chat.permission.test.ts`；真浏览器 headless 验收（亮/暗、桌面/手机宽度） |
 | R4 | note 只作为说明给模型看，不改变任何权限判定，也不带来新授权 | permission_gateway 单元测试：带 note 的拒绝仍是 `DeniedByUser`，允许仍是允许；note 不写入 intent 判定列 |
-| R5 | 不写 note 时行为不变 | permission_gateway 单元测试：无 note 的拒绝文本与当前常量逐字相同；dispatch 无 note 的解析结果与现在一致 |
+| R5 | 不写 note 时行为不变 | permission_gateway 单元测试：无 note 的拒绝文本与当前常量逐字相同；dispatch 无 note 的解析结果与现在一致。**M269 修订**：只放宽到「禁令首句逐字不变」，其后允许追加拒绝范围澄清（见 `m269-deny-means-change-course.md`）|
 
 ## Applicable Harnesses
 
@@ -84,3 +84,12 @@
   liveness 上限，同一提交随后连跑 15 次均 0.01s 通过，判定为繁忙机器上的等待饥饿而不是
   弹窗缺失。已把该等待上限改为 60s（仍是失败即红的断言，只是不再把加载抖动当缺陷），
   改后 `cargo test --lib agent::permission_gateway`：31 passed / 0 failed。
+
+## M269 修订记录（拒绝范围）
+
+M269 起因：用户在被拒后看到助手把整件事当成「已取消」并汇报能力不可行。
+本规格的 R5 因此从「整段文本逐字不变」收窄为「禁令首句逐字不变」：
+`DENIED_BY_USER_CONTENT` 保留原首句，其后追加「只针对这一次操作 / 任务没有被取消 /
+换一条路继续 / 同一操作不得重复 / 有说明时按说明执行」的澄清段。
+不带 note 时仍然没有 note 段（`denial_content_with_note` 不追加）。
+详细需求与验收见 `docs/specs/feature-specs/m269-deny-means-change-course.md`。

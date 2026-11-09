@@ -938,6 +938,42 @@ async fn assistant_declared_unfinished(db: &SqlitePool, session: &str) -> sqlx::
     Ok(row.filter(|(_, content)| declares_unfinished(content)))
 }
 
+/// M269/R3: wording that marks a turn as a blocker summary rather than a finish.
+///
+/// Only explicit stop/blocked phrases count; an ordinary "done" summary carries
+/// none of them, so finished work is never resurrected by the guard below.
+const BLOCKED_SUMMARY_MARKERS: &[&str] = &[
+    "任务已停止",
+    "已停止本次",
+    "整单停",
+    "无法继续",
+    "不能继续",
+    "无法推进",
+    "被阻塞",
+    "审批被拒绝",
+    "blocked",
+];
+
+fn is_blocked_summary(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    BLOCKED_SUMMARY_MARKERS
+        .iter()
+        .any(|marker| lower.contains(&marker.to_lowercase()))
+}
+
+/// M269/R3: the newest assistant message, read only by the terminal guard.
+async fn latest_assistant_text(db: &SqlitePool, session: &str) -> sqlx::Result<Option<String>> {
+    if !has_table(db, "messages").await? {
+        return Ok(None);
+    }
+    sqlx::query_scalar(
+        "SELECT content FROM messages WHERE session_id=? AND role='assistant' ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(session)
+    .fetch_optional(db)
+    .await
+}
+
 /// M211/R2：为「声明未完成」的助手回合落一条真实 pending 续接唤醒。
 /// 同一轮只挂一条（id 带消息时间戳），已存在的行不重排；连续续接按 60s 起的
 /// 指数退避，既不做 60 秒无限重排，也不把系统恢复改问成用户决定。
@@ -1920,6 +1956,29 @@ async fn derive_candidate(db: &SqlitePool, session: &str) -> sqlx::Result<ThinSt
             return Ok(executor_missing_state());
         }
     } else if let Some((_, reason)) = &terminal {
+        // M269/R3：被拒/受阻后模型写的「阻断总结」不是终态事实。会话 833ac8cb 里一次
+        // 审批拒绝让模型写下「任务已停止」，派生随即把会话结成 ended，尽管改动已回滚、
+        // 只差读测试结果与提交。未交付（无真实完成事实）、没有停止意图、最新回合是
+        // 阻断措辞时，挂一条真实续接唤醒，让系统自己把剩余工作接回来。
+        if reason == "最终回答已完成"
+            && stopped_at == 0
+            && completed.as_deref().is_none_or(is_external_failure)
+            && latest_assistant_text(db, session)
+                .await?
+                .is_some_and(|text| is_blocked_summary(&text))
+        {
+            let at = terminal.as_ref().map_or(0, |end| end.0);
+            if let Some(state) = continue_state(
+                db,
+                session,
+                at,
+                "上一回合以阻断总结结束，任务尚未交付：接续剩余工作",
+            )
+            .await?
+            {
+                return Ok(state);
+            }
+        }
         if completed.as_deref().is_some_and(|value| !is_external_failure(value))
             && unfinished_delivery(db, session).await?.is_none() {
             return Ok(ThinState::ended(reason, "本会话记录"));
@@ -2088,6 +2147,48 @@ mod tests {
         assert!(closeout_report(&db, "derive").await.unwrap().is_some());
         sqlx::query("INSERT INTO objectives(id,kind,session_id,root_turn_id,status,decision_type,domain,requested_acceptance,created_at,updated_at) VALUES ('new-work','local_mutation','derive','new-root','active','continue','chat','validated_change',300000,300000)").execute(&db).await.unwrap();
         assert!(merged_closeout_fact(&db, "derive").await.unwrap().is_none(), "old merge cannot end a newer objective");
+    }
+
+    /// M269/R3: an undelivered task whose turn ends with a blocked summary must
+    /// not be settled to `ended`. Session 833ac8cb: a denied command made the
+    /// model write a blocker summary; the derive path saw "final answer" and
+    /// closed the session even though nothing had been delivered.
+    #[tokio::test]
+    async fn m269_a_blocked_summary_on_undelivered_work_keeps_the_session_alive() {
+        let db = fixture().await;
+        sqlx::query("INSERT INTO messages(id,session_id,role,content,created_at) VALUES ('m269-task','derive','user','修复 M269',100),('m269-blocked','derive','assistant','任务已停止：审批被拒绝，改动已回滚，需要你先看后台测试结果。',200)")
+            .execute(&db).await.unwrap();
+        let state = refresh(&db, "derive").await.unwrap();
+        assert_ne!(state.state, SessionState::Ended, "blocked summary must not end undelivered work");
+        assert_eq!(state.state, SessionState::WaitingWake);
+        assert!(
+            state.wake_source.unwrap_or_default().contains("thin-continue-"),
+            "a real continuation wake is required"
+        );
+    }
+
+    /// M269/R2: a user stop is still the only way to end the whole task. A
+    /// blocked summary next to a real stop intent must keep ending the session.
+    #[tokio::test]
+    async fn m269_a_real_stop_still_ends_despite_a_blocked_summary() {
+        let db = fixture().await;
+        sqlx::query("INSERT INTO messages(id,session_id,role,content,created_at) VALUES ('m269-task','derive','user','修复 M269',100),('m269-blocked','derive','assistant','任务已停止：审批被拒绝，需要你先看结果。',200)")
+            .execute(&db).await.unwrap();
+        sqlx::query("INSERT INTO chat_session_cancel_intents(session_id,status,requested_at,updated_at) VALUES ('derive','requested',150,150)")
+            .execute(&db).await.unwrap();
+        let state = refresh(&db, "derive").await.unwrap();
+        assert_eq!(state.state, SessionState::Ended);
+        assert!(state.reason.unwrap_or_default().contains("用户已停止会话"));
+    }
+
+    /// M269/R3: an ordinary completion summary is not a blocked summary and must
+    /// keep settling the session, so the guard does not resurrect finished work.
+    #[tokio::test]
+    async fn m269_an_ordinary_completion_summary_still_ends() {
+        let db = fixture().await;
+        sqlx::query("INSERT INTO messages(id,session_id,role,content,created_at) VALUES ('m269-task','derive','user','回答一个问题',100),('m269-done','derive','assistant','已完成：测试全部通过，无遗留项。',200)")
+            .execute(&db).await.unwrap();
+        assert_eq!(refresh(&db, "derive").await.unwrap().state, SessionState::Ended);
     }
 
     #[test]
