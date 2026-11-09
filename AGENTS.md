@@ -62,6 +62,11 @@
   - 查看占用：`pnpm build-cache`；立刻按上限清理：`pnpm build-cache:enforce`；改上限：`CODEFACTORY_BUILD_CACHE_BUDGET_GB=<GB> pnpm cargo:shared ...`。
   - `pnpm cargo:shared` 每次构建前自动执行一次预算检查，并设置 `CARGO_INCREMENTAL=0`：增量产物按 worktree 路径分桶，在共享缓存里只写不复用（曾是 410 GB 里最大的一块），共享缓存因此只保留可跨任务复用的第三方依赖与最终产物。
   - 每次淘汰/回收都追加到 `.codefactory-cache/build-cache-audit.jsonl`（时间、路径、大小、原因、触发者），可追溯。
+  - 沙箱内（信任模式）共享缓存不可写：共享缓存解析到主 checkout，沙箱只允许写当前 workspace，所以
+    `pnpm cargo:shared` 会改用 workspace 内的 `.codefactory-cache/cargo-target-<task>` 并在 stderr 写明原因；
+    两个目录都不可写时直接以非零退出码报错（"Nothing was compiled"），不会静默当作成功。
+    `CODEFACTORY_BUILD_CACHE_ROOT` 只是给沙箱追加一个可写根的变量，**不是**共享缓存开关，也不改变
+    `cargo:shared` 解析共享缓存的路径（M270）。
   - 规则不得被绕过：不要手动 `rm -rf` 或另起共享目录；新增共享缓存目录时必须接入 `looksLikeManagedCache` 的命名约定与同一预算入口。
 
 ## 验证与测试
