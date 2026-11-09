@@ -1645,6 +1645,10 @@ pub fn run() {
             let setup_started = std::time::Instant::now();
             let data_dir = app.path().app_data_dir().expect("app data dir unavailable");
             std::fs::create_dir_all(&data_dir)?;
+            // M267/R3：额度判定逐行落到应用数据目录，事后能直接查“当时按什么
+            // 数据判成了什么”，不必再靠复现那一小时的调用。
+            crate::agent::quota_cap::shared_quota_ledger()
+                .install_audit_log(data_dir.join("quota-decisions.jsonl"));
             startup_recovery::record(&data_dir, "setup", "started", std::time::Duration::ZERO);
             crate::window_state::restore_and_track_main_window(app)?;
 

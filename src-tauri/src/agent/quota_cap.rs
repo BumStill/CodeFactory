@@ -121,6 +121,84 @@ impl WindowUsage {
     }
 }
 
+/// M267/R2：服务读数超过这个年龄就不再是"当前用量"的直接证据。
+/// 与后台实时刷新（300s）同量级：刷新失败一个周期后，读数必须靠本地增量补足。
+pub const SERVER_READING_MAX_AGE_MS: i64 = 300_000;
+
+/// 判定日志的滚动上限：超过就把当前文件留作 `.1` 并重新开始（M267/R3）。
+const DECISION_LOG_MAX_BYTES: u64 = 4 * 1024 * 1024;
+
+/// How many recent quota decisions stay queryable in memory (M267/R3).
+const DECISION_LOG_CAPACITY: usize = 200;
+
+/// 一次额度判定的完整记录（M267/R3）：时间、数据来源、读数时间、
+/// 用量、上限、结论。默认写入进程内环形缓冲；安装审计文件后同时逐行落盘。
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+pub struct QuotaDecision {
+    pub at_ms: i64,
+    pub endpoint: String,
+    /// Binding (or highest) window, when a window was known.
+    pub window: Option<String>,
+    pub source: Option<String>,
+    pub observed_at_ms: Option<i64>,
+    pub reading_age_ms: Option<i64>,
+    pub used_percent: Option<u8>,
+    pub cap_percent: Option<u8>,
+    /// "allow" | "block" | "no_reading"
+    pub conclusion: String,
+    /// The reading is older than [`SERVER_READING_MAX_AGE_MS`].
+    pub stale: bool,
+}
+
+impl QuotaDecision {
+    fn from_evaluation(
+        endpoint: &str,
+        snapshot: Option<&EndpointQuota>,
+        breach: Option<&CapBreach>,
+        now_ms: i64,
+    ) -> Self {
+        let window = breach.map(|breach| breach.window).or_else(|| {
+            let quota = snapshot?;
+            Some(if quota.weekly.used_percent(now_ms) >= quota.five_hour.used_percent(now_ms) {
+                QuotaWindowKind::Weekly
+            } else {
+                QuotaWindowKind::FiveHour
+            })
+        });
+        let used_percent = breach.map(|breach| breach.used_percent).or_else(|| {
+            let quota = snapshot?;
+            Some(quota.window(window?).used_percent(now_ms))
+        });
+        let cap_percent = breach.map(|breach| breach.cap_percent);
+        let reading_age_ms = snapshot.map(|quota| now_ms - quota.observed_at_ms);
+        let stale = snapshot
+            .map(|quota| {
+                quota.source != UsageSource::Estimated
+                    && now_ms - quota.observed_at_ms > SERVER_READING_MAX_AGE_MS
+            })
+            .unwrap_or(false);
+        let conclusion = if snapshot.is_none() {
+            "no_reading"
+        } else if breach.is_some() {
+            "block"
+        } else {
+            "allow"
+        };
+        Self {
+            at_ms: now_ms,
+            endpoint: endpoint.to_string(),
+            window: window.map(|kind| format!("{kind:?}")),
+            source: snapshot.map(|quota| quota.source.label().to_string()),
+            observed_at_ms: snapshot.map(|quota| quota.observed_at_ms),
+            reading_age_ms,
+            used_percent,
+            cap_percent,
+            conclusion: conclusion.to_string(),
+            stale,
+        }
+    }
+}
+
 /// A subscription endpoint's usage across both metering windows.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct EndpointQuota {
@@ -209,6 +287,11 @@ impl CapBreach {
         self.used_percent >= self.cap_percent
     }
 
+    /// "周窗口" / "五小时窗口" — the window name the user sees in notices.
+    pub fn window_label(&self) -> &'static str {
+        short_window_label(self.window)
+    }
+
     /// "约 18:20 恢复" — plain-language reset hint, or `None` when the service
     /// did not tell us when the window turns over.
     pub fn reset_hint(&self, now_ms: i64) -> Option<String> {
@@ -231,11 +314,13 @@ impl CapBreach {
         } else {
             ""
         };
+        // M267/R5：段话必须同时说清窗口、用量、上限和重置时间。
         format!(
-            "GPT 本{}已用 {}%{}，为给你留余量已切到 {}{}。",
+            "GPT 本{}已用 {}%{}（上限 {}%），为给你留余量已切到 {}{}。",
             short_window_label(self.window),
             self.used_percent,
             estimate,
+            self.cap_percent,
             to_endpoint_label,
             reset,
         )
@@ -477,6 +562,9 @@ struct EndpointLedger {
     server: Option<EndpointQuota>,
     five_hour: LocalWindow,
     weekly: LocalWindow,
+    /// M267/R2：最近一次服务读数之后本地观测到的加权用量（按窗口）。
+    /// 读数只描述它被观测到的那一刻；之后的调用必须继续计入同一窗口。
+    since_reading: [f64; 2],
 }
 
 /// Process-wide ledger of subscription usage, keyed by endpoint name.
@@ -486,6 +574,8 @@ struct EndpointLedger {
 /// subscription endpoint back without any background timer.
 pub struct QuotaLedger {
     inner: Mutex<HashMap<String, EndpointLedger>>,
+    decisions: Mutex<std::collections::VecDeque<QuotaDecision>>,
+    audit_path: Mutex<Option<std::path::PathBuf>>,
 }
 
 impl Default for QuotaLedger {
@@ -498,6 +588,52 @@ impl QuotaLedger {
     pub fn new() -> Self {
         Self {
             inner: Mutex::new(HashMap::new()),
+            decisions: Mutex::new(std::collections::VecDeque::new()),
+            audit_path: Mutex::new(None),
+        }
+    }
+
+    /// M267/R3：把每次判定的记录追加到一个 JSONL 文件，便于事后直接查。
+    pub fn install_audit_log(&self, path: impl Into<std::path::PathBuf>) {
+        if let Ok(mut guard) = self.audit_path.lock() {
+            *guard = Some(path.into());
+        }
+    }
+
+    /// The most recent quota decisions, oldest first (M267/R3).
+    pub fn recent_decisions(&self) -> Vec<QuotaDecision> {
+        self.decisions
+            .lock()
+            .map(|guard| guard.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    fn record_decision(&self, decision: QuotaDecision) {
+        if let Ok(mut log) = self.decisions.lock() {
+            log.push_back(decision.clone());
+            while log.len() > DECISION_LOG_CAPACITY {
+                log.pop_front();
+            }
+        }
+        let path = self.audit_path.lock().ok().and_then(|guard| guard.clone());
+        if let Some(path) = path {
+            if let Ok(line) = serde_json::to_string(&decision) {
+                use std::io::Write;
+                // 每个候选每次放行都会记一行，文件必须有界：超过上限就保留一代。
+                if std::fs::metadata(&path)
+                    .map(|meta| meta.len() > DECISION_LOG_MAX_BYTES)
+                    .unwrap_or(false)
+                {
+                    let _ = std::fs::rename(&path, path.with_extension("jsonl.1"));
+                }
+                if let Ok(mut file) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&path)
+                {
+                    let _ = writeln!(file, "{line}");
+                }
+            }
         }
     }
 
@@ -514,6 +650,7 @@ impl QuotaLedger {
                 server: None,
                 five_hour: LocalWindow::fresh(now_ms, QuotaWindowKind::FiveHour),
                 weekly: LocalWindow::fresh(now_ms, QuotaWindowKind::Weekly),
+                since_reading: [0.0, 0.0],
             });
         f(entry)
     }
@@ -521,7 +658,21 @@ impl QuotaLedger {
     /// Record a snapshot read from the service's own usage headers.
     pub fn record_server_usage(&self, endpoint: &str, quota: EndpointQuota) {
         let now_ms = quota.observed_at_ms;
-        self.with_entry(endpoint, now_ms, |entry| entry.server = Some(quota));
+        self.with_entry(endpoint, now_ms, |entry| {
+            // M267/R2：这条读数已经包含此前的全部调用，"读数之后"的增量清零；
+            // 之后的调用再从零开始累加，而不是被读数永久覆盖。
+            entry.since_reading = [0.0, 0.0];
+            // 本地窗口跟随服务窗口的重置点，估算与真实窗口才对得上（R5）。
+            for kind in [QuotaWindowKind::FiveHour, QuotaWindowKind::Weekly] {
+                if let Some(reset) = quota.window(kind).resets_at_ms.filter(|reset| *reset > now_ms) {
+                    match kind {
+                        QuotaWindowKind::FiveHour => entry.five_hour.resets_at_ms = reset,
+                        QuotaWindowKind::Weekly => entry.weekly.resets_at_ms = reset,
+                    }
+                }
+            }
+            entry.server = Some(quota);
+        });
     }
 
     /// Add locally-observed token usage to the running estimate.
@@ -532,6 +683,8 @@ impl QuotaLedger {
                 .five_hour
                 .observe(QuotaWindowKind::FiveHour, units, now_ms);
             entry.weekly.observe(QuotaWindowKind::Weekly, units, now_ms);
+            entry.since_reading[0] += units.max(0.0);
+            entry.since_reading[1] += units.max(0.0);
         });
     }
 
@@ -546,20 +699,23 @@ impl QuotaLedger {
     ) -> Option<EndpointQuota> {
         self.with_entry(endpoint, now_ms, |entry| {
             let had_reading = entry.server.is_some();
-            if let Some(server) = entry.server {
-                let still_valid = server
-                    .five_hour
-                    .resets_at_ms
-                    .map(|reset| reset > now_ms)
-                    .unwrap_or(false)
-                    || server
-                        .weekly
-                        .resets_at_ms
-                        .map(|reset| reset > now_ms)
-                        .unwrap_or(false);
+            if let Some(mut server) = entry.server {
+                // M267/R2：读数是一个时间点，不是一张长期通行证。服务端没刷新时，
+                // 期间真实发生的调用按本地加权用量累加到同一窗口；否则一条 48% 的
+                // 旧读数会让连续调用一路放行到 89% 才被下一次成功刷新拦下。
+                // 只对真实读数做叠加：估算本身已经包含这些调用。
+                if server.source != UsageSource::Estimated {
+                    let five_hour_delta = entry.since_reading[0]
+                        / budget.units_for(QuotaWindowKind::FiveHour);
+                    let weekly_delta =
+                        entry.since_reading[1] / budget.units_for(QuotaWindowKind::Weekly);
+                    server.five_hour.used_ratio =
+                        (server.five_hour.used_ratio + five_hour_delta).clamp(0.0, 1.0);
+                    server.weekly.used_ratio =
+                        (server.weekly.used_ratio + weekly_delta).clamp(0.0, 1.0);
+                }
                 // Keep stale server evidence for conservative routing; display labels
                 // distinguish expired windows until a successful refresh arrives.
-                let _ = still_valid;
                 return Some(server);
             }
             // No reading and no locally-observed usage: we know nothing, which
@@ -592,8 +748,25 @@ impl QuotaLedger {
         budget: SubscriptionBudget,
         now_ms: i64,
     ) -> Option<CapBreach> {
-        let snapshot = self.snapshot(endpoint, budget, now_ms)?;
-        evaluate_cap(&snapshot, cap, now_ms)
+        let tracked = self
+            .inner
+            .lock()
+            .map(|guard| guard.contains_key(endpoint))
+            .unwrap_or(false);
+        let snapshot = self.snapshot(endpoint, budget, now_ms);
+        let breach = snapshot
+            .as_ref()
+            .and_then(|quota| evaluate_cap(quota, cap, now_ms));
+        // M267/R3：每个判定都留下"当时按什么数据得出的什么结论"。
+        if snapshot.is_some() || tracked {
+            self.record_decision(QuotaDecision::from_evaluation(
+                endpoint,
+                snapshot.as_ref(),
+                breach.as_ref(),
+                now_ms,
+            ));
+        }
+        breach
     }
 
     /// Forget everything we know about `endpoint` (test seam).
@@ -947,6 +1120,149 @@ mod tests {
         assert!(estimate_breach
             .handover_notice("DeepSeek", NOW)
             .contains("（本地估算）"));
+    }
+
+    // M267/R2 复现：07:28 的服务读数是周窗口 48%。此后一小时内 131 次调用
+    // 都在推进同一个窗口，后台实时刷新却一直失败，于是没有任何新读数到达。
+    // 旧实现把这条读到的数字当成永久状态，实际用量涨到 89% 时仍然放行。
+    #[test]
+    fn m267_calls_after_the_last_reading_still_cross_the_cap() {
+        let ledger = QuotaLedger::new();
+        let mut reading = server_quota(0.10, 0.48);
+        reading.observed_at_ms = NOW;
+        ledger.record_server_usage("chatgpt", reading);
+
+        let cap = QuotaCap::new(80, 50);
+        let budget = SubscriptionBudget::default();
+        assert!(
+            ledger.evaluate("chatgpt", cap, budget, NOW).is_none(),
+            "48% is below the 50% weekly cap"
+        );
+
+        // Each call: 5M weighted input units = 2% of the 250M weekly budget.
+        let call = TokenUsage {
+            input_tokens: 5_000_000,
+            ..Default::default()
+        };
+        for minute in 1..=20 {
+            let now = NOW + minute * 60_000;
+            ledger.record_local_usage("chatgpt", call, now);
+            let breach = ledger.evaluate("chatgpt", cap, budget, now);
+            if minute >= 1 {
+                let breach = breach.unwrap_or_else(|| {
+                    panic!(
+                        "call #{minute} pushed weekly usage past the cap but the ledger still allowed it"
+                    )
+                });
+                assert_eq!(breach.window, QuotaWindowKind::Weekly);
+                assert!(breach.used_percent >= 50, "{breach:?}");
+                assert_eq!(breach.cap_percent, 50);
+            }
+        }
+        let final_breach = ledger.evaluate("chatgpt", cap, budget, NOW + 20 * 60_000).unwrap();
+        assert_eq!(final_breach.used_percent, 88, "48% + 20 calls × 2%");
+    }
+
+    // M267/R3：每次判定都能查到时点、来源、读数时间、用量、上限和结论。
+    #[test]
+    fn m267_every_decision_is_recorded_with_its_evidence() {
+        let ledger = QuotaLedger::new();
+        let path = std::env::temp_dir().join(format!(
+            "codefactory-quota-decisions-{}-{}.jsonl",
+            std::process::id(),
+            NOW
+        ));
+        let _ = std::fs::remove_file(&path);
+        ledger.install_audit_log(&path);
+
+        let mut reading = server_quota(0.10, 0.48);
+        reading.observed_at_ms = NOW;
+        ledger.record_server_usage("chatgpt", reading);
+
+        assert!(ledger.evaluate("chatgpt", QuotaCap::new(80, 50), SubscriptionBudget::default(), NOW).is_none());
+        ledger.record_local_usage(
+            "chatgpt",
+            TokenUsage {
+                input_tokens: 10_000_000,
+                ..Default::default()
+            },
+            NOW + 60_000,
+        );
+        let breach = ledger
+            .evaluate(
+                "chatgpt",
+                QuotaCap::new(80, 50),
+                SubscriptionBudget::default(),
+                NOW + 60_000,
+            )
+            .expect("52% is past the 50% cap");
+        assert_eq!(breach.used_percent, 52);
+
+        let decisions = ledger.recent_decisions();
+        let last = decisions.last().expect("a decision was recorded");
+        assert_eq!(last.conclusion, "block");
+        assert_eq!(last.endpoint, "chatgpt");
+        assert_eq!(last.window.as_deref(), Some("Weekly"));
+        assert_eq!(last.used_percent, Some(52));
+        assert_eq!(last.cap_percent, Some(50));
+        assert_eq!(last.observed_at_ms, Some(NOW));
+        assert_eq!(last.reading_age_ms, Some(60_000));
+        assert!(last.source.is_some());
+        assert!(!last.stale, "a one-minute-old reading is still current");
+
+        let audit = std::fs::read_to_string(&path).expect("audit log was written");
+        let last_line = audit.lines().last().expect("at least one line");
+        assert!(last_line.contains("\"conclusion\":\"block\""), "{last_line}");
+        assert!(last_line.contains("\"used_percent\":52"), "{last_line}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // M267/R2：读数超过时限就不再是“当前用量”。连续调用继续累加，
+    // 判定记录里也标出这条读数的年龄，方便事后解释为什么拦住。
+    #[test]
+    fn m267_a_stale_reading_still_binds_through_local_accrual() {
+        let ledger = QuotaLedger::new();
+        let mut reading = server_quota(0.05, 0.45);
+        reading.observed_at_ms = NOW;
+        ledger.record_server_usage("chatgpt", reading);
+
+        let stale_now = NOW + SERVER_READING_MAX_AGE_MS + 30 * 60_000;
+        // 30 分钟连续调用：15 × 2% = 30% → 45% + 30% = 75% > 50%.
+        for minute in 1..=15 {
+            ledger.record_local_usage(
+                "chatgpt",
+                TokenUsage {
+                    input_tokens: 5_000_000,
+                    ..Default::default()
+                },
+                NOW + minute * 60_000,
+            );
+        }
+        let breach = ledger
+            .evaluate(
+                "chatgpt",
+                QuotaCap::new(80, 50),
+                SubscriptionBudget::default(),
+                stale_now,
+            )
+            .expect("local accrual past the cap must block even with a stale reading");
+        assert_eq!(breach.window, QuotaWindowKind::Weekly);
+        assert_eq!(breach.used_percent, 75);
+
+        let last = ledger.recent_decisions().last().cloned().expect("recorded");
+        assert!(last.stale, "the reading is older than the freshness horizon");
+        assert_eq!(last.reading_age_ms, Some(SERVER_READING_MAX_AGE_MS + 30 * 60_000));
+    }
+
+    #[test]
+    fn m267_handover_notice_states_the_cap() {
+        let quota = server_quota(0.10, 0.89);
+        let breach = evaluate_cap(&quota, QuotaCap::new(80, 50), NOW).expect("89% > 50%");
+        let notice = breach.handover_notice("DeepSeek", NOW);
+        assert!(notice.contains("周窗口"), "{notice}");
+        assert!(notice.contains("89%"), "{notice}");
+        assert!(notice.contains("上限 50%"), "{notice}");
+        assert!(notice.contains("恢复"), "{notice}");
     }
 
     #[test]
