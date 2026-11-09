@@ -53,10 +53,28 @@ impl RouteCandidate {
         let spend = config.endpoint_daily_spend_cap(&self.endpoint_name)
             .and_then(|cap| super::quota_cap::daily_spend::cap_wait_cause(&cap, &self.endpoint_name, now));
         let restriction = match (window, quota) {
-            (Some(window), Some(quota)) => Some(WaitCause::new(format!("{label} 不在允许使用时段且"), WaitCauseKind::QuotaCap,
-                window.next_transition_ms.zip(quota.resets_at_ms).map(|(a,b)| a.max(b)))),
+            // M267/R5：阻断时也要说清窗口、用量和上限，而不只是“已达上限”。
+            (Some(window), Some(quota)) => Some(WaitCause::new(
+                format!(
+                    "{label} 不在允许使用时段且本{}已用 {}%（上限 {}%）",
+                    quota.window_label(),
+                    quota.used_percent,
+                    quota.cap_percent
+                ),
+                WaitCauseKind::QuotaCap,
+                window.next_transition_ms.zip(quota.resets_at_ms).map(|(a, b)| a.max(b)),
+            )),
             (Some(window), None) => Some(WaitCause::new(label, WaitCauseKind::UsageWindow, window.next_transition_ms)),
-            (None, Some(quota)) => Some(WaitCause::new(label, WaitCauseKind::QuotaCap, quota.resets_at_ms)),
+            (None, Some(quota)) => Some(WaitCause::new(
+                format!(
+                    "{label} 本{}已用 {}%（上限 {}%）",
+                    quota.window_label(),
+                    quota.used_percent,
+                    quota.cap_percent
+                ),
+                WaitCauseKind::QuotaCap,
+                quota.resets_at_ms,
+            )),
             (None, None) => None,
         };
         match (restriction, spend) {
@@ -749,13 +767,34 @@ impl ActiveRouteState {
                                 format!("outside_usage_window:{}", serde_json::json!({"rule":super::usage_windows::effective_rule(&config, &route.endpoint_name, &route.model_id),"next_available_ms":cause.until_ms}))
                             }
                             WaitCauseKind::QuotaCap => {
-                                quota_blocked.push(route.model_id.clone());
-                                // M244：写明是哪个窗口、多少用量拦下的，否则事后无从分辨误判。
+                                // M267/R5：写明是哪个窗口、多少用量、上限多少、什么时候重置，
+                                // 不要只留一句“已达订阅用量上限”——那样用户无法判断该等到何时。
                                 let ledger = super::quota_cap::shared_quota_ledger();
                                 let cap = config.quota_cap_for(&route.endpoint_name);
                                 let budget = super::quota_cap::SubscriptionBudget::default();
                                 let breach = ledger.evaluate(&route.endpoint_name, cap, budget, now)
                                     .or_else(|| ledger.evaluate(&route.base_url, cap, budget, now));
+                                let reset = cause
+                                    .until_ms
+                                    .and_then(chrono::DateTime::from_timestamp_millis)
+                                    .map(|at| {
+                                        format!(
+                                            "，{} 重置",
+                                            at.with_timezone(&chrono_tz::Asia::Shanghai)
+                                                .format("%m-%d %H:%M")
+                                        )
+                                    })
+                                    .unwrap_or_default();
+                                quota_blocked.push(match breach {
+                                    Some(breach) => format!(
+                                        "{} 本{}已用 {}%（上限 {}%）{reset}",
+                                        route.model_id,
+                                        breach.window_label(),
+                                        breach.used_percent,
+                                        breach.cap_percent
+                                    ),
+                                    None => format!("{} 已达订阅用量上限{reset}", route.model_id),
+                                });
                                 format!("subscription_quota_cap:{}", serde_json::json!({
                                     "resets_at_ms":cause.until_ms,
                                     "window":breach.map(|b| b.window.label()),
@@ -796,7 +835,7 @@ impl ActiveRouteState {
                     ));
                 }
                 if !quota_blocked.is_empty() {
-                    causes.push(format!("{} 已达订阅用量上限", quota_blocked.join("、")));
+                    causes.push(quota_blocked.join("；"));
                 }
                 if !spend_blocked.is_empty() {
                     causes.push(format!(
