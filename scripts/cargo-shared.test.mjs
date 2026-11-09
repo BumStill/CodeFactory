@@ -170,6 +170,19 @@ function slash(value) {
   return value.replace(/\\/g, "/");
 }
 
+// Windows reports the same directory with different casing and short/long
+// spellings depending on who resolved it (`os.tmpdir()` vs. `git rev-parse` vs.
+// `realpath`), so the prefix assertions normalise before comparing. The
+// directory identity, which is what these tests assert, is unaffected.
+function comparable(value) {
+  const normalised = path.resolve(slash(value.trim()));
+  return process.platform === "win32" ? normalised.toLowerCase() : normalised;
+}
+
+function containsPath(haystack, needle) {
+  return comparable(haystack).includes(comparable(needle));
+}
+
 // A regular file where a cache directory is expected refuses the in-use marker
 // on every platform, which is what the sandboxed main checkout did (EPERM).
 // chmod on a directory is a no-op on Windows runners, so it cannot express this.
@@ -274,13 +287,17 @@ test("builds in the task-local cache when the shared cache is read-only", (t) =>
   const run = runShared(root, shim);
 
   assert.equal(run.status, 0, run.stderr);
-  const usedTarget = slash(run.stdout.trim().split("\n").pop());
+  const reportedTarget = slash(run.stdout.trim().split("\n").pop().trim());
   // `cargo-target-<tag>`, never the shared `cargo-target` itself.
-  assert.match(usedTarget, /\.codefactory-cache\/cargo-target-[^/]+$/);
-  const roots = [root, fs.realpathSync(root)].map(slash);
-  assert.ok(roots.some((base) => usedTarget.startsWith(`${base}/`)), `cargo was handed ${usedTarget}`);
+  assert.match(reportedTarget, /\.codefactory-cache\/cargo-target-[^/]+$/);
+  const usedTarget = comparable(reportedTarget);
+  const roots = [root, fs.realpathSync(root)].map(comparable);
+  assert.ok(
+    roots.some((base) => usedTarget.startsWith(`${base}/`)),
+    `cargo was handed ${usedTarget} for root ${roots.join(" | ")}`,
+  );
   assert.match(run.stderr, /not writable/);
-  assert.ok(slash(run.stderr).includes(slash(shared)), run.stderr);
+  assert.ok(containsPath(run.stderr, shared), run.stderr);
 });
 
 // R1/R3: when neither directory works, nothing is compiled and the exit code
