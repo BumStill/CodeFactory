@@ -152,31 +152,11 @@ test("falls back to the manifest inside the current worktree", (t) => {
 // success for work that did not happen.
 // ---------------------------------------------------------------------------
 
-function chmodWritable(dir) {
-  let entries = [];
-  try {
-    entries = fs.readdirSync(dir, { withFileTypes: true });
-  } catch {
-    entries = [];
-  }
-  for (const entry of entries) {
-    if (entry.isDirectory()) chmodWritable(path.join(dir, entry.name));
-  }
-  try {
-    fs.chmodSync(dir, 0o755);
-  } catch {
-    /* already writable or gone */
-  }
-}
-
 // A throwaway git repo: sharedTargetFor() resolves the shared cache from
 // `git rev-parse --git-common-dir`, so a fake profile has to be a real repo.
 function makeGitRepo(t) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "codefactory-cargo-shared-sandbox-"));
-  t.after(() => {
-    chmodWritable(root);
-    fs.rmSync(root, { recursive: true, force: true });
-  });
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   fs.mkdirSync(path.join(root, "src-tauri"), { recursive: true });
   fs.writeFileSync(path.join(root, "src-tauri", "Cargo.toml"), "[workspace]\n");
   execFileSync("git", ["init", "-q", "."], { cwd: root });
@@ -184,22 +164,40 @@ function makeGitRepo(t) {
   return root;
 }
 
-// Stands in for cargo and reports the target directory it was handed, so the
-// test can prove which cache the build actually used.
-function fakeCargo(t, exitCode) {
-  const bin = fs.mkdtempSync(path.join(os.tmpdir(), "codefactory-cargo-bin-"));
-  t.after(() => fs.rmSync(bin, { recursive: true, force: true }));
-  const file = path.join(bin, "cargo");
-  fs.writeFileSync(file, `#!/bin/sh\nprintf '%s\\n' "$CARGO_TARGET_DIR"\nexit ${exitCode}\n`);
-  fs.chmodSync(file, 0o755);
-  return bin;
+// Every platform compares paths its own way; the assertions below only care
+// about which directory was chosen, not about the separator.
+function slash(value) {
+  return value.replace(/\\/g, "/");
 }
 
-function runShared(root, binDir) {
+// A regular file where a cache directory is expected refuses the in-use marker
+// on every platform, which is what the sandboxed main checkout did (EPERM).
+// chmod on a directory is a no-op on Windows runners, so it cannot express this.
+function blockDirectory(dir) {
+  fs.rmSync(dir, { recursive: true, force: true });
+  fs.writeFileSync(dir, "not a cache directory\n");
+}
+
+// Stands in for cargo: reports the target directory it was handed and exits with
+// the requested code, so the test can prove which cache the build actually used
+// and that cargo's own exit code survives. It runs on `node`, because Windows
+// cannot execute the shell-script shim a PATH override would need.
+function fakeCargo(t, exitCode) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "codefactory-cargo-shim-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const shim = path.join(dir, "cargo-shim.mjs");
+  fs.writeFileSync(
+    shim,
+    `process.stdout.write(String(process.env.CARGO_TARGET_DIR) + "\\n");\nprocess.exit(${exitCode});\n`,
+  );
+  return shim;
+}
+
+function runShared(root, shim) {
   return spawnSync(process.execPath, [SCRIPT, "check"], {
     cwd: root,
     encoding: "utf8",
-    env: { ...process.env, PATH: `${binDir}${path.delimiter}${process.env.PATH}` },
+    env: { ...process.env, CODEFACTORY_CARGO_SHIM: shim },
   });
 }
 
@@ -252,8 +250,8 @@ test("fails with both reasons and a remedy when neither cache can be marked", ()
         },
       }),
     (error) => {
-      assert.match(error.message, /\/shared/);
-      assert.match(error.message, /cargo-target-m270/);
+      assert.ok(error.message.includes(sharedDir), error.message);
+      assert.ok(error.message.includes(taskTargetFor("/worktree", { CODEFACTORY_TASK_ID: "m270" })), error.message);
       assert.match(error.message, /Fix:/);
       return true;
     },
@@ -270,35 +268,32 @@ test("names the task-local target after the task and keeps it under .codefactory
 test("builds in the task-local cache when the shared cache is read-only", (t) => {
   const root = makeGitRepo(t);
   const shared = path.join(root, ".codefactory-cache", "cargo-target");
-  fs.chmodSync(shared, 0o555);
-  const bin = fakeCargo(t, 0);
+  blockDirectory(shared);
+  const shim = fakeCargo(t, 0);
 
-  const run = runShared(root, bin);
+  const run = runShared(root, shim);
 
   assert.equal(run.status, 0, run.stderr);
-  // mkdtemp hands back /var/... while the script resolves the git path through
-  // /private/var/..., so compare the real path.
-  const realRoot = fs.realpathSync(root);
-  const usedTarget = run.stdout.trim().split("\n").pop();
-  assert.ok(
-    usedTarget.startsWith(path.join(realRoot, ".codefactory-cache", "cargo-target-")),
-    `cargo was handed ${usedTarget}`,
-  );
+  const usedTarget = slash(run.stdout.trim().split("\n").pop());
+  // `cargo-target-<tag>`, never the shared `cargo-target` itself.
+  assert.match(usedTarget, /\.codefactory-cache\/cargo-target-[^/]+$/);
+  const roots = [root, fs.realpathSync(root)].map(slash);
+  assert.ok(roots.some((base) => usedTarget.startsWith(`${base}/`)), `cargo was handed ${usedTarget}`);
   assert.match(run.stderr, /not writable/);
-  assert.ok(run.stderr.includes(shared), run.stderr);
+  assert.ok(slash(run.stderr).includes(slash(shared)), run.stderr);
 });
 
 // R1/R3: when neither directory works, nothing is compiled and the exit code
 // says so — the incident reported success for a build that never happened.
 test("exits nonzero and compiles nothing when no cache directory can be marked", (t) => {
   const root = makeGitRepo(t);
-  // Both halves read-only: the shared directory itself refuses the marker, and
-  // the container refuses to create the task-local fallback.
-  fs.chmodSync(path.join(root, ".codefactory-cache", "cargo-target"), 0o555);
-  fs.chmodSync(path.join(root, ".codefactory-cache"), 0o555);
-  const bin = fakeCargo(t, 0);
+  // Nothing under the root can hold a cache: `.codefactory-cache` is a plain
+  // file, so neither the shared directory nor the task-local fallback can be
+  // created. Portable stand-in for "both halves read-only".
+  blockDirectory(path.join(root, ".codefactory-cache"));
+  const shim = fakeCargo(t, 0);
 
-  const run = runShared(root, bin);
+  const run = runShared(root, shim);
 
   assert.notEqual(run.status, 0, run.stdout);
   assert.equal(run.stdout.trim(), "");
@@ -309,9 +304,9 @@ test("exits nonzero and compiles nothing when no cache directory can be marked",
 // R1: cargo's own failure code is passed through untouched.
 test("propagates cargo's exit code", (t) => {
   const root = makeGitRepo(t);
-  const bin = fakeCargo(t, 7);
+  const shim = fakeCargo(t, 7);
 
-  const run = runShared(root, bin);
+  const run = runShared(root, shim);
 
   assert.equal(run.status, 7, run.stderr);
 });

@@ -82,6 +82,16 @@ function describeFailure(error) {
   return error?.message ?? String(error);
 }
 
+// Normal runs execute the real `cargo`. CODEFACTORY_CARGO_SHIM points at a Node
+// script instead, so the tests can pin the target directory handed to the build
+// and the exit code that comes back on every platform — a PATH shim cannot do
+// that on Windows, where a bare `cargo` does not resolve to a shell script.
+export function cargoInvocation(args, env = process.env) {
+  const shim = env.CODEFACTORY_CARGO_SHIM;
+  if (shim) return { file: process.execPath, args: [shim, ...args] };
+  return { file: "cargo", args };
+}
+
 // M270-R3: the shared cache lives in the *main checkout*, but a trusted-mode
 // sandbox only lets a command write inside the workspace it was launched from
 // (plus `<workspace>/.codefactory-cache`, which the sandbox profiles already
@@ -188,7 +198,8 @@ function main() {
   let result;
   let clearFailure = null;
   try {
-    result = spawnSync("cargo", args, {
+    const invocation = cargoInvocation(args);
+    result = spawnSync(invocation.file, invocation.args, {
       cwd: resolved.cwd,
       env: sharedBuildEnvironment({ targetDir }),
       stdio: "inherit",

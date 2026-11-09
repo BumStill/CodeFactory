@@ -71,3 +71,9 @@
   名称符合 CF-BUILD 的 `cargo-target-*` 约定，因此仍受同一预算入口与 LRU 淘汰管辖。
 - 降级时预算扫描根是当前 worktree 的 `.codefactory-cache`，不会去动主 checkout 的缓存。
 - `CODEFACTORY_BUILD_CACHE_ROOT` 不是 `cargo-shared.mjs` 的输入；文档中不再把它当共享缓存开关。
+- 测试接缝 `CODEFACTORY_CARGO_SHIM` 指向一个 Node 脚本替身，让进程级测试能在**任何平台**断言
+  "cargo 收到的 `CARGO_TARGET_DIR`" 与"cargo 退出码原样透传"；未设置时一律执行真实 `cargo`。
+  不用 PATH 上的 `#!/bin/sh` 替身，是因为 Windows runner 上裸 `cargo` 解析不到 shell 脚本，
+  会让真实 cargo 跑进夹具仓库（这正是本规格首个 Windows 失败的原因）。
+- 测试夹具阻塞目录可写性的手段是"在该路径放一个普通文件"（`mkdir` 抛 `EEXIST`/`ENOTDIR`），
+  而不是 `chmod`：对目录 `chmod` 在 Windows 上是空操作，无法表达"不可写"。
