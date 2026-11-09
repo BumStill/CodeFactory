@@ -3113,6 +3113,18 @@ fn decide_permission(
     if tool_name.starts_with("skill_") && !KNOWN_SKILL_TOOLS.contains(&tool_name) {
         return PermissionDecision::Deny(format!("unknown skill management tool '{tool_name}'"));
     }
+    // M267: an explicit deny is a refusal, never a request that the user
+    // could approve. In particular shell Ask must not demote a configured deny.
+    let key = match (tool_name, cmd) {
+        ("browser_session", _) => tool_name.to_string(),
+        (_, Some(c)) => format!("{}({})", tool_name, c),
+        (_, None) => tool_name.to_string(),
+    };
+    for pattern in &policy.deny {
+        if glob_match(pattern, &key) || glob_match(pattern, tool_name) {
+            return PermissionDecision::Deny(format!("Denied by policy: matches '{pattern}'"));
+        }
+    }
     if tool_name == "bash" {
         let Some(command) = cmd else {
             // A missing command cannot have earned the shell classifier's
@@ -3129,18 +3141,6 @@ fn decide_permission(
                 return PermissionDecision::Ask;
             }
             crate::tools::shell_policy::ShellCommandPolicy::Allow { .. } => {}
-        }
-    }
-
-    let key = match (tool_name, cmd) {
-        ("browser_session", _) => tool_name.to_string(),
-        (_, Some(c)) => format!("{}({})", tool_name, c),
-        (_, None) => tool_name.to_string(),
-    };
-
-    for pattern in &policy.deny {
-        if glob_match(pattern, &key) || glob_match(pattern, tool_name) {
-            return PermissionDecision::Deny(format!("Denied by policy: matches '{pattern}'"));
         }
     }
 
