@@ -78,6 +78,48 @@ export function sharedBuildEnvironment({ targetDir, baseEnv = process.env }) {
   };
 }
 
+function describeFailure(error) {
+  return error?.message ?? String(error);
+}
+
+// M270-R3: the shared cache lives in the *main checkout*, but a trusted-mode
+// sandbox only lets a command write inside the workspace it was launched from
+// (plus `<workspace>/.codefactory-cache`, which the sandbox profiles already
+// whitelist). Writing the in-use marker into the main checkout is therefore
+// refused under the sandbox, so a build there needs a target directory it can
+// actually mark. The name keeps the `cargo-target-*` shape the cache budget
+// recognises, and being workspace-scoped keeps two tasks off one final path.
+export function taskTargetFor(worktreeRoot, env = process.env) {
+  const raw = env.CODEFACTORY_TASK_ID || path.basename(worktreeRoot) || `pid-${process.pid}`;
+  const tag = raw.replace(/[^A-Za-z0-9._-]/g, "-").slice(0, 48) || `pid-${process.pid}`;
+  return path.join(worktreeRoot, ".codefactory-cache", `cargo-target-${tag}`);
+}
+
+// Pick the target directory by *proving* it can be marked, because the marker is
+// what keeps the LRU sweep from deleting a cache mid-build. Degrading silently
+// would look like the shared cache was used while the artifacts landed in a
+// directory the sweep never sees, so the reason travels back to the caller.
+export function selectTargetDir({ sharedDir, worktreeRoot, mark = markInUse, env = process.env }) {
+  try {
+    mark(sharedDir);
+    return { targetDir: sharedDir, degraded: null };
+  } catch (error) {
+    const reason = describeFailure(error);
+    const fallback = taskTargetFor(worktreeRoot, env);
+    try {
+      mark(fallback);
+    } catch (fallbackError) {
+      throw new Error(
+        `shared build cache ${sharedDir} is not writable (${reason}), and the task-local directory ` +
+          `${fallback} is not writable either (${describeFailure(fallbackError)}). Nothing was compiled. ` +
+          `Fix: make ${path.join(worktreeRoot, ".codefactory-cache")} writable inside the workspace, ` +
+          `or run this command outside the sandbox so the shared cache can be marked.`,
+      );
+    }
+    return { targetDir: fallback, degraded: { sharedDir, fallback, reason } };
+  }
+}
+
 export function enforceSharedBudget({ repoRoot, targetDir, env = process.env, logFile }) {
   const cacheRoot = path.join(repoRoot, ".codefactory-cache");
   return enforceBudget({
@@ -90,11 +132,11 @@ export function enforceSharedBudget({ repoRoot, targetDir, env = process.env, lo
 }
 
 function main() {
-  const targetDir = sharedTargetFor(process.cwd());
+  const sharedDir = sharedTargetFor(process.cwd());
   const args = stripLeadingSeparator(process.argv.slice(2));
 
   if (args.length === 1 && args[0] === "--print-target") {
-    process.stdout.write(`${targetDir}\n`);
+    process.stdout.write(`${sharedDir}\n`);
     process.exit(0);
   }
 
@@ -110,14 +152,32 @@ function main() {
   }
 
   // Mark before sweeping so this build's own directory can never be a
-  // candidate, then bring the shared cache back inside the ceiling.
-  markInUse(targetDir);
+  // candidate, then bring the cache back inside the ceiling.
+  let selection;
+  try {
+    selection = selectTargetDir({ sharedDir, worktreeRoot });
+  } catch (error) {
+    // M270-R1/R3: nothing was compiled, so this must not look like success.
+    process.stderr.write(`cargo target: ${describeFailure(error)}\n`);
+    process.exit(1);
+  }
+  const targetDir = selection.targetDir;
+  if (selection.degraded) {
+    process.stderr.write(
+      `cargo target: ${selection.degraded.sharedDir} is not writable (${selection.degraded.reason}); ` +
+        `building in task-local ${selection.degraded.fallback} and leaving the shared cache alone.\n`,
+    );
+  }
+
   let budgetSummary = null;
+  let budgetFailure = null;
   try {
     budgetSummary = enforceSharedBudget({ repoRoot: path.resolve(targetDir, "..", ".."), targetDir });
   } catch (error) {
-    // A budget pass must never stop a build; the build is the user's work.
-    process.stderr.write(`cargo target: build-cache budget pass skipped: ${error?.message ?? error}\n`);
+    // The build is the user's work, so it still runs — but a sweep that could
+    // not run must not be reported as a clean build (M270-R5).
+    budgetFailure = describeFailure(error);
+    process.stderr.write(`cargo target: build-cache budget pass failed: ${budgetFailure}\n`);
   }
   if (budgetSummary && budgetSummary.reclaimed_bytes + budgetSummary.evicted_bytes > 0) {
     process.stderr.write(
@@ -126,6 +186,7 @@ function main() {
   }
 
   let result;
+  let clearFailure = null;
   try {
     result = spawnSync("cargo", args, {
       cwd: resolved.cwd,
@@ -133,13 +194,25 @@ function main() {
       stdio: "inherit",
     });
   } finally {
-    clearInUse(targetDir);
+    try {
+      clearInUse(targetDir);
+    } catch (error) {
+      // A marker we cannot clear keeps the sweep away from this directory for
+      // good, which is a real failure — report it instead of masking cargo's code.
+      clearFailure = describeFailure(error);
+      process.stderr.write(`cargo target: could not clear the in-use marker in ${targetDir}: ${clearFailure}\n`);
+    }
   }
 
-  if (result.error) {
-    throw result.error;
+  if (!result || result.error) {
+    process.stderr.write(`cargo target: could not run cargo: ${describeFailure(result?.error)}\n`);
+    process.exit(1);
   }
-  process.exit(result.status ?? 1);
+  const status = result.status ?? 1;
+  if (status !== 0) {
+    process.exit(status);
+  }
+  process.exit(budgetFailure || clearFailure ? 1 : 0);
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) main();
