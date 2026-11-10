@@ -53,6 +53,10 @@ SELECT session_id FROM thin_session_state WHERE state IN ('waiting_wake','runnin
 2. `closeout_result`：M259 的逐项核对（合并提交、远端分支、本地改动）；
 3. 结束原因改写为「PR #N 已合并；<逐项事实>。系统已自动完成收尾：<清理明细>。」。
 
+触发点：除了启动时那一次扫描，`objective_supervisor` 的心跳每 12 个 poll（约一分钟）
+也跑同一次 `settle_merged_sessions`，所以会话在应用运行中自己结束也会被收尾，
+不用等重启。
+
 停止路径（`cancelled：用户已停止会话`）在候选查询里就被排除，不会被清理，
 也不会被改写原因。
 
