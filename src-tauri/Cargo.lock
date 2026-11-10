@@ -601,7 +601,7 @@ dependencies = [
 
 [[package]]
 name = "codefactory"
-version = "1.117.0"
+version = "1.118.0"
 dependencies = [
  "anyhow",
  "async-trait",
