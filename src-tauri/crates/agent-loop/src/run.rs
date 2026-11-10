@@ -112,14 +112,35 @@ async fn persist_route_change(
     let Some(change) = route_change else {
         return Ok(());
     };
-    persistence
-        .persist_gate_message(&change.notice, "turn_notice")
+    // M272: while the original route stays unusable (quota cap, cooling
+    // primary) the transport re-derives the SAME switch on every round, so the
+    // raw persist wrote the notice once per model call. Announce one switch
+    // once per session: the marker is the from→to pair plus the reason, so a
+    // different reason (cap reset, provider recovered) or a switch back is new
+    // information and still gets its own notice.
+    let marker = route_change_marker(change);
+    let written = persistence
+        .persist_gate_message_once(&marker, &change.notice, "turn_notice")
         .await?;
+    if !written {
+        return Ok(());
+    }
     events.emit(crate::types::StreamEvent::CompletionGateAction {
         kind: "turn_notice".into(),
         detail: change.notice.clone(),
     });
     Ok(())
+}
+
+/// Stable, user-invisible dedupe key for one route switch (M272). Kept out of
+/// the notice text; whitespace inside the reason is collapsed so two renderings
+/// of the same reason do not read as two switches.
+fn route_change_marker(change: &crate::transport::RouteChange) -> String {
+    let reason = change.reason.split_whitespace().collect::<Vec<_>>().join(" ");
+    format!(
+        "route-switch:{}:{}->{}:{}|{reason}",
+        change.from_endpoint, change.from_model, change.to_endpoint, change.to_model
+    )
 }
 
 /// Assemble + persist one round's usage row, and fire the cost-UI ping ONLY on a
@@ -4551,6 +4572,65 @@ mod tests {
         let outcome = run_agent_loop(inputs(), config(), svc).await.unwrap();
         assert_eq!(outcome.stop_reason, StopReason::Finished);
         assert_eq!(transport.requests().len(), 1);
+    }
+
+    fn m272_quota_switch() -> crate::transport::RouteChange {
+        crate::transport::RouteChange {
+            from_endpoint: "deepseek".into(),
+            from_model: "deepseek-v4".into(),
+            to_endpoint: "chatgpt".into(),
+            to_model: "gpt-6.1-sol".into(),
+            reason: "DeepSeek 今日预算已用完".into(),
+            notice: "已切到 gpt-6.1-sol：DeepSeek 今日预算已用完".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn m272_same_route_change_is_announced_once() {
+        let persistence = Arc::new(RecordingPersistence::default());
+        let events = Arc::new(CollectingEventSink::new());
+        let change = m272_quota_switch();
+        // Every round re-derives the same switch while the original route stays
+        // unusable; the conversation must still show one notice, not one per call.
+        for _ in 0..4 {
+            persist_route_change(persistence.as_ref(), events.as_ref(), Some(&change))
+                .await
+                .unwrap();
+        }
+        let notices = persistence.notices.lock().unwrap().clone();
+        assert_eq!(notices.len(), 1, "同一次切换只提示一次: {notices:?}");
+        assert_eq!(events.events().len(), 1, "界面也只收到一条提示");
+    }
+
+    #[tokio::test]
+    async fn m272_new_reason_or_reverse_switch_is_announced_again() {
+        let persistence = Arc::new(RecordingPersistence::default());
+        let events = Arc::new(CollectingEventSink::new());
+        let forward = m272_quota_switch();
+        persist_route_change(persistence.as_ref(), events.as_ref(), Some(&forward))
+            .await
+            .unwrap();
+        // Same direction, different reason: the cap reset is new information.
+        let mut changed_reason = forward.clone();
+        changed_reason.reason = "DeepSeek 今日预算已用完，已达硬上限".into();
+        changed_reason.notice = "已切到 gpt-6.1-sol：DeepSeek 今日预算已用完，已达硬上限".into();
+        persist_route_change(persistence.as_ref(), events.as_ref(), Some(&changed_reason))
+            .await
+            .unwrap();
+        // Switching back is a different from→to pair.
+        let reverse = crate::transport::RouteChange {
+            from_endpoint: forward.to_endpoint.clone(),
+            from_model: forward.to_model.clone(),
+            to_endpoint: forward.from_endpoint.clone(),
+            to_model: forward.from_model.clone(),
+            reason: "DeepSeek 额度已恢复".into(),
+            notice: "已切回 deepseek-v4：DeepSeek 额度已恢复".into(),
+        };
+        persist_route_change(persistence.as_ref(), events.as_ref(), Some(&reverse))
+            .await
+            .unwrap();
+        assert_eq!(persistence.notices.lock().unwrap().len(), 3);
+        assert_eq!(events.events().len(), 3);
     }
 
     fn services(
