@@ -1391,14 +1391,23 @@ async fn closeout_target(db: &SqlitePool, session: &str) -> Result<Option<Closeo
     {
         return Ok(None);
     }
-    let workspace: Option<(String, String)> = sqlx::query_as(
-        "SELECT worktree_path,branch_name FROM execution_workspaces WHERE session_id=? ORDER BY updated_at DESC LIMIT 1",
-    )
-    .bind(session)
-    .fetch_optional(db)
-    .await
-    .map_err(|e| e.to_string())?;
-    let Some((path, workspace_branch)) = workspace else { return Ok(None) };
+    // M273/R3：收尾已经删掉工作区时，核对仍要能从本会话记录的仓库根继续。
+    let select = if has_column(db, "execution_workspaces", "repo_root")
+        .await
+        .map_err(|e| e.to_string())?
+    {
+        "SELECT worktree_path,branch_name,COALESCE(repo_root,'') FROM execution_workspaces WHERE session_id=? ORDER BY updated_at DESC LIMIT 1"
+    } else {
+        "SELECT worktree_path,branch_name,'' FROM execution_workspaces WHERE session_id=? ORDER BY updated_at DESC LIMIT 1"
+    };
+    let workspace: Option<(String, String, String)> = sqlx::query_as(select)
+        .bind(session)
+        .fetch_optional(db)
+        .await
+        .map_err(|e| e.to_string())?;
+    let Some((path, workspace_branch, repo_root)) = workspace else {
+        return Ok(None);
+    };
     let recorded: Option<String> = if has_table(db, "thin_delivery_refs").await.map_err(|e| e.to_string())? {
         sqlx::query_scalar("SELECT branch FROM thin_delivery_refs WHERE session_id=? AND pr_number=?")
             .bind(session)
@@ -1414,6 +1423,13 @@ async fn closeout_target(db: &SqlitePool, session: &str) -> Result<Option<Closeo
         .as_deref()
         .is_some_and(|branch| !branch.trim().is_empty());
     let repo = crate::agent::delivery::resolve_repo(std::path::Path::new(&path), None)
+        .or_else(|first| {
+            if repo_root.trim().is_empty() {
+                return Err(first);
+            }
+            crate::agent::delivery::resolve_repo(std::path::Path::new(&repo_root), None)
+                .map_err(|_| first)
+        })
         .map_err(|error| format!("无法读取工作区的 git 信息（{path}）：{error}"))?;
     Ok(Some(CloseoutTarget {
         worktree: std::path::PathBuf::from(&path),
@@ -4190,10 +4206,34 @@ pub(crate) mod merged_settlement {
     pub async fn settle_merged_sessions(pool: &SqlitePool) -> Result<SettleSummary> {
         thin_state::ensure(pool).await?;
         super::reconcile_orphan_turns(pool).await?;
-        let sessions: Vec<String> =
+        let mut sessions: Vec<String> =
             sqlx::query_scalar("SELECT session_id FROM thin_session_state WHERE state IN ('waiting_wake','running')")
                 .fetch_all(pool)
                 .await?;
+        // M273/R2：会话自己写完报告就结束（状态是它自己投影的 ended）时，M264 清理
+        // 与 M259 逐项核对同样必须执行一次。用户主动停止的会话不在候选里。
+        if has_table(pool, "thin_external_observations").await? {
+            let unclosed: Vec<String> = sqlx::query_scalar(
+                "SELECT state.session_id FROM thin_session_state state
+                  WHERE state.state='ended'
+                    AND COALESCE(state.reason,'') NOT LIKE 'cancelled%'
+                    AND COALESCE(state.reason,'') NOT LIKE '%系统已自动完成收尾%'
+                    AND COALESCE(state.reason,'') NOT LIKE '%收尾已完成%'
+                    AND COALESCE(state.reason,'') NOT LIKE '%收尾未核验%'
+                    AND EXISTS (SELECT 1 FROM thin_external_observations observation
+                                WHERE observation.session_id=state.session_id
+                                  AND observation.completed_reason IS NOT NULL
+                                  AND (observation.completed_reason LIKE '%已合并%'
+                                       OR observation.completed_reason LIKE '%已关闭%'))",
+            )
+            .fetch_all(pool)
+            .await?;
+            for session in unclosed {
+                if !sessions.contains(&session) {
+                    sessions.push(session);
+                }
+            }
+        }
 
         let mut summary = SettleSummary::default();
         for session in sessions {
@@ -4211,6 +4251,10 @@ pub(crate) mod merged_settlement {
                 summary.skipped += 1;
                 continue;
             };
+            // M273/R2：已经由会话自己结束的行，要用 M259 的逐项事实改写原因。
+            let self_ended = thin_state::load(pool, &session)
+                .await?
+                .is_some_and(|state| state.state == thin_state::SessionState::Ended);
             // M230/R2/R4: gate before touching workspace rows or the filesystem.
             // Scan durable IDs, including history outside dispatch's 200-row list.
             if super::has_column(pool, "objectives", "session_id").await?
@@ -4238,7 +4282,13 @@ pub(crate) mod merged_settlement {
             };
             match result {
                 Ok(note) => {
-                    let text = format!("{reason}。系统已自动完成收尾：{note}。任务已结束。");
+                    let text = if self_ended {
+                        // M273/R2：自结束的会话也要逐项写明 M259 的核对结果。
+                        let verified = super::closeout_result(pool, &session, &reason).await;
+                        format!("{verified}系统已自动完成收尾：{note}。")
+                    } else {
+                        format!("{reason}。系统已自动完成收尾：{note}。任务已结束。")
+                    };
                     settle_ended_and_cancel(pool, &session, &text, &note).await?;
                     close_workspace_rows(pool, &session).await?;
                     tracing::info!(session, %note, "merged/closed session settled after restart");
@@ -4847,6 +4897,189 @@ pub(crate) mod merged_settlement {
             assert_eq!(
                 waiting_wake_without_wake_source(&pool).await,
                 vec!["sess-d".to_string()]
+            );
+        }
+
+        /// M273：真实裸远端。交付分支已推送（已合并 PR 的现场），会话自己有
+        /// 一个托管 worktree，分支在本仓库保留命名空间内。
+        fn self_ended_fixture(dir: &Path) -> (PathBuf, PathBuf, String) {
+            let remote = dir.join("origin.git");
+            std::fs::create_dir_all(&remote).unwrap();
+            git_ok(&remote, &["init", "--bare", "-q", "-b", "main"]);
+            let repo = dir.join("repo");
+            std::fs::create_dir_all(&repo).unwrap();
+            git_ok(&repo, &["init", "-q", "-b", "main"]);
+            git_ok(&repo, &["config", "user.name", "Synthetic"]);
+            git_ok(
+                &repo,
+                &["config", "user.email", "synthetic@example.invalid"],
+            );
+            std::fs::write(repo.join("tracked.txt"), "base").unwrap();
+            git_ok(&repo, &["add", "."]);
+            git_ok(&repo, &["commit", "-qm", "synthetic base"]);
+            git_ok(
+                &repo,
+                &["remote", "add", "origin", &remote.to_string_lossy()],
+            );
+            git_ok(&repo, &["push", "-q", "origin", "main"]);
+            let branch = "codefactory/objective-m273".to_string();
+            let worktree = dir.join("ws-m273");
+            git_ok(
+                &repo,
+                &[
+                    "worktree",
+                    "add",
+                    "-q",
+                    "-b",
+                    &branch,
+                    &worktree.to_string_lossy(),
+                    "HEAD",
+                ],
+            );
+            git_ok(&worktree, &["push", "-q", "-u", "origin", &branch]);
+            (repo, worktree, branch)
+        }
+
+        /// M273：真实 DB + 真实合并事实，会话状态由它自己写成 ended。
+        async fn seed_self_ended_session(
+            dir: &Path,
+            repo: &Path,
+            worktree: &Path,
+            branch: &str,
+            reason: &str,
+        ) -> SqlitePool {
+            let pool = seed_state(dir).await;
+            // seed_state 建的是历史库结构；M259/M264 需要真实观测列。
+            for column in [
+                "pr_number INTEGER NOT NULL DEFAULT 0",
+                "ceiling TEXT NOT NULL DEFAULT 'ThroughMerge'",
+                "closeout_queued INTEGER NOT NULL DEFAULT 1",
+                "merged_at INTEGER",
+            ] {
+                sqlx::query(&format!(
+                    "ALTER TABLE thin_external_observations ADD COLUMN {column}"
+                ))
+                .execute(&pool)
+                .await
+                .unwrap();
+            }
+            sqlx::query("INSERT INTO objectives(id,status) VALUES ('obj-m273','completed')")
+                .execute(&pool)
+                .await
+                .unwrap();
+            sqlx::query(
+                "INSERT INTO execution_workspaces
+                 (id, objective_id, session_id, repo_identity, repo_root, git_common_dir,
+                  worktree_path, branch_name, base_ref, base_sha, state, created_at, updated_at)
+                 VALUES ('ws-m273','obj-m273','sess-m273',?,?,?,?,?,'HEAD','deadbeef','active',1,1)",
+            )
+            .bind(repo.to_string_lossy().to_string())
+            .bind(repo.to_string_lossy().to_string())
+            .bind(repo.join(".git").to_string_lossy().to_string())
+            .bind(worktree.to_string_lossy().to_string())
+            .bind(branch)
+            .execute(&pool)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO thin_external_observations
+                 (session_id,completed_reason,observed_at,pr_number,ceiling,closeout_queued,merged_at)
+                 VALUES ('sess-m273','PR #1052 已合并',1,1052,'ThroughMerge',1,1)",
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+            thin_state::save(
+                &pool,
+                "sess-m273",
+                &thin_state::ThinState::ended(reason, "本会话记录"),
+            )
+            .await
+            .unwrap();
+            pool
+        }
+
+        /// M273/R2+R3：会话自己写完最终报告就 ended，也不能跳过 M264 清理与
+        /// M259 逐项核对；再跑一轮不重复清理。
+        #[tokio::test]
+        async fn m273_self_ended_session_still_gets_system_closeout() {
+            let dir = scratch_dir("m273-self-end");
+            let (repo, worktree, branch) = self_ended_fixture(&dir);
+            let pool = seed_self_ended_session(
+                &dir,
+                &repo,
+                &worktree,
+                &branch,
+                "PR #1052 已合并",
+            )
+            .await;
+            let before = thin_state::load(&pool, "sess-m273").await.unwrap().unwrap();
+            assert_eq!(before.state, crate::agent::thin_state::SessionState::Ended);
+            assert_eq!(before.reason.as_deref(), Some("PR #1052 已合并"));
+            assert!(
+                !git(&repo, &["ls-remote", "--heads", "origin", &branch])
+                    .unwrap()
+                    .is_empty(),
+                "fixture must leave the merged branch on the remote"
+            );
+
+            let summary = settle_merged_sessions(&pool).await.unwrap();
+            assert_eq!(summary.settled, 1, "{summary:?}");
+
+            assert!(
+                git(&repo, &["ls-remote", "--heads", "origin", &branch])
+                    .unwrap()
+                    .is_empty(),
+                "自结束会话的远端分支也必须由系统删除"
+            );
+            assert!(!worktree.exists(), "本地工作区应由系统删除");
+            assert!(
+                git(&repo, &["rev-parse", "--verify", &branch]).is_err(),
+                "本地分支应由系统删除"
+            );
+
+            let after = thin_state::load(&pool, "sess-m273").await.unwrap().unwrap();
+            assert_eq!(after.state, crate::agent::thin_state::SessionState::Ended);
+            let reason = after.reason.unwrap_or_default();
+            assert!(reason.contains("系统已自动完成收尾"), "{reason}");
+            assert!(reason.contains("已删除已合并远端分支"), "{reason}");
+            assert!(
+                reason.matches('；').count() >= 2,
+                "结束原因必须逐项写明核对与清理结果：{reason}"
+            );
+
+            let again = settle_merged_sessions(&pool).await.unwrap();
+            assert_eq!(again.settled, 0, "已收尾的会话不重复清理：{again:?}");
+        }
+
+        /// M273/R2 例外：用户主动停止的会话不清理、不改原因。
+        #[tokio::test]
+        async fn m273_user_stopped_session_is_not_cleaned_up() {
+            let dir = scratch_dir("m273-stop");
+            let (repo, worktree, branch) = self_ended_fixture(&dir);
+            let pool = seed_self_ended_session(
+                &dir,
+                &repo,
+                &worktree,
+                &branch,
+                "cancelled：用户已停止会话",
+            )
+            .await;
+            let summary = settle_merged_sessions(&pool).await.unwrap();
+            assert_eq!(summary.settled, 0, "{summary:?}");
+            assert!(worktree.exists(), "停止的会话工作区不得删除");
+            assert!(
+                !git(&repo, &["ls-remote", "--heads", "origin", &branch])
+                    .unwrap()
+                    .is_empty(),
+                "停止的会话远端分支不得删除"
+            );
+            let state = thin_state::load(&pool, "sess-m273").await.unwrap().unwrap();
+            assert_eq!(state.state, crate::agent::thin_state::SessionState::Ended);
+            assert_eq!(
+                state.reason.as_deref(),
+                Some("cancelled：用户已停止会话"),
+                "停止原因不得被收尾改写"
             );
         }
     }
