@@ -923,7 +923,12 @@ fn declares_unfinished(content: &str) -> bool {
         "尚未完成", "还没有完成", "还没完成", "任务未完成", "将继续", "会继续", "自动继续",
     ];
     let text = content.trim();
-    !text.is_empty() && MARKERS.iter().any(|marker| text.contains(marker))
+    if text.is_empty() {
+        return false;
+    }
+    // M276/R2: `尚未提交、未开 PR` declares the same thing as `尚未完成` — the
+    // work is not delivered yet — and the incident wording used exactly this.
+    MARKERS.iter().any(|marker| text.contains(marker)) || declares_undelivered_work(text)
 }
 
 async fn assistant_declared_unfinished(db: &SqlitePool, session: &str) -> sqlx::Result<Option<(i64, String)>> {
@@ -952,13 +957,56 @@ const BLOCKED_SUMMARY_MARKERS: &[&str] = &[
     "被阻塞",
     "审批被拒绝",
     "blocked",
+    // M276：会话 afc40ac6 的真实措辞（M269 的清单一个都没命中）。
+    "阻塞总结",
+    "停在哪一步",
+    "需要人工介入",
 ];
+
+/// M276/R2: how a turn says the work is still un-delivered. `尚未提交、未开 PR`
+/// is the incident wording; it declares unfinished work just as plainly as
+/// `尚未完成` does, and two separate settlement paths read it.
+const UNDELIVERED_WORK_MARKERS: &[&str] = &[
+    "尚未提交",
+    "没有提交",
+    "未提交",
+    "尚未开 pr",
+    "未开 pr",
+    "没有开 pr",
+    "未创建 pr",
+    "尚未交付",
+    "未交付",
+    "未完成",
+    "尚未完成",
+    "还没完成",
+];
+
+fn mentions_refusal(text: &str) -> bool {
+    ["被拒绝", "被拒", "拒绝执行", "拦下"]
+        .iter()
+        .any(|marker| text.contains(marker))
+}
+
+fn declares_undelivered_work(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    UNDELIVERED_WORK_MARKERS
+        .iter()
+        .any(|marker| lower.contains(marker))
+}
 
 fn is_blocked_summary(text: &str) -> bool {
     let lower = text.to_lowercase();
-    BLOCKED_SUMMARY_MARKERS
+    if BLOCKED_SUMMARY_MARKERS
         .iter()
         .any(|marker| lower.contains(&marker.to_lowercase()))
+    {
+        return true;
+    }
+    // M276/R2: `那次调用被拒绝` alone is not a blocker — a finished task can
+    // mention a refusal it routed around. It only marks a blocker when the same
+    // turn also says the work is still un-delivered; the caller already proved
+    // nothing was delivered before this is consulted.
+    mentions_refusal(&lower) && declares_undelivered_work(&lower)
 }
 
 /// M269/R3: the newest assistant message, read only by the terminal guard.
@@ -2203,6 +2251,52 @@ mod tests {
     async fn m269_an_ordinary_completion_summary_still_ends() {
         let db = fixture().await;
         sqlx::query("INSERT INTO messages(id,session_id,role,content,created_at) VALUES ('m269-task','derive','user','回答一个问题',100),('m269-done','derive','assistant','已完成：测试全部通过，无遗留项。',200)")
+            .execute(&db).await.unwrap();
+        assert_eq!(refresh(&db, "derive").await.unwrap().state, SessionState::Ended);
+    }
+
+    /// M276/R2+R5: the wording of the real M274 incident (session afc40ac6) must
+    /// keep the session alive. Title `阻塞总结`, then `那次调用被拒绝` and
+    /// `尚未提交、未开 PR` — none of the M269 markers matched, so v1.115.0 settled
+    /// a merely-denied operation into `ended`.
+    #[tokio::test]
+    async fn m276_the_m274_blocker_summary_keeps_the_session_alive() {
+        let db = fixture().await;
+        let summary = "## 阻塞总结\n\n**停在哪一步**：交付前校验。`deliver_changes` 被 scenario 注册表门禁拒绝 ——\n需要为这个新文件声明 `Scenario-Test: <IDs>`；我读取注册表的那次调用被拒绝，因此没有可用的既有 ID 依据。代码本身已改完并验证，但**尚未提交、未开 PR**。";
+        sqlx::query("INSERT INTO messages(id,session_id,role,content,created_at) VALUES ('m276-task','derive','user','修复 M274',100),('m276-blocked','derive','assistant',?,200)")
+            .bind(summary)
+            .execute(&db).await.unwrap();
+        let state = refresh(&db, "derive").await.unwrap();
+        assert_ne!(state.state, SessionState::Ended, "a denied operation must not end undelivered work");
+        assert_eq!(state.state, SessionState::WaitingWake);
+        assert!(
+            state.wake_source.unwrap_or_default().contains("thin-continue-"),
+            "a real continuation wake is required"
+        );
+    }
+
+    /// M276/R2: the two independent settlement paths both recognise the incident
+    /// wording. M211's declared-unfinished check must read `尚未提交、未开 PR` as
+    /// unfinished work, not only `尚未完成`.
+    #[tokio::test]
+    async fn m276_undelivered_wording_counts_as_declared_unfinished() {
+        let db = fixture().await;
+        sqlx::query("INSERT INTO messages(id,session_id,role,content,created_at) VALUES ('m276-task','derive','user','修复 M274',100),('m276-blocked','derive','assistant','代码已改完并验证，但尚未提交、未开 PR。',200)")
+            .execute(&db).await.unwrap();
+        let declared = assistant_declared_unfinished(&db, "derive").await.unwrap();
+        assert!(
+            declared.as_ref().is_some_and(|(_, text)| text.contains("未开 PR")),
+            "undelivered wording must count as unfinished: {declared:?}"
+        );
+    }
+
+    /// M276/R2: a refusal that did not leave work undelivered is not a blocker.
+    /// A finished summary that mentions a denial must still settle, otherwise the
+    /// widened markers would resurrect completed work.
+    #[tokio::test]
+    async fn m276_a_resolved_refusal_still_ends() {
+        let db = fixture().await;
+        sqlx::query("INSERT INTO messages(id,session_id,role,content,created_at) VALUES ('m276-task','derive','user','整理一份说明',100),('m276-done','derive','assistant','已完成：读取注册表的调用被拒绝后改用工单接口，全部内容已整理并交付。',200)")
             .execute(&db).await.unwrap();
         assert_eq!(refresh(&db, "derive").await.unwrap().state, SessionState::Ended);
     }

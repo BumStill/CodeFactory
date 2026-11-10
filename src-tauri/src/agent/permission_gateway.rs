@@ -1031,8 +1031,12 @@ fn permission_recovery_rejected() -> PermissionOutcome {
 /// the missing scope: the incident (session 833ac8cb) showed a model reading one
 /// refusal as "the whole task was cancelled" and writing a blocker summary. So the
 /// text now also says the task continues, that a different approach is welcome, and
-/// that a user note is guidance to follow.
-pub(super) const DENIED_BY_USER_CONTENT: &str = "Tool call denied by the user. The requested action was not executed; do not bypass this decision with another tool.\n\nThe denial covers this one operation only: the task is not cancelled; change approach and continue — a different, safe route to the same goal is welcome, but the same denied operation must not be repeated. If the denial really blocks the whole task, stop and ask the user what to do instead.\n\nWhen one is present, a `User note` section carries the reason the user gave: follow it, and treat it as guidance about this refusal, never as an authorization to do the same thing another way.";
+/// that a user note is guidance to follow. M276: session afc40ac6 proved the M269
+/// wording still left a door open — the model read `If the denial really blocks the
+/// whole task, stop and ask` as permission to write `## 阻塞总结` and end the turn.
+/// The denial now forbids that outcome outright and asks for one concrete question
+/// when a decision really is the user's alone.
+pub(super) const DENIED_BY_USER_CONTENT: &str = "Tool call denied by the user. The requested action was not executed; do not bypass this decision with another tool.\n\nThe denial covers this one operation only: the task is not cancelled; change approach and continue. Keep working in this same turn — do not answer with a blocker summary, and do not report the task as ended or blocked. A different, safe route to the same goal is the expected next step; the same denied operation must not be repeated. Only when every remaining step genuinely needs a decision that is yours alone, ask one concrete question instead of declaring a blocker.\n\nWhen one is present, a `User note` section carries the reason the user gave: follow it, and treat it as guidance about this refusal, never as an authorization to do the same thing another way.";
 
 /// M265 + M269/R1: attach the user's own explanation to the denial the model reads.
 ///
@@ -2595,6 +2599,58 @@ mod tests {
             }
             other => panic!("expected a denial, got {other:?}"),
         }
+    }
+
+    /// M276/R3+R5: the denial that reaches the model through the real gateway must
+    /// stop the model from turning one refusal into a whole-task stop, and the
+    /// user's note must survive the redaction applied before the message is stored
+    /// and replayed into the next request.
+    ///
+    /// Incident afc40ac6: the model received the M269 text plus a note, then wrote
+    /// `## 阻塞总结` claiming `那次调用被拒绝` and ended the turn.
+    #[tokio::test]
+    async fn m276_a_denial_tells_the_model_to_keep_working_in_the_same_turn() {
+        let gateway = test_gateway("standard").await;
+        let command = "git reset --hard HEAD";
+        let args = serde_json::json!({"command":command});
+        let call = ToolCall {
+            id: "m276-deny".into(),
+            r#type: "function".into(),
+            function: FunctionCall {
+                name: "bash".into(),
+                arguments: args.to_string(),
+            },
+        };
+        let other = gateway.clone();
+        let task = tokio::spawn(async move { other.authorize(&call, &args, Some(command)).await });
+        take_pending_sender(&gateway)
+            .await
+            .send(crate::PermissionDecision {
+                allow: false,
+                note: Some("请改用工单接口，不要再用 python".into()),
+            })
+            .expect("permission receiver remains live");
+        let denial = match task.await.unwrap() {
+            PermissionOutcome::Deny(denial) => denial,
+            other => panic!("expected a denial, got {other:?}"),
+        };
+        for marker in [
+            "the task is not cancelled",
+            "Keep working in this same turn",
+            "do not answer with a blocker summary",
+        ] {
+            assert!(
+                denial.content.contains(marker),
+                "denial text must say `{marker}`: {}",
+                denial.content
+            );
+        }
+        assert!(!denial.content.contains("stop and ask the user what to do instead"));
+        // The stored/replayed message goes through this redaction; the note must
+        // still be readable by the next model request.
+        let stored = crate::trajectory::redact_derived_message_for_storage(&denial.content);
+        assert!(stored.contains("请改用工单接口"));
+        assert!(stored.contains("Keep working in this same turn"));
     }
 
     /// M265 R4: an approval carrying a note is still just an approval.
