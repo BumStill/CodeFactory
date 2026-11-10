@@ -1463,6 +1463,25 @@ pub fn spawn_objective_recovery_supervisor(app: AppHandle, pool: SqlitePool) {
                     }
                 }
             }
+            // M273/R2: a session that ends itself (the model writes the final
+            // report and the projection turns `ended`) is never a settlement
+            // candidate again, so the startup sweep alone leaves its merged
+            // branch behind. Run the same settlement on the heartbeat, at most
+            // once a minute, whichever way the session ended.
+            if polls_since_stall_sweep % 12 == 0 {
+                match super::thin_derive::settle_merged_sessions(&pool).await {
+                    Ok(summary) if summary.settled + summary.asked_user > 0 => tracing::info!(
+                        settled = summary.settled,
+                        asked_user = summary.asked_user,
+                        "heartbeat: merged/closed sessions settled"
+                    ),
+                    Ok(_) => {}
+                    Err(error) => tracing::warn!(
+                        %error,
+                        "heartbeat: merged-session settlement deferred to the next sweep"
+                    ),
+                }
+            }
             // 阶段 2 P0/R2: a `running` thin row whose executor died (crashed
             // turn, restart race) is resumed from the heartbeat once it is past
             // the grace window. Runs at most once a minute.
