@@ -4094,7 +4094,14 @@ pub(crate) mod merged_settlement {
         session_id: &str,
         state: &thin_state::ThinState,
     ) -> Result<()> {
+        // M275/R2：收尾未核验的结束会在同一事务里取消 pending 唤醒，所以不能
+        // 被「有排队唤醒就不能结束」这一子守卫挡回 running；其余守卫保持原样。
+        let closeout_unverified = state
+            .reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("收尾未核验"));
         if state.state == thin_state::SessionState::Ended
+            && !closeout_unverified
             && state.reason.as_deref().is_some_and(|reason| reason.contains("PR #"))
             && !super::delivery_closeout_may_end(db, session_id).await? {
             thin_state::save(db, session_id, &thin_state::ThinState::running()).await?;
@@ -4170,7 +4177,10 @@ pub(crate) mod merged_settlement {
     #[derive(Debug, Default, PartialEq, Eq)]
     pub struct SettleSummary {
         pub settled: usize,
+        /// M275/R2：收尾路径不再提问；保留字段只用于旧日志兼容。
         pub asked_user: usize,
+        /// M275/R2：确有未保存内容，已以 ended 写明现场、需要保留的会话数。
+        pub unverified: usize,
         pub skipped: usize,
     }
 
@@ -4201,11 +4211,38 @@ pub(crate) mod merged_settlement {
             .is_ok()
     }
 
+    /// M275/R3：收尾范围的持久边界。首次扫描时写入，此后不前移——多次重启
+    /// 不能让「上次运行中刚结束、尚未收尾」的会话掉出范围。边界之前结束的
+    /// 历史会话永远不进候选，不会被重新打开。
+    ///
+    /// 回看 10 分钟覆盖「进程已起来、首次安全 tick 之前自己结束」的会话；
+    /// 历史残留（天级）依然被排除。
+    const CLOSEOUT_SCOPE_GRACE_MS: i64 = 10 * 60 * 1000;
+
+    pub(crate) async fn closeout_scope_boundary(pool: &SqlitePool) -> Result<i64> {
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS closeout_scope_boundary (id INTEGER PRIMARY KEY CHECK (id = 1), installed_at INTEGER NOT NULL)",
+        )
+        .execute(pool)
+        .await?;
+        let now = chrono::Utc::now().timestamp_millis();
+        sqlx::query("INSERT OR IGNORE INTO closeout_scope_boundary(id, installed_at) VALUES (1, ?)")
+            .bind(now.saturating_sub(CLOSEOUT_SCOPE_GRACE_MS))
+            .execute(pool)
+            .await?;
+        Ok(sqlx::query_scalar(
+            "SELECT installed_at FROM closeout_scope_boundary WHERE id = 1",
+        )
+        .fetch_one(pool)
+        .await?)
+    }
+
     /// R1/R2: settle every `waiting_wake` session whose external work concluded.
     /// Deterministic — this never asks a model to finish the task.
     pub async fn settle_merged_sessions(pool: &SqlitePool) -> Result<SettleSummary> {
         thin_state::ensure(pool).await?;
         super::reconcile_orphan_turns(pool).await?;
+        let scope_boundary = closeout_scope_boundary(pool).await?;
         let mut sessions: Vec<String> =
             sqlx::query_scalar("SELECT session_id FROM thin_session_state WHERE state IN ('waiting_wake','running')")
                 .fetch_all(pool)
@@ -4216,6 +4253,7 @@ pub(crate) mod merged_settlement {
             let unclosed: Vec<String> = sqlx::query_scalar(
                 "SELECT state.session_id FROM thin_session_state state
                   WHERE state.state='ended'
+                    AND state.updated_at >= ?
                     AND COALESCE(state.reason,'') NOT LIKE 'cancelled%'
                     AND COALESCE(state.reason,'') NOT LIKE '%系统已自动完成收尾%'
                     AND COALESCE(state.reason,'') NOT LIKE '%收尾已完成%'
@@ -4226,6 +4264,7 @@ pub(crate) mod merged_settlement {
                                   AND (observation.completed_reason LIKE '%已合并%'
                                        OR observation.completed_reason LIKE '%已关闭%'))",
             )
+            .bind(scope_boundary)
             .fetch_all(pool)
             .await?;
             for session in unclosed {
@@ -4301,12 +4340,14 @@ pub(crate) mod merged_settlement {
                     summary.skipped += 1;
                 }
                 Err(failure) => {
-                    let question = format!(
-                        "{reason}，但系统自动收尾没有完成：{failure}。需要你决定如何处理这个工作区。"
+                    // M275/R2：收尾不能为了收尾去问用户。确实有内容不在默认分支时，
+                    // 写清楚现场，直接以结束状态写明；不再进入 waiting_user。
+                    let text = format!(
+                        "{reason}；收尾未核验：{failure}。任务已结束，系统未做删除，已保留本地工作区、分支与远端分支。"
                     );
-                    ask_user_and_cancel(pool, &session, &question).await?;
-                    tracing::warn!(session, %failure, "merged session closeout deferred to the user");
-                    summary.asked_user += 1;
+                    settle_ended_and_cancel(pool, &session, &text, &failure).await?;
+                    tracing::warn!(session, %failure, "merged session closeout ended with preserved evidence");
+                    summary.unverified += 1;
                 }
             }
         }
@@ -4416,6 +4457,118 @@ pub(crate) mod merged_settlement {
         Ok(count > 0)
     }
 
+    /// M275/R1：默认分支引用。真实安装先看 `origin/HEAD`，再用常见远端/本地
+    /// 名称；都取不到时上层退回「提交号可达」判定。
+    fn default_branch_ref(repo: &Path) -> Option<String> {
+        ["origin/HEAD", "origin/main", "origin/master", "main", "master"]
+            .into_iter()
+            .find(|name| super::closeout_git(repo, &["rev-parse", "--verify", "--quiet", name]).is_ok())
+            .map(str::to_string)
+    }
+
+    /// M275/R1：给一段补丁算稳定的 patch-id。空补丁或 git 失败返回 None。
+    fn closeout_patch_id(cwd: &Path, patch: &str) -> Option<String> {
+        use std::io::Write;
+        if patch.trim().is_empty() {
+            return None;
+        }
+        let mut child = Command::new("git")
+            .no_window()
+            .current_dir(cwd)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .args(["patch-id", "--stable"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .ok()?;
+        child.stdin.take()?.write_all(patch.as_bytes()).ok()?;
+        let output = child.wait_with_output().ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let text = String::from_utf8_lossy(&output.stdout);
+        text.split_whitespace().next().map(str::to_string)
+    }
+
+    /// M275/R1：压缩合并保留内容、丢弃提交号。先比整树（树相同即已保存）；
+    /// 树不同再比补丁内容：分支自合并基点的聚合补丁，与默认分支自同一基点起
+    /// 的某个非合并提交（GitHub 的 squash 提交）补丁相同，即说明分支内容已经
+    /// 在默认分支里。只比提交号会把压缩合并误报成「未推送」。
+    fn closeout_content_saved(
+        workspace: &TerminalWorkspace,
+        default_ref: &str,
+    ) -> Result<bool, String> {
+        if super::closeout_git(
+            &workspace.worktree_path,
+            &["diff", "--quiet", default_ref, "HEAD"],
+        )
+        .is_ok()
+        {
+            return Ok(true);
+        }
+        let base = super::closeout_git(
+            &workspace.worktree_path,
+            &["merge-base", default_ref, "HEAD"],
+        )?;
+        let branch_patch = super::closeout_git(
+            &workspace.worktree_path,
+            &["diff", &base, "HEAD"],
+        )?;
+        let Some(branch_id) = closeout_patch_id(&workspace.worktree_path, &branch_patch) else {
+            return Ok(false);
+        };
+        let range = format!("{base}..{default_ref}");
+        let commits = super::closeout_git(
+            &workspace.worktree_path,
+            &["rev-list", "--no-merges", "--max-count=200", &range],
+        )?;
+        for commit in commits.lines().map(str::trim).filter(|line| !line.is_empty()) {
+            let patch = super::closeout_git(
+                &workspace.worktree_path,
+                &["show", "--format=", "--patch", commit],
+            )?;
+            if closeout_patch_id(&workspace.worktree_path, &patch).as_deref()
+                == Some(branch_id.as_str())
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// M275/R2：确实没有进默认分支时，写清楚是哪些提交、在哪个分支。
+    fn unsaved_commit_listing(
+        workspace: &TerminalWorkspace,
+        default_ref: Option<&str>,
+    ) -> String {
+        let excluded = format!("--exclude={}", workspace.branch_name);
+        let listing = match default_ref {
+            Some(default_ref) => super::closeout_git(
+                &workspace.worktree_path,
+                &["log", "--oneline", "--max-count=5", "HEAD", "--not", default_ref],
+            ),
+            None => super::closeout_git(
+                &workspace.worktree_path,
+                &[
+                    "log",
+                    "--oneline",
+                    "--max-count=5",
+                    "HEAD",
+                    "--not",
+                    "--remotes",
+                    "--branches",
+                    &excluded,
+                ],
+            ),
+        };
+        match listing {
+            Ok(text) if !text.trim().is_empty() => text.replace('\n', "、"),
+            Ok(_) => "（提交列表为空）".to_string(),
+            Err(error) => format!("（提交列表不可用：{error}）"),
+        }
+    }
+
     /// R1: no workspace left → nothing to close out. R2: workspace still there →
     /// deterministic §8 closeout, or a plain reason for the user.
     fn closeout_all(workspaces: &[TerminalWorkspace]) -> Result<String, String> {
@@ -4463,14 +4616,35 @@ pub(crate) mod merged_settlement {
                     workspace.worktree_path.display()
                 ));
             }
-            // M187/R3: clean does not imply published. Preserve commits that
-            // have no surviving local branch or remote-tracking reference.
-            let unpublished = git(&workspace.worktree_path, &[
-                "rev-list", "--count", "HEAD", "--not", "--remotes",
-                &format!("--exclude={}", workspace.branch_name), "--branches",
-            ])?;
-            if unpublished.trim() != "0" {
-                return Err(format!("工作区还有 {unpublished} 个未推送且未被其他分支保存的提交，系统自动重试/自愈：保留工作区"));
+            // M187/R3: clean does not imply published. M275/R1: a squash merge
+            // keeps the branch content but not its commit ids, so compare content
+            // (tree, then patch) instead of commit ids alone.
+            let default_ref = default_branch_ref(&workspace.repo_root);
+            let content_saved = match default_ref.as_deref() {
+                Some(default_ref) => closeout_content_saved(workspace, default_ref)?,
+                None => false,
+            };
+            let preserved_by_other_ref = super::closeout_git(
+                &workspace.worktree_path,
+                &[
+                    "rev-list",
+                    "--count",
+                    "HEAD",
+                    "--not",
+                    "--remotes",
+                    &format!("--exclude={}", workspace.branch_name),
+                    "--branches",
+                ],
+            )
+            .map(|count| count.trim() == "0")
+            .unwrap_or(false);
+            if !content_saved && !preserved_by_other_ref {
+                let listing = unsaved_commit_listing(workspace, default_ref.as_deref());
+                let target = default_ref.as_deref().unwrap_or("默认分支");
+                return Err(format!(
+                    "分支 {} 还有未进入 {} 的提交：{listing}；系统未做删除，已保留工作区、本地分支与远端分支",
+                    workspace.branch_name, target
+                ));
             }
             let path = workspace.worktree_path.to_string_lossy().to_string();
             git(
@@ -4798,9 +4972,10 @@ pub(crate) mod merged_settlement {
             assert!(alive.exists(), "M187: unpublished worktree was removed");
         }
 
-        /// R2: a dirty workspace is not silently deleted and not silently waited on.
+        /// M275/R2：脏工作区不再提问，也不进 waiting_user；以 ended 写明未提交
+        /// 项，保留现场并取消唤醒（旧行为「需要你决定」正是 M275 的误报中间态）。
         #[tokio::test]
-        async fn r2_dirty_workspace_asks_user_with_a_reason() {
+        async fn r2_dirty_workspace_ends_with_a_clear_reason() {
             let dir = scratch_dir("dirty");
             let (repo, _branch_a, alive, branch_b) = build_fixture(&dir);
             std::fs::write(alive.join("scratch.txt"), "uncommitted").unwrap();
@@ -4831,19 +5006,20 @@ pub(crate) mod merged_settlement {
             .unwrap();
 
             let summary = settle_merged_sessions(&pool).await.unwrap();
-            assert_eq!(summary.asked_user, 1, "{summary:?}");
+            assert_eq!(summary.asked_user, 0, "收尾不得提问：{summary:?}");
+            assert_eq!(summary.unverified, 1, "脏工作区要记一笔未核验：{summary:?}");
             assert!(alive.exists(), "dirty worktree must be preserved");
             let state = thin_state::load(&pool, "sess-b").await.unwrap().unwrap();
-            assert_eq!(state.state, crate::agent::thin_state::SessionState::WaitingUser);
-            assert!(state.question.unwrap().contains("未提交"));
-            // M199/R3: a question is not explicit stop or terminal settlement;
-            // preserve the pending wake rather than silently killing closeout.
+            assert_eq!(state.state, crate::agent::thin_state::SessionState::Ended);
+            assert!(state.question.is_none(), "不得写入问题");
+            assert!(state.reason.unwrap().contains("未提交"));
+            // 结束后不得留下会起模型回合的唤醒。
             let pending: i64 =
                 sqlx::query_scalar("SELECT COUNT(*) FROM wakeup_schedules WHERE status='pending'")
                     .fetch_one(&pool)
                     .await
                     .unwrap();
-            assert_eq!(pending, 1);
+            assert_eq!(pending, 0);
             assert!(waiting_wake_without_wake_source(&pool).await.is_empty());
         }
 
@@ -5081,6 +5257,226 @@ pub(crate) mod merged_settlement {
                 Some("cancelled：用户已停止会话"),
                 "停止原因不得被收尾改写"
             );
+        }
+
+        async fn seed_merged_workspace(
+            pool: &SqlitePool,
+            session: &str,
+            objective: &str,
+            repo: &Path,
+            worktree: &Path,
+            branch: &str,
+        ) {
+            sqlx::query("INSERT INTO objectives(id,status) VALUES (?, 'completed')")
+                .bind(objective)
+                .execute(pool)
+                .await
+                .unwrap();
+            sqlx::query(
+                "INSERT INTO execution_workspaces
+                 (id, objective_id, session_id, repo_identity, repo_root, git_common_dir,
+                  worktree_path, branch_name, base_ref, base_sha, state, created_at, updated_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'HEAD', 'deadbeef', 'active', 1, 1)",
+            )
+            .bind(format!("ws-{session}"))
+            .bind(objective)
+            .bind(session)
+            .bind(repo.to_string_lossy().to_string())
+            .bind(repo.to_string_lossy().to_string())
+            .bind(repo.join(".git").to_string_lossy().to_string())
+            .bind(worktree.to_string_lossy().to_string())
+            .bind(branch)
+            .execute(pool)
+            .await
+            .unwrap();
+        }
+
+        /// M275/R1：压缩合并保留内容、丢弃提交号。远端分支已被删除、默认分支
+        /// 又前移之后，本地原始提交仍必须判定为「已保存」。
+        #[test]
+        fn m275_squash_merged_branch_content_counts_as_saved() {
+            let dir = scratch_dir("m275-squash");
+            let remote = dir.join("origin.git");
+            std::fs::create_dir_all(&remote).unwrap();
+            git_ok(&remote, &["init", "--bare", "-q", "-b", "main"]);
+            let repo = dir.join("repo");
+            std::fs::create_dir_all(&repo).unwrap();
+            git_ok(&repo, &["init", "-q", "-b", "main"]);
+            git_ok(&repo, &["config", "user.name", "Synthetic"]);
+            git_ok(
+                &repo,
+                &["config", "user.email", "synthetic@example.invalid"],
+            );
+            std::fs::write(repo.join("tracked.txt"), "base\n").unwrap();
+            git_ok(&repo, &["add", "."]);
+            git_ok(&repo, &["commit", "-qm", "synthetic base"]);
+            git_ok(
+                &repo,
+                &["remote", "add", "origin", &remote.to_string_lossy()],
+            );
+            git_ok(&repo, &["push", "-q", "origin", "main"]);
+
+            let branch = "codefactory/objective-m275".to_string();
+            let worktree = dir.join("ws-m275");
+            git_ok(
+                &repo,
+                &[
+                    "worktree",
+                    "add",
+                    "-q",
+                    "-b",
+                    &branch,
+                    &worktree.to_string_lossy(),
+                    "HEAD",
+                ],
+            );
+            std::fs::write(worktree.join("feature.txt"), "feature one\n").unwrap();
+            git_ok(&worktree, &["add", "feature.txt"]);
+            git_ok(&worktree, &["commit", "-qm", "synthetic feature one"]);
+            std::fs::write(worktree.join("feature.txt"), "feature one\nfeature two\n").unwrap();
+            git_ok(&worktree, &["commit", "-qam", "synthetic feature two"]);
+            git_ok(&worktree, &["push", "-q", "-u", "origin", &branch]);
+
+            // 压缩合并：内容进 main，提交号不进；远端分支随后被删除。
+            git_ok(&repo, &["merge", "--squash", "-q", &branch]);
+            git_ok(&repo, &["commit", "-qm", "synthetic squash merge (#275)"]);
+            // main 前移，制造非空树差异，确保判定走补丁内容而不是整树相等。
+            std::fs::write(repo.join("unrelated.txt"), "later main work\n").unwrap();
+            git_ok(&repo, &["add", "unrelated.txt"]);
+            git_ok(&repo, &["commit", "-qm", "synthetic later main work"]);
+            git_ok(&repo, &["push", "-q", "origin", "main"]);
+            git_ok(&repo, &["push", "-q", "origin", "--delete", &branch]);
+
+            let result = closeout_workspace(&TerminalWorkspace {
+                worktree_path: worktree.clone(),
+                repo_root: repo.clone(),
+                branch_name: branch.clone(),
+            });
+            assert!(
+                result.is_ok(),
+                "压缩合并后的内容必须算已保存，而不是未推送提交：{result:?}"
+            );
+            assert!(!worktree.exists(), "压缩合并后工作区应被清理");
+            assert!(
+                git(&repo, &["rev-parse", "--verify", &branch]).is_err(),
+                "压缩合并后本地分支应被清理"
+            );
+        }
+
+        /// M275/R3：升级前就已经 ended 的历史会话不能被重新打开。
+        #[tokio::test]
+        async fn m275_historical_ended_session_is_not_reopened() {
+            let dir = scratch_dir("m275-history");
+            let (repo, _branch_a, alive, branch) = build_fixture(&dir);
+            let pool = seed_state(&dir).await;
+            sqlx::query(
+                "INSERT INTO thin_session_state(session_id,state,waiting_for,reason,updated_at)
+                 VALUES ('sess-old','ended',NULL,'PR #767 已合并',1)",
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO thin_external_observations(session_id, completed_reason, observed_at)
+                 VALUES ('sess-old','PR #767 已合并',1)",
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+            seed_merged_workspace(&pool, "sess-old", "obj-old", &repo, &alive, &branch).await;
+            let wakes_before: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM wakeup_schedules")
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+
+            let summary = settle_merged_sessions(&pool).await.unwrap();
+            assert_eq!(summary.settled, 0, "历史会话不得被收尾：{summary:?}");
+            assert_eq!(summary.asked_user, 0, "历史会话不得被提问：{summary:?}");
+            assert_eq!(summary.unverified, 0, "历史会话不得被改写：{summary:?}");
+            let state = thin_state::load(&pool, "sess-old").await.unwrap().unwrap();
+            assert_eq!(state.state, crate::agent::thin_state::SessionState::Ended);
+            assert_eq!(state.reason.as_deref(), Some("PR #767 已合并"));
+            assert!(state.question.is_none(), "历史会话不得被写入问题");
+            assert!(alive.exists(), "历史工作区不得被自动删除");
+            let open: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM execution_workspaces WHERE state<>'closed'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(open, 1, "历史工作区记录不得被改写");
+            let wakes_after: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM wakeup_schedules")
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            assert_eq!(wakes_before, wakes_after, "历史会话不得新增唤醒");
+        }
+
+        /// M275/R2+R4：确有内容没进默认分支时，以 ended 写明提交与分支，
+        /// 不问用户、不进入 waiting_user。
+        #[tokio::test]
+        async fn m275_unsaved_content_ends_session_without_asking() {
+            let dir = scratch_dir("m275-unsaved");
+            let (repo, _branch_a, alive, branch) = build_fixture(&dir);
+            std::fs::write(alive.join("local-only.txt"), "synthetic unpublished work").unwrap();
+            git_ok(&alive, &["add", "local-only.txt"]);
+            git_ok(&alive, &["commit", "-qm", "synthetic local-only commit"]);
+
+            let pool = seed_state(&dir).await;
+            sqlx::query(
+                "INSERT INTO thin_session_state(session_id,state,waiting_for,updated_at)
+                 VALUES ('sess-unsaved','waiting_wake','PR #276 合并',1)",
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO thin_external_observations(session_id, completed_reason, observed_at)
+                 VALUES ('sess-unsaved','PR #276 已合并',1)",
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO wakeup_schedules(id, session_id, prompt, source, next_at, status, created_at)
+                 VALUES ('w-unsaved','sess-unsaved','p','agent_decided',1,'pending',1)",
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+            seed_merged_workspace(&pool, "sess-unsaved", "obj-unsaved", &repo, &alive, &branch).await;
+
+            let summary = settle_merged_sessions(&pool).await.unwrap();
+            assert_eq!(summary.asked_user, 0, "收尾不得提问：{summary:?}");
+            assert_eq!(summary.settled, 0, "未核验的收尾不计入已收尾：{summary:?}");
+            assert_eq!(summary.unverified, 1, "要记一笔未核验收尾：{summary:?}");
+            let state = thin_state::load(&pool, "sess-unsaved")
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                state.state,
+                crate::agent::thin_state::SessionState::Ended,
+                "未合并内容也必须以结束状态写明：{state:?}"
+            );
+            assert!(state.question.is_none(), "不得写入 waiting_user 问题");
+            let reason = state.reason.unwrap_or_default();
+            assert!(reason.contains(&branch), "原因要写明分支：{reason}");
+            assert!(
+                reason.contains("local-only"),
+                "原因要写明哪些提交：{reason}"
+            );
+            assert!(!reason.contains("需要你决定"), "不得写中间态：{reason}");
+            assert!(alive.exists(), "未合并内容的工作区必须保留");
+            let pending: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM wakeup_schedules WHERE status='pending'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(pending, 0, "结束后不得留下会起模型回合的唤醒");
         }
     }
 }
