@@ -2017,6 +2017,9 @@ pub mod daily_spend {
 pub struct EndpointSpendReport {
     pub currency: String,
     pub statuses: Vec<crate::agent::quota_cap::daily_spend::EndpointSpendStatus>,
+    /// M274/R5: USD budgets (the OpenAI API route) — a separate list because the
+    /// currency, the price list and the ledger are different from the CNY caps.
+    pub usd_statuses: Vec<crate::agent::openai_api::UsdSpendStatus>,
 }
 
 /// 只报告**有预算概念**的端点：显式配置过，或命中内置默认值（DeepSeek）。
@@ -2045,7 +2048,31 @@ pub fn endpoint_spend_report(
     EndpointSpendReport {
         currency: crate::agent::quota_cap::daily_spend::CURRENCY.to_string(),
         statuses,
+        usd_statuses: usd_spend_statuses(settings, now_ms),
     }
+}
+
+/// M274/R5: today's USD spend for every `openai*` endpoint, with the cap, the
+/// reset time and an explicit estimate marker.
+pub fn usd_spend_statuses(
+    settings: &crate::config::settings::Settings,
+    now_ms: i64,
+) -> Vec<crate::agent::openai_api::UsdSpendStatus> {
+    let mut names: Vec<String> = settings
+        .endpoints
+        .keys()
+        .filter(|name| crate::agent::openai_api::is_usd_endpoint(name))
+        .cloned()
+        .collect();
+    names.sort();
+    names
+        .into_iter()
+        .filter_map(|name| {
+            settings
+                .endpoint_openai_api_cap(&name)
+                .map(|cap| crate::agent::openai_api::ledger().status(&name, &cap, now_ms))
+        })
+        .collect()
 }
 
 /// 用法页面与只读入口共用：今日花了多少、上限多少、什么时候重置。

@@ -199,6 +199,12 @@ pub struct Settings {
     /// built-in ¥10/day default the user asked for.
     #[serde(default)]
     pub endpoint_daily_spend_caps: HashMap<String, crate::agent::quota_cap::daily_spend::DailySpendConfig>,
+    #[serde(default = "default_endpoint_route_order")]
+    pub endpoint_route_order: Vec<String>,
+    /// M274/R3: the OpenAI **API** route bills in USD, so its daily ceiling is
+    /// a separate, dollar-denominated budget from the CNY caps above.
+    #[serde(default)]
+    pub openai_api_daily_cap: crate::agent::openai_api::UsdDailyCap,
     /// CF-WINDOW-R1: JSON [endpoint, model] tuple keys, default unrestricted.
     #[serde(default)]
     pub model_usage_windows: HashMap<String, crate::agent::usage_windows::UsageWindow>,
@@ -279,6 +285,19 @@ impl Settings {
             .unwrap_or(false)
     }
 
+    /// M274/R2/R5: the USD budget for the OpenAI API route (`None` for every
+    /// endpoint that is not billed in dollars).
+    pub fn endpoint_openai_api_cap(
+        &self,
+        endpoint_name: &str,
+    ) -> Option<crate::agent::openai_api::UsdDailyCap> {
+        if crate::agent::openai_api::is_usd_endpoint(endpoint_name) {
+            Some(self.openai_api_daily_cap)
+        } else {
+            None
+        }
+    }
+
     /// M212：该端点的每日人民币预算。配置优先，缺省时 DeepSeek 走内置 ¥10
     /// 默认值；其它端点没有配置就是不设上限（`None`）。
     pub fn endpoint_daily_spend_cap(
@@ -309,6 +328,54 @@ impl Settings {
             )
             .collect();
         crate::agent::quota_cap::daily_spend::install_configs(configs);
+    }
+
+    /// M274/R1: an existing settings file predates the OpenAI API preset, so
+    /// forward-add it. A user-customised `openai` entry is never overwritten.
+    pub fn ensure_openai_api_preset(&mut self) {
+        let name = crate::agent::openai_api::ENDPOINT_NAME;
+        if self.endpoints.contains_key(name) {
+            return;
+        }
+        self.endpoints.insert(
+            name.into(),
+            Endpoint {
+                base_url: "https://api.openai.com/v1".into(),
+                key_ref: Some("codefactory.endpoint.openai".into()),
+                api_style: ApiStyle::Openai,
+                custom_models: vec![],
+                active_model: Some("gpt-5".into()),
+            },
+        );
+    }
+
+    /// M274/R4: the reserve order the user can reorder — the subscription route
+    /// first, then the API route, then the other pay-per-token providers. Only
+    /// names that exist in `endpoints` are returned, so a missing preset can
+    /// never produce a phantom candidate.
+    pub fn ordered_endpoint_names(&self) -> Vec<String> {
+        let mut ordered: Vec<String> = Vec::new();
+        for name in &self.endpoint_route_order {
+            if self.endpoints.contains_key(name) && !ordered.contains(name) {
+                ordered.push(name.clone());
+            }
+        }
+        // Anything the user added later keeps a stable place after the reserve
+        // list, so routing is deterministic without reordering their edits.
+        let mut rest: Vec<String> = self
+            .endpoints
+            .keys()
+            .filter(|name| !ordered.contains(*name))
+            .cloned()
+            .collect();
+        rest.sort();
+        ordered.extend(rest);
+        ordered
+    }
+
+    /// M274/R3: the OpenAI API USD ceiling, if this endpoint is billed in USD.
+    pub fn endpoint_is_usd_billed(&self, endpoint_name: &str) -> bool {
+        crate::agent::openai_api::is_usd_endpoint(endpoint_name)
     }
 }
 
@@ -415,6 +482,17 @@ impl MergeMethod {
 
 fn default_delivery_ci_timeout_secs() -> u32 {
     1800
+}
+
+/// M274/R4: subscription first (no per-token bill), then the Pro-funded API
+/// route, then the independent pay-per-token providers.
+fn default_endpoint_route_order() -> Vec<String> {
+    vec![
+        "chatgpt".into(),
+        crate::agent::openai_api::ENDPOINT_NAME.into(),
+        "deepseek".into(),
+        "openrouter".into(),
+    ]
 }
 
 /// How parallel subagents are isolated from each other on disk.
@@ -703,12 +781,27 @@ impl Default for Settings {
                 active_model: Some("anthropic/claude-opus-4-7".into()),
             },
         );
+        // M274/R1: the pay-per-token OpenAI API route, funded by the Pro
+        // membership credit. It ships visible but inert — without a key the
+        // route is skipped with a recorded reason, never a silent failure.
+        endpoints.insert(
+            crate::agent::openai_api::ENDPOINT_NAME.into(),
+            Endpoint {
+                base_url: "https://api.openai.com/v1".into(),
+                key_ref: Some("codefactory.endpoint.openai".into()),
+                api_style: ApiStyle::Openai,
+                custom_models: vec![],
+                active_model: Some("gpt-5".into()),
+            },
+        );
         Self {
             endpoints,
             default_endpoint: "openrouter".into(),
             // M212：DeepSeek 的 ¥10/天 由 `endpoint_daily_spend_cap()` 的
             // 内置默认值提供，所以这里不需要预置条目。
             endpoint_daily_spend_caps: HashMap::new(),
+            endpoint_route_order: default_endpoint_route_order(),
+            openai_api_daily_cap: crate::agent::openai_api::UsdDailyCap::default(),
             vision_assistant: None,
             default_model: "anthropic/claude-opus-4-7".into(),
             default_model_policy: default_model_policy(),
@@ -1219,6 +1312,10 @@ pub fn load() -> Settings {
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default();
+
+    // M274/R1: settings files written before the OpenAI API preset existed get
+    // the entry forward-added, so the route is visible without a reinstall.
+    settings.ensure_openai_api_preset();
 
     if let Err(error) = migrate_usage_windows_at_path(&new_path, &mut settings) {
         tracing::warn!("settings: usage-window migration skipped: {error}");
