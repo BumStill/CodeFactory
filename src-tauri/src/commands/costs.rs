@@ -273,6 +273,21 @@ pub async fn record_usage_event(
                 crate::agent::quota_cap::daily_spend::ledger().record_estimated(&event.endpoint, cost, now);
             }
         }
+        // M274/R2/R3: the same event also feeds the USD ledger for the OpenAI
+        // API route, priced from the model + token counts. An unknown model is
+        // priced conservatively — it is never recorded as free.
+        if crate::agent::openai_api::is_usd_endpoint(&event.endpoint) {
+            let now = Utc::now().timestamp_millis();
+            if crate::agent::quota_cap::daily_spend::day_start_ms(recorded_at_ms) == crate::agent::quota_cap::daily_spend::day_start_ms(now) {
+                let cost_usd = crate::agent::openai_api::estimate_cost_usd(
+                    &event.model,
+                    event.input_tokens,
+                    event.cached_tokens,
+                    event.output_tokens,
+                );
+                crate::agent::openai_api::ledger().record_estimated(&event.endpoint, cost_usd, now);
+            }
+        }
     }
     Ok(inserted)
 }
