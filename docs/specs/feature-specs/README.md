@@ -48,6 +48,7 @@
 - `m221-local-commit-heredoc.md`: `git commit -F -`/`git tag -F -` 的 heredoc 正文按「数据」而非「脚本」判定，本工作区内的本地 commit 直接放行；远端段与工作区外仓库仍按 M208/M130 审批。
 - `m223-release-retry-transient-infra.md`: 发版链路上的 GitHub 瞬时故障（502/限流、runner 排不到、检查被判 cancelled）按有限次数自动重跑，真实失败仍 fail-closed；含可测的判定脚本与真实 workflow shell 的验收测试。
 - `m234-endpoint-cooldown-is-a-transient-wait.md`: 端点的瞬时失败冷却必须作为一条「时间会治好」的等待原因参与准入，唤醒按 M220 退避与 12 次上限交代真实端点，而不是静默跳过、把会话挂到另一个端点的额度/预算重置上；含文案与唤醒时间一致性、可审计 skipped 路由记录规格。
+- `m275-closeout-squash-and-scope.md`: 系统收尾把压缩合并识别为「内容已保存」（比较树与补丁内容，不只比提交号），只对上线后结束或仍在进行中的会话收尾，未保存内容以结束状态写清提交与分支而不进入 `waiting_user`。
 
 ## 模板
 - `requirements-traceability-template.md`
