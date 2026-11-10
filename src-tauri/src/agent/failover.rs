@@ -52,6 +52,12 @@ impl RouteCandidate {
         } else { None };
         let spend = config.endpoint_daily_spend_cap(&self.endpoint_name)
             .and_then(|cap| super::quota_cap::daily_spend::cap_wait_cause(&cap, &self.endpoint_name, now));
+        // M274/R3: the OpenAI API route is billed in USD, so it carries its own
+        // dollar ceiling. Reaching it makes this endpoint yield to the next
+        // candidate exactly like the CNY cap does.
+        let usd_spend = config
+            .endpoint_openai_api_cap(&self.endpoint_name)
+            .and_then(|cap| super::openai_api::cap_wait_cause(&cap, &self.endpoint_name, now));
         let restriction = match (window, quota) {
             // M267/R5：阻断时也要说清窗口、用量和上限，而不只是“已达上限”。
             (Some(window), Some(quota)) => Some(WaitCause::new(
@@ -77,7 +83,7 @@ impl RouteCandidate {
             )),
             (None, None) => None,
         };
-        match (restriction, spend) {
+        match (restriction, spend.or(usd_spend)) {
             (Some(restriction), Some(mut spend)) => {
                 spend.label = format!("{}；{}", restriction.sentence(), spend.label);
                 spend.until_ms = restriction.until_ms.zip(spend.until_ms).map(|(a, b)| a.max(b));
@@ -1809,6 +1815,27 @@ mod tests {
             supports_vision: true,
             api_style: ApiStyle::Openai,
         }
+    }
+
+    /// M274/R3/R4/R7: once the OpenAI API USD budget is gone this candidate
+    /// yields with a stated reason, and the next candidate is unaffected — so a
+    /// single exhausted route never blocks the turn.
+    #[test]
+    fn openai_api_usd_cap_yields_to_the_next_candidate() {
+        let config = crate::config::settings::Settings::default();
+        let now = crate::agent::usage_windows::now_ms();
+        let api = route("openai-m274-yield", "gpt-5");
+        let backup = route("deepseek-m274-yield", "deepseek-chat");
+        assert!(api.unavailable_cause(&config, now, true).is_none());
+        // Spend past the $3/day default.
+        crate::agent::openai_api::ledger().record_estimated("openai-m274-yield", 5.0, now);
+        let cause = api.unavailable_cause(&config, now, true).expect("usd cap reached");
+        assert_eq!(cause.kind, super::super::usage_windows::WaitCauseKind::DailySpendCap);
+        assert!(cause.sentence().contains("OpenAI API"));
+        // The other route still runs, and the money cap is not bypassed by
+        // ignore_windows.
+        assert!(backup.unavailable_cause(&config, now, true).is_none());
+        assert!(api.unavailable_cause(&config, now, true).is_some());
     }
 
     #[test]

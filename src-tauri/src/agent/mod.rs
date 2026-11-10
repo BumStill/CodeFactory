@@ -37,6 +37,7 @@ mod lifecycle_hooks;
 pub mod memory_manifest;
 pub mod model_transport;
 pub mod objective;
+pub mod openai_api;
 /// M151：会话级诊断与状态重置（存量会话卡「正在做 · 等待中」）。
 pub mod objective_diagnostics;
 pub mod objective_supervisor;
