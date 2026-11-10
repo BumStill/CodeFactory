@@ -25,6 +25,25 @@ pub async fn observe<F: std::future::Future>(future: F) -> (F::Output, BTreeMap<
     (output, snapshot)
 }
 
+/// Settings for the synthetic endpoint. Route planning admits only endpoints
+/// with a saved credential reference (M152/M155), so the fixture must name one
+/// even though it never resolves it: the fixture route carries an inline key,
+/// which the transport prefers, so no OS credential store is touched.
+pub(crate) fn fixture_settings(base_url: &str) -> crate::config::settings::Settings {
+    use crate::config::settings::{ApiStyle, Endpoint, Settings};
+    let mut settings = Settings::default();
+    settings.endpoints.clear();
+    settings.default_endpoint = "synthetic".into();
+    settings.default_model = "synthetic-model".into();
+    settings.endpoints.insert("synthetic".into(), Endpoint {
+        base_url: base_url.into(),
+        key_ref: Some("codefactory.endpoint.synthetic-latency-fixture".into()),
+        api_style: ApiStyle::Openai,
+        custom_models: Vec::new(), active_model: Some("synthetic-model".into()),
+    });
+    settings
+}
+
 /// Synthetic, local-only first POST measurement through production admission,
 /// checkpoint, route gates, context loading and AgentLoop transport. Run in a
 /// separate process with an empty HOME so no user skills or credentials load.
@@ -32,9 +51,9 @@ pub async fn observe<F: std::future::Future>(future: F) -> (F::Output, BTreeMap<
 pub async fn measure() -> anyhow::Result<serde_json::Value> {
     use super::{AgentLoop, AgentMode};
     use super::events::{CollectingEventSink, EventSink};
-    use crate::config::settings::{ApiStyle, Endpoint, Settings};
+    use crate::config::settings::ApiStyle;
     use crate::mcp::McpManager;
-    use anyhow::{anyhow, ensure};
+    use anyhow::{anyhow, ensure, Context};
     use crate::util::no_window::NoWindow;
     use std::io::{Read, Write};
     use std::net::TcpListener;
@@ -60,12 +79,19 @@ pub async fn measure() -> anyhow::Result<serde_json::Value> {
         let base_url = format!("http://{}", listener.local_addr()?);
         let (send, receive) = tokio::sync::oneshot::channel();
         let start = Instant::now();
+        // Set when the agent ends before any POST, so the fake provider stops
+        // waiting and the agent's own error is what gets reported.
+        let abandoned = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let server_abandoned = abandoned.clone();
         let server = std::thread::spawn(move || -> anyhow::Result<()> {
             let deadline = Instant::now() + Duration::from_secs(30);
             let mut stream = loop {
                 match listener.accept() {
                     Ok((stream, _)) => break stream,
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        if server_abandoned.load(std::sync::atomic::Ordering::SeqCst) {
+                            return Ok(());
+                        }
                         ensure!(Instant::now() < deadline, "first HTTP request timed out");
                         std::thread::sleep(Duration::from_millis(1));
                     }
@@ -102,14 +128,7 @@ pub async fn measure() -> anyhow::Result<serde_json::Value> {
         let session = format!("synthetic-latency-{round}");
         sqlx::query("INSERT INTO sessions (id,title,cwd,model_id,permission_mode,created_at,updated_at) VALUES (?, 'Synthetic', ?, 'synthetic-model', 'trusted', 0, 0)")
             .bind(&session).bind(project.to_string_lossy().as_ref()).execute(&pool).await?;
-        let mut settings = Settings::default();
-        settings.endpoints.clear();
-        settings.default_endpoint = "synthetic".into();
-        settings.default_model = "synthetic-model".into();
-        settings.endpoints.insert("synthetic".into(), Endpoint {
-            base_url: base_url.clone(), key_ref: None, api_style: ApiStyle::Openai,
-            custom_models: Vec::new(), active_model: Some("synthetic-model".into()),
-        });
+        let settings = fixture_settings(&base_url);
         let (result, mut stages) = observe(async {
             let started = Instant::now();
             crate::commands::chat::admit_headless_chat_turn(&pool, &session, "Explain the synthetic fixture; do not change files.").await?;
@@ -133,8 +152,15 @@ pub async fn measure() -> anyhow::Result<serde_json::Value> {
                 outcome = agent.run(history) => Err(anyhow!("agent ended before first HTTP receipt: {outcome:?}")),
             }
         }).await;
-        server.join().map_err(|_| anyhow!("fixture server panicked"))??;
-        stages.insert("admission_to_http".into(), result?);
+        if result.is_err() {
+            abandoned.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        let served = server.join().map_err(|_| anyhow!("fixture server panicked"))?;
+        // The agent's failure explains a missing POST; report it before any
+        // server-side timeout it caused.
+        let arrived = result.with_context(|| format!("round {round}"))?;
+        served?;
+        stages.insert("admission_to_http".into(), arrived);
         ensure!(stages.contains_key("skills_memory"), "skills/memory stage missing");
         ensure!(stages.contains_key("provider_post"), "provider admission stage missing");
         samples.push(stages);
@@ -147,4 +173,28 @@ pub async fn measure() -> anyhow::Result<serde_json::Value> {
         median_ms.insert(key.clone(), values[2]);
     }
     Ok(serde_json::json!({"synthetic_only": true, "rounds": samples, "median_ms": median_ms}))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fixture_settings;
+
+    /// The latency fixture silently broke when route planning started
+    /// excluding endpoints without a saved credential (M155): the run failed
+    /// before any POST and was reported as a 30s HTTP timeout. Keep the
+    /// fixture's settings admissible by the production planner.
+    #[tokio::test]
+    async fn fixture_settings_are_admitted_by_the_production_route_planner() {
+        let settings = fixture_settings("http://127.0.0.1:9");
+        let (plan, excluded) = crate::commands::chat::resolve_route_plan(
+            &settings, "synthetic-model", "fixed", false,
+        )
+        .await
+        .expect("fixture endpoint must be routable");
+        assert!(excluded.is_empty(), "{excluded:?}");
+        let route = &plan.candidates()[0];
+        assert_eq!(route.endpoint_name, "synthetic");
+        assert_eq!(route.model_id, "synthetic-model");
+        assert_eq!(route.base_url, "http://127.0.0.1:9");
+    }
 }
