@@ -171,10 +171,13 @@ fn next_reset_ms(now_ms: i64) -> Option<i64> {
 
 // ------------------------------------------------------------------- ledger
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Default)]
 struct Entry {
     day_start_ms: i64,
     estimated_usd: f64,
+    /// M279: pre-request holds that have not settled yet.
+    reserved_usd: f64,
+    reservations: HashMap<u64, (f64, i64)>,
 }
 
 /// In-memory per-endpoint, per-local-day USD spend. Same shape as the CNY
@@ -183,20 +186,141 @@ struct Entry {
 #[derive(Debug, Default)]
 pub struct UsdSpendLedger {
     entries: Mutex<HashMap<String, Entry>>,
+    next_reservation: std::sync::atomic::AtomicU64,
 }
 
 impl UsdSpendLedger {
+    /// M279 / R1: replace today's totals with values rebuilt from
+    /// `model_usage_events`, mirroring the CNY ledger's startup restore.
+    pub fn restore_estimates(&self, totals: HashMap<String, f64>, now_ms: i64) {
+        let day = day_start_ms(now_ms);
+        let mut guard = self.entries.lock().expect("usd spend ledger poisoned");
+        guard.retain(|_, entry| entry.day_start_ms == day);
+        for entry in guard.values_mut() {
+            entry.estimated_usd = 0.0;
+        }
+        for (endpoint, cost) in totals {
+            guard
+                .entry(endpoint)
+                .or_insert_with(|| Entry { day_start_ms: day, ..Default::default() })
+                .estimated_usd = cost;
+        }
+    }
+
     pub fn record_estimated(&self, endpoint: &str, cost_usd: f64, now_ms: i64) {
         if !(cost_usd > 0.0) || !is_usd_endpoint(endpoint) {
             return;
         }
         let day = day_start_ms(now_ms);
         let mut guard = self.entries.lock().expect("usd spend ledger poisoned");
-        let entry = guard.entry(endpoint.to_string()).or_insert(Entry { day_start_ms: day, estimated_usd: 0.0 });
+        let entry = guard.entry(endpoint.to_string()).or_insert(Entry { day_start_ms: day, ..Default::default() });
         if entry.day_start_ms < day {
-            *entry = Entry { day_start_ms: day, estimated_usd: 0.0 };
+            *entry = Entry { day_start_ms: day, ..Default::default() };
         }
         entry.estimated_usd += cost_usd;
+    }
+
+    fn prune_reservations(entry: &mut Entry, now_ms: i64) {
+        let expired = entry
+            .reservations
+            .iter()
+            .filter(|(_, (_, at))| now_ms.saturating_sub(*at) >= crate::agent::quota_cap::daily_spend::RESERVATION_TTL_MS)
+            .map(|(token, _)| *token)
+            .collect::<Vec<_>>();
+        for token in expired {
+            if let Some((amount, _)) = entry.reservations.remove(&token) {
+                entry.reserved_usd = (entry.reserved_usd - amount).max(0.0);
+            }
+        }
+    }
+
+    /// M279 / R2: hold this request's estimated cost before it is sent. The
+    /// check and the hold share one lock, so concurrent requests cannot both
+    /// spend the same remaining headroom.
+    pub fn try_reserve(
+        &self,
+        endpoint: &str,
+        amount_usd: f64,
+        cap_usd: f64,
+        now_ms: i64,
+    ) -> Option<u64> {
+        if !is_usd_endpoint(endpoint)
+            || !amount_usd.is_finite()
+            || amount_usd < 0.0
+            || !cap_usd.is_finite()
+        {
+            return None;
+        }
+        let day = day_start_ms(now_ms);
+        let mut guard = self.entries.lock().expect("usd spend ledger poisoned");
+        let entry = guard
+            .entry(endpoint.to_string())
+            .or_insert(Entry { day_start_ms: day, ..Default::default() });
+        if entry.day_start_ms < day {
+            *entry = Entry { day_start_ms: day, ..Default::default() };
+        }
+        Self::prune_reservations(entry, now_ms);
+        if entry.estimated_usd + entry.reserved_usd + amount_usd > cap_usd {
+            return None;
+        }
+        let token = self
+            .next_reservation
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1;
+        entry.reserved_usd += amount_usd;
+        entry.reservations.insert(token, (amount_usd, now_ms));
+        Some(token)
+    }
+
+    pub fn settle_reservation(&self, token: u64, actual_usd: f64) {
+        let mut guard = self.entries.lock().expect("usd spend ledger poisoned");
+        for entry in guard.values_mut() {
+            if let Some((reserved, _)) = entry.reservations.remove(&token) {
+                entry.reserved_usd = (entry.reserved_usd - reserved).max(0.0);
+                if actual_usd.is_finite() && actual_usd > 0.0 {
+                    entry.estimated_usd += actual_usd;
+                }
+                return;
+            }
+        }
+    }
+
+    pub fn release_reservation(&self, token: u64) {
+        let mut guard = self.entries.lock().expect("usd spend ledger poisoned");
+        for entry in guard.values_mut() {
+            if let Some((reserved, _)) = entry.reservations.remove(&token) {
+                entry.reserved_usd = (entry.reserved_usd - reserved).max(0.0);
+                return;
+            }
+        }
+    }
+
+    pub fn reserved_usd(&self, endpoint: &str, now_ms: i64) -> f64 {
+        if !is_usd_endpoint(endpoint) {
+            return 0.0;
+        }
+        let day = day_start_ms(now_ms);
+        let guard = self.entries.lock().expect("usd spend ledger poisoned");
+        guard
+            .get(endpoint)
+            .filter(|entry| entry.day_start_ms == day)
+            .map(|entry| entry.reserved_usd)
+            .unwrap_or(0.0)
+    }
+
+    /// M279: today's settled USD spend for one endpoint (used by the restart
+    /// rebuild test and by status surfaces).
+    pub fn spent_usd(&self, endpoint: &str, now_ms: i64) -> f64 {
+        if !is_usd_endpoint(endpoint) {
+            return 0.0;
+        }
+        let day = day_start_ms(now_ms);
+        let guard = self.entries.lock().expect("usd spend ledger poisoned");
+        guard
+            .get(endpoint)
+            .filter(|entry| entry.day_start_ms == day)
+            .map(|entry| entry.estimated_usd)
+            .unwrap_or(0.0)
     }
 
     pub fn estimated_usd(&self, endpoint: &str, now_ms: i64) -> f64 {
@@ -341,6 +465,24 @@ mod tests {
     ///
     /// Each test uses its own `openai-*` endpoint: the ledger is global and the
     /// suite runs in parallel, so a shared name would race.
+    /// M279 / R1 + R2: a restored total is no longer free headroom, and holds
+    /// still cannot overspend the restored value.
+    #[test]
+    fn m279_restored_usd_total_blocks_new_reservations() {
+        let now = at("2026-10-30T02:00:00Z");
+        let endpoint = "openai-m279-restore";
+        let ledger = UsdSpendLedger::default();
+        let totals = HashMap::from([(endpoint.to_string(), 0.24)]);
+        ledger.restore_estimates(totals, now);
+        assert!((ledger.spent_usd(endpoint, now) - 0.24).abs() < 1e-9);
+        assert!(
+            ledger.try_reserve(endpoint, 0.01, 0.24, now).is_none(),
+            "0.24 already spent leaves no room for another 0.01 under a 0.24 cap"
+        );
+        assert!(ledger.try_reserve(endpoint, 0.1, 1.0, now).is_some());
+        assert!((ledger.reserved_usd(endpoint, now) - 0.1).abs() < 1e-9);
+    }
+
     #[test]
     fn usd_cap_blocks_then_resets_at_local_midnight() {
         let now = at("2026-10-30T02:00:00Z"); // 10:00 +08:00

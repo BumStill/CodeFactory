@@ -250,6 +250,11 @@ pub fn classify_provider_failure(message: &str) -> ProviderFailureClass {
         }
     }
     let lower = message.to_ascii_lowercase();
+    // M279: a local daily cap (CNY or USD) refused this request before it was
+    // sent. It is a retryable budget condition, not a provider verdict.
+    if lower.contains("daily_budget_exhausted") {
+        return ProviderFailureClass::RateLimited;
+    }
     if let Some((_, payload)) = message.split_once(ModelUnavailable::MARKER) {
         if serde_json::Deserializer::from_str(payload).into_iter::<serde_json::Value>().next()
             .and_then(|value| value.ok()).is_some_and(|value| value["transient_endpoints"].as_array().is_some_and(|endpoints| !endpoints.is_empty())) {
@@ -698,6 +703,18 @@ impl ActiveRouteState {
 
     pub fn attach_usage_settings(&self, settings: Arc<tokio::sync::RwLock<crate::config::settings::Settings>>) {
         self.inner.lock().expect("active route mutex poisoned").usage_settings = Some(settings);
+    }
+
+    /// M279 / R2: the live settings handle, so the transport can read the
+    /// per-endpoint daily caps at the moment it is about to send.
+    pub(crate) fn usage_settings(
+        &self,
+    ) -> Option<Arc<tokio::sync::RwLock<crate::config::settings::Settings>>> {
+        self.inner
+            .lock()
+            .expect("active route mutex poisoned")
+            .usage_settings
+            .clone()
     }
 
     /// Called before every POST, including retries; waits are not failures.
