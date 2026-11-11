@@ -1779,10 +1779,13 @@ pub fn run_headless_smoke_cli() -> bool {
 }
 
 pub fn run() {
-    // A dead stdout/stderr pipe must not take the whole process with it; repair
-    // it before the first log line. See `std_stream_guard` for the v1.114.0 crash.
-    crate::std_stream_guard::install();
     let context = tauri::generate_context!();
+    // A dead stdout/stderr pipe must not take the whole process with it; repair
+    // both streams before the first log line and before any GUI work starts.
+    // See `std_stream_guard` for the v1.114.0 crash. This stays after the
+    // context line on purpose: `tests/test_desktop_isolation_contract.py`
+    // requires the context macro call to open `run()`.
+    crate::std_stream_guard::install();
     // U34: the local-only dispatch client entry. `src-tauri/src/main.rs` is the
     // E2E-001 trust root and an ordinary PR must keep it byte-identical, so the
     // client is resolved here — the entry the frozen main falls through to —
