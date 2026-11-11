@@ -56,6 +56,7 @@
     { "pattern": "src-tauri/src/agent/delivery_scenario_repair.rs", "scenario_id": "CXD-002" },
     { "pattern": "src-tauri/src/tools/edit.rs", "scenario_id": "HLT-001" },
     { "pattern": "scripts/cargo-shared.mjs", "scenario_id": "RTE-005" },
-    { "pattern": "src-tauri/src/agent/openai_api.rs", "scenario_id": "HLT-001" }
+    { "pattern": "src-tauri/src/agent/openai_api.rs", "scenario_id": "HLT-001" },
+    { "pattern": "src-tauri/src/agent/daily_spend_live_m279_tests.rs", "scenario_id": "HLT-001" }
   ]
 }
