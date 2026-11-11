@@ -1943,6 +1943,13 @@ pub mod daily_spend {
             let now = at("2026-10-30T02:00:00Z");
             let ledger = Arc::new(SpendLedger::default());
             ledger.record_estimated("deepseek-m279-race", 9.2, now);
+            // The production example: at ¥9.60 booked, a ¥0.50 hold is already
+            // over the ¥10 line, so it must be refused outright.
+            ledger.record_estimated("deepseek-m279-spec", 9.6, now);
+            assert!(
+                ledger.try_reserve("deepseek-m279-spec", 0.5, 10.0, now).is_none(),
+                "9.6 + 0.5 > 10 must not be sent"
+            );
             let barrier = Arc::new(Barrier::new(3));
             let mut handles = Vec::new();
             for _ in 0..2 {
@@ -1964,6 +1971,10 @@ pub mod daily_spend {
             let winner = results.into_iter().flatten().next().expect("one reservation");
             ledger.settle_reservation(winner, 0.3, now);
             assert!(ledger.reserved_cny("deepseek-m279-race", now).abs() < 1e-9);
+            assert!(
+                (ledger.estimated_cny("deepseek-m279-race", now) - 9.5).abs() < 1e-9,
+                "settlement adds only the actual ¥0.30, not the ¥0.50 hold"
+            );
             assert!(ledger.try_reserve("deepseek-m279-race", 0.39, 10.0, now).is_some());
         }
 
