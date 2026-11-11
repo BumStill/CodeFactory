@@ -24,6 +24,8 @@ pub(crate) mod thin_restart;
 pub(crate) mod thin_state;
 pub(crate) use execution_workspace::workspace_recovery_budget;
 pub mod daily_spend_live;
+#[cfg(test)]
+mod daily_spend_live_m279_tests;
 mod fact_checker;
 pub mod failover;
 pub mod failure_summary;
