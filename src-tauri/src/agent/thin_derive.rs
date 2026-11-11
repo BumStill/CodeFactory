@@ -1026,6 +1026,16 @@ async fn latest_assistant_text(db: &SqlitePool, session: &str) -> sqlx::Result<O
 /// 同一轮只挂一条（id 带消息时间戳），已存在的行不重排；连续续接按 60s 起的
 /// 指数退避，既不做 60 秒无限重排，也不把系统恢复改问成用户决定。
 async fn continue_state(db: &SqlitePool, session: &str, at: i64, why: &str) -> sqlx::Result<Option<ThinState>> {
+    continue_state_after(db, session, at, why, None).await
+}
+
+/// M278/R1：同一条续接，但不再等 60 秒。只用于「审批刚被拒、任务未交付」——用户
+/// 已经当场表态，系统没有理由再隔一分钟才动。
+async fn continue_state_now(db: &SqlitePool, session: &str, at: i64, why: &str) -> sqlx::Result<Option<ThinState>> {
+    continue_state_after(db, session, at, why, Some(0)).await
+}
+
+async fn continue_state_after(db: &SqlitePool, session: &str, at: i64, why: &str, fixed_delay: Option<i64>) -> sqlx::Result<Option<ThinState>> {
     super::background_tasks::ensure_wake_schema(db).await?;
     super::thin_state::ensure(db).await?;
     let why: String = why.chars().take(200).collect();
@@ -1036,9 +1046,9 @@ async fn continue_state(db: &SqlitePool, session: &str, at: i64, why: &str) -> s
         let fired: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM wakeup_schedules WHERE session_id=? AND id LIKE 'thin-continue-%' AND COALESCE(last_fired_at,0)>=?",
         ).bind(session).bind(at / 1000 - 3600).fetch_one(db).await?;
-        let delay = 60i64 * (1i64 << fired.min(5));
+        let delay = fixed_delay.unwrap_or_else(|| 60i64 * (1i64 << fired.min(5)));
         let now = chrono::Utc::now().timestamp();
-        let prompt = format!("{why}。系统自动重试/自愈：上一回合明确表示任务尚未完成，继续原任务；先核对仓库/工作区的真实状态，再推进剩余验收项，不要重复已完成的部分。");
+        let prompt = format!("{why}。系统自动重试/自愈：继续原任务；先核对仓库/工作区的真实状态，再推进剩余验收项，不要重复已完成的部分。");
         sqlx::query("INSERT INTO wakeup_schedules(id,session_id,prompt,source,after_sec,next_at,status,created_at) VALUES (?,?,?,'agent_decided',?,?,'pending',?) ON CONFLICT(id) DO NOTHING")
             .bind(&id).bind(session).bind(prompt).bind(delay).bind(now + delay).bind(now).execute(db).await?;
     } else if existing.as_deref() != Some("pending") {
@@ -1051,6 +1061,23 @@ async fn continue_state(db: &SqlitePool, session: &str, at: i64, why: &str) -> s
         reason: Some(format!("{why}；系统自动重试/自愈：接续未完成的工作")),
         ..ThinState::running()
     }))
+}
+
+/// M278/R1：本会话里真实发生过的「审批被拒」——`permission_intents` 的 denied 行
+/// 是用户当场给出的权限答复，属于结构化事实；助手在回合末尾写了什么词一律不参与。
+/// 返回该行时间戳（只用于生成唯一的续接唤醒 id）。
+async fn denied_intent_at(db: &SqlitePool, session: &str) -> sqlx::Result<Option<i64>> {
+    if !has_table(db, "permission_intents").await? {
+        return Ok(None);
+    }
+    let denied: Option<i64> = sqlx::query_scalar(
+        "SELECT MAX(created_at) FROM permission_intents WHERE session_id=? AND status='denied'",
+    )
+    .bind(session)
+    .fetch_optional(db)
+    .await?
+    .flatten();
+    Ok(denied)
 }
 
 /// M259：结束原因只写当场查到的事实。查得到的写结果，查不到的写「未核验」和原因；
@@ -1945,6 +1972,18 @@ async fn derive_candidate(db: &SqlitePool, session: &str) -> sqlx::Result<ThinSt
     if terminal.as_ref().is_some_and(|(_, reason)| reason == "delivery_pending") {
         if let Some(state) = super::thin_state::load(db, session).await?.filter(|state| state.state == SessionState::WaitingUser) {
             return Ok(state);
+        }
+    }
+    // M278/R1：审批被拒之后，模型若用一句「需要你做一件事」收尾，60 秒的退避只是把
+    // 会话摆在用户面前（M278 现场：被拒 → 助手提问 → 结算成等待用户）。被拒本身就是
+    // 用户已经表态的真实权限事实，任务又没交付，系统立即接续；同一条拒绝只接续一次
+    // （唤醒 id 绑定该行，已兑现的唤醒让这里自然落回正常结算），用户停止与已交付的
+    // 情况在前面就已经返回。
+    if completed.is_none() && !stale_scope {
+        if let Some(denied_at) = denied_intent_at(db, session).await? {
+            if let Some(state) = continue_state_now(db, session, denied_at, "上一回合的审批被拒，任务未交付").await? {
+                return Ok(state);
+            }
         }
     }
     let mut pending_question_at = 0;
@@ -3464,6 +3503,83 @@ mod tests {
         assert_eq!(state.waiting_for.as_deref(), Some("等 PR #73 合并/CI"));
         assert!(state.wake_source.unwrap().contains("系统 PR 监视"));
         assert!(state.question.is_none());
+    }
+
+    /// M278/R1：审批被拒是真实权限事实。助手随后用一句「需要你做一件事」收尾，不该被
+    /// 结算成等待用户，也不该再等 60 秒——系统立即接续，而且这份由系统事实触发，
+    /// 与助手写了什么词无关。
+    #[tokio::test]
+    async fn m278_denied_approval_continues_immediately_instead_of_asking_user() {
+        let db = fixture().await;
+        let now = chrono::Utc::now().timestamp_millis();
+        sqlx::query("INSERT INTO messages(id,session_id,role,content,created_at) VALUES ('q','derive','user','把这个改完',?)")
+            .bind(now - 60_000).execute(&db).await.unwrap();
+        sqlx::query("INSERT INTO messages(id,session_id,role,content,created_at) VALUES ('a','derive','assistant','当前权限被拒绝。需要你做一件事：手动跑一次登录，然后我继续。',?)")
+            .bind(now - 30_000).execute(&db).await.unwrap();
+        sqlx::raw_sql("DROP TABLE permission_intents; CREATE TABLE permission_intents(session_id TEXT, status TEXT, expires_at INTEGER, created_at INTEGER, tool_name TEXT, prompt_args_json TEXT);").execute(&db).await.unwrap();
+        sqlx::query("INSERT INTO permission_intents VALUES ('derive','denied',?,?,'bash','{}')")
+            .bind(now + 600_000).bind(now - 40_000).execute(&db).await.unwrap();
+        let state = refresh(&db, "derive").await.unwrap();
+        assert_eq!(state.state, SessionState::WaitingWake, "{state:?}");
+        assert!(
+            state.wake_source.as_deref().unwrap_or_default().contains("thin-continue-"),
+            "M278/R1: 被拒后应由系统接续，实际 {state:?}"
+        );
+        let (next_at, prompt): (i64, String) =
+            sqlx::query_as("SELECT next_at,prompt FROM wakeup_schedules WHERE session_id='derive'")
+                .fetch_one(&db).await.unwrap();
+        assert!(
+            next_at <= chrono::Utc::now().timestamp(),
+            "M278/R1: 被拒后不应再等 60 秒才动手（next_at={next_at}）"
+        );
+        assert!(
+            !prompt.contains("手动跑一次登录"),
+            "M278/R1: 唤醒词由系统事实拼出，不搬运助手措辞：{prompt}"
+        );
+    }
+
+    /// M278/R1 反证：没有审批被拒这件事时，不凭空造续接唤醒。
+    #[tokio::test]
+    async fn m278_question_without_denial_arms_no_wake() {
+        let db = fixture().await;
+        super::super::background_tasks::ensure_wake_schema(&db).await.unwrap();
+        let now = chrono::Utc::now().timestamp_millis();
+        sqlx::query("INSERT INTO messages(id,session_id,role,content,created_at) VALUES ('q2','derive','user','把这个改完',?)")
+            .bind(now - 60_000).execute(&db).await.unwrap();
+        sqlx::query("INSERT INTO messages(id,session_id,role,content,created_at) VALUES ('a2','derive','assistant','需要你做一件事：手动跑一次登录，然后我继续。',?)")
+            .bind(now - 30_000).execute(&db).await.unwrap();
+        let _ = refresh(&db, "derive").await.unwrap();
+        let wakes: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM wakeup_schedules WHERE session_id='derive' AND id LIKE 'thin-continue-%'")
+            .fetch_one(&db).await.unwrap();
+        assert_eq!(wakes, 0, "M278/R1: 没有被拒事实就不该自作主张接续");
+    }
+
+    /// M278/R1：同一条拒绝只接续一次——已兑现的唤醒不再重排，也不会把会话变成
+    /// 无限自动重试。
+    #[tokio::test]
+    async fn m278_denied_approval_continues_only_once() {
+        let db = fixture().await;
+        let now = chrono::Utc::now().timestamp_millis();
+        let denied_at = now - 40_000;
+        sqlx::query("INSERT INTO messages(id,session_id,role,content,created_at) VALUES ('q3','derive','user','把这个改完',?)")
+            .bind(now - 60_000).execute(&db).await.unwrap();
+        sqlx::query("INSERT INTO messages(id,session_id,role,content,created_at) VALUES ('a3','derive','assistant','当前权限被拒绝。需要你做一件事。',?)")
+            .bind(now - 30_000).execute(&db).await.unwrap();
+        super::super::background_tasks::ensure_wake_schema(&db).await.unwrap();
+        sqlx::raw_sql("DROP TABLE permission_intents; CREATE TABLE permission_intents(session_id TEXT, status TEXT, expires_at INTEGER, created_at INTEGER, tool_name TEXT, prompt_args_json TEXT);").execute(&db).await.unwrap();
+        sqlx::query("INSERT INTO permission_intents VALUES ('derive','denied',?,?,'bash','{}')")
+            .bind(now + 600_000).bind(denied_at).execute(&db).await.unwrap();
+        sqlx::query("INSERT INTO wakeup_schedules(id,session_id,prompt,source,next_at,status,created_at,last_fired_at) VALUES (?, 'derive', '继续原任务', 'agent_decided', ?, 'done', ?, ?)")
+            .bind(format!("thin-continue-derive-{denied_at}"))
+            .bind(now - 1000).bind(now - 2000).bind(now - 1000)
+            .execute(&db).await.unwrap();
+        let _ = refresh(&db, "derive").await.unwrap();
+        let rows: Vec<(String, String, i64)> = sqlx::query_as("SELECT id,status,next_at FROM wakeup_schedules WHERE session_id='derive' ORDER BY id")
+            .fetch_all(&db).await.unwrap();
+        let pending: Vec<&(String, String, i64)> = rows.iter()
+            .filter(|(id, status, _)| id.starts_with("thin-continue-") && status == "pending")
+            .collect();
+        assert!(pending.is_empty(), "M278/R1: 同一条拒绝只接续一次，已兑现的唤醒不应重排：{rows:?}");
     }
 
     #[test]

@@ -3605,8 +3605,24 @@ mod trusted_shell_structure {
         match next {
             '(' => {
                 // `$(( ))` is arithmetic, not a command substitution.
+                //
+                // M278 R2: an arithmetic body made only of literals, variables,
+                // `+ - * / %` and parentheses computes a number and runs nothing,
+                // so it stays a literal word the way `$VAR` does. Anything else
+                // in there — a nested `$(...)`, a backtick, a quote, an
+                // assignment — can still run a program, so it keeps the old
+                // unproved answer.
                 if chars.get(start + 2) == Some(&'(') {
-                    return None;
+                    let close = matching_paren(chars, start + 1)?;
+                    if close <= start + 3 {
+                        return None;
+                    }
+                    let body: String = chars[start + 3..close - 1].iter().collect();
+                    if !pure_arithmetic_body(&body) {
+                        return None;
+                    }
+                    let text: String = chars[start..=close].iter().collect();
+                    return Some((close - start + 1, Dollar::Text(text)));
                 }
                 let close = matching_paren(chars, start + 1)?;
                 let inner: String = chars[start + 2..close].iter().collect();
@@ -3640,6 +3656,21 @@ mod trusted_shell_structure {
             }
             _ => Some((1, Dollar::Text("$".into()))),
         }
+    }
+
+    /// M278/R2：`$((...))` 里到底能不能算出数而不执行任何东西。
+    /// 只允许十进制字面量、变量名、`+ - * / %`、括号和空白——这些在 bash 算术里只
+    /// 计算数值；出现 `$`、反引号、引号、`=`（会在算术里赋值）、`[`（数组下标可以嵌
+    /// 命令替换）或分隔符，一律不认。
+    fn pure_arithmetic_body(body: &str) -> bool {
+        if body.trim().is_empty() {
+            return false;
+        }
+        body.chars().all(|ch| match ch {
+            '0'..='9' | 'a'..='z' | 'A'..='Z' | '_' | '+' | '-' | '*' | '/' | '%' | '('
+            | ')' | ' ' | '\t' => true,
+            _ => false,
+        })
     }
 
     fn matching_paren(chars: &[char], start: usize) -> Option<usize> {
@@ -4172,10 +4203,13 @@ mod trusted_shell_structure {
 
         #[test]
         fn m260_unparseable_structure_fails_closed() {
+            // 原先这里还有一条 `for c in a b; do echo $((1+2)); done`：循环本身是有模型的
+            // （见 LOCAL_STRUCTURES，按内容逐段判定），它当年能失败关闭靠的是 `$((...))`
+            // 未证明。M278/R2 把纯算术证明成字面量后，这条只剩模型内的正常内容，已不是
+            // 「未建模结构」的例子，因此移除；纯算术免审批的情况由 M278 回归表直接断言。
             for command in [
                 "for c in a b; do echo `git rev-parse HEAD`; done",
                 "case $x in a) git log -1;; esac",
-                "for c in a b; do echo $((1+2)); done",
                 "for c in a b; do $(echo git) log -1; done",
             ] {
                 assert!(
@@ -4296,6 +4330,48 @@ mod m266_tests {
         assert!(
             failures.is_empty(),
             "M266/R5 regressions:\n{}",
+            failures.join("\n")
+        );
+    }
+
+    /// M278/R2：`$(( ))` 是算术，不是命令替换。纯算术体照 `$VAR` 一样当字面量，
+    /// 里面还能藏命令的写法一律继续要求审批。
+    #[test]
+    fn m278_pure_arithmetic_is_literal_but_nested_commands_still_ask() {
+        let literal = [
+            ("literal", "echo $((1+1))"),
+            ("quoted", "echo \"$(( (1+2)*3 ))\""),
+            ("variable", "echo $((count % 7))"),
+            ("prefix-assignment", "y=$((a*2)) echo ok"),
+            ("subtraction", "echo $((n-1))"),
+        ];
+        let mut failures = Vec::new();
+        for (name, command) in literal {
+            if asks_for_approval(command) {
+                failures.push(format!("{name}: still asks -> {command}"));
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "M278/R2 arithmetic false positives:\n{}",
+            failures.join("\n")
+        );
+
+        let commands = [
+            ("nested substitution", "echo $(( $(rm -rf /tmp/m278) ))"),
+            ("backtick", "echo $((`id`))"),
+            ("arithmetic assignment", "echo $((x=1))"),
+            ("array subscript", "echo $((arr[$(id)]))"),
+        ];
+        let mut failures = Vec::new();
+        for (name, command) in commands {
+            if !asks_for_approval(command) {
+                failures.push(format!("{name}: no longer asks -> {command}"));
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "M278/R2 arithmetic regressions:\n{}",
             failures.join("\n")
         );
     }
