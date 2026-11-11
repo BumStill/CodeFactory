@@ -54,6 +54,8 @@ mod notify;
 mod openrouter;
 mod panic_log;
 mod startup_recovery;
+mod specialist_observations;
+mod specialist_credential_fence;
 mod secrets;
 mod session_title;
 mod storage;
@@ -2232,6 +2234,10 @@ pub fn run() {
             commands::mcp::test_mcp_tool,
             commands::git_remote::github_cli_credential_status,
             commands::git_remote::list_git_remotes,
+            commands::specialist_observations::bind_specialist_project,
+            commands::specialist_observations::query_specialist_observation,
+            commands::specialist_observations::list_specialist_observations,
+            commands::specialist_observations::stop_specialist_observations,
             commands::git_remote::add_git_remote,
             commands::git_remote::delete_git_remote,
             commands::git_remote::test_git_remote,

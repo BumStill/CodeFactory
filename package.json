@@ -38,6 +38,7 @@
     "test:turn-result-card:headless": "node scripts/verify-turn-result-card-headless.mjs",
     "test:turn-progress:headless": "node scripts/verify-turn-progress-headless.mjs",
     "test:streaming-markdown:headless": "node scripts/verify-streaming-markdown-headless.mjs",
+    "test:specialistbots:headless": "node scripts/verify-specialistbots-headless.mjs",
     "test:permission-mode:headless": "node scripts/verify-permission-mode-headless.mjs",
     "test:m265-reject-note:headless": "node scripts/verify-m265-reject-note-headless.mjs",
     "test:startup-session:headless": "node scripts/verify-startup-session-headless.mjs",
