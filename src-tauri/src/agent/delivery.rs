@@ -53,7 +53,7 @@ const BUILTIN_EXCLUDES: &[&str] = &[
     "CLAUDE.md",
     "AGENTS.md",
     "codex-worktrees/",
-    ".codefactory/attachments/",
+    ".codefactory/",
     "src-tauri/gen/schemas/",
     ".DS_Store",
 ];
@@ -4141,18 +4141,18 @@ fn canonical_delivery_title(
     log_args.extend(base_exclusion_refs(root, base));
     let log_args: Vec<&str> = log_args.iter().map(String::as_str).collect();
     if let Ok(log) = git(root, &log_args) {
-        let mut best: Option<(u8, String)> = None;
-        for subject in log.lines().map(str::trim).filter(|line| !line.is_empty()) {
-            let slot = conventional_slot(subject);
-            if !is_canonical_delivery_title(subject) {
-                continue;
-            }
-            if best.as_ref().is_none_or(|(best_slot, _)| slot > *best_slot) {
-                best = Some((slot, subject.to_string()));
-            }
-        }
-        if let Some((_, subject)) = best {
-            return subject;
+        // Newest own commit wins: `git log` is reverse-chronological, so the
+        // first canonical subject is the intent this task stated most recently.
+        // Ranking the candidates by conventional slot instead let an older
+        // commit that happened to be a `feat` outrank the newer one — and on a
+        // branch that inherited a neighbour task's commit that older subject
+        // won a delivery it does not describe (M280/R3, PR #1055 titled M272).
+        if let Some(subject) = log
+            .lines()
+            .map(str::trim)
+            .find(|line| !line.is_empty() && is_canonical_delivery_title(line))
+        {
+            return subject.to_string();
         }
     }
     // Nothing at all describes this change: no title from the agent, no commit
@@ -19643,6 +19643,47 @@ GITHUB.COM:
         assert_eq!(canonical_delivery_title(&root, "feat/x", "main",
             Some("fix: update 8 file(s)"), &[]), title);
         let _ = std::fs::remove_dir_all(root.parent().unwrap());
+    }
+
+    /// M280/R3: the delivery title must describe THIS task. A branch that still
+    /// carries an older commit from a neighbouring task used to win by
+    /// conventional slot — an old `feat:` beat this task's newer `fix:` and
+    /// #1055 shipped with M272's title. The newest own commit now decides.
+    #[test]
+    fn m280_title_follows_the_newest_own_commit_not_an_inherited_task() {
+        let root = feature_branch_repo("m280-title-newest");
+        git(&root, &["add", "feature.rs"]).unwrap();
+        git(&root, &["commit", "-q", "-m", "feat: previous task capability"]).unwrap();
+        std::fs::write(root.join("feature.rs"), "current work\n").unwrap();
+        git(&root, &["commit", "-qam", "fix(delivery): current task repair"]).unwrap();
+
+        let title = canonical_delivery_title(&root, "feat/x", "main", None, &[]);
+        assert_eq!(title, "fix(delivery): current task repair");
+        let _ = std::fs::remove_dir_all(root.parent().unwrap());
+    }
+
+    /// M280/R2: leftover local state (attachments copied in from the parent
+    /// checkout, tool-local `.claude/` scratch) must never be staged for a
+    /// delivery, while real work in the same tree still is.
+    #[test]
+    fn m280_leftover_local_state_is_never_staged() {
+        let sandbox = tempfile::tempdir().unwrap();
+        let root = sandbox.path();
+        git_in(root, &["init", "-q", "-b", "main"]);
+        git_in(root, &["config", "user.email", "t@t"]);
+        git_in(root, &["config", "user.name", "t"]);
+        std::fs::write(root.join("src.rs"), "fn a() {}\n").unwrap();
+        git_in(root, &["add", "-A"]);
+        git_in(root, &["commit", "-q", "-m", "chore: baseline"]);
+
+        std::fs::write(root.join("src.rs"), "fn a() { let _ = 1; }\n").unwrap();
+        std::fs::create_dir_all(root.join(".codefactory/attachments")).unwrap();
+        std::fs::write(root.join(".codefactory/attachments/pic.png"), "png").unwrap();
+        std::fs::create_dir_all(root.join(".claude/deferred")).unwrap();
+        std::fs::write(root.join(".claude/deferred/session.json"), "{}").unwrap();
+
+        let staged = stage_scoped(root, &[]).unwrap();
+        assert_eq!(staged, vec!["src.rs".to_string()], "staged: {staged:?}");
     }
 
     #[test]
