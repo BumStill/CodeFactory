@@ -54,6 +54,185 @@ mod notify;
 mod openrouter;
 mod panic_log;
 mod startup_recovery;
+/// Keep a dead stdout/stderr pipe from aborting the process.
+///
+/// 2026-11-10, v1.114.0: two crash records landed in the same second —
+/// `panic-20261110-142456.853.log` on `tokio-rt-worker` and `.854.log` on
+/// `main` — and both say `failed printing to stderr: Broken pipe (os error 32)`.
+/// That is not a logging bug, it is a killed process: `print!`/`eprintln!`
+/// **panic** on a failed write, `[profile.release]` builds with `panic =
+/// "abort"`, and the panic hook's own stderr copy fails the same way, so the
+/// real cause is overwritten by "failed printing to stderr" and lost.
+///
+/// Whoever launched us may stop reading — the app's own child entry points, a
+/// driver script that timed out, a closed terminal tab — and that lifetime is
+/// not ours to trust. So at load time we check whether fd 1 / fd 2 still have a
+/// reader and, when they do not, repoint them at the null device. Healthy
+/// streams are untouched: terminal runs, `tracing` and CLI stdout contracts are
+/// unchanged.
+///
+/// Boundaries (deliberate, not oversights):
+/// - Only a reader that is *already gone* at startup is repaired. A pipe that
+///   dies later still reaches the panicking macros; preventing that needs a
+///   writer that cannot fail, which the std macros do not allow.
+/// - Unix only. Windows console/pipe handles need a different repair and are
+///   not claimed.
+/// - Regular files and ttys are never touched: those writes are the diagnostics
+///   worth keeping.
+///
+/// Installed from a load-time hook rather than from each entry point: the two
+/// earliest entry points (`main.rs`, `unattended_smoke_cli.rs`) are frozen
+/// trust-root files an ordinary pull request may not edit, and a load-time hook
+/// covers every entry point — including future binaries — before any line of
+/// Rust can print, which is exactly the window this defect lives in. The two
+/// section spellings below are the mechanism the `ctor` crate wraps; owning the
+/// four lines keeps a startup-critical hook free of a new dependency.
+mod std_stream_guard {
+    /// Repair whatever can be repaired, once. Cheap and idempotent.
+    pub fn install() {
+        #[cfg(unix)]
+        unix::install();
+    }
+
+    #[cfg(all(unix, not(test)))]
+    mod load_time {
+        extern "C" fn install_before_main() {
+            super::install();
+        }
+
+        #[used]
+        #[cfg_attr(target_os = "linux", unsafe(link_section = ".init_array"))]
+        #[cfg_attr(target_os = "macos", unsafe(link_section = "__DATA,__mod_init_func"))]
+        static INSTALL_BEFORE_MAIN: extern "C" fn() = install_before_main;
+    }
+
+    #[cfg(unix)]
+    mod unix {
+        use std::os::fd::RawFd;
+
+        pub fn install() {
+            for fd in [libc::STDOUT_FILENO, libc::STDERR_FILENO] {
+                detach_if_broken(fd);
+            }
+        }
+
+        /// True when `fd` is the write end of a pipe whose reader has gone away.
+        ///
+        /// `fstat` filters to pipes first: `poll` reports `POLLERR` on a socket
+        /// or a tty in situations that are not fatal, and a regular file's owner
+        /// closing it has no effect on us at all. Only a `S_IFIFO` write end with
+        /// a dead reader means the next write is guaranteed to fail.
+        pub fn reader_is_gone(fd: RawFd) -> bool {
+            if fd < 0 {
+                return false;
+            }
+            let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+            if unsafe { libc::fstat(fd, &mut stat) } != 0 {
+                return false;
+            }
+            let kind = (stat.st_mode as u32) & (libc::S_IFMT as u32);
+            if kind != libc::S_IFIFO as u32 {
+                return false;
+            }
+            let mut polled = libc::pollfd { fd, events: libc::POLLOUT, revents: 0 };
+            let ready = unsafe { libc::poll(&mut polled, 1, 0) };
+            if ready <= 0 {
+                return false;
+            }
+            polled.revents & (libc::POLLERR | libc::POLLHUP) != 0
+        }
+
+        /// Repoint `fd` at the null device when its reader is gone.
+        ///
+        /// Returns whether the descriptor was repaired. Failure is not fatal: an
+        /// unrepaired stream behaves exactly as it did before this module existed.
+        pub fn detach_if_broken(fd: RawFd) -> bool {
+            if !reader_is_gone(fd) {
+                return false;
+            }
+            let null_fd = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_WRONLY) };
+            if null_fd < 0 {
+                return false;
+            }
+            let rc = unsafe { libc::dup2(null_fd, fd) };
+            unsafe { libc::close(null_fd) };
+            rc >= 0
+        }
+    }
+
+    #[cfg(all(test, unix))]
+    mod tests {
+        use super::unix::{detach_if_broken, reader_is_gone};
+
+        /// A pipe nobody reads any more, returned as its write end.
+        fn pipe_with_dead_reader() -> libc::c_int {
+            let mut fds = [0 as libc::c_int; 2];
+            assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe() failed");
+            unsafe { libc::close(fds[0]) };
+            fds[1]
+        }
+
+        #[test]
+        fn a_live_pipe_is_not_reported_broken() {
+            // The guard must be inert on a healthy stream, or every CLI whose
+            // stdout a driver parses would be silently repointed at /dev/null.
+            let mut fds = [0 as libc::c_int; 2];
+            assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+            assert!(!reader_is_gone(fds[1]), "a pipe with a reader must stay untouched");
+            assert!(!detach_if_broken(fds[1]), "and must not be repaired");
+            unsafe {
+                libc::close(fds[0]);
+                libc::close(fds[1]);
+            }
+        }
+
+        #[test]
+        fn a_pipe_whose_reader_closed_is_detected() {
+            let write_fd = pipe_with_dead_reader();
+            assert!(reader_is_gone(write_fd), "a closed read end must be detected");
+            unsafe { libc::close(write_fd) };
+        }
+
+        #[test]
+        fn a_regular_descriptor_is_never_repaired() {
+            // /dev/null is not a pipe: the tty/file paths must be left alone.
+            let null_fd = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_WRONLY) };
+            assert!(null_fd >= 0);
+            assert!(!reader_is_gone(null_fd));
+            assert!(!detach_if_broken(null_fd));
+            unsafe { libc::close(null_fd) };
+        }
+
+        /// The defect itself: before the repair this write returns `EPIPE`,
+        /// which is what makes `eprintln!` panic and the release build abort.
+        #[test]
+        fn a_repaired_stream_accepts_writes_again() {
+            let write_fd = pipe_with_dead_reader();
+
+            let payload = b"still alive\n";
+            let refused = unsafe {
+                libc::write(write_fd, payload.as_ptr() as *const libc::c_void, payload.len())
+            };
+            assert_eq!(refused, -1, "a dead pipe must refuse the write (this is the crash)");
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::EPIPE),
+                "and must refuse it with EPIPE, the error the std macros turn into a panic"
+            );
+
+            assert!(detach_if_broken(write_fd), "the guard must repair it");
+            let written = unsafe {
+                libc::write(write_fd, payload.as_ptr() as *const libc::c_void, payload.len())
+            };
+            assert_eq!(
+                written,
+                payload.len() as isize,
+                "after the repair a write must succeed instead of panicking the process"
+            );
+            unsafe { libc::close(write_fd) };
+        }
+    }
+}
 mod secrets;
 mod session_title;
 mod storage;
@@ -1601,6 +1780,12 @@ pub fn run_headless_smoke_cli() -> bool {
 
 pub fn run() {
     let context = tauri::generate_context!();
+    // A dead stdout/stderr pipe must not take the whole process with it; repair
+    // both streams before the first log line and before any GUI work starts.
+    // See `std_stream_guard` for the v1.114.0 crash. This stays after the
+    // context line on purpose: `tests/test_desktop_isolation_contract.py`
+    // requires the context macro call to open `run()`.
+    crate::std_stream_guard::install();
     // U34: the local-only dispatch client entry. `src-tauri/src/main.rs` is the
     // E2E-001 trust root and an ordinary PR must keep it byte-identical, so the
     // client is resolved here — the entry the frozen main falls through to —
