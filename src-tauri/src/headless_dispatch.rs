@@ -1862,5 +1862,125 @@ mod unix_tests {
             "only parsed requests are audited: {logged}"
         );
     }
+
+    #[test]
+    fn h1_wrong_or_missing_auth_is_unauthenticated_before_the_request_is_parsed() {
+        let wrong = authenticate_line(
+            r#"{"auth":"not-the-token","request":{"operation":"this-is-not-a-real-operation"}}"#,
+            "expected-token",
+        )
+        .unwrap_err();
+        assert_eq!(wrong.code, "unauthenticated");
+        let missing = authenticate_line(
+            r#"{"operation":"status","session_id":"s-1"}"#,
+            "expected-token",
+        )
+        .unwrap_err();
+        assert_eq!(missing.code, "unauthenticated");
+    }
+
+    #[test]
+    fn h1_token_file_is_private_and_changes_every_install() {
+        let dir = private_dir();
+        let first = install_dispatch_token(dir.path()).unwrap();
+        let second = install_dispatch_token(dir.path()).unwrap();
+        assert_ne!(first, second);
+        assert_eq!(first.len(), 64);
+        let path = dir.path().join("dispatch.token");
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            std::fs::metadata(dir.path()).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        remove_dispatch_token(dir.path());
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn h1_privileged_ops_default_off_returns_forbidden_by_setting_without_calling_the_host() {
+        struct CountingHost(std::sync::atomic::AtomicUsize);
+        impl DispatchHost for CountingHost {
+            fn execute(&self, _request: &Request) -> Result<serde_json::Value, ErrorBody> {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(serde_json::json!({"called": true}))
+            }
+        }
+        let dir = private_dir();
+        let path = dir.path().join("dispatch.sock");
+        let token = install_dispatch_token(dir.path()).unwrap();
+        let listener = socket::bind(&path).unwrap();
+        let host = std::sync::Arc::new(CountingHost(std::sync::atomic::AtomicUsize::new(0)));
+        let dyn_host: std::sync::Arc<dyn DispatchHost> = host.clone();
+        let token_for_server = token.clone();
+        let worker = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            server::handle_connection(stream, &dyn_host, None, socket::current_uid(), &token_for_server, false);
+        });
+        let body = serde_json::json!({
+            "auth": token,
+            "request": {"operation":"resolve_approval","approval_id":"a-1","approve":true}
+        });
+        let reply = client::request_raw(&path, &body.to_string()).unwrap();
+        let reply: Response = serde_json::from_str(&reply).unwrap();
+        assert!(!reply.ok);
+        assert_eq!(reply.error.unwrap().code, "forbidden_by_setting");
+        worker.join().unwrap();
+        assert_eq!(host.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        let downgrade = Request::SetPermission {
+            session_id: "s-1".into(),
+            permission_mode: "safe".into(),
+        };
+        assert!(!is_privileged_request(&downgrade));
+        assert_eq!(request_tier(&downgrade), "B");
+        let deny = Request::ResolveApproval {
+            approval_id: "a-1".into(),
+            approve: false,
+            note: None,
+        };
+        assert!(!is_privileged_request(&deny));
+    }
+
+    #[test]
+    fn h1_privileged_ops_reach_the_host_when_the_setting_is_on_and_the_token_is_not_audited() {
+        struct CountingHost(std::sync::atomic::AtomicUsize);
+        impl DispatchHost for CountingHost {
+            fn execute(&self, _request: &Request) -> Result<serde_json::Value, ErrorBody> {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(serde_json::json!({"called": true}))
+            }
+        }
+        let dir = private_dir();
+        let path = dir.path().join("dispatch.sock");
+        let audit_path = dir.path().join("audit.jsonl");
+        let token = install_dispatch_token(dir.path()).unwrap();
+        let listener = socket::bind(&path).unwrap();
+        let host = std::sync::Arc::new(CountingHost(std::sync::atomic::AtomicUsize::new(0)));
+        let dyn_host: std::sync::Arc<dyn DispatchHost> = host.clone();
+        let token_for_server = token.clone();
+        let audit_for_server = audit_path.clone();
+        let worker = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let audit = AuditLog::new(audit_for_server);
+            server::handle_connection(stream, &dyn_host, Some(&audit), socket::current_uid(), &token_for_server, true);
+        });
+        let body = serde_json::json!({
+            "auth": token,
+            "request": {"operation":"resolve_approval","approval_id":"a-1","approve":true}
+        });
+        let reply = client::request_raw(&path, &body.to_string()).unwrap();
+        let reply: Response = serde_json::from_str(&reply).unwrap();
+        assert!(reply.ok, "{reply:?}");
+        worker.join().unwrap();
+        assert_eq!(host.0.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let logged = std::fs::read_to_string(&audit_path).unwrap();
+        assert!(logged.contains("\"tier\":\"C\""));
+        assert!(logged.contains("\"auth\":\"ok\""));
+        assert!(logged.contains("由本地任务入口批准/授权"));
+        assert!(!logged.contains(&token), "the token must not be written to the audit log");
+    }
 }
 

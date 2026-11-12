@@ -1224,7 +1224,7 @@ export function SettingsPage({
                 )}
               </div>
               {generalDraft.sandbox_mode === "docker" && generalDraft.sandbox_image && !generalDraft.sandbox_image.includes("@sha256:") && (
-                <p className="text-caption text-amber-300">未固定版本</p>
+                <p className="text-caption text-amber-700 dark:text-amber-300">未固定版本</p>
               )}
               {generalDraft.sandbox_mode === "docker" && generalDraft.sandbox_network === "bridge" && (
                 <p className="text-caption text-gray-500">开启后容器可访问网络。</p>

@@ -42,6 +42,9 @@ pub struct HostGit {
     cwd: Option<PathBuf>,
     host_credentials: bool,
     finalized: bool,
+    stdin: Option<Stdio>,
+    stdout: Option<Stdio>,
+    stderr: Option<Stdio>,
 }
 
 impl HostGit {
@@ -54,6 +57,9 @@ impl HostGit {
             cwd: None,
             host_credentials,
             finalized: false,
+            stdin: None,
+            stdout: None,
+            stderr: None,
         }
     }
 
@@ -93,17 +99,32 @@ impl HostGit {
     }
 
     pub fn stdin<T: Into<Stdio>>(&mut self, cfg: T) -> &mut Self {
-        self.command.stdin(cfg);
+        let cfg = cfg.into();
+        if self.finalized {
+            self.command.stdin(cfg);
+        } else {
+            self.stdin = Some(cfg);
+        }
         self
     }
 
     pub fn stdout<T: Into<Stdio>>(&mut self, cfg: T) -> &mut Self {
-        self.command.stdout(cfg);
+        let cfg = cfg.into();
+        if self.finalized {
+            self.command.stdout(cfg);
+        } else {
+            self.stdout = Some(cfg);
+        }
         self
     }
 
     pub fn stderr<T: Into<Stdio>>(&mut self, cfg: T) -> &mut Self {
-        self.command.stderr(cfg);
+        let cfg = cfg.into();
+        if self.finalized {
+            self.command.stderr(cfg);
+        } else {
+            self.stderr = Some(cfg);
+        }
         self
     }
 
@@ -173,19 +194,26 @@ impl HostGit {
                 prefix.push(OsString::from(format!("credential.helper={helper}")));
             }
         }
+        let existing: Vec<OsString> = self.command.get_args().map(|arg| arg.to_os_string()).collect();
+        // `git config --get` 必须仍读仓库里的值。`-c core.hooksPath=` 会把这次查询的结果改成覆盖值。
         if let Some(cwd) = cwd.as_deref() {
-            if hooks_are_sandbox_writable(cwd) {
+            if git_subcommand(&existing).as_deref() != Some("config")
+                && hooks_are_sandbox_writable(cwd)
+            {
                 prefix.push(OsString::from("-c"));
                 prefix.push(OsString::from(format!("core.hooksPath={}", null_hooks())));
                 note_skipped_hooks(cwd);
             }
         }
-        let existing: Vec<OsString> = self.command.get_args().map(|arg| arg.to_os_string()).collect();
         let envs: Vec<(OsString, Option<OsString>)> = self
             .command
             .get_envs()
             .map(|(key, value)| (key.to_os_string(), value.map(|value| value.to_os_string())))
             .collect();
+        let stdin = self.stdin.take();
+        let stdout = self.stdout.take();
+        let stderr = self.stderr.take();
+        let cwd = self.cwd.clone();
         self.command = {
             let program = self.command.get_program().to_os_string();
             let mut rebuilt = Command::new(program).no_window();
@@ -202,12 +230,43 @@ impl HostGit {
             command_env::apply_developer_path_std(&mut rebuilt);
             rebuilt.args(prefix);
             rebuilt.args(existing);
-            if let Some(dir) = &self.cwd {
+            if let Some(dir) = &cwd {
                 rebuilt.current_dir(dir);
+            }
+            if let Some(stdin) = stdin {
+                rebuilt.stdin(stdin);
+            }
+            if let Some(stdout) = stdout {
+                rebuilt.stdout(stdout);
+            }
+            if let Some(stderr) = stderr {
+                rebuilt.stderr(stderr);
             }
             rebuilt
         };
     }
+}
+
+fn git_subcommand(args: &[OsString]) -> Option<String> {
+    let mut index = 0;
+    while index < args.len() {
+        let arg = args[index].to_string_lossy();
+        if matches!(arg.as_ref(), "-c" | "-C" | "--git-dir" | "--work-tree" | "--namespace") {
+            index += 2;
+            continue;
+        }
+        if arg.starts_with("-c")
+            || arg.starts_with("--git-dir=")
+            || arg.starts_with("--work-tree=")
+            || arg == "--no-pager"
+            || arg.starts_with('-')
+        {
+            index += 1;
+            continue;
+        }
+        return Some(arg.into_owned());
+    }
+    None
 }
 
 impl NoWindow for HostGit {
@@ -389,6 +448,21 @@ mod tests {
         #[cfg(unix)]
         std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
         assert!(Command::new("git").current_dir(&root).args(["config", "core.hooksPath", ".githooks"]).status().unwrap().success());
+        let shown = command()
+            .current_dir(&root)
+            .args(["config", "--get", "core.hooksPath"])
+            .output()
+            .unwrap();
+        assert!(
+            shown.status.success(),
+            "{}",
+            String::from_utf8_lossy(&shown.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&shown.stdout).trim(),
+            ".githooks",
+            "config --get must keep the configured hooks path"
+        );
         std::fs::write(root.join("a.txt"), "a\n").unwrap();
         let status = command()
             .current_dir(&root)
