@@ -713,6 +713,13 @@ impl DesktopPermissionGateway {
             .map(|intent| intent.intent_id.clone())
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         let (sender, mut receiver) = tokio::sync::oneshot::channel();
+        // M281 R1: a slot whose receiver is already gone belongs to a wait that
+        // was torn down (app restart, cancelled run, recovery takeover). It can
+        // never deliver a decision, so keeping it is what let an approval die
+        // before it expired: the retried call hit its own dead slot and answered
+        // `ChannelClosed`. A slot that is still on screen keeps the ownership
+        // conflict below — a live wait is never pre-empted.
+        let mut adopted_stale_slot = false;
         let registry_collision = {
             use std::collections::hash_map::Entry;
             let mut pending = self.pending_permissions.lock().await;
@@ -721,9 +728,23 @@ impl DesktopPermissionGateway {
                     entry.insert(sender);
                     false
                 }
-                Entry::Occupied(_) => true,
+                Entry::Occupied(mut entry) => {
+                    if entry.get().is_closed() {
+                        entry.insert(sender);
+                        adopted_stale_slot = true;
+                        false
+                    } else {
+                        true
+                    }
+                }
             }
         };
+        if adopted_stale_slot {
+            tracing::info!(
+                intent_id,
+                "adopted an interrupted permission slot instead of voiding the approval"
+            );
+        }
         if registry_collision {
             tracing::error!(intent_id, "permission intent sender collision");
             let intent_store = PermissionIntentStore::new(self.db.clone());
@@ -3899,5 +3920,170 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(intents, 0, "a quoted << is not a heredoc: {command}");
+    }
+
+    /// M281 R2: a `for` loop whose list comes from a substitution or a glob, and
+    /// whose body is read-only, must not surface a prompt. The structure prover
+    /// unfolds it and the per-segment judges prove each command; nothing here is
+    /// a write, a remote action or an unprovable structure.
+    #[tokio::test]
+    async fn m281_readonly_for_loops_skip_approval() {
+        for command in [
+            // 现场的逐文件巡检：字面量列表 + `echo` 里的 `$(wc -l < …)` + `head -60`。
+            "for f in package.json README.md; do echo \"== $f ($(wc -l < \"$f\") 行) ==\"; head -60 \"$f\"; done",
+            "for f in $(git ls-files '*.rs'); do grep -n TODO \"$f\"; done",
+            "for b in $(git branch --format='%(refname:short)'); do echo \"$b\"; done",
+            "for f in a b; do cat \"$f\" | head -5; done",
+            "for d in src docs; do ls -la \"$d\"; done",
+            "for f in a b; do wc -l \"$f\"; done",
+        ] {
+            for mode in ["trusted", "standard"] {
+                let gateway = test_gateway(mode).await;
+                let args = serde_json::json!({ "command": command });
+                let call = ToolCall {
+                    id: format!("m281-read-{mode}"),
+                    r#type: "function".into(),
+                    function: FunctionCall {
+                        name: "bash".into(),
+                        arguments: args.to_string(),
+                    },
+                };
+                assert!(
+                    matches!(
+                        gateway.authorize(&call, &args, Some(command)).await,
+                        PermissionOutcome::Allow
+                    ),
+                    "{mode}: read-only loop must not prompt: {command}"
+                );
+                assert!(gateway.pending_permissions.lock().await.is_empty());
+            }
+        }
+    }
+
+    /// M281 R2.2 反例：同一种结构里只要有一处写/网络/非字面量来源，就必须继续问。
+    /// 展开成单命令不能变成绕过 shell 安全判定的途径。
+    #[tokio::test]
+    async fn m281_for_loops_with_writes_still_ask() {
+        for command in [
+            "for f in a b; do rm -rf \"$f\"; done",
+            "for f in a b; do echo hi > \"$f\"; done",
+            "for f in a b; do echo hi >> \"$f\"; done",
+            "for f in a b; do git push origin main; done",
+            "for f in $(git rev-list --all); do echo \"$f\"; done",
+            "for f in a b; do echo \"$(date > /tmp/m281)\"; done",
+        ] {
+            let gateway = test_gateway("trusted").await;
+            let args = serde_json::json!({ "command": command });
+            let call = ToolCall {
+                id: "m281-write".into(),
+                r#type: "function".into(),
+                function: FunctionCall {
+                    name: "bash".into(),
+                    arguments: args.to_string(),
+                },
+            };
+            let task_gateway = gateway.clone();
+            let mut authorization = tokio::spawn(async move {
+                task_gateway.authorize(&call, &args, Some(command)).await
+            });
+            // 要么直接拒绝，要么挂起审批；两种都不是 Allow。挂起时要收尾，避免留下悬挂任务。
+            let prompted = tokio::select! {
+                _ = &mut authorization => false,
+                _ = async {
+                    loop {
+                        if !gateway.pending_permissions.lock().await.is_empty() { break; }
+                        tokio::task::yield_now().await;
+                    }
+                } => true,
+            };
+            if prompted {
+                take_pending_sender(&gateway).await.send(deny()).unwrap();
+                assert_denied_for(
+                    authorization.await.unwrap(),
+                    PermissionDenialReason::DeniedByUser,
+                );
+            }
+        }
+    }
+
+    /// M281 R1 (red first): an approval that was interrupted (app restart,
+    /// cancelled run) leaves its oneshot sender behind in the pending map
+    /// because the waiting future is dropped before its cleanup line runs. The
+    /// retry reconciles to the *same* durable intent id, hits that dead entry,
+    /// and today answers `ChannelClosed` — the user's prompt never reappears and
+    /// the tool call is refused as if a channel had failed.
+    #[tokio::test]
+    async fn m281_retry_after_an_interrupted_attempt_adopts_the_stale_slot() {
+        let gateway = durable_test_gateway().await;
+        let (tool_call, args) = browser_call("m281-interrupted", "click");
+
+        let interrupted_gateway = gateway.clone();
+        let interrupted_call = tool_call.clone();
+        let interrupted_args = args.clone();
+        let interrupted = tokio::spawn(async move {
+            interrupted_gateway
+                .authorize(&interrupted_call, &interrupted_args, None)
+                .await
+        });
+        let first_intent = wait_for_durable_intent(&gateway).await;
+        // The attempt is torn down mid-wait: its receiver dies while its sender
+        // is still registered — exactly the state a restart leaves behind.
+        interrupted.abort();
+        let _ = interrupted.await;
+        assert!(
+            gateway
+                .pending_permissions
+                .lock()
+                .await
+                .contains_key(&first_intent.intent_id),
+            "precondition: the interrupted attempt leaves its unusable sender behind"
+        );
+
+        let retry_gateway = gateway.clone();
+        let retry = tokio::spawn(async move { retry_gateway.authorize(&tool_call, &args, None).await });
+        let retry_intent = wait_for_durable_intent(&gateway).await;
+        assert_eq!(
+            retry_intent.intent_id, first_intent.intent_id,
+            "the retry reconciles onto the interrupted request, which is what makes the stale slot reachable"
+        );
+
+        // The user answers the prompt that is actually on screen now. Wait for a
+        // *live* channel: the interrupted attempt's entry is only usable again
+        // once the retry owns it, and a closed slot can never be answered.
+        let sender = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                {
+                    let mut pending = gateway.pending_permissions.lock().await;
+                    if pending
+                        .get(&retry_intent.intent_id)
+                        .is_some_and(|sender| !sender.is_closed())
+                    {
+                        return pending
+                            .remove(&retry_intent.intent_id)
+                            .expect("the live slot was just observed");
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("M281 R1: the retried prompt must stay answerable, not inherit a dead channel");
+        // The user comes back and approves through the same durable path the real
+        // command uses: record the exact decision, then wake the waiter. The
+        // retry must have kept this intent answerable instead of voiding it.
+        PermissionIntentStore::new(gateway.db.clone())
+            .record_user_response(
+                &retry_intent.prompt_key(),
+                PermissionPromptResponse::Allow,
+                chrono::Utc::now().timestamp_millis(),
+            )
+            .await
+            .expect("M281 R1: the retried intent must still accept a decision");
+        sender.send(allow()).unwrap();
+        assert_eq!(
+            retry.await.unwrap(),
+            PermissionOutcome::Allow,
+            "M281 R1: a retry must adopt the dead slot and ask again instead of denying with ChannelClosed"
+        );
     }
 }
