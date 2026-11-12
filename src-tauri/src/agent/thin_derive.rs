@@ -1080,6 +1080,57 @@ async fn denied_intent_at(db: &SqlitePool, session: &str) -> sqlx::Result<Option
     Ok(denied)
 }
 
+/// M282/R1：本会话是否已有真实交付事实（PR 已合并或已关闭）。已经交付的任务不再
+/// 因为一条旧的拒绝被反复接续。
+async fn delivery_settled(db: &SqlitePool, session: &str) -> sqlx::Result<bool> {
+    if !has_table(db, "thin_delivery_refs").await?
+        || !has_table(db, "thin_external_observations").await?
+    {
+        return Ok(false);
+    }
+    let settled: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM thin_external_observations observation JOIN thin_delivery_refs ref ON ref.session_id=observation.session_id AND ref.pr_number=observation.pr_number WHERE observation.session_id=? AND (observation.merged_at IS NOT NULL OR observation.completed_reason LIKE '%已关闭但未合并%')",
+    )
+    .bind(session)
+    .fetch_one(db)
+    .await?;
+    Ok(settled > 0)
+}
+
+/// M282/R1：`refresh` 与回合结束结算（`thin_state::settle_final`）共用的唯一判定。
+/// 用户主动停止、任务已经交付时按原规则结算；确有被拒的审批且任务未交付时，系统立即
+/// 接续——延迟 0，唤醒 id 绑定 denied 行时间戳，所以同一条拒绝只接续一次（M278/R2）。
+/// 这里只读结构化事实（`permission_intents` 的 denied 行），助手在回合末尾写了什么
+/// 词一律不参与判断（R5）。
+pub(crate) async fn denial_continuation(
+    db: &SqlitePool,
+    session: &str,
+) -> sqlx::Result<Option<ThinState>> {
+    if has_table(db, "chat_session_cancel_intents").await? {
+        let stop: Option<i64> =
+            sqlx::query_scalar("SELECT requested_at FROM chat_session_cancel_intents WHERE session_id=?")
+                .bind(session)
+                .fetch_optional(db)
+                .await?;
+        if stop.is_some() {
+            return Ok(None);
+        }
+    }
+    if delivery_settled(db, session).await? {
+        return Ok(None);
+    }
+    let Some(denied_at) = denied_intent_at(db, session).await? else {
+        return Ok(None);
+    };
+    continue_state_now(
+        db,
+        session,
+        denied_at,
+        "上一回合的审批被拒，任务未交付",
+    )
+    .await
+}
+
 /// M259：结束原因只写当场查到的事实。查得到的写结果，查不到的写「未核验」和原因；
 /// 不再用固定的「未核验项」清单，因为那会把已经做完的收尾说成没做。
 pub(crate) async fn closeout_result(db: &SqlitePool, session: &str, reason: &str) -> String {
@@ -1974,16 +2025,10 @@ async fn derive_candidate(db: &SqlitePool, session: &str) -> sqlx::Result<ThinSt
             return Ok(state);
         }
     }
-    // M278/R1：审批被拒之后，模型若用一句「需要你做一件事」收尾，60 秒的退避只是把
-    // 会话摆在用户面前（M278 现场：被拒 → 助手提问 → 结算成等待用户）。被拒本身就是
-    // 用户已经表态的真实权限事实，任务又没交付，系统立即接续；同一条拒绝只接续一次
-    // （唤醒 id 绑定该行，已兑现的唤醒让这里自然落回正常结算），用户停止与已交付的
-    // 情况在前面就已经返回。
+    // M278/R1 + M282/R1：判定已下沉到 `denial_continuation`，回合结束结算走同一个函数。
     if completed.is_none() && !stale_scope {
-        if let Some(denied_at) = denied_intent_at(db, session).await? {
-            if let Some(state) = continue_state_now(db, session, denied_at, "上一回合的审批被拒，任务未交付").await? {
-                return Ok(state);
-            }
+        if let Some(state) = denial_continuation(db, session).await? {
+            return Ok(state);
         }
     }
     let mut pending_question_at = 0;
@@ -3580,6 +3625,98 @@ mod tests {
             .filter(|(id, status, _)| id.starts_with("thin-continue-") && status == "pending")
             .collect();
         assert!(pending.is_empty(), "M278/R1: 同一条拒绝只接续一次，已兑现的唤醒不应重排：{rows:?}");
+    }
+
+    /// M282/R3：回合结束的真实入口是 `settle_final`，不是 `refresh`。现场会话
+    /// ebe54c65：审批被拒、任务未交付、助手以「需要你做一件事」收尾，`settle_final`
+    /// 却写成 `ended / 任务已结束` 并让触发器取消全部 pending 唤醒。
+    #[tokio::test]
+    async fn m282_settle_final_continues_after_denied_approval() {
+        let db = fixture().await;
+        let now = chrono::Utc::now().timestamp_millis();
+        sqlx::query("INSERT INTO messages(id,session_id,role,content,created_at) VALUES ('m282-q','derive','user','把这个改完',?)")
+            .bind(now - 60_000).execute(&db).await.unwrap();
+        sqlx::query("INSERT INTO messages(id,session_id,role,content,created_at) VALUES ('m282-a','derive','assistant','阻断总结：需要你做一件事：手工补三行。',?)")
+            .bind(now - 30_000).execute(&db).await.unwrap();
+        sqlx::raw_sql("DROP TABLE permission_intents; CREATE TABLE permission_intents(session_id TEXT, status TEXT, expires_at INTEGER, created_at INTEGER, tool_name TEXT, prompt_args_json TEXT);").execute(&db).await.unwrap();
+        sqlx::query("INSERT INTO permission_intents VALUES ('derive','denied',?,?,'bash','{}')")
+            .bind(now + 600_000).bind(now - 40_000).execute(&db).await.unwrap();
+        let state = crate::agent::thin_state::settle_final(&db, "derive", "m282-turn", None).await.unwrap();
+        assert_eq!(state.state, SessionState::WaitingWake, "M282/R3: {state:?}");
+        assert!(
+            state.wake_source.as_deref().unwrap_or_default().contains("thin-continue-"),
+            "M282/R3: 回合结束结算也必须由系统接续，实际 {state:?}"
+        );
+        let (id, next_at, status): (String, i64, String) =
+            sqlx::query_as("SELECT id,next_at,status FROM wakeup_schedules WHERE session_id='derive' AND id LIKE 'thin-continue-%'")
+                .fetch_one(&db).await.unwrap();
+        assert!(id.starts_with("thin-continue-derive-"), "M282/R3: {id}");
+        assert!(
+            next_at <= chrono::Utc::now().timestamp(),
+            "M282/R3: 被拒后立即接续，next_at={next_at}"
+        );
+        assert_eq!(status, "pending", "M282/R3: ended 触发器不得取消这条接续唤醒");
+        let stored: String = sqlx::query_scalar("SELECT state FROM thin_session_state WHERE session_id='derive'")
+            .fetch_one(&db).await.unwrap();
+        assert_ne!(stored, "ended", "M282/R3: 被拒且未交付的回合不能被写成 ended");
+    }
+
+    /// M282/R4 反例：没有被拒事实时，`settle_final` 按原规则结算，不造接续唤醒。
+    #[tokio::test]
+    async fn m282_settle_final_without_denial_still_settles_by_rule() {
+        let db = fixture().await;
+        let now = chrono::Utc::now().timestamp_millis();
+        sqlx::query("INSERT INTO messages(id,session_id,role,content,created_at) VALUES ('m282-q4','derive','user','把这个改完',?)")
+            .bind(now - 60_000).execute(&db).await.unwrap();
+        sqlx::query("INSERT INTO messages(id,session_id,role,content,created_at) VALUES ('m282-a4','derive','assistant','需要你做一件事：手工补三行。',?)")
+            .bind(now - 30_000).execute(&db).await.unwrap();
+        let _ = crate::agent::thin_state::settle_final(&db, "derive", "m282-turn-4", None).await.unwrap();
+        let wakes: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM wakeup_schedules WHERE session_id='derive' AND id LIKE 'thin-continue-%'")
+            .fetch_one(&db).await.unwrap();
+        assert_eq!(wakes, 0, "M282/R4: 没有被拒事实就不该接续");
+    }
+
+    /// M282/R4 反例：用户主动停止会话后，被拒的历史不覆盖用户决定。
+    #[tokio::test]
+    async fn m282_settle_final_respects_user_stop() {
+        let db = fixture().await;
+        let now = chrono::Utc::now().timestamp_millis();
+        sqlx::query("INSERT INTO chat_session_cancel_intents(session_id,status,requested_at,updated_at) VALUES ('derive','requested',?,?)")
+            .bind(now - 10_000).bind(now - 10_000).execute(&db).await.unwrap();
+        sqlx::query("INSERT INTO messages(id,session_id,role,content,created_at) VALUES ('m282-q5','derive','user','停下',?)")
+            .bind(now - 60_000).execute(&db).await.unwrap();
+        sqlx::query("INSERT INTO messages(id,session_id,role,content,created_at) VALUES ('m282-a5','derive','assistant','需要你做一件事：手工补三行。',?)")
+            .bind(now - 30_000).execute(&db).await.unwrap();
+        sqlx::raw_sql("DROP TABLE permission_intents; CREATE TABLE permission_intents(session_id TEXT, status TEXT, expires_at INTEGER, created_at INTEGER, tool_name TEXT, prompt_args_json TEXT);").execute(&db).await.unwrap();
+        sqlx::query("INSERT INTO permission_intents VALUES ('derive','denied',?,?,'bash','{}')")
+            .bind(now + 600_000).bind(now - 40_000).execute(&db).await.unwrap();
+        let state = crate::agent::thin_state::settle_final(&db, "derive", "m282-turn-5", None).await.unwrap();
+        let wakes: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM wakeup_schedules WHERE session_id='derive' AND id LIKE 'thin-continue-%'")
+            .fetch_one(&db).await.unwrap();
+        assert_eq!(wakes, 0, "M282/R4: 用户已停止，不接续");
+        assert_eq!(state.state, SessionState::Ended, "M282/R4: {state:?}");
+    }
+
+    /// M282/R4 反例：已交付（PR 合并）之后，旧拒绝不再触发接续。
+    #[tokio::test]
+    async fn m282_settle_final_skips_continuation_after_delivery() {
+        let db = fixture().await;
+        let now = chrono::Utc::now().timestamp_millis();
+        sqlx::query("INSERT INTO messages(id,session_id,role,content,created_at) VALUES ('m282-q6','derive','user','把这个改完',?)")
+            .bind(now - 60_000).execute(&db).await.unwrap();
+        sqlx::query("INSERT INTO messages(id,session_id,role,content,created_at) VALUES ('m282-a6','derive','assistant','需要你做一件事：手工补三行。',?)")
+            .bind(now - 30_000).execute(&db).await.unwrap();
+        sqlx::raw_sql("DROP TABLE permission_intents; CREATE TABLE permission_intents(session_id TEXT, status TEXT, expires_at INTEGER, created_at INTEGER, tool_name TEXT, prompt_args_json TEXT);").execute(&db).await.unwrap();
+        sqlx::query("INSERT INTO permission_intents VALUES ('derive','denied',?,?,'bash','{}')")
+            .bind(now + 600_000).bind(now - 40_000).execute(&db).await.unwrap();
+        sqlx::query("INSERT INTO thin_delivery_refs VALUES ('derive','synthetic',73,'ThroughMerge')").execute(&db).await.unwrap();
+        ensure_external(&db).await.unwrap();
+        sqlx::query("INSERT INTO thin_external_observations(session_id,pr_number,ceiling,observed_at,completed_reason,merged_at) VALUES ('derive',73,'ThroughMerge',?,'PR #73 已合并',?)")
+            .bind(now - 5_000).bind(now - 5_000).execute(&db).await.unwrap();
+        let _ = crate::agent::thin_state::settle_final(&db, "derive", "m282-turn-6", None).await.unwrap();
+        let wakes: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM wakeup_schedules WHERE session_id='derive' AND id LIKE 'thin-continue-%'")
+            .fetch_one(&db).await.unwrap();
+        assert_eq!(wakes, 0, "M282/R4: 已交付的任务不再为旧拒绝接续");
     }
 
     #[test]
