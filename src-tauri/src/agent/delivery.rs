@@ -31,6 +31,15 @@
 //!   double-opened), an already-merged PR short-circuits. Re-invoking after a
 //!   crash continues from the real state.
 
+#[path = "delivery_scope.rs"]
+mod task_scope;
+pub(crate) use task_scope::TaskDeliveryScope;
+#[path = "delivery_hook_commit.rs"]
+mod hook_commit;
+pub(crate) use hook_commit::{commit_with_hooks, verify_hook_policy, HookCommitPlan};
+#[cfg(test)]
+pub(crate) use super::tool_backend::{r2_native_delivery_fixture, r2_native_write_existing_fixture, r2_production_native_fixture, r2_fresh_thin_fixture};
+
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -649,6 +658,8 @@ pub struct DeliverOpts {
     /// every local or external mutation rung. Non-durable/manual callers leave
     /// this unset and retain the legacy single-process behavior.
     pub mutation_permit: Option<DeliveryMutationPermit>,
+    /// Host-only exact receipt-chain proof; never accepted from tool arguments.
+    pub(crate) task_scope: Option<TaskDeliveryScope>,
     /// U28 `CF-REL-R2`: explicit force for a release-only batch. Force alone is
     /// only the caller's intent; `release_force_approved` records that the SAME
     /// authorization explicitly approved releasing a batch with no `feat`/`fix`.
@@ -2559,6 +2570,8 @@ pub struct LocalCommitIntentEvidence {
     pub staged_tree_sha: String,
     pub expected_head_sha: String,
     pub commit_message_digest: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hook_policy_digest: Option<String>,
 }
 
 impl LocalCommitIntentEvidence {
@@ -2584,6 +2597,7 @@ impl LocalCommitIntentEvidence {
             staged_tree_sha: staged_tree_sha.into(),
             expected_head_sha: expected_head_sha.into(),
             commit_message_digest: external_operation_key("message", &[commit_message]),
+            hook_policy_digest: None,
         }
     }
 
@@ -2616,10 +2630,16 @@ impl LocalCommitIntentEvidence {
             staged_tree_sha: staged_tree_sha.into(),
             expected_head_sha: expected_head_sha.into(),
             commit_message_digest: external_operation_key("message", &[commit_message]),
+            hook_policy_digest: None,
         }
     }
 
     pub fn operation_key(&self) -> String {
+        if let Some(policy) = self.hook_policy_digest.as_deref() {
+            let mut original = self.clone();
+            original.hook_policy_digest = None;
+            return external_operation_key("git_local_commit_with_hooks", &[&original.operation_key(), policy]);
+        }
         if !self.original_index_tree_sha.is_empty() && !self.source_manifest_digest.is_empty() {
             return external_operation_key(
                 "git_local_commit",
@@ -2945,6 +2965,9 @@ pub(crate) fn materialize_receipted_local_commit_with_fault_marker(
                 );
             }
             if locked_head == persisted_identity.head_sha {
+                if let Some(policy) = evidence.hook_policy_digest.as_deref() {
+                    hook_commit::verify_hook_policy(&repo.root, policy)?;
+                }
                 let branch_ref = format!("refs/heads/{expected_branch}");
                 git(
                     &repo.root,
@@ -3628,7 +3651,7 @@ fn bytes_digest(bytes: &[u8]) -> String {
     format!("sha256:{:x}", Sha256::digest(bytes))
 }
 
-fn current_index_digest(root: &Path) -> Result<String, String> {
+pub(super) fn current_index_digest(root: &Path) -> Result<String, String> {
     let repository = git2::Repository::open(root)
         .map_err(|error| format!("cannot open delivery repository index: {error}"))?;
     let index_path = repository
@@ -3883,7 +3906,7 @@ fn delivery_size_block_message(report: &DeliverySizeReport) -> String {
 /// Compute the exact scoped commit tree in an isolated copy of the current
 /// index. No real index, ref, worktree path, or remote is mutated here. This
 /// closes every `git add` crash window with one pre-stage write-ahead receipt.
-fn prepare_scoped_commit(root: &Path, extra: &[String]) -> Result<ScopedCommitPlan, String> {
+pub(super) fn prepare_scoped_commit(root: &Path, extra: &[String]) -> Result<ScopedCommitPlan, String> {
     let repository = git2::Repository::open(root)
         .map_err(|error| format!("cannot prepare isolated delivery index: {error}"))?;
     let real_index = repository
@@ -5955,6 +5978,13 @@ pub async fn deliver<R: DeliveryRemote>(
         }
     }
 
+    let Some(task_scope) = opts.task_scope.as_ref() else {
+        return outcome.blocked_at(StepResult::blocked("task_scope", "TASK_DELIVERY_SCOPE_UNPROVEN: 缺少宿主任务归属证明；未执行交付。"));
+    };
+    if let Err(error) = task_scope.verify(&repo.root) {
+        return outcome.blocked_at(StepResult::blocked("task_scope", error));
+    }
+
     // `deliver_changes` intentionally owns its native sync gate instead of
     // trusting the repository hook: the commit path uses `--no-verify`, and a
     // process can run with hooks disabled or missing. Fetch is read-only with
@@ -5999,6 +6029,9 @@ pub async fn deliver<R: DeliveryRemote>(
             ))
         }
     };
+    if let Err(error) = task_scope.verify_plan(&repo.root, &commit_plan.target_tree_sha) {
+        return outcome.blocked_at(StepResult::blocked("task_scope", error));
+    }
     // M258: look at WHAT would be committed before any index, ref or remote
     // mutation. Build output or a runaway change set is refused here with the
     // paths and a fix the model can apply — never as a network wait.
@@ -6051,6 +6084,7 @@ pub async fn deliver<R: DeliveryRemote>(
                 .to_string(),
         ));
     }
+    let mut proven_delivery_head = task_scope.committed_head_sha().to_string();
     if commit_plan.target_tree_sha != head_tree {
         let msg = append_release_urgency(
             generate_commit_message_for_paths(
@@ -6185,6 +6219,7 @@ pub async fn deliver<R: DeliveryRemote>(
             }
         };
         let committed_head = committed_identity.head_sha;
+        proven_delivery_head = expected_commit_sha.clone();
         if committed_head != expected_commit_sha {
             let error = fail_external_mutation(
                 opts.mutation_permit.as_ref(),
@@ -6228,7 +6263,7 @@ pub async fn deliver<R: DeliveryRemote>(
             .steps
             .push(StepResult::skipped("commit", "无待提交改动(可能已提交)"));
     }
-    outcome.commit_sha = git(&repo.root, &["rev-parse", "HEAD"]).ok();
+    outcome.commit_sha = Some(proven_delivery_head);
 
     // Nothing to deliver at all: branch has no commits beyond base and there
     // was nothing to commit. Report a clean noop rather than open an empty PR.
@@ -6248,6 +6283,9 @@ pub async fn deliver<R: DeliveryRemote>(
     }
     if let Err(step) = verify_mutation_permit(opts, "git_push").await {
         return outcome.blocked_on_uncertain_side_effect(step);
+    }
+    if let Err(error) = task_scope.verify_materialized(&repo.root) {
+        return outcome.blocked_at(StepResult::blocked("task_scope", error));
     }
     let push_sha = outcome.commit_sha.clone().unwrap_or_default();
     let remote_identity = opts
@@ -6320,7 +6358,10 @@ pub async fn deliver<R: DeliveryRemote>(
         // The durable result was positively observed above. Continue to the
         // next rung without replaying `git push`.
     } else {
-        match git(&repo.root, &["push", "-u", &repo.remote, &repo.branch]) {
+        // Resolve the content before dispatch. A concurrent local branch move
+        // must not change the tree sent to the remote after scope verification.
+        let exact_refspec = format!("{push_sha}:refs/heads/{}", repo.branch);
+        match git(&repo.root, &["push", "-u", &repo.remote, &exact_refspec]) {
             Ok(_) => {
                 match observe_remote_branch_head(&repo) {
                     Ok(Some(observed_head)) if observed_head == push_sha => {}
@@ -12555,6 +12596,8 @@ pub(crate) mod github_api_budget {
 #[cfg(test)]
 mod tests {
     use super::*;
+    include!("delivery_scope_acceptance.rs");
+    include!("delivery_legacy_fixture.rs");
     use std::collections::{HashMap, VecDeque};
     use std::sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -13421,8 +13464,25 @@ mod tests {
 
     #[tokio::test]
     async fn m258_delivery_refuses_to_commit_a_cargo_build_directory() {
-        let root = feature_branch_repo("m258-deliver-block");
-        write_cargo_build_dir(&root, ".m258-target", 4);
+        let fixture = OwnedDeliveryFixture::new().await;
+        let root = fixture.root.clone();
+        // The build-output guard receives genuinely owned host writes, so
+        // rejection still reaches size_guard rather than missing ownership.
+        // Match the original build-directory fixture: creating directories
+        // establishes path spelling, but grants no file-content ownership.
+        std::fs::create_dir_all(root.join(".m258-target/debug/deps")).unwrap();
+        std::fs::create_dir_all(root.join(".m258-target/debug/.fingerprint/dep-0")).unwrap();
+        for (path, content) in [
+            (".m258-target/CACHEDIR.TAG", "Signature: 8a477f597d28d172789f06886806bc55\n"),
+            (".m258-target/.rustc_info.json", "{}"),
+            (".m258-target/debug/dep.d", "src/lib.rs:\n"),
+            (".m258-target/debug/.fingerprint/dep-0/invoked.timestamp", "t"),
+        ] {
+            fixture.write(path, content).await;
+        }
+        for index in 0..4 {
+            fixture.write(&format!(".m258-target/debug/deps/libdep-{index}.rlib"), "binary").await;
+        }
         let before_head = git(&root, &["rev-parse", "HEAD"]).unwrap();
         let before_status = git(
             &root,
@@ -13444,7 +13504,7 @@ mod tests {
             DeliveryCeiling::PrOnly,
             MergeMethod::Squash,
             1,
-            &DeliverOpts::default(),
+            &fixture.options().await,
             Some(&remote),
             Some("main"),
         )
@@ -13807,7 +13867,8 @@ README-Update: reviewed\nREADME-Update-Reason: 本轮不改变产品承诺与安
     #[tokio::test]
     async fn m114c_arm_failure_blocks_instead_of_merging_directly() {
         use std::sync::atomic::Ordering;
-        let root = feature_branch_repo("m114c-arm-failure");
+        let fixture = OwnedDeliveryFixture::new().await;
+        let root = fixture.root.clone();
         let calls = stub_calls();
         calls.arm_fails.store(true, std::sync::atomic::Ordering::SeqCst);
         let remote = StubRemote {
@@ -13823,7 +13884,7 @@ README-Update: reviewed\nREADME-Update-Reason: 本轮不改变产品承诺与安
             DeliveryCeiling::ThroughMerge,
             MergeMethod::Squash,
             42,
-            &DeliverOpts::default(),
+            &fixture.options().await,
             Some(&remote),
             Some("main"),
         )
@@ -15062,15 +15123,16 @@ else:
 
     #[tokio::test]
     async fn deliver_state_machine_uses_delivery_provider_hook_after_push() {
-        let root = feature_branch_repo("hook-deliver");
-        let hook = root.join("provider.py");
+        let fixture = OwnedDeliveryFixture::new().await;
+        let root = fixture.root.clone();
+        let hook = fixture._temp.path().join("provider.py");
         std::fs::write(
             &hook,
             r#"#!/usr/bin/env python3
 import json, pathlib, sys
 req=json.load(sys.stdin)
 action=req.get('action')
-state_path=pathlib.Path('provider-state.json')
+state_path=pathlib.Path(__file__).with_name('provider-state.json')
 if action == 'open_or_get_pr':
     state_path.write_text(json.dumps(req))
     print(json.dumps({
@@ -15137,7 +15199,7 @@ README-Update-Reason: synthetic fixture\n\nbody"
                 expect_branch: None,
                 expected_identity: None,
                 mutation_permit: None,
-                ..DeliverOpts::default()
+                ..fixture.options().await
             },
             Some(&remote),
             Some("main"),
@@ -15809,7 +15871,8 @@ README-Update-Reason: synthetic fixture\n\nbody"
                         "synthetic provider branch update",
                     ],
                 )?;
-                let refspec = format!("+{next}:refs/heads/feat/x");
+                let branch = git(&root, &["branch", "--show-current"])?;
+                let refspec = format!("+{next}:refs/heads/{branch}");
                 git(&root, &["push", "-q", "origin", &refspec])?;
                 next
             } else {
@@ -16039,8 +16102,10 @@ README-Update-Reason: synthetic fixture\n\nbody"
     async fn successful_push_with_foreign_post_receive_head_never_commits_a_receipt_or_opens_pr() {
         use std::os::unix::fs::PermissionsExt;
 
-        let root = feature_branch_repo("push-post-observe-foreign-head");
-        git(&root, &["add", "feature.rs"]).unwrap();
+        let fixture = OwnedDeliveryFixture::new().await;
+        let root = fixture.root.clone();
+        let branch = git(&root, &["branch", "--show-current"]).unwrap();
+        git(&root, &["add", "base.txt", "owned.txt"]).unwrap();
         git(&root, &["commit", "-q", "-m", "feature A"]).unwrap();
         let authorized_head = git(&root, &["rev-parse", "HEAD"]).unwrap();
 
@@ -16050,15 +16115,15 @@ README-Update-Reason: synthetic fixture\n\nbody"
         git(&root, &["commit", "-q", "-m", "foreign B"]).unwrap();
         let foreign_head = git(&root, &["rev-parse", "HEAD"]).unwrap();
         git(&root, &["push", "-q", "origin", "foreign"]).unwrap();
-        git(&root, &["checkout", "-q", "feat/x"]).unwrap();
+        git(&root, &["checkout", "-q", &branch]).unwrap();
         assert_eq!(git(&root, &["rev-parse", "HEAD"]).unwrap(), authorized_head);
 
-        let origin = root.parent().unwrap().join("origin.git");
+        let origin = fixture._temp.path().join("origin.git");
         let hook = origin.join("hooks/post-receive");
         std::fs::write(
             &hook,
             format!(
-                "#!/bin/sh\ngit --git-dir='{}' update-ref refs/heads/feat/x {}\n",
+                "#!/bin/sh\ngit --git-dir='{}' update-ref refs/heads/{branch} {}\n",
                 origin.display(),
                 foreign_head
             ),
@@ -16086,7 +16151,7 @@ README-Update-Reason: synthetic fixture\n\nbody"
             5,
             &DeliverOpts {
                 mutation_permit: Some(permit),
-                ..DeliverOpts::default()
+                ..fixture.options().await
             },
             Some(&remote),
             Some("main"),
@@ -16095,10 +16160,10 @@ README-Update-Reason: synthetic fixture\n\nbody"
 
         assert_eq!(
             observe_remote_ref_head(
-                &resolve_delivery_repo(&root, Some("main"), Some("feat/x"))
+                &resolve_delivery_repo(&root, Some("main"), Some(&branch))
                     .unwrap()
                     .0,
-                "feat/x",
+                &branch,
             )
             .unwrap()
             .as_deref(),
@@ -16303,7 +16368,8 @@ else:
 
     #[tokio::test]
     async fn pr_only_commits_pushes_and_opens_pr_then_stops() {
-        let root = feature_branch_repo("pronly");
+        let fixture = OwnedDeliveryFixture::new().await;
+        let root = fixture.root.clone();
         let remote = StubRemote {
             ci: CiStatus::Success,
             existing_pr: None,
@@ -16317,7 +16383,7 @@ else:
             DeliveryCeiling::PrOnly,
             MergeMethod::Squash,
             5,
-            &DeliverOpts::default(),
+            &fixture.options().await,
             Some(&remote),
             Some("main"),
         )
@@ -16350,13 +16416,9 @@ else:
 
     #[tokio::test]
     async fn stale_feature_branch_is_blocked_before_stage_commit_push_or_pr() {
-        let root = feature_branch_repo("stale-native-base");
-        let updater = root.parent().unwrap().join("upstream-main");
-        git(
-            &root,
-            &["worktree", "add", "-q", updater.to_str().unwrap(), "main"],
-        )
-        .unwrap();
+        let fixture = OwnedDeliveryFixture::new().await;
+        let root = fixture.root.clone();
+        let updater = fixture._temp.path().join("source");
         git(&updater, &["config", "user.name", "CodeFactory Test"]).unwrap();
         git(
             &updater,
@@ -16385,7 +16447,7 @@ else:
             DeliveryCeiling::PrOnly,
             MergeMethod::Squash,
             5,
-            &DeliverOpts::default(),
+            &fixture.options().await,
             Some(&remote),
             Some("main"),
         )
@@ -16407,8 +16469,9 @@ else:
 
     #[tokio::test]
     async fn readme_diff_is_declared_required_in_generated_pr_body() {
-        let root = feature_branch_repo("pr-readme-required");
-        std::fs::write(root.join("README.md"), "# User-facing change\n").unwrap();
+        let fixture = OwnedDeliveryFixture::new().await;
+        let root = fixture.root.clone();
+        fixture.write("README.md", "# User-facing change\n").await;
         let calls = stub_calls();
         let remote = StubRemote {
             ci: CiStatus::Success,
@@ -16424,7 +16487,7 @@ else:
             DeliveryCeiling::PrOnly,
             MergeMethod::Squash,
             5,
-            &DeliverOpts::default(),
+            &fixture.options().await,
             Some(&remote),
             Some("main"),
         )
@@ -16438,7 +16501,8 @@ else:
 
     #[tokio::test]
     async fn existing_pr_body_is_converged_instead_of_left_to_fail_ci() {
-        let root = feature_branch_repo("pr-body-converge");
+        let fixture = OwnedDeliveryFixture::new().await;
+        let root = fixture.root.clone();
         let calls = stub_calls();
         *calls.remote_pr_text.lock().unwrap() = Some((
             "fix: existing PR".into(),
@@ -16458,7 +16522,7 @@ else:
             DeliveryCeiling::PrOnly,
             MergeMethod::Squash,
             5,
-            &DeliverOpts::default(),
+            &fixture.options().await,
             Some(&remote),
             Some("main"),
         )
@@ -16477,16 +16541,9 @@ else:
         // The U19 defect: a managed branch derives the title
         // `objective <hash>`, which then reached a real PR. With no title
         // intent the delivery must refuse instead of opening that PR.
-        let root = feature_branch_repo("placeholder-pr-title");
-        git(
-            &root,
-            &[
-                "branch",
-                "-m",
-                "codefactory/objective-0123456789abcdef0123456789abcdef",
-            ],
-        )
-        .unwrap();
+        let fixture = OwnedDeliveryFixture::new().await;
+        let root = fixture.root.clone();
+        // The real managed allocator already chooses an Objective placeholder branch.
         let calls = stub_calls();
         let remote = StubRemote {
             ci: CiStatus::Success,
@@ -16502,7 +16559,7 @@ else:
             DeliveryCeiling::PrOnly,
             MergeMethod::Squash,
             5,
-            &DeliverOpts::default(),
+            &DeliverOpts { task_scope: Some(fixture.scope().await), ..DeliverOpts::default() },
             Some(&remote),
             Some("main"),
         )
@@ -16526,8 +16583,9 @@ else:
         // The agent's latest intent wins: an open PR that carries the old
         // placeholder title is renamed to the agent's title and its body is
         // converged, instead of adopting the stale remote value.
-        let root = feature_branch_repo("pr-title-converge");
-        git(&root, &["add", "feature.rs"]).unwrap();
+        let fixture = OwnedDeliveryFixture::new().await;
+        let root = fixture.root.clone();
+        git(&root, &["add", "base.txt", "owned.txt"]).unwrap();
         git(&root, &["commit", "-q", "-m", "fix: seed feature"]).unwrap();
         let calls = stub_calls();
         *calls.remote_pr_text.lock().unwrap() = Some((
@@ -16554,7 +16612,7 @@ else:
                     "Scenario-Test: E2E-001\n\nREADME-Update: reviewed\nREADME-Update-Reason: synthetic"
                         .into(),
                 ),
-                ..DeliverOpts::default()
+                ..fixture.options().await
             },
             Some(&remote),
             Some("main"),
@@ -16590,7 +16648,8 @@ else:
     /// 阻塞等待把回合占满（background_tasks 表 0 行）。
     #[tokio::test]
     async fn pending_ci_is_handed_back_to_the_agent_with_a_background_watch_instead_of_looping() {
-        let root = feature_branch_repo("ci-pending-handoff");
+        let fixture = OwnedDeliveryFixture::new().await;
+        let root = fixture.root.clone();
         let calls = stub_calls();
         let remote = StubRemote {
             ci: CiStatus::Pending,
@@ -16607,7 +16666,7 @@ else:
             DeliveryCeiling::ThroughCiGreen,
             MergeMethod::Squash,
             600,
-            &DeliverOpts::default(),
+            &fixture.options().await,
             Some(&remote),
             Some("main"),
         )
@@ -16628,7 +16687,8 @@ else:
 
     #[tokio::test]
     async fn retryable_ci_infrastructure_failure_reruns_once_then_continues() {
-        let root = feature_branch_repo("ci-retryable");
+        let fixture = OwnedDeliveryFixture::new().await;
+        let root = fixture.root.clone();
         let calls = stub_calls();
         *calls.ci_sequence.lock().unwrap() = VecDeque::from([
             CiStatus::Failure("check:timed_out".into()),
@@ -16648,7 +16708,7 @@ else:
             DeliveryCeiling::ThroughCiGreen,
             MergeMethod::Squash,
             5,
-            &DeliverOpts::default(),
+            &fixture.options().await,
             Some(&remote),
             Some("main"),
         )
@@ -16661,7 +16721,8 @@ else:
 
     #[tokio::test]
     async fn ordinary_test_failure_is_actionable_but_not_blindly_rerun() {
-        let root = feature_branch_repo("ci-actionable");
+        let fixture = OwnedDeliveryFixture::new().await;
+        let root = fixture.root.clone();
         let calls = stub_calls();
         let remote = StubRemote {
             ci: CiStatus::Failure("check:failure".into()),
@@ -16677,7 +16738,7 @@ else:
             DeliveryCeiling::ThroughCiGreen,
             MergeMethod::Squash,
             5,
-            &DeliverOpts::default(),
+            &fixture.options().await,
             Some(&remote),
             Some("main"),
         )
@@ -16692,7 +16753,8 @@ else:
 
     #[tokio::test]
     async fn pr_only_metadata_survives_a_parameterless_resume_through_release() {
-        let root = feature_branch_repo("pr-metadata-resume");
+        let fixture = OwnedDeliveryFixture::new().await;
+        let root = fixture.root.clone();
         let calls = stub_calls();
         let remote = StubRemote {
             ci: CiStatus::Success,
@@ -16709,6 +16771,7 @@ else:
             5,
             &DeliverOpts {
                 title: Some("fix: resume guarded metadata".into()),
+                task_scope: Some(fixture.scope().await),
                 body: Some(
                     "Scenario-Test: CXD-002\nREADME-Update: reviewed\n\
 README-Update-Reason: synthetic fixture\n\n\
@@ -16731,7 +16794,7 @@ Release-Urgency: hold"
             DeliveryCeiling::ThroughRelease,
             MergeMethod::Squash,
             5,
-            &DeliverOpts::default(),
+            &DeliverOpts { task_scope: Some(fixture.scope().await), ..DeliverOpts::default() },
             Some(&remote),
             Some("main"),
         )
@@ -16757,7 +16820,8 @@ Release-Urgency: hold"
 
     #[tokio::test]
     async fn remote_pr_metadata_is_refreshed_before_a_parameterless_merge() {
-        let root = feature_branch_repo("remote-pr-metadata-refresh");
+        let fixture = OwnedDeliveryFixture::new().await;
+        let root = fixture.root.clone();
         let calls = stub_calls();
         let remote = StubRemote {
             ci: CiStatus::Success,
@@ -16779,7 +16843,7 @@ Release-Urgency: hold"
 README-Update-Reason: synthetic fixture\n\nInitial review notes."
                         .into(),
                 ),
-                ..DeliverOpts::default()
+                ..fixture.options().await
             },
             Some(&remote),
             Some("main"),
@@ -16799,7 +16863,7 @@ Release-Urgency: hold"
             DeliveryCeiling::ThroughRelease,
             MergeMethod::Squash,
             5,
-            &DeliverOpts::default(),
+            &DeliverOpts { task_scope: Some(fixture.scope().await), ..DeliverOpts::default() },
             Some(&remote),
             Some("main"),
         )
@@ -17075,26 +17139,29 @@ Release-Urgency: hold"
     #[tokio::test]
     async fn m100_receipt_survives_edits_and_delivery_appends_without_rewinding() {
         for edits in [1, 2] {
-            let root = feature_branch_repo(&format!("m100-edits-{edits}"));
-            let (repo, _) = resolve_delivery_repo(&root, Some("main"), Some("feat/x")).unwrap();
+            let fixture = OwnedDeliveryFixture::new().await;
+            let root = fixture.root.clone();
+            fixture.write("feature.rs", "pub fn f() {}\n").await;
+            let branch = git(&root, &["branch", "--show-current"]).unwrap();
+            let (repo, _) = resolve_delivery_repo(&root, Some("main"), Some(&branch)).unwrap();
             let parent = capture_delivery_identity(&repo).unwrap();
             let plan = prepare_scoped_commit(&root, &[]).unwrap();
             let message = "fix: initial receipted change";
             let head = git(&root, &["-c", "user.name=CodeFactory", "-c", "user.email=noreply@codefactory.local", "commit-tree", &plan.target_tree_sha, "-p", &parent.head_sha, "-m", message]).unwrap();
             let evidence = LocalCommitIntentEvidence::prepared(&parent, &repo.branch, &plan.original_index_tree_sha, &plan.original_index_digest, &plan.target_index_digest, &plan.source_manifest_digest, &plan.target_tree_sha, &head, message);
-            materialize_receipted_local_commit(&root, Some("main"), "feat/x", &parent, &evidence).unwrap();
+            materialize_receipted_local_commit(&root, Some("main"), &branch, &parent, &evidence).unwrap();
             for edit in 0..edits {
-                std::fs::write(root.join("feature.rs"), format!("// follow-up {edit}\n")).unwrap();
+                fixture.write("feature.rs", &format!("// follow-up {edit}\n")).await;
             }
             git(&root, &["add", "feature.rs"]).unwrap();
             let index = git(&root, &["write-tree"]).unwrap();
-            let observed = observe_receipted_local_commit(&root, Some("main"), "feat/x", &parent, &evidence).unwrap();
+            let observed = observe_receipted_local_commit(&root, Some("main"), &branch, &parent, &evidence).unwrap();
             assert_eq!(observed.head_sha, head);
             assert_eq!(git(&root, &["write-tree"]).unwrap(), index);
             assert_eq!(git(&root, &["rev-parse", "HEAD"]).unwrap(), head);
             let calls = stub_calls();
             let remote = StubRemote { ci: CiStatus::Success, existing_pr: None, merge_queues: false, merge_ok: true, caps: every_capability(), calls };
-            let outcome = deliver(&root, DeliveryCeiling::PrOnly, MergeMethod::Squash, 1, &DeliverOpts { title: Some("fix: follow-up edit".into()), expect_branch: Some("feat/x".into()), expected_identity: Some(observed), ..DeliverOpts::default() }, Some(&remote), Some("main")).await;
+            let outcome = deliver(&root, DeliveryCeiling::PrOnly, MergeMethod::Squash, 1, &DeliverOpts { title: Some("fix: follow-up edit".into()), expect_branch: Some(branch.clone()), expected_identity: Some(observed), ..fixture.options().await }, Some(&remote), Some("main")).await;
             assert_ne!(outcome.final_state, "blocked", "{:?}", outcome.steps);
             let next = git(&root, &["rev-parse", "HEAD"]).unwrap();
             assert_ne!(next, head);
@@ -17812,8 +17879,10 @@ Release-Urgency: hold"
 
     #[tokio::test]
     async fn lost_claim_epoch_fences_every_later_mutation_rung() {
-        let root = feature_branch_repo("claim-epoch-rung-fence");
-        let origin = root.parent().unwrap().join("origin.git");
+        let fixture = OwnedDeliveryFixture::new().await;
+        let root = fixture.root.clone();
+        let branch = git(&root, &["branch", "--show-current"]).unwrap();
+        let origin = fixture._temp.path().join("origin.git");
         let calls = stub_calls();
         let remote = StubRemote {
             ci: CiStatus::Success,
@@ -17838,8 +17907,8 @@ Release-Urgency: hold"
             1,
             &DeliverOpts {
                 mutation_permit: Some(permit),
-                expect_branch: Some("feat/x".into()),
-                ..DeliverOpts::default()
+                expect_branch: Some(branch.clone()),
+                ..fixture.options().await
             },
             Some(&remote),
             Some("main"),
@@ -17852,7 +17921,7 @@ Release-Urgency: hold"
         );
         assert_eq!(outcome.stage, "mutation_intent");
         assert!(
-            git(&origin, &["show-ref", "--verify", "refs/heads/feat/x"]).is_err(),
+            git(&origin, &["show-ref", "--verify", &format!("refs/heads/{branch}")]).is_err(),
             "a stale owner must not push after losing its epoch"
         );
         assert_eq!(calls.open_pr.load(Ordering::SeqCst), 0);
@@ -17912,7 +17981,8 @@ Release-Urgency: hold"
 
     #[tokio::test]
     async fn through_merge_stops_when_ci_fails() {
-        let root = feature_branch_repo("cifail");
+        let fixture = OwnedDeliveryFixture::new().await;
+        let root = fixture.root.clone();
         let remote = StubRemote {
             ci: CiStatus::Failure("build red".into()),
             existing_pr: None,
@@ -17926,7 +17996,7 @@ Release-Urgency: hold"
             DeliveryCeiling::ThroughMerge,
             MergeMethod::Squash,
             1,
-            &DeliverOpts::default(),
+            &fixture.options().await,
             Some(&remote),
             Some("main"),
         )
@@ -17945,7 +18015,8 @@ Release-Urgency: hold"
 
     #[tokio::test]
     async fn queued_auto_merge_is_a_waiting_state_not_a_permission_failure() {
-        let root = feature_branch_repo("merge-queued");
+        let fixture = OwnedDeliveryFixture::new().await;
+        let root = fixture.root.clone();
         let calls = stub_calls();
         let remote = StubRemote {
             ci: CiStatus::Success,
@@ -17960,7 +18031,7 @@ Release-Urgency: hold"
             DeliveryCeiling::ThroughRelease,
             MergeMethod::Squash,
             5,
-            &DeliverOpts::default(),
+            &fixture.options().await,
             Some(&remote),
             Some("main"),
         )
@@ -17983,7 +18054,8 @@ Release-Urgency: hold"
 
     #[tokio::test]
     async fn queued_auto_merge_resume_observes_without_reissuing_merge() {
-        let root = feature_branch_repo("merge-queued-resume");
+        let fixture = OwnedDeliveryFixture::new().await;
+        let root = fixture.root.clone();
         let calls = stub_calls();
         let remote = StubRemote {
             ci: CiStatus::Success,
@@ -17999,7 +18071,7 @@ Release-Urgency: hold"
             DeliveryCeiling::ThroughRelease,
             MergeMethod::Squash,
             5,
-            &DeliverOpts::default(),
+            &fixture.options().await,
             Some(&remote),
             Some("main"),
         )
@@ -18012,7 +18084,7 @@ Release-Urgency: hold"
             DeliveryCeiling::ThroughRelease,
             MergeMethod::Squash,
             5,
-            &DeliverOpts::default(),
+            &DeliverOpts { task_scope: Some(fixture.scope().await), ..DeliverOpts::default() },
             Some(&remote),
             Some("main"),
         )
@@ -18031,7 +18103,8 @@ Release-Urgency: hold"
 
     #[tokio::test]
     async fn queued_auto_merge_updates_a_behind_branch_instead_of_waiting_forever() {
-        let root = feature_branch_repo("merge-queued-behind");
+        let fixture = OwnedDeliveryFixture::new().await;
+        let root = fixture.root.clone();
         let calls = stub_calls();
         *calls.merge_readiness.lock().unwrap() = Some(MergeReadiness::Behind);
         *calls.branch_update_repo.lock().unwrap() = Some(root.clone());
@@ -18049,7 +18122,7 @@ Release-Urgency: hold"
             DeliveryCeiling::ThroughRelease,
             MergeMethod::Squash,
             5,
-            &DeliverOpts::default(),
+            &fixture.options().await,
             Some(&remote),
             Some("main"),
         )
@@ -18070,7 +18143,8 @@ Release-Urgency: hold"
 
     #[tokio::test]
     async fn through_merge_merges_on_green() {
-        let root = feature_branch_repo("merge");
+        let fixture = OwnedDeliveryFixture::new().await;
+        let root = fixture.root.clone();
         let remote = StubRemote {
             ci: CiStatus::Success,
             existing_pr: None,
@@ -18084,7 +18158,7 @@ Release-Urgency: hold"
             DeliveryCeiling::ThroughMerge,
             MergeMethod::Squash,
             5,
-            &DeliverOpts::default(),
+            &fixture.options().await,
             Some(&remote),
             Some("main"),
         )
@@ -18141,7 +18215,8 @@ Release-Urgency: hold"
     /// 而且结论如实写明「PR #7 保持打开，没有合并」。
     #[tokio::test]
     async fn r1_a_stop_while_waiting_for_ci_never_merges_the_green_pr() {
-        let root = feature_branch_repo("stop-during-ci-wait");
+        let fixture = OwnedDeliveryFixture::new().await;
+        let root = fixture.root.clone();
         let calls = stub_calls();
         // 第一次轮询还"在跑"；停止就在这之后到达，随后 CI 才变绿。
         *calls.ci_sequence.lock().unwrap() = VecDeque::from([CiStatus::Pending, CiStatus::Success]);
@@ -18163,7 +18238,7 @@ Release-Urgency: hold"
             5,
             &DeliverOpts {
                 stop_gate: Some(gate),
-                ..DeliverOpts::default()
+                ..fixture.options().await
             },
             Some(&remote),
             Some("main"),
@@ -18197,7 +18272,8 @@ Release-Urgency: hold"
 
     #[tokio::test]
     async fn m47_stop_on_green_ci_never_arms_the_queue() {
-        let root = feature_branch_repo("m47-green-ci-stop");
+        let fixture = OwnedDeliveryFixture::new().await;
+        let root = fixture.root.clone();
         let calls = stub_calls();
         let gate = crate::agent::stop_fence::FlagStopGate::new("user_stop");
         *calls.stop_gate_on_ci.lock().unwrap() = Some(gate.clone());
@@ -18211,7 +18287,7 @@ Release-Urgency: hold"
         };
         let out = deliver(
             &root, DeliveryCeiling::ThroughMerge, MergeMethod::Squash, 5,
-            &DeliverOpts { stop_gate: Some(gate), ..DeliverOpts::default() },
+            &DeliverOpts { stop_gate: Some(gate), ..fixture.options().await },
             Some(&remote), Some("main"),
         ).await;
         assert_eq!(out.final_state, "stopped", "{:?}", out.steps);
@@ -18226,8 +18302,10 @@ Release-Urgency: hold"
     /// 「悄悄恢复」——推送、开 PR、合并、发版全部不发生。
     #[tokio::test]
     async fn r3_a_stopped_session_never_silently_resumes_delivery() {
-        let root = feature_branch_repo("stop-no-silent-resume");
-        let origin = root.parent().unwrap().join("origin.git");
+        let fixture = OwnedDeliveryFixture::new().await;
+        let root = fixture.root.clone();
+        let branch = git(&root, &["branch", "--show-current"]).unwrap();
+        let origin = fixture._temp.path().join("origin.git");
         let calls = stub_calls();
         let gate = crate::agent::stop_fence::FlagStopGate::new("user_stop");
         gate.stop();
@@ -18248,7 +18326,7 @@ Release-Urgency: hold"
                 5,
                 &DeliverOpts {
                     stop_gate: Some(gate.clone()),
-                    ..DeliverOpts::default()
+                    ..fixture.options().await
                 },
                 Some(&remote),
                 Some("main"),
@@ -18262,7 +18340,7 @@ Release-Urgency: hold"
         assert_eq!(calls.merge.load(Ordering::SeqCst), 0);
         assert_eq!(calls.release.load(Ordering::SeqCst), 0);
         assert!(
-            git(&origin, &["show-ref", "--verify", "refs/heads/feat/x"]).is_err(),
+            git(&origin, &["show-ref", "--verify", &format!("refs/heads/{branch}")]).is_err(),
             "停止之后的任何一次交付尝试都不得推送"
         );
         let _ = std::fs::remove_dir_all(root.parent().unwrap());
@@ -18271,8 +18349,10 @@ Release-Urgency: hold"
     /// CF-STOP-R1：提交已经发生、推送还没发生时停止，只留下本地提交。
     #[tokio::test]
     async fn r1_a_stop_before_push_leaves_the_commit_unpublished() {
-        let root = feature_branch_repo("stop-before-push");
-        let origin = root.parent().unwrap().join("origin.git");
+        let fixture = OwnedDeliveryFixture::new().await;
+        let root = fixture.root.clone();
+        let branch = git(&root, &["branch", "--show-current"]).unwrap();
+        let origin = fixture._temp.path().join("origin.git");
         let calls = stub_calls();
         let gate = crate::agent::stop_fence::FlagStopGate::new("user_stop");
         gate.stop();
@@ -18292,7 +18372,7 @@ Release-Urgency: hold"
             5,
             &DeliverOpts {
                 stop_gate: Some(gate),
-                ..DeliverOpts::default()
+                ..fixture.options().await
             },
             Some(&remote),
             Some("main"),
@@ -18304,7 +18384,7 @@ Release-Urgency: hold"
         assert_eq!(calls.open_pr.load(Ordering::SeqCst), 0);
         assert_eq!(calls.merge.load(Ordering::SeqCst), 0);
         assert!(
-            git(&origin, &["show-ref", "--verify", "refs/heads/feat/x"]).is_err(),
+            git(&origin, &["show-ref", "--verify", &format!("refs/heads/{branch}")]).is_err(),
             "停止在推送之前，远端不应出现这个分支"
         );
         assert!(out.summary.contains("本地改动保留在工作区"), "{}", out.summary);
@@ -18327,7 +18407,8 @@ Release-Urgency: hold"
 
     #[tokio::test]
     async fn a_missing_live_verifier_still_delivers_and_only_withholds_the_live_claim() {
-        let root = feature_branch_repo("nolive");
+        let fixture = OwnedDeliveryFixture::new().await;
+        let root = fixture.root.clone();
         let calls = stub_calls();
         let remote = StubRemote {
             ci: CiStatus::Success,
@@ -18345,7 +18426,7 @@ Release-Urgency: hold"
             DeliveryCeiling::ThroughRelease,
             MergeMethod::Squash,
             5,
-            &DeliverOpts::default(),
+            &fixture.options().await,
             Some(&remote),
             Some("main"),
         )
@@ -18385,7 +18466,7 @@ Release-Urgency: hold"
             DeliveryCeiling::ThroughRelease,
             MergeMethod::Squash,
             5,
-            &DeliverOpts::default(),
+            &DeliverOpts { task_scope: Some(fixture.scope().await), ..DeliverOpts::default() },
             Some(&remote),
             Some("main"),
         )
@@ -18398,7 +18479,8 @@ Release-Urgency: hold"
 
     #[tokio::test]
     async fn a_hold_trailer_survives_commit_and_merge_but_blocks_release_dispatch() {
-        let root = feature_branch_repo("release-hold");
+        let fixture = OwnedDeliveryFixture::new().await;
+        let root = fixture.root.clone();
         let calls = stub_calls();
         let remote = StubRemote {
             ci: CiStatus::Success,
@@ -18421,7 +18503,7 @@ README-Update-Reason: synthetic fixture\n\nRequires a companion change."
                         .into(),
                 ),
                 release_urgency: Some(ReleaseUrgency::Hold),
-                ..DeliverOpts::default()
+                ..fixture.options().await
             },
             Some(&remote),
             Some("main"),
@@ -18441,7 +18523,8 @@ README-Update-Reason: synthetic fixture\n\nRequires a companion change."
 
     #[tokio::test]
     async fn release_receipt_resumes_observation_when_release_adapter_is_temporarily_missing() {
-        let root = feature_branch_repo("resume-release-receipt");
+        let fixture = OwnedDeliveryFixture::new().await;
+        let root = fixture.root.clone();
         let calls = stub_calls();
         let first_remote = StubRemote {
             ci: CiStatus::Success,
@@ -18459,7 +18542,7 @@ README-Update-Reason: synthetic fixture\n\nRequires a companion change."
             DeliveryCeiling::ThroughRelease,
             MergeMethod::Squash,
             5,
-            &DeliverOpts::default(),
+            &fixture.options().await,
             Some(&first_remote),
             Some("main"),
         )
@@ -18483,7 +18566,7 @@ README-Update-Reason: synthetic fixture\n\nRequires a companion change."
             DeliveryCeiling::ThroughRelease,
             MergeMethod::Squash,
             5,
-            &DeliverOpts::default(),
+            &DeliverOpts { task_scope: Some(fixture.scope().await), ..DeliverOpts::default() },
             Some(&resume_remote),
             Some("main"),
         )
@@ -18577,8 +18660,9 @@ README-Update-Reason: synthetic fixture\n\nRequires a companion change."
 
     #[tokio::test]
     async fn merge_intent_reconciles_open_same_head_and_resumes_safely() {
-        let root = feature_branch_repo("intent-merge-reconcile");
-        git(&root, &["add", "feature.rs"]).unwrap();
+        let fixture = OwnedDeliveryFixture::new().await;
+        let root = fixture.root.clone();
+        git(&root, &["add", "base.txt", "owned.txt"]).unwrap();
         git(&root, &["commit", "-q", "-m", "feature"]).unwrap();
         let repo = resolve_repo(&root, Some("main")).unwrap();
         let sha = git(&root, &["rev-parse", "HEAD"]).unwrap();
@@ -18611,7 +18695,7 @@ README-Update-Reason: synthetic fixture\n\nRequires a companion change."
             DeliveryCeiling::ThroughMerge,
             MergeMethod::Squash,
             5,
-            &DeliverOpts::default(),
+            &fixture.options().await,
             Some(&remote),
             Some("main"),
         )
@@ -18629,10 +18713,12 @@ README-Update-Reason: synthetic fixture\n\nRequires a companion change."
 
     #[tokio::test]
     async fn local_release_intent_with_proven_absence_resumes_and_dispatches_exactly_once() {
-        let root = feature_branch_repo("intent-release-proven-absent");
-        git(&root, &["add", "feature.rs"]).unwrap();
+        let fixture = OwnedDeliveryFixture::new().await;
+        let root = fixture.root.clone();
+        git(&root, &["add", "base.txt", "owned.txt"]).unwrap();
         git(&root, &["commit", "-q", "-m", "feature"]).unwrap();
         let repo = resolve_repo(&root, Some("main")).unwrap();
+        let branch = repo.branch.clone();
         let sha = git(&root, &["rev-parse", "HEAD"]).unwrap();
         let release_head = observe_remote_ref_head(&repo, &repo.default_branch)
             .unwrap()
@@ -18670,7 +18756,7 @@ README-Update-Reason: synthetic fixture\n\nRequires a companion change."
             reconcile_local_release_intent(
                 &root,
                 Some("main"),
-                "feat/x",
+                &branch,
                 &sha,
                 true,
                 Some(&remote),
@@ -18684,7 +18770,7 @@ README-Update-Reason: synthetic fixture\n\nRequires a companion change."
             DeliveryCeiling::ThroughRelease,
             MergeMethod::Squash,
             5,
-            &DeliverOpts::default(),
+            &fixture.options().await,
             Some(&remote),
             Some("main"),
         )
@@ -18698,7 +18784,7 @@ README-Update-Reason: synthetic fixture\n\nRequires a companion change."
             DeliveryCeiling::ThroughRelease,
             MergeMethod::Squash,
             5,
-            &DeliverOpts::default(),
+            &fixture.options().await,
             Some(&remote),
             Some("main"),
         )
@@ -18714,7 +18800,8 @@ README-Update-Reason: synthetic fixture\n\nRequires a companion change."
 
     #[tokio::test]
     async fn a_missing_release_actuator_descends_to_merge_instead_of_refusing_everything() {
-        let root = feature_branch_repo("norelease");
+        let fixture = OwnedDeliveryFixture::new().await;
+        let root = fixture.root.clone();
         let calls = stub_calls();
         let remote = StubRemote {
             ci: CiStatus::Success,
@@ -18733,7 +18820,7 @@ README-Update-Reason: synthetic fixture\n\nRequires a companion change."
             DeliveryCeiling::ThroughRelease,
             MergeMethod::Squash,
             5,
-            &DeliverOpts::default(),
+            &fixture.options().await,
             Some(&remote),
             Some("main"),
         )
@@ -18775,7 +18862,8 @@ README-Update-Reason: synthetic fixture\n\nRequires a companion change."
     #[tokio::test]
     async fn a_missing_ci_observer_descends_to_pr_only() {
         // GitlabRemote's real matrix: review+merge, no ci, no release, no live.
-        let root = feature_branch_repo("nocianyway");
+        let fixture = OwnedDeliveryFixture::new().await;
+        let root = fixture.root.clone();
         let calls = stub_calls();
         let remote = StubRemote {
             ci: CiStatus::Success,
@@ -18795,7 +18883,7 @@ README-Update-Reason: synthetic fixture\n\nRequires a companion change."
             DeliveryCeiling::ThroughRelease,
             MergeMethod::Squash,
             5,
-            &DeliverOpts::default(),
+            &fixture.options().await,
             Some(&remote),
             Some("main"),
         )
@@ -18826,7 +18914,8 @@ README-Update-Reason: synthetic fixture\n\nRequires a companion change."
 
     #[tokio::test]
     async fn a_missing_merge_adapter_descends_to_ci_green_and_reports_partial_truth() {
-        let root = feature_branch_repo("nomerge");
+        let fixture = OwnedDeliveryFixture::new().await;
+        let root = fixture.root.clone();
         let calls = stub_calls();
         let remote = StubRemote {
             ci: CiStatus::Success,
@@ -18846,7 +18935,7 @@ README-Update-Reason: synthetic fixture\n\nRequires a companion change."
             DeliveryCeiling::ThroughRelease,
             MergeMethod::Squash,
             5,
-            &DeliverOpts::default(),
+            &fixture.options().await,
             Some(&remote),
             Some("main"),
         )
@@ -18866,7 +18955,8 @@ README-Update-Reason: synthetic fixture\n\nRequires a companion change."
 
     #[tokio::test]
     async fn explicit_lower_ceiling_is_complete_not_partial() {
-        let root = feature_branch_repo("requested-pr-only");
+        let fixture = OwnedDeliveryFixture::new().await;
+        let root = fixture.root.clone();
         let calls = stub_calls();
         let remote = StubRemote {
             ci: CiStatus::Success,
@@ -18889,7 +18979,7 @@ README-Update-Reason: synthetic fixture\n\nRequires a companion change."
             5,
             &DeliverOpts {
                 requested_ceiling: Some(DeliveryCeiling::PrOnly),
-                ..DeliverOpts::default()
+                ..fixture.options().await
             },
             Some(&remote),
             Some("main"),
@@ -19034,7 +19124,8 @@ README-Update-Reason: synthetic fixture\n\nRequires a companion change."
 
     #[tokio::test]
     async fn a_matching_target_branch_does_not_get_in_the_way() {
-        let root = feature_branch_repo("rightbranch");
+        let fixture = OwnedDeliveryFixture::new().await;
+        let root = fixture.root.clone();
         let branch = git(&root, &["rev-parse", "--abbrev-ref", "HEAD"]).expect("branch");
         let remote = StubRemote {
             ci: CiStatus::Success,
@@ -19051,7 +19142,7 @@ README-Update-Reason: synthetic fixture\n\nRequires a companion change."
             5,
             &DeliverOpts {
                 expect_branch: Some(branch),
-                ..DeliverOpts::default()
+                ..fixture.options().await
             },
             Some(&remote),
             Some("main"),
@@ -19314,7 +19405,13 @@ README-Update-Reason: synthetic fixture\n\nRequires a companion change."
 
     #[test]
     fn worktree_feature_branch_is_discovered_and_delivered_from_main() {
-        let (root, _wt) = repo_with_worktree_feature("wt-discover");
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let fixture = rt.block_on(OwnedDeliveryFixture::new());
+        let root = fixture._temp.path().join("source");
+        let wt1 = fixture.root.clone();
+        let branch = git(&wt1, &["branch", "--show-current"]).unwrap();
+        git(&wt1, &["add", "base.txt", "owned.txt"]).unwrap();
+        git(&wt1, &["commit", "-q", "-m", "feat(wt): work"]).unwrap();
         let remote = StubRemote {
             ci: CiStatus::Success,
             existing_pr: None,
@@ -19323,14 +19420,14 @@ README-Update-Reason: synthetic fixture\n\nRequires a companion change."
             caps: every_capability(),
             calls: stub_calls(),
         };
-        let rt = tokio::runtime::Runtime::new().unwrap();
+
         let out = rt.block_on(deliver(
             &root,
             DeliveryCeiling::PrOnly,
             MergeMethod::Squash,
             1,
             &DeliverOpts {
-                title: None,
+                title: Some("feat(wt): work".into()),
                 body: None,
                 release_urgency: None,
                 requested_ceiling: None,
@@ -19338,6 +19435,7 @@ README-Update-Reason: synthetic fixture\n\nRequires a companion change."
                 expect_branch: None,
                 expected_identity: None,
                 mutation_permit: None,
+                task_scope: Some(rt.block_on(fixture.scope())),
                 ..DeliverOpts::default()
             },
             Some(&remote),
@@ -19345,7 +19443,7 @@ README-Update-Reason: synthetic fixture\n\nRequires a companion change."
         ));
         // Delivery must NOT refuse on default branch: it found the worktree
         // branch and opened the PR from it.
-        assert_eq!(out.branch.as_deref(), Some("feat/wt"));
+        assert_eq!(out.branch.as_deref(), Some(branch.as_str()));
         assert_eq!(out.pr_number, Some(7));
         assert!(
             out.steps
@@ -19359,7 +19457,13 @@ README-Update-Reason: synthetic fixture\n\nRequires a companion change."
 
     #[test]
     fn multiple_worktree_candidates_are_reported_as_ambiguous() {
-        let (root, wt1) = repo_with_worktree_feature("wt-multi");
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let fixture = rt.block_on(OwnedDeliveryFixture::new());
+        let root = fixture._temp.path().join("source");
+        let wt1 = fixture.root.clone();
+        let branch = git(&wt1, &["branch", "--show-current"]).unwrap();
+        git(&wt1, &["add", "base.txt", "owned.txt"]).unwrap();
+        git(&wt1, &["commit", "-q", "-m", "feat(wt): work"]).unwrap();
         // A second sibling worktree with its own ahead branch.
         let wt2 = root.parent().unwrap().join("wt-feat2");
         git(
@@ -19387,7 +19491,7 @@ README-Update-Reason: synthetic fixture\n\nRequires a companion change."
             caps: every_capability(),
             calls: stub_calls(),
         };
-        let rt = tokio::runtime::Runtime::new().unwrap();
+
         let out = rt.block_on(deliver(
             &root,
             DeliveryCeiling::PrOnly,
@@ -19402,6 +19506,7 @@ README-Update-Reason: synthetic fixture\n\nRequires a companion change."
                 expect_branch: None,
                 expected_identity: None,
                 mutation_permit: None,
+                task_scope: Some(rt.block_on(fixture.scope())),
                 ..DeliverOpts::default()
             },
             Some(&remote),
@@ -19413,7 +19518,7 @@ README-Update-Reason: synthetic fixture\n\nRequires a companion change."
             "summary should name both candidates, got: {}",
             out.summary
         );
-        assert!(out.summary.contains("feat/wt"), "candidate 1 named");
+        assert!(out.summary.contains(&branch), "candidate 1 named");
         assert!(out.summary.contains("feat/wt2"), "candidate 2 named");
         // No PR was opened for an ambiguous choice.
         assert_eq!(remote.calls.open_pr.load(Ordering::SeqCst), 0);
@@ -19424,23 +19529,24 @@ README-Update-Reason: synthetic fixture\n\nRequires a companion change."
             MergeMethod::Squash,
             1,
             &DeliverOpts {
-                title: None,
+                title: Some("feat(wt): work".into()),
                 body: None,
                 release_urgency: None,
                 requested_ceiling: None,
                 extra_excludes: vec![],
-                expect_branch: Some("feat/wt".into()),
+                expect_branch: Some(branch.clone()),
                 expected_identity: None,
                 mutation_permit: None,
+                task_scope: Some(rt.block_on(fixture.scope())),
                 ..DeliverOpts::default()
             },
             Some(&remote),
             Some("main"),
         ));
-        assert_eq!(selected.branch.as_deref(), Some("feat/wt"));
+        assert_eq!(selected.branch.as_deref(), Some(branch.as_str()));
         assert_eq!(selected.pr_number, Some(7));
         assert_eq!(remote.calls.open_pr.load(Ordering::SeqCst), 1);
-        assert!(wt1.join("feature.rs").exists());
+        assert!(wt1.join("owned.txt").exists());
         let _ = std::fs::remove_dir_all(root.parent().unwrap());
     }
 

@@ -22,18 +22,91 @@ trait Commands {
     }
 }
 
-struct Local<'a>(&'a Path);
-impl Commands for Local<'_> {
-    fn git(&mut self, args: &[&str]) -> Result<String, String> { delivery::git(self.0, args) }
-    fn gh(&mut self, args: &[&str]) -> Result<String, String> {
-        delivery::bounded_delivery_output(delivery::dev_command("gh").current_dir(self.0).args(args))
+/// Production adapter only. Synthetic command fixtures cannot manufacture this
+/// host-owned proof, and the proof is never read from tool arguments.
+struct Local<'a> {
+    root: &'a Path,
+    scope: Option<&'a delivery::TaskDeliveryScope>,
+    staged: bool,
+    installed_head: Option<String>,
+    stop: Option<(tokio::runtime::Handle, std::sync::Arc<dyn crate::agent::stop_fence::DeliveryStopGate>)>,
+}
+impl Local<'_> {
+    fn check_stop(&self) -> Result<(), String> {
+        if let Some((runtime, gate)) = &self.stop {
+            if let Some(reason) = runtime.block_on(gate.stop_reason()) {
+                return Err(format!("DELIVERY_STOPPED: {reason}"));
+            }
+        }
+        Ok(())
     }
-    fn stage(&mut self, excludes: &[String]) -> Result<Vec<String>, String> { delivery::stage_scoped(self.0, excludes) }
+    fn dispatch_forge(&self, args: &[&str], dispatch: impl FnOnce() -> Result<String, String>) -> Result<String, String> {
+        let read_only = matches!(args, ["pr", "list", ..] | ["pr", "view", ..] | ["pr", "checks", ..]
+            | ["run", "list", ..] | ["run", "view", ..] | ["release", "view", ..]);
+        if !read_only { self.verify_current()?; self.check_stop()?; }
+        dispatch()
+    }
+
+    fn proof(&self) -> Result<&delivery::TaskDeliveryScope, String> {
+        self.scope.ok_or_else(|| "TASK_OWNERSHIP_UNPROVEN: host proof is missing; no delivery mutation performed".into())
+    }
+    fn verify_current(&self) -> Result<(), String> {
+        if let Some(expected) = self.installed_head.as_deref() {
+            if delivery::git(self.root, &["rev-parse", "HEAD"])? != expected {
+                return Err("installed hook commit HEAD changed before thin mutation".into());
+            }
+        }
+        if self.staged { self.proof()?.verify_materialized(self.root) }
+        else { self.proof()?.verify(self.root) }
+    }
+}
+impl Commands for Local<'_> {
+    fn git(&mut self, args: &[&str]) -> Result<String, String> {
+        if args.first() == Some(&"commit") {
+            return Err("TASK_DELIVERY_SCOPE_UNPROVEN: thin 自动提交尚无保留正常 hooks 的固定树原子事务；未提交、推送或覆盖暂存。".into());
+        }
+        let mutation = args.first() == Some(&"push");
+        if mutation {
+            self.verify_current()?;
+            let expected = self.installed_head.as_ref().map(|head| format!("{head}:refs/heads/{}", self.proof().expect("proof checked").proven_branch()))
+                .unwrap_or_else(|| self.proof().expect("proof checked").proven_push_refspec());
+            let refspec = args.last().copied().unwrap_or_default();
+            if refspec != expected {
+                return Err("TASK_DELIVERY_SCOPE_UNPROVEN: push 必须使用已验证的固定提交 SHA 与目标分支，不能解析可变 HEAD 或更换目标。".into());
+            }
+        }
+        if mutation { self.check_stop()?; }
+        let result = delivery::git(self.root, args)?;
+        if mutation { self.verify_current()?; }
+        Ok(result)
+    }
+    fn gh(&mut self, args: &[&str]) -> Result<String, String> {
+        self.dispatch_forge(args, || delivery::bounded_delivery_output(delivery::dev_command("gh").current_dir(self.root).args(args)))
+    }
+
+    fn stage(&mut self, excludes: &[String]) -> Result<Vec<String>, String> {
+        let proof = self.proof()?;
+        if self.installed_head.is_some() {
+            proof.verify_materialized(self.root)?;
+            return Ok(Vec::new());
+        }
+        proof.verify(self.root)?;
+        if proof.requires_commit() {
+            // Do not stage first and fail later: Git's ordinary commit reads a
+            // mutable index, while commit-tree would bypass normal hooks. Until
+            // thin has a guarded fixed-tree commit, preserve every original byte.
+            return Err("TASK_DELIVERY_SCOPE_UNPROVEN: thin 自动提交尚无保留正常 hooks 的固定树原子事务；工作区和原始 index 保持不变，未提交或推送。".into());
+        }
+        let _ = excludes; // No files are staged for an already-committed tree.
+        self.staged = true;
+        self.verify_current()?;
+        Ok(Vec::new())
+    }
     fn precheck_governance(&mut self) -> Result<(Vec<String>, u64), String> {
-        delivery::precheck_thin_governance(self.0)
+        delivery::precheck_thin_governance(self.root)
     }
     fn reconcile_body(&mut self, title: &str, body: &str, urgency: Option<ReleaseUrgency>) -> Result<String, String> {
-        delivery::prepare_thin_pr_body(self.0, title, body, urgency)
+        delivery::prepare_thin_pr_body(self.root, title, body, urgency)
     }
 }
 
@@ -252,13 +325,18 @@ fn resolve_title(commands: &mut impl Commands, args: &Value, branch: &str) -> Re
     Ok(retype(&chosen, &kind))
 }
 
-fn run(commands: &mut impl Commands, args: &Value, ceiling: DeliveryCeiling, excludes: &[String], log: &mut Log) -> Result<Value, String> {
-    if ceiling == DeliveryCeiling::Off { return Ok(json!({"state":"noop"})); }
+fn preflight(commands: &mut impl Commands, args: &Value, ceiling: DeliveryCeiling) -> Result<Option<String>, String> {
+    if ceiling == DeliveryCeiling::Off { return Ok(None); }
     let branch = commands.git(&["branch", "--show-current"])?;
     if branch.is_empty() { return Err("detached HEAD cannot be delivered".into()); }
     if args.get("expect_branch").and_then(Value::as_str).is_some_and(|expected| expected != branch) {
         return Err(format!("expect_branch 不匹配当前 objective 的交付分支 {branch}；未执行提交或推送。系统自动重试/自愈：在登记工作区核对 git status 和 git branch --show-current，使用 expect_branch={branch} 重试 deliver_changes；不得切回上一单已合并分支。"));
     }
+    Ok(Some(branch))
+}
+
+fn run(commands: &mut impl Commands, args: &Value, ceiling: DeliveryCeiling, excludes: &[String], log: &mut Log) -> Result<Value, String> {
+    let Some(branch) = preflight(commands, args, ceiling)? else { return Ok(json!({"state":"noop"})); };
     log.branch = branch.clone();
     // M132: resolve the title first — a delivery that cannot describe itself must
     // not write `fix: <branch>` into the commit history or onto the PR.
@@ -297,7 +375,7 @@ fn run(commands: &mut impl Commands, args: &Value, ceiling: DeliveryCeiling, exc
             commands.git(&["merge-base", "--is-ancestor", remote_sha, "HEAD"])
                 .map_err(|_| "remote branch diverged; refusing force push".to_string())?;
         }
-        commands.git(&["push", "--set-upstream", "origin", &format!("HEAD:{remote_ref}")])?;
+        commands.git(&["push", "--set-upstream", "origin", &format!("{sha}:{remote_ref}")])?;
         log.step("push", "pushed");
     } else { log.step("push", "unchanged"); }
     let listed = log.gh(commands, &["pr", "list", "--head", &branch, "--state", "all", "--json", "number,url,title,body,state,headRefOid"])?;
@@ -391,15 +469,44 @@ fn session_release_args(args: &Value, session_urgency: &str) -> Value {
     effective
 }
 
-pub(super) async fn execute(args: &Value, ctx: &ExecCtx, ceiling: DeliveryCeiling, excludes: &[String]) -> crate::errors::Result<ToolOutput> {
-    let mut log = Log::default();
+pub(super) async fn prepared_commit_message(args: &Value, ctx: &ExecCtx, scope: &delivery::TaskDeliveryScope) -> crate::errors::Result<String> {
+    let mut effective = args.clone();
+    if let (Some(db), Some(session)) = (&ctx.db, &ctx.session_id) {
+        let urgency: String = sqlx::query_scalar("SELECT release_urgency FROM sessions WHERE id=?")
+            .bind(session).fetch_one(db).await?;
+        effective = session_release_args(args, &urgency);
+    }
+    let mut local = Local { root: &ctx.cwd, scope: Some(scope), staged: false, installed_head: None, stop: None };
+    let branch = preflight(&mut local, &effective, DeliveryCeiling::PrOnly)
+        .map_err(crate::errors::AppError::Other)?.ok_or_else(|| crate::errors::AppError::Other("local commit preflight is disabled".into()))?;
+    let title = resolve_title(&mut local, &effective, &branch).map_err(crate::errors::AppError::Other)?;
+    let urgency = super::delivery::release_urgency_from_args(&effective).map_err(crate::errors::AppError::Other)?;
+    Ok(delivery::append_release_urgency(title, urgency))
+}
+
+pub(super) async fn execute(
+    args: &Value, ctx: &ExecCtx, ceiling: DeliveryCeiling, excludes: &[String],
+    scope: &delivery::TaskDeliveryScope, installed_head: Option<String>,
+    gate: std::sync::Arc<dyn crate::agent::stop_fence::DeliveryStopGate>,
+) -> crate::errors::Result<ToolOutput> {
     let mut effective_args = args.clone();
     if let (Some(db), Some(session)) = (&ctx.db, &ctx.session_id) {
         let urgency: String = sqlx::query_scalar("SELECT release_urgency FROM sessions WHERE id=?")
             .bind(session).fetch_one(db).await?;
         effective_args = session_release_args(args, &urgency);
     }
-    let result = run(&mut Local(&ctx.cwd), &effective_args, ceiling, excludes, &mut log);
+    let runtime = tokio::runtime::Handle::current();
+    let root = ctx.cwd.clone();
+    let scope = scope.clone();
+    let excludes = excludes.to_vec();
+    // All synchronous commands run outside the async runtime worker. Each
+    // actual write re-reads the existing persistent stop authorities.
+    let (result, log) = tokio::task::spawn_blocking(move || {
+        let mut log = Log::default();
+        let mut local = Local { root: &root, scope: Some(&scope), staged: installed_head.is_some(), installed_head, stop: Some((runtime, gate)) };
+        let result = run(&mut local, &effective_args, ceiling, &excludes, &mut log);
+        (result, log)
+    }).await.map_err(|error| crate::errors::AppError::Other(format!("thin delivery worker failed: {error}")))?;
     if let (Some(db), Some(session), Some(number)) = (&ctx.db, &ctx.session_id, log.pr_number) {
         sqlx::query("INSERT INTO thin_delivery_refs (session_id,branch,pr_number,ceiling) VALUES (?,?,?,?) ON CONFLICT(session_id) DO UPDATE SET branch=excluded.branch,pr_number=excluded.pr_number,ceiling=excluded.ceiling")
             .bind(session).bind(&log.branch).bind(number as i64).bind(format!("{ceiling:?}")).execute(db).await?;
@@ -418,6 +525,20 @@ pub(super) async fn execute(args: &Value, ctx: &ExecCtx, ceiling: DeliveryCeilin
 }
 
 #[cfg(test)]
+pub(super) fn task_scope_stage_fixture(
+    cwd: &Path, scope: &delivery::TaskDeliveryScope,
+) -> Result<Vec<String>, String> {
+    Local { root: cwd, scope: Some(scope), staged: false, installed_head: None, stop: None }.stage(&[])
+}
+
+#[cfg(test)]
+pub(super) fn task_scope_native_fixture(
+    cwd: &Path, scope: &delivery::TaskDeliveryScope, args: &[&str],
+) -> Result<String, String> {
+    Local { root: cwd, scope: Some(scope), staged: true, installed_head: None, stop: None }.git(args)
+}
+
+#[cfg(test)]
 pub(super) fn m232_deliver_fixture(cwd: &Path) -> Value {
     tests::deliver_real_git_fixture(cwd)
 }
@@ -425,6 +546,62 @@ pub(super) fn m232_deliver_fixture(cwd: &Path) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn task_ownership_missing_proof_preserves_thin_index_and_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        delivery::git(root, &["init", "-q"]).unwrap();
+        delivery::git(root, &["config", "user.name", "Synthetic"]).unwrap();
+        delivery::git(root, &["config", "user.email", "synthetic@example.invalid"]).unwrap();
+        std::fs::write(root.join("src.rs"), "base\n").unwrap();
+        delivery::git(root, &["add", "src.rs"]).unwrap();
+        delivery::git(root, &["commit", "-qm", "synthetic baseline"]).unwrap();
+        let head = delivery::git(root, &["rev-parse", "HEAD"]).unwrap();
+        let index = std::fs::read(root.join(".git/index")).unwrap();
+        std::fs::write(root.join("src.rs"), "requested change\n").unwrap();
+        std::fs::write(root.join("t1.py"), "unrelated source\n").unwrap();
+        let result = Local { root, scope: None, staged: false, installed_head: None, stop: None }.stage(&[]);
+        assert!(result.is_err(), "missing host proof must refuse staging: {result:?}");
+        assert_eq!(std::fs::read(root.join(".git/index")).unwrap(), index);
+        assert_eq!(delivery::git(root, &["rev-parse", "HEAD"]).unwrap(), head);
+        assert_eq!(std::fs::read_to_string(root.join("src.rs")).unwrap(), "requested change\n");
+        assert_eq!(std::fs::read_to_string(root.join("t1.py")).unwrap(), "unrelated source\n");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn r2_thin_dirty_commit_runs_normal_hook_and_installs_exact_child() {
+        use std::os::unix::fs::PermissionsExt;
+        let (db, temp, root, objective_id) = delivery::r2_production_native_fixture().await;
+        let common = delivery::git(&root, &["rev-parse", "--path-format=absolute", "--git-common-dir"]).unwrap();
+        let hook = std::path::PathBuf::from(&common).join("hooks/pre-commit");
+        std::fs::create_dir_all(hook.parent().unwrap()).unwrap();
+        std::fs::write(&hook, "#!/bin/sh\nset -eu\ngit symbolic-ref -q HEAD >/dev/null\nprintf hook-ran > \"$(git rev-parse --git-common-dir)/r2-hook-ran\"\n").unwrap();
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let scope = delivery::TaskDeliveryScope::load(&db, &objective_id, &root, &[]).await.unwrap();
+        let parent = delivery::git(&root, &["rev-parse", "HEAD"]).unwrap();
+        let origin_refs = delivery::git(&temp.path().join("origin.git"), &["show-ref"]).unwrap();
+        let installed = super::super::delivery::task_scope_thin_commit_fixture(&db, &objective_id, &root, &scope)
+            .await.expect("proven dirty content must commit through the durable hook transaction");
+        let mut local = Local { root: &root, scope: Some(&scope), staged: true, installed_head: Some(installed), stop: None };
+        assert!(local.stage(&[]).unwrap().is_empty(), "normal thin flow must not commit the child twice");
+        assert_eq!(std::fs::read_to_string(std::path::PathBuf::from(common).join("r2-hook-ran")).unwrap(), "hook-ran");
+        assert_eq!(delivery::git(&root, &["rev-parse", "HEAD^"]).unwrap(), parent);
+        assert_eq!(delivery::git(&root, &["ls-tree", "-r", "--name-only", "HEAD"]).unwrap(), "base.txt\nowned.txt");
+        assert_eq!(delivery::git(&root, &["show", "HEAD:base.txt"]).unwrap(), "owned edit");
+        assert_eq!(delivery::git(&root, &["show", "HEAD:owned.txt"]).unwrap(), "owned new content");
+        assert!(delivery::git(&root, &["status", "--porcelain"]).unwrap().is_empty());
+        assert_eq!(delivery::git(&temp.path().join("origin.git"), &["show-ref"]).unwrap(), origin_refs);
+        let owner: (Option<String>, String, i64) = sqlx::query_as("SELECT delivery_run_id, status, revision FROM objectives WHERE id=?")
+            .bind(&objective_id).fetch_one(&db).await.unwrap();
+        assert_eq!(owner, (None, "active".into(), 1), "local completion must atomically hand back the pointer without completing or advancing the Objective");
+        let commits: i64 = sqlx::query_scalar("SELECT count(*) FROM delivery_mutation_intents WHERE status='committed' AND rung IN ('git_hook_commit_prepare','git_local_commit')")
+            .fetch_one(&db).await.unwrap();
+        assert_eq!(commits, 2);
+    }
+
+    include!("delivery_hook_commit_tests.rs");
 
     pub(super) fn deliver_real_git_fixture(cwd: &Path) -> Value {
         struct Fixture<'a> { cwd: &'a Path, forge: Forge }
