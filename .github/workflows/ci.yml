@@ -520,8 +520,19 @@ jobs:
       - name: R10 build matrix
         run: |
           set -euo pipefail
+          python3 tools/verify/registry_proxy_stub.py > /tmp/registry-proxy.port &
+          proxy_pid=$!
+          for _ in 1 2 3 4 5 6 7 8 9 10; do
+            if [ -s /tmp/registry-proxy.port ]; then
+              break
+            fi
+            sleep 0.2
+          done
+          export CODEFACTORY_REGISTRY_PROXY_PORT="$(tr -d '[:space:]' < /tmp/registry-proxy.port)"
+          test -n "$CODEFACTORY_REGISTRY_PROXY_PORT"
           cargo test --manifest-path src-tauri/Cargo.toml --lib -- trusted_sandbox::tests::emits_repo_profile_for_the_r10_matrix -- --nocapture
           node tools/verify/m224-r10-matrix.mjs
+          kill "$proxy_pid" || true
 
   docker-sandbox:
     name: docker-sandbox
