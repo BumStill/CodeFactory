@@ -4407,6 +4407,7 @@ mod m266_tests {
 #[cfg(test)]
 mod m281_readonly_for_loops {
     use super::sensitive;
+    use super::standalone_shell_policy;
 
     /// R2 现场形态：只读的 `for` 循环，列表来自 `$()`，循环体只读文件与 Git 状态。
     const READ_ONLY_LOOPS: [&str; 5] = [
@@ -4442,8 +4443,8 @@ mod m281_readonly_for_loops {
         ] {
             assert!(
                 !matches!(
-                    crate::tools::shell_policy::classify_command(command),
-                    crate::tools::shell_policy::ShellCommandPolicy::Allow { .. }
+                    standalone_shell_policy::classify_command(command),
+                    standalone_shell_policy::ShellCommandPolicy::Allow { .. }
                 ),
                 "M281 R2 negative control: {command} must not be auto-allowed"
             );
