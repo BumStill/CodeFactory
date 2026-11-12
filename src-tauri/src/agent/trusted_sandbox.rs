@@ -224,6 +224,15 @@ fn git_dirs(workspace: &Path) -> Option<(PathBuf, PathBuf)> {
 
 /// `$TMPDIR/codefactory-sbx/<session>/`，0700。失败时调用方必须退回审批，不能改用全局临时目录。
 pub fn private_tmpdir(session_id: Option<&str>) -> Result<PathBuf, String> {
+    // R10 矩阵先生成仓库 profile，再生成 worktree profile。两次如果各自再套一层
+    // `codefactory-sbx/<pid>`，worktree 会写到第一份目录，而第二份策略只放行自己的
+    // 子目录。显式钉住同一目录时，profile 与子进程 TMPDIR 才是同一条写白名单。
+    if let Some(pinned) = std::env::var_os("M224_PRIVATE_TMP") {
+        let dir = PathBuf::from(pinned);
+        if dir.is_absolute() {
+            return prepare_private_dir(&dir);
+        }
+    }
     let base = std::env::var_os("TMPDIR")
         .map(PathBuf::from)
         .filter(|path| path.is_absolute())
@@ -245,14 +254,18 @@ pub fn private_tmpdir(session_id: Option<&str>) -> Result<PathBuf, String> {
         return Err("会话标识为空，无法建立私有临时目录".into());
     }
     let dir = base.join("codefactory-sbx").join(leaf);
-    std::fs::create_dir_all(&dir).map_err(|error| format!("私有临时目录不可用：{error}"))?;
+    prepare_private_dir(&dir)
+}
+
+fn prepare_private_dir(dir: &Path) -> Result<PathBuf, String> {
+    std::fs::create_dir_all(dir).map_err(|error| format!("私有临时目录不可用：{error}"))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
             .map_err(|error| format!("私有临时目录权限不可设置：{error}"))?;
     }
-    Ok(dir)
+    Ok(dir.to_path_buf())
 }
 
 pub fn cleanup_private_tmpdir(session_id: &str) {

@@ -32,6 +32,7 @@ if (fs.existsSync(privateTmpFile)) {
   process.env.TMPDIR = privateTmp;
   process.env.TMP = privateTmp;
   process.env.TEMP = privateTmp;
+  process.env.M224_PRIVATE_TMP = privateTmp;
 }
 
 if (!fs.existsSync(profile)) {
@@ -105,7 +106,7 @@ function record(id, title, runner) {
       entry.output
         .trim()
         .split("\n")
-        .slice(-8)
+        .slice(-30)
         .map((line) => `       ${line}`)
         .join("\n"),
     );
@@ -229,7 +230,7 @@ record("git-hook", "linked worktree 内执行 pre-commit 钩子（沙箱内）",
 record("git-hook-repo", "版本化 pre-commit 钩子脚本（沙箱内，真实仓库）", () => {
   const outcome = sandboxed(["python3", "tools/git/ensure_branch_current.py"]);
   // 钩子可能因"分支已落后于 origin/main"而拒绝提交：那是正常裁决，不是环境失败。
-  const refused = /merge|落后|behind|out of date|fetch|拒绝|403|proxy|unable to access|could not resolve/i.test(outcome.output);
+  const refused = /merge|落后|behind|out of date|fetch|拒绝|403|proxy|unable to access|could not resolve|detached HEAD/i.test(outcome.output);
   return {
     ok: outcome.ok || refused,
     detail: outcome.ok ? "hook reported branch current" : "hook refused (expected when behind)",

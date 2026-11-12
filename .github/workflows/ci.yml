@@ -521,6 +521,8 @@ jobs:
           node-version: 22
       - name: Seatbelt, secrets, and dispatch tests
         run: cargo test --manifest-path src-tauri/Cargo.toml --lib --tests -- command_sandbox trusted_sandbox headless_dispatch secrets h1_ h2_ h3_ h4_
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
       - name: R10 build matrix
         run: |
           set -euo pipefail
@@ -534,6 +536,12 @@ jobs:
           done
           export CODEFACTORY_REGISTRY_PROXY_PORT="$(tr -d '[:space:]' < /tmp/registry-proxy.port)"
           test -n "$CODEFACTORY_REGISTRY_PROXY_PORT"
+          # /usr/bin/cc 会经 xcrun 查 LaunchServices。策略故意不放行 lsd.mapdb，
+          # 所以在沙箱外先解析出真正的 clang，再让沙箱内的 cargo 直接调用它。
+          if command -v xcrun >/dev/null 2>&1; then
+            export CC="$(xcrun -find clang)"
+            export CXX="$(xcrun -find clang++)"
+          fi
           cargo test --manifest-path src-tauri/Cargo.toml --lib -- trusted_sandbox::tests::emits_repo_profile_for_the_r10_matrix -- --nocapture
           node tools/verify/m224-r10-matrix.mjs
           kill "$proxy_pid" || true

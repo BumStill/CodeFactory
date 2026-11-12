@@ -562,6 +562,9 @@ fn build_profile(
     // 外进程，两者都不可接受。
     profile.push_str("(allow signal (target same-sandbox))\n");
     profile.push_str("(allow ipc-posix-sem)\n");
+    // clang/cc 在编译期用 POSIX 共享内存做临时缓冲。只放行这一类 IPC，
+    // 不放行 LaunchServices（lsd.mapdb）那条逃逸面。
+    profile.push_str("(allow ipc-posix-shm)\n");
     profile.push_str("(allow file-read*)\n");
     profile.push_str("(deny file-write*)\n");
     // R3：白名单先写"登记工作区"，再写调用方显式登记的支撑路径；写在 deny 之后才生效。
@@ -766,6 +769,7 @@ mod tests {
             "signal 不得无目标放行（会给同用户任意进程发信号）: {profile}"
         );
         assert!(profile.contains("(allow ipc-posix-sem)"), "{profile}");
+        assert!(profile.contains("(allow ipc-posix-shm)"), "{profile}");
     }
 
     #[test]
