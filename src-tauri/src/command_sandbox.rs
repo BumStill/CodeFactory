@@ -598,28 +598,23 @@ fn build_profile(
         NetworkPolicy::Full => profile.push_str("(allow network*)\n"),
         NetworkPolicy::RegistryProxy { port } => {
             // 先拒绝全部网络，再放行回环，最后按端口和套接字收紧。后写的规则覆盖先写的规则。
+            // sandbox-exec 的 ip/tcp 主机只接受 `*` 或 `localhost`。写 `127.0.0.1` 会在
+            // 加载配置时直接失败（host must be * or localhost），命令根本进不了沙箱。
+            // 代理绑定的 127.0.0.1 就是 localhost 这个回环名。
             profile.push_str("(deny network*)\n");
             profile.push_str("(allow network-bind (local ip \"localhost:*\"))\n");
-            profile.push_str("(allow network-bind (local ip \"127.0.0.1:*\"))\n");
             profile.push_str("(allow network-inbound (local ip \"localhost:*\"))\n");
-            profile.push_str("(allow network-inbound (local ip \"127.0.0.1:*\"))\n");
             profile.push_str("(allow network-outbound (remote ip \"localhost:*\"))\n");
-            profile.push_str("(allow network-outbound (remote ip \"127.0.0.1:*\"))\n");
             profile.push_str(&format!(
                 "(allow network-outbound (remote tcp \"localhost:{port}\"))\n"
             ));
-            profile.push_str(&format!(
-                "(allow network-outbound (remote tcp \"127.0.0.1:{port}\"))\n"
-            ));
             for denied in &constraints.denied_loopback_ports {
-                for host in ["localhost", "127.0.0.1"] {
-                    profile.push_str(&format!(
-                        "(deny network-outbound (remote tcp \"{host}:{denied}\"))\n"
-                    ));
-                    profile.push_str(&format!(
-                        "(deny network-outbound (remote ip \"{host}:{denied}\"))\n"
-                    ));
-                }
+                profile.push_str(&format!(
+                    "(deny network-outbound (remote tcp \"localhost:{denied}\"))\n"
+                ));
+                profile.push_str(&format!(
+                    "(deny network-outbound (remote ip \"localhost:{denied}\"))\n"
+                ));
             }
             for socket in &constraints.socket_paths {
                 let literal = escape(&socket.to_string_lossy());
@@ -727,6 +722,23 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn registry_proxy_profile_names_localhost_and_not_a_numeric_address() {
+        let mut constraints = SandboxConstraints::default();
+        constraints.denied_loopback_ports.push(1);
+        let profile = build_profile(
+            Path::new("/private/var/ws"),
+            &[],
+            &[],
+            NetworkPolicy::RegistryProxy { port: 9 },
+            &constraints,
+        );
+        assert!(!profile.contains("127.0.0.1"), "{profile}");
+        assert!(profile.contains("(allow network-outbound (remote ip \"localhost:*\"))"));
+        assert!(profile.contains("(allow network-outbound (remote tcp \"localhost:9\"))"));
+        assert!(profile.contains("(deny network-outbound (remote tcp \"localhost:1\"))"));
     }
 
     #[test]

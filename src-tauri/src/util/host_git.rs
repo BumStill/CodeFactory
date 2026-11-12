@@ -145,7 +145,7 @@ impl HostGit {
 
     pub fn into_tokio(mut self) -> tokio::process::Command {
         self.finalize();
-        let mut command = tokio::process::Command::new(self.command.get_program());
+        let mut command = tokio::process::Command::new(self.command.get_program()).no_window();
         command.args(self.command.get_args());
         if let Some(dir) = &self.cwd {
             command.current_dir(dir);
@@ -430,7 +430,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         let git = |args: &[&str]| {
-            assert!(Command::new("git").current_dir(&root).args(args).status().unwrap().success());
+            assert!(Command::new("git").no_window().current_dir(&root).args(args).status().unwrap().success());
         };
         git(&["init", "-q", "-b", "main"]);
         git(&["config", "user.email", "host-git@example.com"]);
@@ -447,7 +447,7 @@ mod tests {
         std::fs::write(&hook, "#!/bin/sh\nroot=$(git rev-parse --show-toplevel)\nprintf RAN > \"$root/hook-ran.txt\"\n").unwrap();
         #[cfg(unix)]
         std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
-        assert!(Command::new("git").current_dir(&root).args(["config", "core.hooksPath", ".githooks"]).status().unwrap().success());
+        assert!(Command::new("git").no_window().current_dir(&root).args(["config", "core.hooksPath", ".githooks"]).status().unwrap().success());
         let shown = command()
             .current_dir(&root)
             .args(["config", "--get", "core.hooksPath"])
@@ -488,7 +488,7 @@ mod tests {
         let notices = take_notices();
         assert!(notices.iter().any(|notice| notice.contains("已跳过工作区内 hooks")), "{notices:?}");
 
-        assert!(Command::new("git").current_dir(&root).args(["config", "--unset", "core.hooksPath"]).status().unwrap().success());
+        assert!(Command::new("git").no_window().current_dir(&root).args(["config", "--unset", "core.hooksPath"]).status().unwrap().success());
         let dot_git_hooks = root.join(".git").join("hooks");
         std::fs::create_dir_all(&dot_git_hooks).unwrap();
         let native = dot_git_hooks.join("pre-commit");
@@ -514,8 +514,8 @@ mod tests {
     #[test]
     fn h5_fsmonitor_and_credential_helper_are_forced_off() {
         let root = repo("cfg");
-        assert!(Command::new("git").current_dir(&root).args(["config", "core.fsmonitor", "true"]).status().unwrap().success());
-        assert!(Command::new("git").current_dir(&root).args(["config", "credential.helper", "store"]).status().unwrap().success());
+        assert!(Command::new("git").no_window().current_dir(&root).args(["config", "core.fsmonitor", "true"]).status().unwrap().success());
+        assert!(Command::new("git").no_window().current_dir(&root).args(["config", "credential.helper", "store"]).status().unwrap().success());
         let fsmonitor = command().current_dir(&root).args(["config", "--get", "core.fsmonitor"]).output().unwrap();
         let helper = command().current_dir(&root).args(["config", "--get", "credential.helper"]).output().unwrap();
         assert!(!fsmonitor.status.success() || String::from_utf8_lossy(&fsmonitor.stdout).trim().is_empty());

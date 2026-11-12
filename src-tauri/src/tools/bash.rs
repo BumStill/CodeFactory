@@ -1086,6 +1086,8 @@ fn read_github_quota() -> Option<shell_policy::GithubQuota> {
 
 #[cfg(test)]
 mod tests {
+    use crate::util::no_window::NoWindow;
+
     #[cfg(windows)]
     #[tokio::test]
     async fn m143_windows_foreground_outputs_chinese_and_chains() {
@@ -1159,6 +1161,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         assert!(std::process::Command::new("git")
+            .no_window()
             .arg("-C")
             .arg(&root)
             .args(["init", "-q", "-b", "main"])
@@ -1182,6 +1185,7 @@ mod tests {
         )
         .unwrap();
         let output = std::process::Command::new(&inv.program)
+            .no_window()
             .args(&inv.args)
             .output()
             .expect("docker run");
@@ -1211,6 +1215,7 @@ mod tests {
         )
         .unwrap();
         let net_out = std::process::Command::new(&net.program)
+            .no_window()
             .args(&net.args)
             .output()
             .expect("docker network probe");
