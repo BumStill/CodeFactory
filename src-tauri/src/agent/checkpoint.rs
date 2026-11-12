@@ -74,7 +74,7 @@ pub fn create(cwd: &Path, label: &str) -> CheckpointResult<Option<String>> {
 
     // git stash create: returns a SHA when there's something to stash,
     // empty when the tree is already clean.
-    let out = Command::new("git")
+    let out = crate::util::host_git::command()
         .no_window()
         .args(["stash", "create"])
         .arg("--include-untracked")
@@ -93,7 +93,7 @@ pub fn create(cwd: &Path, label: &str) -> CheckpointResult<Option<String>> {
         // per-checkpoint ref under refs/codefactory/checkpoints/ so the
         // anchors are easy to enumerate or clean up later.
         let ref_name = format!("refs/codefactory/checkpoints/{}", &stash_sha[..12]);
-        let _ = Command::new("git")
+        let _ = crate::util::host_git::command()
             .no_window()
             .args(["update-ref", &ref_name, &stash_sha])
             .current_dir(cwd)
@@ -104,7 +104,7 @@ pub fn create(cwd: &Path, label: &str) -> CheckpointResult<Option<String>> {
 
     // Working tree was clean. Use HEAD's SHA so the checkpoint still has
     // a stable handle the user can compare against later.
-    let head = Command::new("git")
+    let head = crate::util::host_git::command()
         .no_window()
         .args(["rev-parse", "HEAD"])
         .current_dir(cwd)
@@ -135,7 +135,7 @@ pub fn revert(cwd: &Path, git_sha: &str) -> CheckpointResult<()> {
     }
 
     // Validate the sha resolves to something we can read.
-    let cat = Command::new("git")
+    let cat = crate::util::host_git::command()
         .no_window()
         .args(["cat-file", "-e", git_sha])
         .current_dir(cwd)
@@ -152,7 +152,7 @@ pub fn revert(cwd: &Path, git_sha: &str) -> CheckpointResult<()> {
     // sometimes parent[0] for ancient git). The committed tree itself is
     // the merge of the index + worktree changes; checking it out is the
     // right "restore to that snapshot" semantics.
-    let restore = Command::new("git")
+    let restore = crate::util::host_git::command()
         .no_window()
         .args(["restore", "--source", git_sha, "--worktree", "--", "."])
         .current_dir(cwd)
@@ -171,7 +171,7 @@ pub fn changeset(cwd: &Path, git_sha: &str) -> CheckpointResult<Vec<CheckpointFi
     if !is_git_repo(cwd) {
         return Ok(vec![]);
     }
-    let out = Command::new("git")
+    let out = crate::util::host_git::command()
         .no_window()
         .args(["diff", "--name-status", git_sha, "--"])
         .current_dir(cwd)
@@ -208,7 +208,7 @@ pub fn changeset(cwd: &Path, git_sha: &str) -> CheckpointResult<Vec<CheckpointFi
 fn is_git_repo(cwd: &Path) -> bool {
     let p: PathBuf = cwd.join(".git");
     p.exists()
-        || Command::new("git")
+        || crate::util::host_git::command()
             .no_window()
             .args(["rev-parse", "--git-dir"])
             .current_dir(cwd)
@@ -224,19 +224,19 @@ mod tests {
     use std::process::Command;
 
     fn init_repo(dir: &Path) {
-        Command::new("git")
+        crate::util::host_git::command()
             .no_window()
             .args(["init"])
             .current_dir(dir)
             .output()
             .unwrap();
-        Command::new("git")
+        crate::util::host_git::command()
             .no_window()
             .args(["config", "user.email", "t@t"])
             .current_dir(dir)
             .output()
             .unwrap();
-        Command::new("git")
+        crate::util::host_git::command()
             .no_window()
             .args(["config", "user.name", "t"])
             .current_dir(dir)
@@ -244,20 +244,20 @@ mod tests {
             .unwrap();
         // Disable Windows autocrlf so byte-exact comparisons in the asserts
         // below don't break on CRLF translation.
-        Command::new("git")
+        crate::util::host_git::command()
             .no_window()
             .args(["config", "core.autocrlf", "false"])
             .current_dir(dir)
             .output()
             .unwrap();
         fs::write(dir.join("a.txt"), "hello\n").unwrap();
-        Command::new("git")
+        crate::util::host_git::command()
             .no_window()
             .args(["add", "."])
             .current_dir(dir)
             .output()
             .unwrap();
-        Command::new("git")
+        crate::util::host_git::command()
             .no_window()
             .args(["commit", "-m", "init"])
             .current_dir(dir)

@@ -305,7 +305,30 @@ impl ChromiumDriver {
             install::detect_in_any(&install::install_root_candidates(), platform).1
         });
         if let Some(InstallState::Ready(found)) = state {
-            return Ok(found.binary);
+            let writable = crate::agent::trusted_sandbox::is_sandbox_writable(
+                &found.binary,
+                std::path::Path::new("/"),
+            );
+            match crate::runtime_manifest::verify_or_adopt("chromium", &found.binary, writable) {
+                Ok(()) => {
+                    if let Err(error) = crate::agent::trusted_sandbox::assert_host_may_execute(
+                        &found.binary,
+                        std::path::Path::new("/"),
+                    ) {
+                        return Err(AppError::Other(error));
+                    }
+                    return Ok(found.binary);
+                }
+                Err(error) => {
+                    if let Some(binary) = system_chrome() {
+                        tracing::warn!("managed browser failed integrity check, using system Chrome: {error}");
+                        return Ok(binary);
+                    }
+                    return Err(AppError::Other(format!(
+                        "下载的 Chromium 未通过完整性校验，且没有可用的系统 Chrome。请在设置中重新下载。{error}"
+                    )));
+                }
+            }
         }
         if let Some(binary) = system_chrome() {
             return Ok(binary);

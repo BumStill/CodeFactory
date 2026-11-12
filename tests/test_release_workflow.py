@@ -406,14 +406,15 @@ class ReleaseWorkflowTests(unittest.TestCase):
             "Windows and macOS must share the same prerequisites",
         )
         self.assertIn(
-            "needs: [changelog, prepare-release, build-windows, build-macos]",
+            "needs: [changelog, prepare-release, build-windows, build-macos, sign-updater]",
             workflow,
         )
         self.assertIn("gh release create", workflow)
         self.assertIn("--draft", workflow)
         self.assertIn("releases?per_page=100", workflow)
         self.assertIn("| .draft", workflow)
-        self.assertEqual(workflow.count("includeUpdaterJson: false"), 2)
+        self.assertEqual(workflow.count("includeUpdaterJson:"), 0)
+        self.assertGreaterEqual(workflow.count("tauri.release-unsigned.json"), 2)
 
     def test_release_builds_the_requested_tag_not_the_dispatch_ref(self) -> None:
         workflow = (REPO_ROOT / ".github/workflows/release.yml").read_text(
@@ -830,7 +831,7 @@ class ReleaseWorkflowTests(unittest.TestCase):
             steps = self._job_steps(workflow, job)
             upload = [
                 i for i, step in enumerate(steps)
-                if "tauri-apps/tauri-action@v0" in step
+                if "tauri-apps/tauri-action@" in step
             ]
             self.assertEqual(
                 len(upload), 1, f"{job} must upload through exactly one tauri-action step"
@@ -874,7 +875,7 @@ class ReleaseWorkflowTests(unittest.TestCase):
         )
 
         self.assertIn(
-            "needs: [changelog, prepare-release, build-windows, build-macos]",
+            "needs: [changelog, prepare-release, build-windows, build-macos, sign-updater]",
             workflow,
             "a failed post-upload recheck must keep the draft unpublished: only "
             "finalize publishes, and it may not run unless both builds passed",
@@ -899,7 +900,7 @@ class ReleaseWorkflowTests(unittest.TestCase):
             "\n  verify-published-macos:\n", 1
         )[0]
         self.assertIn(
-            "needs: [changelog, prepare-release, build-windows, build-macos]",
+            "needs: [changelog, prepare-release, build-windows, build-macos, sign-updater]",
             finalize,
         )
         self.assertIn(
@@ -967,7 +968,7 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertIn("scripts/verify-macos-release-artifact.sh", job)
         self.assertIn('tee "$CODEFACTORY_RELEASE_EVIDENCE_DIR/verification.log"', job)
         self.assertIn("if: always()", job)
-        self.assertIn("actions/upload-artifact@v4", job)
+        self.assertIn("actions/upload-artifact@", job)
 
         ci_workflow = (REPO_ROOT / ".github/workflows/ci.yml").read_text(
             encoding="utf-8"
@@ -988,10 +989,17 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertNotIn("needs: macos-signing-preflight", release)
 
         macos_job = release.split("\n  build-macos:\n", 1)[1].split(
+            "\n  sign-updater:\n", 1
+        )[0]
+        self.assertNotIn("TAURI_SIGNING_PRIVATE_KEY", macos_job)
+        self.assertNotIn("TAURI_SIGNING_PRIVATE_KEY_PASSWORD", macos_job)
+        self.assertIn("contents: read", macos_job)
+        sign_job = release.split("\n  sign-updater:\n", 1)[1].split(
             "\n  finalize:\n", 1
         )[0]
-        self.assertIn("TAURI_SIGNING_PRIVATE_KEY", macos_job)
-        self.assertIn("TAURI_SIGNING_PRIVATE_KEY_PASSWORD", macos_job)
+        self.assertIn("environment: release-signing", sign_job)
+        self.assertEqual(sign_job.count("TAURI_SIGNING_PRIVATE_KEY:"), 1)
+        self.assertIn("TAURI_SIGNING_PRIVATE_KEY_PASSWORD", sign_job)
         self.assertNotIn("APPLE_CERTIFICATE", macos_job)
         self.assertNotIn("APPLE_API_", macos_job)
         self.assertNotIn("scripts/import-apple-signing-identity.sh", macos_job)

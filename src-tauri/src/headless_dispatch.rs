@@ -451,6 +451,15 @@ pub struct AuditEntry {
     pub message: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub delivery_authorized: Option<bool>,
+    /// `A` / `B` / `C`。令牌本身不入库，只记 `auth=ok` 和哈希前 8 位。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tier: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeline: Option<String>,
 }
 
 impl AuditEntry {
@@ -464,6 +473,10 @@ impl AuditEntry {
             project: None,
             message: None,
             delivery_authorized: None,
+            tier: Some(request_tier(request).to_string()),
+            auth: Some("ok".into()),
+            auth_ref: None,
+            timeline: is_privileged_request(request).then(|| TIMELINE_LOCAL_ENTRY.to_string()),
         };
         match request {
             Request::CreateAndSend {
@@ -607,6 +620,165 @@ pub fn authorize_peer(peer_uid: u32, current_uid: u32) -> Result<(), ErrorBody> 
         ));
     }
     Ok(())
+}
+
+pub fn unauthenticated(message: impl Into<String>) -> ErrorBody {
+    ErrorBody {
+        code: "unauthenticated".into(),
+        message: message.into(),
+    }
+}
+
+pub fn forbidden_by_setting(message: impl Into<String>) -> ErrorBody {
+    ErrorBody {
+        code: "forbidden_by_setting".into(),
+        message: message.into(),
+    }
+}
+
+pub const PRIVILEGED_SETTING_MESSAGE: &str = "本地任务入口的授权操作已关闭。请在设置中打开「允许本地任务入口批准请求、切换到信任模式、授予交付权限」。审批保持待处理。";
+
+pub const TIMELINE_LOCAL_ENTRY: &str = "由本地任务入口批准/授权";
+
+/// C 级：批准、切到信任模式、或带交付权限。拒绝审批和降级权限不是 C 级。
+pub fn is_privileged_request(request: &Request) -> bool {
+    match request {
+        Request::ResolveApproval { approve: true, .. } => true,
+        Request::SetPermission { permission_mode, .. } if permission_mode == "trusted" => true,
+        Request::CreateAndSend { delivery_authorized: true, .. }
+        | Request::Send { delivery_authorized: true, .. } => true,
+        _ => false,
+    }
+}
+
+pub fn request_tier(request: &Request) -> &'static str {
+    if is_privileged_request(request) {
+        "C"
+    } else if matches!(
+        request,
+        Request::Status { .. }
+            | Request::ListApprovals {}
+            | Request::GetQuota {}
+            | Request::UsageStatus {}
+            | Request::GetUsageWindows {}
+            | Request::ListMemories {}
+    ) {
+        "A"
+    } else {
+        "B"
+    }
+}
+
+pub fn constant_time_eq(left: &str, right: &str) -> bool {
+    let left = left.as_bytes();
+    let right = right.as_bytes();
+    let mut diff = left.len() ^ right.len();
+    let len = left.len().max(right.len());
+    for index in 0..len {
+        let l = left.get(index).copied().unwrap_or(0);
+        let r = right.get(index).copied().unwrap_or(0);
+        diff |= (l ^ r) as usize;
+    }
+    diff == 0
+}
+
+pub fn token_ref(token: &str) -> String {
+    let digest = crate::runtime_manifest::hex_sha256(token.as_bytes());
+    digest.chars().take(8).collect()
+}
+
+/// 在目录里原子写入 0600 令牌。目录保持 0700。令牌不进日志。
+pub fn install_dispatch_token(dir: &std::path::Path) -> Result<String, ErrorBody> {
+    std::fs::create_dir_all(dir).map_err(|error| ErrorBody::internal(format!("dispatch dir: {error}")))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+            .map_err(|error| ErrorBody::internal(format!("dispatch dir mode: {error}")))?;
+    }
+    let mut bytes = [0_u8; 32];
+    getrandom::getrandom(&mut bytes)
+        .map_err(|error| ErrorBody::internal(format!("dispatch token: {error}")))?;
+    let token = hex_encode(&bytes);
+    write_token_file(dir, &token)?;
+    Ok(token)
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
+}
+
+fn write_token_file(dir: &std::path::Path, token: &str) -> Result<(), ErrorBody> {
+    let target = dir.join("dispatch.token");
+    let temporary = dir.join(format!(".dispatch.token.{}", std::process::id()));
+    {
+        let mut options = std::fs::OpenOptions::new();
+        options.create(true).write(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options
+            .open(&temporary)
+            .map_err(|error| ErrorBody::internal(format!("dispatch token: {error}")))?;
+        use std::io::Write;
+        file.write_all(token.as_bytes())
+            .map_err(|error| ErrorBody::internal(format!("dispatch token: {error}")))?;
+        file.sync_all().ok();
+    }
+    std::fs::rename(&temporary, &target)
+        .map_err(|error| ErrorBody::internal(format!("dispatch token: {error}")))?;
+    Ok(())
+}
+
+pub fn read_dispatch_token(dir: &std::path::Path) -> Result<String, ErrorBody> {
+    let path = dir.join("dispatch.token");
+    match std::fs::read_to_string(&path) {
+        Ok(token) => {
+            let token = token.trim().to_string();
+            if token.is_empty() {
+                Err(unauthenticated("应用未运行或版本过旧"))
+            } else {
+                Ok(token)
+            }
+        }
+        Err(_) => Err(unauthenticated("应用未运行或版本过旧")),
+    }
+}
+
+pub fn remove_dispatch_token(dir: &std::path::Path) {
+    let _ = std::fs::remove_file(dir.join("dispatch.token"));
+}
+
+/// 只看 `auth`。令牌不对时不反序列化内层请求。
+pub fn authenticate_line(line: &str, expected: &str) -> Result<Request, ErrorBody> {
+    let value: serde_json::Value = serde_json::from_str(line)
+        .map_err(|_| unauthenticated("缺少 auth"))?;
+    let Some(auth) = value.get("auth").and_then(|item| item.as_str()) else {
+        return Err(unauthenticated("缺少 auth"));
+    };
+    if !constant_time_eq(auth, expected) {
+        return Err(unauthenticated("令牌不正确"));
+    }
+    let request = value.get("request").ok_or_else(|| ErrorBody::invalid("malformed dispatch request: missing request"))?;
+    parse_request(&request.to_string())
+}
+
+pub fn privileged_ops_enabled() -> bool {
+    let Ok(text) = std::fs::read_to_string(crate::config::settings::config_path()) else {
+        return false;
+    };
+    serde_json::from_str::<serde_json::Value>(&text)
+        .ok()
+        .and_then(|value| value.get("dispatch_privileged_ops").and_then(|item| item.as_bool()))
+        .unwrap_or(false)
 }
 
 // ---------------------------------------------------------------------------
@@ -846,6 +1018,8 @@ mod server {
         host: &Arc<dyn DispatchHost>,
         audit: Option<&AuditLog>,
         current_uid: u32,
+        token: &str,
+        privileged_ops: bool,
     ) {
         let peer = match socket::peer_uid_of(&stream) {
             Ok(uid) => uid,
@@ -873,15 +1047,20 @@ mod server {
         });
 
         let response = match socket::read_line_capped(&mut reader) {
-            Ok(line) => match super::parse_request(line.trim()) {
+            Ok(line) => match super::authenticate_line(line.trim(), token) {
                 Ok(request) => {
-                    if let Some(audit) = audit {
-                        let entry = AuditEntry::for_request(&request, chrono::Utc::now());
-                        let _ = audit.append(&entry);
-                    }
-                    match host.execute(&request) {
-                        Ok(result) => Response::ok(result),
-                        Err(error) => Response::failed(error),
+                    if super::is_privileged_request(&request) && !privileged_ops {
+                        Response::failed(super::forbidden_by_setting(super::PRIVILEGED_SETTING_MESSAGE))
+                    } else {
+                        if let Some(audit) = audit {
+                            let mut entry = AuditEntry::for_request(&request, chrono::Utc::now());
+                            entry.auth_ref = Some(super::token_ref(token));
+                            let _ = audit.append(&entry);
+                        }
+                        match host.execute(&request) {
+                            Ok(result) => Response::ok(result),
+                            Err(error) => Response::failed(error),
+                        }
                     }
                 }
                 Err(error) => Response::failed(error),
@@ -902,6 +1081,8 @@ mod server {
         listener: UnixListener,
         host: Arc<dyn DispatchHost>,
         audit: Option<AuditLog>,
+        token: String,
+        privileged_ops: bool,
     ) -> std::io::Result<()> {
         let current_uid = socket::current_uid();
         for stream in listener.incoming() {
@@ -909,8 +1090,9 @@ mod server {
                 Ok(stream) => {
                     let host = Arc::clone(&host);
                     let audit = audit.clone();
+                    let token = token.clone();
                     std::thread::spawn(move || {
-                        handle_connection(stream, &host, audit.as_ref(), current_uid)
+                        handle_connection(stream, &host, audit.as_ref(), current_uid, &token, privileged_ops)
                     });
                 }
                 Err(error) => tracing::warn!("dispatch accept failed: {error}"),
@@ -926,10 +1108,13 @@ mod server {
         audit: Option<AuditLog>,
     ) -> Result<(), ErrorBody> {
         let listener = socket::bind(path)?;
+        let dir = path.parent().ok_or_else(|| ErrorBody::internal("dispatch socket has no directory"))?;
+        let token = super::install_dispatch_token(dir)?;
+        let privileged_ops = super::privileged_ops_enabled();
         std::thread::Builder::new()
             .name("headless-dispatch".to_string())
             .spawn(move || {
-                if let Err(error) = serve(listener, host, audit) {
+                if let Err(error) = serve(listener, host, audit, token, privileged_ops) {
                     tracing::warn!("headless dispatch server stopped: {error}");
                 }
             })
@@ -983,7 +1168,18 @@ pub mod client {
 
     /// Send a request and parse the structured reply.
     pub fn request(socket_path: &Path, request_json: &str) -> Result<Response, ErrorBody> {
-        let raw = request_raw(socket_path, request_json)?;
+        let dir = socket_path.parent().ok_or_else(|| {
+            super::unauthenticated("应用未运行或版本过旧")
+        })?;
+        let token = super::read_dispatch_token(dir)?;
+        let inner: serde_json::Value = serde_json::from_str(request_json)
+            .map_err(|error| ErrorBody::invalid(format!("malformed dispatch request: {error}")))?;
+        let envelope = if inner.get("auth").is_some() && inner.get("request").is_some() {
+            inner
+        } else {
+            serde_json::json!({ "auth": token, "request": inner })
+        };
+        let raw = request_raw(socket_path, &envelope.to_string())?;
         serde_json::from_str(&raw)
             .map_err(|error| ErrorBody::internal(format!("malformed reply: {error}")))
     }
@@ -1587,12 +1783,13 @@ mod unix_tests {
         let path = dir.path().join("window.sock");
         let audit_path = dir.path().join("audit.jsonl");
         let listener = socket::bind(&path).unwrap();
+        let token = install_dispatch_token(dir.path()).unwrap();
         let host: std::sync::Arc<dyn DispatchHost> = std::sync::Arc::new(WindowHost(std::sync::Mutex::new(crate::config::settings::Settings::default())));
         let audit = AuditLog::new(&audit_path);
         let worker = std::thread::spawn(move || {
             for _ in 0..4 {
                 let (stream, _) = listener.accept().unwrap();
-                server::handle_connection(stream, &host, Some(&audit), socket::current_uid());
+                server::handle_connection(stream, &host, Some(&audit), socket::current_uid(), &token, true);
             }
         });
         for (model, mode) in [("pro","custom"),("flash","anytime")] {
@@ -1635,10 +1832,11 @@ mod unix_tests {
         let path = dir.path().join("dispatch.sock");
         let audit_path = dir.path().join("dispatch-audit.log");
         let listener = socket::bind(&path).unwrap();
+        let token = install_dispatch_token(dir.path()).unwrap();
         let host: std::sync::Arc<dyn DispatchHost> = std::sync::Arc::new(Recording);
         let audit = AuditLog::new(&audit_path);
         std::thread::spawn(move || {
-            let _ = server::serve(listener, host, Some(audit));
+            let _ = server::serve(listener, host, Some(audit), token, true);
         });
 
         let response = client::request(

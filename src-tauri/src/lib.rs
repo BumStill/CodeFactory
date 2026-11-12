@@ -49,6 +49,8 @@ mod mcp;
 mod menu;
 mod clipboard_attachments;
 mod command_sandbox;
+mod registry_proxy;
+mod runtime_manifest;
 mod menu_spec;
 mod notify;
 mod openrouter;
@@ -1853,6 +1855,29 @@ pub fn run() {
             // still works with the screen locked or the window on another display.
             // It never re-implements behaviour: every request is forwarded to the
             // same code path the GUI uses (`src/lib/desktopDispatch.ts`).
+            let _ = crate::secrets::migrate_plaintext_fallback();
+            crate::registry_proxy::absorb_user_registries();
+            {
+                let settings = crate::config::settings::load();
+                crate::registry_proxy::set_extra_hosts(&settings.sandbox_registry_hosts);
+                let mut accounts = Vec::new();
+                for endpoint in settings.endpoints.values() {
+                    if let Some(key_ref) = &endpoint.key_ref {
+                        accounts.push(key_ref.clone());
+                    }
+                }
+                for remote in &settings.git_remotes {
+                    if let Some(key_ref) = &remote.token_ref {
+                        accounts.push(key_ref.clone());
+                    }
+                }
+                tauri::async_runtime::spawn(async move {
+                    crate::credential_broker::CredentialBroker::global()
+                        .prewarm(&accounts)
+                        .await;
+                });
+            }
+
             #[cfg(unix)]
             match crate::headless_dispatch::bridge::start(app.handle()) {
                 Ok(bridge) => {

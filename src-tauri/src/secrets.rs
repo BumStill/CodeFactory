@@ -192,20 +192,47 @@ pub fn get_key(account: &str) -> crate::errors::Result<Option<String>> {
     crate::desktop_context::read_secret(|| get_key_normal(account))
 }
 
+fn plaintext_fallback_enabled() -> bool {
+    if !cfg!(target_os = "macos") {
+        return false;
+    }
+    let Ok(text) = std::fs::read_to_string(crate::config::settings::config_path()) else {
+        return false;
+    };
+    serde_json::from_str::<serde_json::Value>(&text)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("macos_plaintext_key_fallback")
+                .and_then(|item| item.as_bool())
+        })
+        .unwrap_or(false)
+}
+
 fn get_key_normal(account: &str) -> crate::errors::Result<Option<String>> {
-    let recovery_copy = fallback_key(account);
-    // macOS always keeps a user-only recovery copy after an authorized save.
-    // Prefer it so lock-screen keychain availability cannot block model calls.
-    if let Some(value) = select_stored_key(
-        if recovery_copy.is_some() {
-            Ok(None)
-        } else {
-            get_os_key(account)
-        },
-        recovery_copy,
-        cfg!(target_os = "macos"),
-    )? {
-        return Ok(Some(value));
+    if cfg!(target_os = "macos") {
+        match get_os_key(account) {
+            Ok(Some(value)) => return Ok(Some(value)),
+            Ok(None) => {}
+            Err(error) => {
+                if plaintext_fallback_enabled() {
+                    if let Some(value) = fallback_key(account) {
+                        return Ok(Some(value));
+                    }
+                }
+                return Err(error);
+            }
+        }
+        if plaintext_fallback_enabled() {
+            if let Some(value) = fallback_key(account) {
+                return Ok(Some(value));
+            }
+        }
+    } else {
+        let recovery_copy = fallback_key(account);
+        if let Some(value) = select_stored_key(get_os_key(account), recovery_copy, false)? {
+            return Ok(Some(value));
+        }
     }
 
     let Some(legacy_value) = load_legacy_map().get(account).cloned() else {
@@ -220,41 +247,41 @@ pub fn set_key(account: &str, value: &str) -> crate::errors::Result<()> {
     crate::desktop_context::write_secret(|| set_key_normal(account, value))
 }
 
+fn set_os_key_checked(account: &str, value: &str) -> crate::errors::Result<()> {
+    set_os_key(account, value)?;
+    let stored = get_os_key(account)?.ok_or_else(|| {
+        crate::errors::AppError::Other(format!(
+            "OS credential write for key_ref '{}' did not persist a readable value",
+            account
+        ))
+    })?;
+    if stored != value {
+        return Err(crate::errors::AppError::Other(format!(
+            "OS credential read-back mismatch for key_ref '{}'",
+            account
+        )));
+    }
+    Ok(())
+}
+
 fn set_key_normal(account: &str, value: &str) -> crate::errors::Result<()> {
+    if cfg!(target_os = "macos") {
+        set_os_key_checked(account, value)?;
+        if plaintext_fallback_enabled() {
+            save_fallback_key(account, value)?;
+        } else {
+            remove_fallback_key(account)?;
+        }
+        remove_legacy_key(account)?;
+        return Ok(());
+    }
+
     if fallback_key(account).is_some() {
         save_fallback_key(account, value)?;
         remove_legacy_key(account)?;
         return Ok(());
     }
-
-    let os_result = set_os_key(account, value).and_then(|_| {
-        let stored = get_os_key(account)?.ok_or_else(|| {
-            crate::errors::AppError::Other(format!(
-                "OS credential write for key_ref '{}' did not persist a readable value",
-                account
-            ))
-        })?;
-        if stored != value {
-            return Err(crate::errors::AppError::Other(format!(
-                "OS credential read-back mismatch for key_ref '{}'",
-                account
-            )));
-        }
-        Ok(())
-    });
-    match os_result {
-        Ok(()) => {}
-        Err(error) if !cfg!(target_os = "macos") => return Err(error),
-        Err(_) => tracing::warn!(
-            "OS credential store unavailable; using the user-only local fallback for key_ref '{}'",
-            account
-        ),
-    }
-    if cfg!(target_os = "macos") {
-        // Keep the availability copy even when the first keychain read-back
-        // succeeds: a later locked-screen read can otherwise strand the user.
-        save_fallback_key(account, value)?;
-    }
+    set_os_key_checked(account, value)?;
     remove_legacy_key(account)?;
     Ok(())
 }
@@ -266,12 +293,64 @@ pub fn delete_key(account: &str) -> crate::errors::Result<()> {
 fn delete_key_normal(account: &str) -> crate::errors::Result<()> {
     let had_fallback = remove_fallback_key(account)?;
     if let Err(error) = delete_os_key(account) {
-        if !cfg!(target_os = "macos") || !had_fallback {
+        // macOS 不再吞掉钥匙串删除错误。其他平台保持原有行为。
+        if cfg!(target_os = "macos") || !had_fallback {
             return Err(error);
         }
     }
     remove_legacy_key(account)?;
     Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MigrationReport {
+    pub migrated: usize,
+    pub pending: Vec<String>,
+}
+
+/// 把已有明文副本逐条写入钥匙串。失败的条目留在文件里，不阻断启动。
+pub fn migrate_plaintext_fallback() -> MigrationReport {
+    let _guard = FALLBACK_FILE_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let path = fallback_keys_path();
+    let mut map = load_map(&path);
+    if map.is_empty() {
+        return MigrationReport { migrated: 0, pending: Vec::new() };
+    }
+    let mut pending = Vec::new();
+    let mut migrated = 0;
+    let accounts: Vec<(String, String)> = map.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+    for (account, value) in accounts {
+        match set_os_key_checked(&account, &value) {
+            Ok(()) => {
+                map.remove(&account);
+                migrated += 1;
+            }
+            Err(error) => {
+                tracing::warn!(account = %account, "credential migration left one entry in place: {error}");
+                pending.push(account);
+            }
+        }
+    }
+    let _ = save_map(&path, &map);
+    tracing::info!(
+        migrated,
+        pending = pending.len(),
+        "credential plaintext migration finished without secret values"
+    );
+    MigrationReport { migrated, pending }
+}
+
+pub fn plaintext_fallback_pending() -> usize {
+    load_map(&fallback_keys_path()).len()
+}
+
+pub fn delete_plaintext_fallback_file() -> crate::errors::Result<()> {
+    let _guard = FALLBACK_FILE_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    save_map(&fallback_keys_path(), &HashMap::new())
 }
 
 #[cfg(test)]

@@ -576,7 +576,7 @@ fn external_path_str(path: &Path) -> Result<String> {
 }
 
 fn git(cwd: &Path, args: &[&str]) -> Result<String> {
-    let mut command = Command::new("git");
+    let mut command = crate::util::host_git::command();
     command
         .arg("-C")
         .arg(external_path(cwd))
@@ -762,7 +762,7 @@ fn snapshot_tree(path: &Path, label: &str) -> Result<String> {
     let index_path = index.path().join("index");
     let index_file = index_path.to_string_lossy().to_string();
     let with_index = |args: &[&str]| -> Result<String> {
-        let output = Command::new("git")
+        let output = crate::util::host_git::command()
             .no_window()
             .current_dir(path)
             .env("GIT_INDEX_FILE", &index_file)
@@ -918,7 +918,7 @@ async fn restore_registered_branch(pool: &SqlitePool, row: &WorkspaceRow, worktr
         // only tracked merge debris; remove only files named in the saved
         // untracked tree, never broad `git clean` or ignored user files.
         git(worktree, &["reset", "--hard", "HEAD"])?;
-        let mut command = Command::new("git");
+        let mut command = crate::util::host_git::command();
         let output = command.no_window().arg("-C").arg(external_path(worktree))
             .args(["ls-tree", "-rz", "--name-only", &format!("{rescue_ref}^3")]).output()?;
         if output.status.success() {
@@ -4126,7 +4126,7 @@ fn rescue_snapshot(row: &WorkspaceRow) -> Result<String> {
     let index = tempfile::tempdir()?;
     let index_path = index.path().join("index");
     let run = |args: &[&str]| -> Result<String> {
-        let output = Command::new("git").no_window().args(args).current_dir(path)
+        let output = crate::util::host_git::command().no_window().args(args).current_dir(path)
             .env("GIT_INDEX_FILE", &index_path)
             .env("GIT_AUTHOR_NAME", "CodeFactory Recovery")
             .env("GIT_AUTHOR_EMAIL", "recovery@codefactory.invalid")
@@ -4223,7 +4223,7 @@ async fn repair_session_split_locked(pool: &SqlitePool, session: &str) -> Result
         let tree = git(path, &["merge-tree", "--write-tree", &snapshot, donor])?;
         let tree = tree.lines().next().ok_or_else(|| anyhow!("missing recovered tree"))?;
         // Use commit-tree solely as a merge input; the managed branch is unchanged.
-        let output = Command::new("git").no_window().current_dir(path)
+        let output = crate::util::host_git::command().no_window().current_dir(path)
             .args(["-c", "user.name=CodeFactory Recovery", "-c", "user.email=recovery@codefactory.invalid",
                 "commit-tree", tree, "-p", &snapshot, "-p", donor, "-m", "combine split workspace rescue"])
             .output()?;
@@ -4446,7 +4446,7 @@ mod tests {
     use std::process::Command;
 
     fn git_at(root: &Path, args: &[&str]) -> String {
-        let output = Command::new("git")
+        let output = crate::util::host_git::command()
             .no_window()
             .current_dir(root)
             .args(args)
@@ -4556,7 +4556,7 @@ mod tests {
     }
 
     fn git(cwd: &Path, args: &[&str]) -> String {
-        let output = Command::new("git")
+        let output = crate::util::host_git::command()
             .no_window()
             .arg("-C")
             .arg(cwd)
@@ -4579,7 +4579,7 @@ mod tests {
         let seed = temp.path().join("seed");
         std::fs::create_dir_all(&root).unwrap();
         std::fs::create_dir_all(&seed).unwrap();
-        assert!(Command::new("git")
+        assert!(crate::util::host_git::command()
             .no_window()
             .args(["init", "--bare", "--initial-branch=main"])
             .arg(&remote)

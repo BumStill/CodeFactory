@@ -37,7 +37,7 @@ jobs:
       content: ${{ steps.cliff.outputs.content }}
       authorized_tag_sha: ${{ steps.authorize.outputs.authorized_tag_sha }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ inputs.tag }}
           fetch-depth: 0
@@ -83,7 +83,7 @@ jobs:
           echo "base_tag=$BASE_TAG" >> "$GITHUB_OUTPUT"
 
       - name: Install git-cliff
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2
         with:
           tool: git-cliff
 
@@ -119,13 +119,13 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ needs.changelog.outputs.authorized_tag_sha }}
           fetch-depth: 0
 
       - name: Checkout trusted default-branch scenario policy
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ github.sha }}
           path: policy
@@ -229,14 +229,16 @@ jobs:
   build-windows:
     runs-on: windows-latest
     needs: [changelog, prepare-release]
-    # tauri-action needs contents:write to upload assets to the prepared draft.
-    # Keep the permission explicit on each platform job.
+    outputs:
+      setup_sha256: ${{ steps.pack.outputs.sha256 }}
+      setup_name: ${{ steps.pack.outputs.name }}
     permissions:
-      contents: write
+      contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ needs.prepare-release.outputs.tag_sha }}
+          persist-credentials: false
 
       - name: Require remote release tag to remain authorized
         shell: bash
@@ -246,22 +248,22 @@ jobs:
         run: tools/release/require_authorized_tag.sh "$TAG" "$AUTHORIZED_TAG_SHA" "start the Windows build"
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: '20'
 
       - name: Setup pnpm
-        uses: pnpm/action-setup@v4
+        uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
         with:
           version: 10
 
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           targets: x86_64-pc-windows-msvc
 
       - name: Cache Cargo registry
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
             ~/.cargo/registry/index
@@ -286,7 +288,7 @@ jobs:
       # sccache would then have no cache backend and silently degrade to
       # local-only mode — losing all cross-run benefit.
       - name: Setup sccache
-        uses: mozilla-actions/sccache-action@v0.0.6
+        uses: mozilla-actions/sccache-action@9e326ebed976843c9932b3aa0e021c6f50310eb4 # v0.0.6
 
       - name: Get pnpm store path
         id: pnpm-cache
@@ -294,7 +296,7 @@ jobs:
         run: echo "store=$(pnpm store path)" >> $env:GITHUB_OUTPUT
 
       - name: Cache pnpm store
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: ${{ steps.pnpm-cache.outputs.store }}
           key: pnpm-${{ hashFiles('pnpm-lock.yaml') }}
@@ -311,7 +313,7 @@ jobs:
         run: tools/release/require_authorized_tag.sh "$TAG" "$AUTHORIZED_TAG_SHA" "upload release assets"
 
       - name: Build Tauri app
-        uses: tauri-apps/tauri-action@v0
+        uses: tauri-apps/tauri-action@84b9d35b5fc46c1e45415bdb6144030364f7ebc5 # v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           # Route all rustc invocations through sccache so artifacts persist
@@ -333,26 +335,35 @@ jobs:
           # for ~50% shorter compile time.
           CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
           CARGO_PROFILE_RELEASE_LTO: "false"
-          # Sign updater artifacts so finalize can assemble the cross-platform
-          # latest.json. The private key is stored as a repo secret.
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
-          tagName: ${{ inputs.tag }}
-          # Upload to the draft created by prepare-release and keep it draft.
-          # `finalize` is the only job allowed to publish the release.
-          releaseDraft: true
-          prerelease: false
-          # Both platforms would otherwise race to delete and re-upload the
-          # same latest.json. Finalize creates the authoritative merged file.
-          includeUpdaterJson: false
+          # Build only. The signing key is not available here; sign-updater
+          # uploads the draft release after a separate approval.
+          args: --config src-tauri/tauri.release-unsigned.json
 
-      - name: Recheck release tag immediately after uploading assets
+      - name: Recheck release tag immediately after the build
         shell: bash
         env:
           TAG: ${{ inputs.tag }}
           AUTHORIZED_TAG_SHA: ${{ needs.prepare-release.outputs.tag_sha }}
-        run: tools/release/require_authorized_tag.sh "$TAG" "$AUTHORIZED_TAG_SHA" "keep uploaded assets on the authorized tag"
+        run: tools/release/require_authorized_tag.sh "$TAG" "$AUTHORIZED_TAG_SHA" "keep the Windows build on the authorized tag"
+
+      - name: Package unsigned Windows updater
+        id: pack
+        shell: pwsh
+        run: |
+          $exe = Get-ChildItem "src-tauri/target/release/bundle/nsis" -Filter "*_x64-setup.exe" | Select-Object -First 1
+          if (-not $exe) { throw "Windows installer was not produced" }
+          $hash = (Get-FileHash $exe.FullName -Algorithm SHA256).Hash.ToLower()
+          Copy-Item $exe.FullName "$env:RUNNER_TEMP/windows-setup.exe"
+          "sha256=$hash" >> $env:GITHUB_OUTPUT
+          "name=$($exe.Name)" >> $env:GITHUB_OUTPUT
+
+      - name: Upload unsigned Windows updater
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: windows-unsigned-updater
+          path: ${{ runner.temp }}/windows-setup.exe
+          if-no-files-found: error
 
       - name: Verify Windows release executable Evolution closed loop
         shell: pwsh
@@ -546,12 +557,16 @@ jobs:
   build-macos:
     runs-on: macos-latest          # macos-latest is Apple Silicon (arm64)
     needs: [changelog, prepare-release]
+    outputs:
+      updater_sha256: ${{ steps.pack.outputs.sha256 }}
+      updater_name: ${{ steps.pack.outputs.name }}
     permissions:
-      contents: write
+      contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ needs.prepare-release.outputs.tag_sha }}
+          persist-credentials: false
 
       - name: Require remote release tag to remain authorized
         shell: bash
@@ -561,22 +576,22 @@ jobs:
         run: tools/release/require_authorized_tag.sh "$TAG" "$AUTHORIZED_TAG_SHA" "start the macOS build"
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: '20'
 
       - name: Setup pnpm
-        uses: pnpm/action-setup@v4
+        uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
         with:
           version: 10
 
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           targets: aarch64-apple-darwin
 
       - name: Cache Cargo registry
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
             ~/.cargo/registry/index
@@ -588,7 +603,7 @@ jobs:
       # Same rationale as the Windows job: sccache survives the per-release
       # Cargo.lock churn where a Cargo.lock-keyed rust-cache would always miss.
       - name: Setup sccache
-        uses: mozilla-actions/sccache-action@v0.0.6
+        uses: mozilla-actions/sccache-action@9e326ebed976843c9932b3aa0e021c6f50310eb4 # v0.0.6
 
       - name: Get pnpm store path
         id: pnpm-cache
@@ -596,7 +611,7 @@ jobs:
         run: echo "store=$(pnpm store path)" >> "$GITHUB_OUTPUT"
 
       - name: Cache pnpm store
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: ${{ steps.pnpm-cache.outputs.store }}
           key: pnpm-${{ hashFiles('pnpm-lock.yaml') }}
@@ -613,7 +628,7 @@ jobs:
         run: tools/release/require_authorized_tag.sh "$TAG" "$AUTHORIZED_TAG_SHA" "upload release assets"
 
       - name: Build Tauri app (macOS compatibility channel)
-        uses: tauri-apps/tauri-action@v0
+        uses: tauri-apps/tauri-action@84b9d35b5fc46c1e45415bdb6144030364f7ebc5 # v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RUSTC_WRAPPER: sccache
@@ -623,27 +638,44 @@ jobs:
           CODEFACTORY_BUILD_GIT_SHA: ${{ needs.prepare-release.outputs.tag_sha }}
           CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
           CARGO_PROFILE_RELEASE_LTO: "false"
-          # This signs the updater archive. It is independent from optional
-          # Apple Developer ID/notarization and preserves the existing channel.
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
-          tagName: ${{ inputs.tag }}
-          # Upload into the existing draft; keep it draft for `finalize`.
-          releaseDraft: true
-          prerelease: false
-          # Avoid a cross-platform latest.json upload race; finalize owns it.
-          includeUpdaterJson: false
           # bundle.targets in tauri.conf.json is ["nsis"] (Windows); nsis is not
           # a macOS bundle, so override to the mac bundles for this build only.
-          args: --target aarch64-apple-darwin --bundles app,dmg
+          # Updater archives are packed below and signed in sign-updater.
+          args: --target aarch64-apple-darwin --bundles app,dmg --config src-tauri/tauri.release-unsigned.json
 
       - name: Recheck release tag immediately after uploading assets
         shell: bash
         env:
           TAG: ${{ inputs.tag }}
           AUTHORIZED_TAG_SHA: ${{ needs.prepare-release.outputs.tag_sha }}
-        run: tools/release/require_authorized_tag.sh "$TAG" "$AUTHORIZED_TAG_SHA" "keep uploaded assets on the authorized tag"
+        run: tools/release/require_authorized_tag.sh "$TAG" "$AUTHORIZED_TAG_SHA" "keep the macOS build on the authorized tag"
+
+      - name: Package unsigned macOS updater archive
+        id: pack
+        shell: bash
+        run: |
+          set -euo pipefail
+          APP="$(find src-tauri/target/aarch64-apple-darwin/release/bundle/macos -type d -name '*.app' -print -quit)"
+          if [ -z "$APP" ]; then
+            echo "::error::macOS app bundle was not produced"
+            exit 1
+          fi
+          DIR="$(dirname "$APP")"
+          BASE="$(basename "$APP")"
+          ARCHIVE="$DIR/${BASE}.tar.gz"
+          tar -czf "$ARCHIVE" -C "$DIR" "$BASE"
+          HASH="$(shasum -a 256 "$ARCHIVE" | awk '{print $1}')"
+          cp "$ARCHIVE" "$RUNNER_TEMP/macos-updater.tar.gz"
+          echo "sha256=$HASH" >> "$GITHUB_OUTPUT"
+          echo "name=$(basename "$ARCHIVE")" >> "$GITHUB_OUTPUT"
+
+      - name: Upload unsigned macOS updater
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: macos-unsigned-updater
+          path: ${{ runner.temp }}/macos-updater.tar.gz
+          if-no-files-found: error
 
       - name: Verify installed macOS release artifact
         shell: bash
@@ -671,11 +703,121 @@ jobs:
 
       - name: Upload installed release GUI evidence
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: macos-release-gui-evidence
           path: ${{ runner.temp }}/codefactory-release-evidence
           if-no-files-found: error
+
+  # ── Step 3b: sign updater artifacts in a job that does not build code ────
+  # The signing key exists only in this job's sign step, and only after the
+  # release-signing environment is approved. This workflow does not approve it.
+  sign-updater:
+    runs-on: ubuntu-latest
+    needs: [prepare-release, build-windows, build-macos]
+    if: startsWith(inputs.tag, 'v')
+    environment: release-signing
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.prepare-release.outputs.tag_sha }}
+          persist-credentials: false
+
+      - name: Download unsigned updater artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: '*-unsigned-updater'
+          path: unsigned
+
+      - name: Require artifact hashes to match the build jobs
+        shell: bash
+        env:
+          WINDOWS_SHA: ${{ needs.build-windows.outputs.setup_sha256 }}
+          MACOS_SHA: ${{ needs.build-macos.outputs.updater_sha256 }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib, os, pathlib, sys
+          expected = {
+              "unsigned/windows-unsigned-updater/windows-setup.exe": os.environ["WINDOWS_SHA"],
+              "unsigned/macos-unsigned-updater/macos-updater.tar.gz": os.environ["MACOS_SHA"],
+          }
+          for path, want in expected.items():
+              file = pathlib.Path(path)
+              if not file.is_file():
+                  sys.exit(f"missing unsigned artifact: {path}")
+              digest = hashlib.sha256(file.read_bytes()).hexdigest()
+              if digest != want:
+                  sys.exit(f"hash mismatch for {path}")
+              print(f"ok {path} {digest}")
+          PY
+
+      - name: Install pinned Tauri CLI without lifecycle scripts
+        run: npm install --ignore-scripts --no-save --no-package-lock @tauri-apps/cli@2.12.4
+
+      - name: Sign updater artifacts
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          npx --no-install tauri signer sign \
+            -k "$TAURI_SIGNING_PRIVATE_KEY" \
+            -p "$TAURI_SIGNING_PRIVATE_KEY_PASSWORD" \
+            unsigned/windows-unsigned-updater/windows-setup.exe \
+            unsigned/macos-unsigned-updater/macos-updater.tar.gz
+
+      - name: Verify signatures with the repository public key
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y minisign
+          python3 - <<'PY'
+          import base64, json, pathlib, subprocess, sys
+          config = json.loads(pathlib.Path("src-tauri/tauri.conf.json").read_text())
+          pubkey = base64.b64decode(config["plugins"]["updater"]["pubkey"])
+          key_path = pathlib.Path("updater.pub")
+          key_path.write_bytes(pubkey)
+          files = [
+              "unsigned/windows-unsigned-updater/windows-setup.exe",
+              "unsigned/macos-unsigned-updater/macos-updater.tar.gz",
+          ]
+          for path in files:
+              sig = pathlib.Path(path + ".sig")
+              if not sig.is_file():
+                  sys.exit(f"missing signature: {sig}")
+              subprocess.run(["minisign", "-Vm", path, "-x", path + ".sig", "-p", str(key_path)], check=True)
+          print("updater signatures match the repository public key")
+          PY
+
+      - name: Require remote release tag to remain authorized
+        env:
+          TAG: ${{ inputs.tag }}
+          AUTHORIZED_TAG_SHA: ${{ needs.prepare-release.outputs.tag_sha }}
+        run: tools/release/require_authorized_tag.sh "$TAG" "$AUTHORIZED_TAG_SHA" "upload signed updater artifacts"
+
+      - name: Upload signed updater artifacts to the draft release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ inputs.tag }}
+          WIN_NAME: ${{ needs.build-windows.outputs.setup_name }}
+          MAC_NAME: ${{ needs.build-macos.outputs.updater_name }}
+        run: |
+          set -euo pipefail
+          cp unsigned/windows-unsigned-updater/windows-setup.exe "$WIN_NAME"
+          cp unsigned/windows-unsigned-updater/windows-setup.exe.sig "$WIN_NAME.sig"
+          cp unsigned/macos-unsigned-updater/macos-updater.tar.gz "$MAC_NAME"
+          cp unsigned/macos-unsigned-updater/macos-updater.tar.gz.sig "$MAC_NAME.sig"
+          gh release upload "$TAG" --repo "$REPO" "$WIN_NAME" "$WIN_NAME.sig" "$MAC_NAME" "$MAC_NAME.sig" --clobber
+
+      - name: Require remote release tag to remain authorized after upload
+        env:
+          TAG: ${{ inputs.tag }}
+          AUTHORIZED_TAG_SHA: ${{ needs.prepare-release.outputs.tag_sha }}
+        run: tools/release/require_authorized_tag.sh "$TAG" "$AUTHORIZED_TAG_SHA" "keep signed updater artifacts on the authorized tag"
 
   # ── Step 4: assemble the cross-platform updater manifest, then publish ────
   # Build jobs intentionally skip latest.json to avoid a concurrent same-name
@@ -684,11 +826,11 @@ jobs:
   # publish point, after every asset is in place.
   finalize:
     runs-on: ubuntu-latest
-    needs: [changelog, prepare-release, build-windows, build-macos]
+    needs: [changelog, prepare-release, build-windows, build-macos, sign-updater]
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ needs.prepare-release.outputs.tag_sha }}
           fetch-depth: 0
@@ -769,7 +911,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ needs.prepare-release.outputs.tag_sha }}
 
@@ -837,7 +979,7 @@ jobs:
 
       - name: Upload published release GUI evidence
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: macos-published-release-gui-evidence-${{ inputs.tag }}
           path: ${{ runner.temp }}/codefactory-published-release-evidence

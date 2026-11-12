@@ -184,28 +184,59 @@ pub mod sandbox {
     pub const MISSING_DOCKER_ERROR: &str = "沙箱模式已开启,但找不到可用的 docker 运行时。\
 请安装/启动 Docker,或在设置中将沙箱模式改回 off。为保证隔离承诺,不会自动回退到本机执行。";
 
-    /// Build the docker invocation: disposable container, ONLY the project
-    /// directory mounted (rw, same absolute path so tool output paths stay
-    /// meaningful), workdir there, command via bash -lc. Network stays on —
-    /// builds need registries; the isolation goal is the filesystem.
-    pub fn docker_invocation(command: &str, cwd: &Path, image: &str) -> SandboxInvocation {
-        let cwd = cwd.to_string_lossy();
-        SandboxInvocation {
-            program: "docker".into(),
-            args: vec![
-                "run".into(),
-                "--rm".into(),
-                "--init".into(),
-                "-v".into(),
-                format!("{cwd}:{cwd}"),
-                "-w".into(),
-                cwd.to_string(),
-                image.to_string(),
-                "bash".into(),
-                "-lc".into(),
-                command.to_string(),
-            ],
+    pub struct DockerRun {
+        pub image: String,
+        pub network: crate::config::settings::SandboxNetwork,
+        pub uid: u32,
+        pub gid: u32,
+    }
+
+    /// 只挂载项目目录，`.git` 只读。默认无网络、非 root、丢掉全部能力。
+    /// 路径里的冒号用 `--mount` 的 `src=` / `dst=` 传递，避免被 `-v` 当成分隔符。
+    pub fn docker_invocation(command: &str, cwd: &Path, run: &DockerRun) -> Result<SandboxInvocation, String> {
+        let cwd_text = cwd.to_string_lossy();
+        if cwd_text.contains(',') {
+            return Err("项目路径含有逗号，无法安全生成容器挂载参数".into());
         }
+        let mut args = vec![
+            "run".into(),
+            "--rm".into(),
+            "--init".into(),
+            "--mount".into(),
+            format!("type=bind,src={cwd_text},dst={cwd_text}"),
+        ];
+        let git = cwd.join(".git");
+        if git.exists() {
+            let git_text = git.to_string_lossy();
+            args.push("--mount".into());
+            args.push(format!("type=bind,src={git_text},dst={git_text},readonly"));
+        }
+        args.extend([
+            "--user".into(),
+            format!("{}:{}", run.uid, run.gid),
+            "--cap-drop".into(),
+            "ALL".into(),
+            "--security-opt".into(),
+            "no-new-privileges".into(),
+            "--pids-limit".into(),
+            "512".into(),
+            "--tmpfs".into(),
+            "/tmp".into(),
+            "-e".into(),
+            "HOME=/tmp/home".into(),
+            "--network".into(),
+            match run.network {
+                crate::config::settings::SandboxNetwork::Bridge => "bridge".into(),
+                crate::config::settings::SandboxNetwork::None => "none".into(),
+            },
+            "-w".into(),
+            cwd_text.to_string(),
+            run.image.clone(),
+            "bash".into(),
+            "-lc".into(),
+            command.to_string(),
+        ]);
+        Ok(SandboxInvocation { program: "docker".into(), args })
     }
 
     /// Cheap liveness probe for the container runtime binary. Answers "is the
@@ -400,11 +431,28 @@ async fn execute_inner(
                 .settings
                 .as_ref()
                 .map(|s| s.sandbox_image.clone())
-                .unwrap_or_else(|| "ubuntu:24.04".into());
+                .filter(|image| !image.trim().is_empty())
+                .unwrap_or_else(|| crate::config::settings::DEFAULT_SANDBOX_IMAGE.into());
+            let network = ctx
+                .settings
+                .as_ref()
+                .map(|s| s.sandbox_network)
+                .unwrap_or(crate::config::settings::SandboxNetwork::None);
+            #[cfg(unix)]
+            let (uid, gid) = (unsafe { libc::geteuid() }, unsafe { libc::getegid() });
+            #[cfg(not(unix))]
+            let (uid, gid) = (0, 0);
             // Canonicalize before mounting: macOS paths like /tmp are
             // symlinks, and Docker mounts the LINK path as an empty dir.
             let mount_cwd = ctx.cwd.canonicalize().unwrap_or_else(|_| ctx.cwd.clone());
-            let inv = sandbox::docker_invocation(&a.command, &mount_cwd, &image);
+            let inv = match sandbox::docker_invocation(
+                &a.command,
+                &mount_cwd,
+                &sandbox::DockerRun { image, network, uid, gid },
+            ) {
+                Ok(inv) => inv,
+                Err(error) => return Ok(ToolOutput::err(error)),
+            };
             launched_program = inv.program.clone();
             let mut cmd = Command::new(inv.program).no_window();
             cmd.args(inv.args)
@@ -418,11 +466,17 @@ async fn execute_inner(
             let shell = command_env::shell_invocation(&a.command);
             // M224/R1+R5：信任模式的本地命令走系统沙箱；沙箱不可用时
             // `wrap_command` 返回 None，命令保持原样，由权限网关退回审批（R7）。
-            let (program, program_args, sandbox) = crate::agent::trusted_sandbox::wrap_command(
+            let full_network = ctx
+                .session_id
+                .as_deref()
+                .is_some_and(|session| crate::agent::trusted_sandbox::take_full_network(session, &a.command));
+            let (program, program_args, sandbox) = crate::agent::trusted_sandbox::wrap_command_with(
                 &ctx.cwd,
                 ctx.settings.as_ref(),
                 &shell.program,
                 &shell.args,
+                ctx.session_id.as_deref(),
+                full_network,
             );
             trusted_sandbox = sandbox;
             if trusted_sandbox.is_none() {
@@ -439,6 +493,20 @@ async fn execute_inner(
                 .stderr(Stdio::piped());
             command_env::apply_developer_path(&mut cmd);
             apply_one_shot_build_env(&mut cmd, &a.command);
+            if trusted_sandbox.is_some() {
+                let port = trusted_sandbox.as_ref().and_then(|sandbox| match sandbox.network_policy() {
+                    crate::command_sandbox::NetworkPolicy::RegistryProxy { port } => Some(port),
+                    _ => None,
+                });
+                let private = crate::agent::trusted_sandbox::private_tmpdir(ctx.session_id.as_deref()).ok();
+                crate::util::sandbox_env::apply_tokio(
+                    &mut cmd,
+                    &crate::util::sandbox_env::SandboxChildEnv {
+                        proxy_port: port,
+                        private_tmpdir: private.as_deref(),
+                    },
+                );
+            }
             cmd
         }
     };
@@ -1055,24 +1123,99 @@ mod tests {
     }
 
     #[test]
-    fn docker_invocation_mounts_only_the_project_directory() {
-        // WorkBuddy-gap P0-2: optional container isolation. The wrapper must
-        // mount ONLY the project dir (rw, same absolute path), set it as the
-        // workdir, and run the exact command via bash -lc. No home dir, no
-        // extra host mounts.
+    fn h5_docker_invocation_is_locked_down() {
+        let path = std::path::Path::new("/Users/leo/Projects/My Demo:app");
         let inv = super::sandbox::docker_invocation(
             "cargo test && printf done",
-            std::path::Path::new("/Users/leo/Projects/Demo"),
-            "ubuntu:24.04",
-        );
+            path,
+            &super::sandbox::DockerRun {
+                image: "ubuntu:24.04@sha256:abc".into(),
+                network: crate::config::settings::SandboxNetwork::None,
+                uid: 501,
+                gid: 20,
+            },
+        )
+        .unwrap();
         assert_eq!(inv.program, "docker");
-        let args = inv.args.join(" ");
-        assert!(args.starts_with("run --rm --init"));
-        assert!(args.contains("-v /Users/leo/Projects/Demo:/Users/leo/Projects/Demo"));
-        assert!(args.contains("-w /Users/leo/Projects/Demo"));
-        assert!(args.ends_with("ubuntu:24.04 bash -lc cargo test && printf done"));
-        // Exactly one volume mount.
-        assert_eq!(inv.args.iter().filter(|a| *a == "-v").count(), 1);
+        let args = inv.args.join("\n");
+        assert!(args.contains("type=bind,src=/Users/leo/Projects/My Demo:app,dst=/Users/leo/Projects/My Demo:app"));
+        assert!(args.contains("--user\n501:20"));
+        assert!(args.contains("--cap-drop\nALL"));
+        assert!(args.contains("no-new-privileges"));
+        assert!(args.contains("--pids-limit\n512"));
+        assert!(args.contains("--network\nnone"));
+        assert!(args.contains("ubuntu:24.04@sha256:abc"));
+        assert!(!inv.args.iter().any(|arg| arg == "-v"));
+        assert!(inv.args.iter().any(|arg| arg == "HOME=/tmp/home"));
+    }
+
+    #[test]
+    fn h5_container_git_metadata_is_not_writable_and_files_belong_to_the_user() {
+        if !super::sandbox::runtime_available("docker") || !super::sandbox::daemon_available("docker") {
+            eprintln!("skip: docker daemon unavailable");
+            return;
+        }
+        let root = std::env::temp_dir().join(format!("cf-docker-sbx-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        assert!(std::process::Command::new("git")
+            .arg("-C")
+            .arg(&root)
+            .args(["init", "-q", "-b", "main"])
+            .status()
+            .unwrap()
+            .success());
+        let before = std::fs::read_to_string(root.join(".git/config")).unwrap_or_default();
+        #[cfg(unix)]
+        let (uid, gid) = (unsafe { libc::geteuid() }, unsafe { libc::getegid() });
+        #[cfg(not(unix))]
+        let (uid, gid) = (0, 0);
+        let inv = super::sandbox::docker_invocation(
+            "printf x >> .git/config; printf owned > owned.txt; echo done",
+            &root,
+            &super::sandbox::DockerRun {
+                image: crate::config::settings::DEFAULT_SANDBOX_IMAGE.into(),
+                network: crate::config::settings::SandboxNetwork::None,
+                uid,
+                gid,
+            },
+        )
+        .unwrap();
+        let output = std::process::Command::new(&inv.program)
+            .args(&inv.args)
+            .output()
+            .expect("docker run");
+        assert!(
+            output.status.success(),
+            "container command failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let after = std::fs::read_to_string(root.join(".git/config")).unwrap_or_default();
+        assert_eq!(before, after, "container must not change git config");
+        let owned = root.join("owned.txt");
+        assert_eq!(std::fs::read_to_string(&owned).unwrap(), "owned");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            assert_eq!(owned.metadata().unwrap().uid(), uid);
+        }
+        let net = super::sandbox::docker_invocation(
+            "timeout 3 bash -c 'echo >/dev/tcp/1.1.1.1/443'",
+            &root,
+            &super::sandbox::DockerRun {
+                image: crate::config::settings::DEFAULT_SANDBOX_IMAGE.into(),
+                network: crate::config::settings::SandboxNetwork::None,
+                uid,
+                gid,
+            },
+        )
+        .unwrap();
+        let net_out = std::process::Command::new(&net.program)
+            .args(&net.args)
+            .output()
+            .expect("docker network probe");
+        assert!(!net_out.status.success(), "default container network must not connect");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -1082,7 +1225,16 @@ mod tests {
             settings.sandbox_mode,
             crate::config::settings::SandboxMode::Off
         );
-        assert_eq!(settings.sandbox_image, "ubuntu:24.04");
+        assert_eq!(
+            settings.sandbox_image,
+            crate::config::settings::DEFAULT_SANDBOX_IMAGE
+        );
+        assert_eq!(
+            settings.sandbox_network,
+            crate::config::settings::SandboxNetwork::None
+        );
+        assert!(!settings.dispatch_privileged_ops);
+        assert!(!settings.macos_plaintext_key_fallback);
     }
 
     /// Real-runtime smoke: only meaningful on a machine that can actually run

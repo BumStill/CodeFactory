@@ -22,20 +22,20 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Setup Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22
 
       - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           targets: x86_64-pc-windows-msvc
 
       - name: Rust cache
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           workspaces: src-tauri
 
@@ -81,7 +81,7 @@ jobs:
 
       - name: Upload unattended receipt
         if: ${{ !cancelled() && steps.unattended_smoke.outcome != 'skipped' }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: unattended-long-task-nightly-${{ github.run_id }}
           path: ${{ runner.temp }}/unattended-long-task-nightly.json
@@ -115,7 +115,7 @@ jobs:
 
       - name: Upload delivery recovery receipt
         if: ${{ !cancelled() && steps.delivery_recovery_smoke.outcome != 'skipped' }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: delivery-recovery-nightly-${{ github.run_id }}
           path: ${{ runner.temp }}/delivery-recovery-nightly.json
@@ -142,7 +142,7 @@ jobs:
 
       - name: Upload historical session receipt
         if: ${{ !cancelled() && steps.history_session_smoke.outcome != 'skipped' }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: history-session-nightly-${{ github.run_id }}
           path: ${{ runner.temp }}/history-session-nightly.json
@@ -158,13 +158,13 @@ jobs:
     runs-on: macos-latest
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
 
       - name: Rust cache
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           workspaces: src-tauri
 
@@ -200,7 +200,7 @@ jobs:
 
       - name: Upload macOS unattended receipt
         if: ${{ !cancelled() && steps.unattended_smoke_macos.outcome != 'skipped' }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: unattended-long-task-nightly-macos-${{ github.run_id }}
           path: ${{ runner.temp }}/unattended-long-task-nightly-macos.json

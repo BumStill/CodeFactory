@@ -1447,7 +1447,7 @@ console.log(reg.scenarios.map(s=>[s.id,s.change_patterns,s.restore,s.cleanup,s.w
 }
 
 fn git(root: &Path, args: &[&str]) -> Option<String> {
-    let out = Command::new("git")
+    let out = crate::util::host_git::command()
         .no_window()
         .current_dir(root)
         .args(args)
@@ -2834,7 +2834,7 @@ fn snapshot(root: &Path, paths: &[String]) -> Option<String> {
     let index = dir.join("index");
     let result = (|| {
         let run = |args: &[&str], input: Option<&str>| -> Option<String> {
-            let mut child = Command::new("git")
+            let mut child = crate::util::host_git::command()
                 .no_window()
                 .current_dir(root)
                 .env("GIT_INDEX_FILE", &index)

@@ -55,9 +55,10 @@ fn quota_socket_round_trip_preserves_partial_caps_and_audits_updates() {
     let path = dir.path().join("dispatch.sock");
     let audit = dir.path().join("dispatch-audit.log");
     let listener = socket::bind(&path).unwrap();
+    let token = dispatch::install_dispatch_token(dir.path()).unwrap();
     let log = AuditLog::new(&audit);
     let host: Arc<dyn DispatchHost> = Arc::new(QuotaHost(Mutex::new((80, 80))));
-    std::thread::spawn(move || { let _ = dispatch::serve(listener, host, Some(log)); });
+    std::thread::spawn(move || { let _ = dispatch::serve(listener, host, Some(log), token, true); });
     let initial = client::request(&path, r#"{"operation":"get_quota"}"#).unwrap();
     assert!(initial.ok);
     let initial = initial.result.unwrap();

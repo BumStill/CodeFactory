@@ -3974,7 +3974,7 @@ impl delivery::DeliveryRemote for DeliveryRecoverySmokeRemote {
 
 #[cfg(not(test))]
 fn delivery_recovery_smoke_git(cwd: &std::path::Path, args: &[&str]) -> anyhow::Result<String> {
-    let output = std::process::Command::new("git")
+    let output = crate::util::host_git::command()
         .no_window()
         .current_dir(cwd)
         .args(args)
@@ -4877,7 +4877,7 @@ mod tests {
     }
 
     fn recovery_git(cwd: &std::path::Path, args: &[&str]) -> String {
-        let output = std::process::Command::new("git")
+        let output = crate::util::host_git::command()
             .no_window()
             .current_dir(cwd)
             .args(args)

@@ -7,7 +7,14 @@ use command_sandbox::{CommandSandbox, NetworkPolicy};
 
 #[cfg(target_os = "macos")]
 fn sandbox() -> CommandSandbox {
-    CommandSandbox::new(&std::env::current_dir().unwrap(), vec![], vec![], NetworkPolicy::Enabled).unwrap()
+    CommandSandbox::new(
+        &std::env::current_dir().unwrap(),
+        vec![],
+        vec![],
+        NetworkPolicy::Full,
+        command_sandbox::SandboxConstraints::default(),
+    )
+    .unwrap()
 }
 
 #[cfg(target_os = "macos")]

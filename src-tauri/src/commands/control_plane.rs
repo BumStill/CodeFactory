@@ -228,14 +228,14 @@ async fn git_command_output(
     args: &[&str],
     allow_missing: bool,
 ) -> Result<Option<String>, GitCommandFailureKind> {
-    let mut command = tokio::process::Command::new("git").no_window();
-    command
-        .arg("--no-pager")
+    let mut git = crate::util::host_git::command();
+    git.arg("--no-pager")
         .args(args)
         .current_dir(cwd)
         .env("LC_ALL", "C")
         .env("LANG", "C")
         .env("GIT_TERMINAL_PROMPT", "0");
+    let mut command = git.into_tokio();
     let output =
         process_output_with_timeout(command, Duration::from_millis(GIT_PROBE_TIMEOUT_MS)).await?;
 
@@ -752,13 +752,13 @@ mod tests {
     #[tokio::test]
     async fn normal_git_delivery_is_complete_and_confirmed_clean() {
         let cwd = tmp_project();
-        std::process::Command::new("git")
+        crate::util::host_git::command()
             .no_window()
             .args(["init"])
             .current_dir(&cwd)
             .output()
             .unwrap();
-        std::process::Command::new("git")
+        crate::util::host_git::command()
             .no_window()
             .args([
                 "-c",
@@ -837,7 +837,7 @@ mod tests {
         let cwd = tmp_project();
         std::fs::create_dir_all(cwd.join(".githooks")).unwrap();
         std::fs::write(cwd.join(".githooks").join("pre-commit"), "#!/bin/sh\n").unwrap();
-        std::process::Command::new("git")
+        crate::util::host_git::command()
             .no_window()
             .args(["init"])
             .current_dir(&cwd)
@@ -848,7 +848,7 @@ mod tests {
         assert!(unconfigured.sync_gate_present);
         assert_eq!(unconfigured.sync_gate_configured, Some(false));
 
-        std::process::Command::new("git")
+        crate::util::host_git::command()
             .no_window()
             .args(["config", "core.hooksPath", ".githooks"])
             .current_dir(&cwd)

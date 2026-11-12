@@ -68,10 +68,12 @@ fn harness() -> Harness {
         projects_that_exist: vec!["/tmp/known-project".to_string()],
     });
     let listener = socket::bind(&socket_path).expect("private socket binds");
+    let token = codefactory_lib::headless_dispatch::install_dispatch_token(dir.path())
+        .expect("token");
     let dyn_host: Arc<dyn DispatchHost> = host.clone();
     let audit = AuditLog::new(&audit_path);
     std::thread::spawn(move || {
-        let _ = codefactory_lib::headless_dispatch::serve(listener, dyn_host, Some(audit));
+        let _ = codefactory_lib::headless_dispatch::serve(listener, dyn_host, Some(audit), token, true);
     });
     Harness {
         _dir: dir,

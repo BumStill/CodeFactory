@@ -6,6 +6,7 @@ pub mod browser_session;
 pub mod web_fetch;
 pub mod delegate_tasks;
 pub mod delivery;
+pub mod sync_remote;
 mod delivery_thin;
 pub mod docx;
 pub mod edit;
@@ -213,6 +214,7 @@ pub fn all_definitions() -> Vec<crate::openrouter::types::ToolDefinition> {
         xlsx::edit_definition(),
         delegate_tasks::definition(),
         delivery::definition(),
+        sync_remote::definition(),
         parallel::definition(),
         update_plan::definition(),
         view_image::definition(),
@@ -268,6 +270,7 @@ pub async fn dispatch(name: &str, args: Value, ctx: &ExecCtx) -> Result<ToolOutp
         "edit_xlsx" => xlsx::execute_edit(args, ctx).await,
         "delegate_tasks" => delegate_tasks::execute(args, ctx).await,
         "deliver_changes" => delivery::execute(args, ctx).await,
+        "sync_remote" => sync_remote::execute(args, ctx).await,
         "dispatch_parallel_tasks" => parallel::execute(args, ctx).await,
         "update_plan" => update_plan::execute(args, ctx).await,
         other => Ok(ToolOutput::err(format!("Unknown tool: {other}"))),

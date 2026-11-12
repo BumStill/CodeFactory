@@ -15,10 +15,10 @@ jobs:
   governance-baseline:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0 # need history so the rules validator can diff vs base
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: "3.11"
       - run: pip install pyyaml
@@ -41,6 +41,8 @@ jobs:
           echo "${ACTIONLINT_LINUX_AMD64_SHA256}  /tmp/${archive}" | sha256sum -c -
           tar -xzf "/tmp/${archive}" -C /tmp actionlint
           python tools/governance/validate_ci_workflows.py --actionlint /tmp/actionlint
+      - name: Supply-chain and host-git guards
+        run: python tools/governance/check_supply_chain.py
       - run: python tools/governance/validate_repo_governance_baseline.py
       - name: Enforce the Windows CI UTF-8 contract
         run: python tools/governance/validate_python_utf8_contract.py

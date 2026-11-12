@@ -16,7 +16,7 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 fn git(cwd: &Path, args: &[&str]) -> anyhow::Result<String> {
-    let output = Command::new("git")
+    let output = crate::util::host_git::command()
         .no_window()
         .current_dir(cwd)
         .args(args)

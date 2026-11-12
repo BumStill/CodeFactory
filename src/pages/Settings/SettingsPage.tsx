@@ -446,6 +446,10 @@ export function SettingsPage({
     im_webhook_format: NonNullable<Settings["im_webhook_format"]>;
     sandbox_mode: NonNullable<Settings["sandbox_mode"]>;
     sandbox_image: string;
+    sandbox_network: NonNullable<Settings["sandbox_network"]>;
+    sandbox_registry_hosts: string;
+    dispatch_privileged_ops: boolean;
+    macos_plaintext_key_fallback: boolean;
   } | null>(null);
   const [generalSaved, setGeneralSaved] = useState(false);
   const [showImBindingDialog, setShowImBindingDialog] = useState(false);
@@ -487,7 +491,11 @@ export function SettingsPage({
       im_webhook_url: settings.im_webhook_url ?? "",
       im_webhook_format: settings.im_webhook_format ?? "wecom",
       sandbox_mode: settings.sandbox_mode ?? "off",
-      sandbox_image: settings.sandbox_image ?? "ubuntu:24.04",
+      sandbox_image: settings.sandbox_image ?? "",
+      sandbox_network: settings.sandbox_network ?? "none",
+      sandbox_registry_hosts: (settings.sandbox_registry_hosts ?? []).join("\n"),
+      dispatch_privileged_ops: settings.dispatch_privileged_ops ?? false,
+      macos_plaintext_key_fallback: settings.macos_plaintext_key_fallback ?? false,
     });
   }, [settings]);
 
@@ -596,7 +604,14 @@ export function SettingsPage({
       im_webhook_url: generalDraft.im_webhook_url.trim(),
       im_webhook_format: generalDraft.im_webhook_format,
       sandbox_mode: generalDraft.sandbox_mode,
-      sandbox_image: generalDraft.sandbox_image.trim() || "ubuntu:24.04",
+      sandbox_image: generalDraft.sandbox_image.trim(),
+      sandbox_network: generalDraft.sandbox_network,
+      sandbox_registry_hosts: generalDraft.sandbox_registry_hosts
+        .split(/\s+/)
+        .map((host) => host.trim())
+        .filter(Boolean),
+      dispatch_privileged_ops: generalDraft.dispatch_privileged_ops,
+      macos_plaintext_key_fallback: generalDraft.macos_plaintext_key_fallback,
     } as Settings & { auto_create_pr: boolean });
 
     setGeneralSaved(true);
@@ -1181,17 +1196,73 @@ export function SettingsPage({
                   <option value="docker">Docker 容器隔离</option>
                 </select>
                 {generalDraft.sandbox_mode === "docker" && (
-                  <input
-                    value={generalDraft.sandbox_image}
-                    onChange={(e) =>
-                      setGeneralDraft({ ...generalDraft, sandbox_image: e.target.value })
-                    }
-                    placeholder="ubuntu:24.04"
-                    className="w-44 rounded border border-border bg-surface-2 px-2 py-1 text-label text-gray-300"
-                    aria-label="沙箱镜像"
-                  />
+                  <>
+                    <input
+                      value={generalDraft.sandbox_image}
+                      onChange={(e) =>
+                        setGeneralDraft({ ...generalDraft, sandbox_image: e.target.value })
+                      }
+                      placeholder="ubuntu:24.04@sha256:…"
+                      className="w-44 rounded border border-border bg-surface-2 px-2 py-1 text-label text-gray-300"
+                      aria-label="沙箱镜像"
+                    />
+                    <select
+                      value={generalDraft.sandbox_network}
+                      onChange={(e) =>
+                        setGeneralDraft({
+                          ...generalDraft,
+                          sandbox_network: e.target.value as NonNullable<Settings["sandbox_network"]>,
+                        })
+                      }
+                      aria-label="容器网络"
+                      className="rounded border border-border bg-surface-2 px-2 py-1 text-label text-gray-300"
+                    >
+                      <option value="none">容器不联网（默认）</option>
+                      <option value="bridge">容器可访问网络</option>
+                    </select>
+                  </>
                 )}
               </div>
+              {generalDraft.sandbox_mode === "docker" && generalDraft.sandbox_image && !generalDraft.sandbox_image.includes("@sha256:") && (
+                <p className="text-caption text-amber-300">未固定版本</p>
+              )}
+              {generalDraft.sandbox_mode === "docker" && generalDraft.sandbox_network === "bridge" && (
+                <p className="text-caption text-gray-500">开启后容器可访问网络。</p>
+              )}
+              <label className="mt-2 flex items-start gap-2 text-caption text-gray-400">
+                <input
+                  type="checkbox"
+                  checked={generalDraft.dispatch_privileged_ops}
+                  onChange={(e) =>
+                    setGeneralDraft({ ...generalDraft, dispatch_privileged_ops: e.target.checked })
+                  }
+                />
+                <span>允许本地任务入口批准请求、切换到信任模式、授予交付权限</span>
+              </label>
+              <label className="mt-2 flex items-start gap-2 text-caption text-gray-400">
+                <input
+                  type="checkbox"
+                  checked={generalDraft.macos_plaintext_key_fallback}
+                  onChange={(e) =>
+                    setGeneralDraft({
+                      ...generalDraft,
+                      macos_plaintext_key_fallback: e.target.checked,
+                    })
+                  }
+                />
+                <span>在本机保存一份未加密的密钥副本，用于钥匙串反复不可用的环境</span>
+              </label>
+              <label className="mt-2 block text-caption text-gray-500">
+                额外注册表主机（每行一个，不含 forge）
+                <textarea
+                  value={generalDraft.sandbox_registry_hosts}
+                  onChange={(e) =>
+                    setGeneralDraft({ ...generalDraft, sandbox_registry_hosts: e.target.value })
+                  }
+                  className="mt-1 w-full rounded border border-border bg-surface-2 px-2 py-1 text-label text-gray-300"
+                  rows={3}
+                />
+              </label>
             </div>
 
             {/* R9 `trusted_command_sandbox` 是内部回退开关，不是产品选项：
