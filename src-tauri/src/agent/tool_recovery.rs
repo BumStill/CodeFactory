@@ -560,6 +560,11 @@ impl ToolRecoveryStore {
                 None => SnapshotObservation::Unknown,
             }
         } else if let Ok(locator) = row.try_get::<String, _>("file_locator") {
+            // Shell file manifests are supplemental delivery evidence, not
+            // proof that an entire command may be retried or marked done.
+            if super::tool_backend::shell_intent::is_locator(&locator) {
+                return Ok(ToolRecoveryDisposition::ObserveOnly);
+            }
             let pre: String = row.try_get("file_precondition")?;
             let expected: String = row.try_get("file_expected")?;
             match observe_exact_file(&cwd, &locator, &pre, &expected).await {

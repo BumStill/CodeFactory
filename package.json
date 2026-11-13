@@ -3,6 +3,7 @@
   "version": "1.123.0",
   "type": "module",
   "scripts": {
+    "test:delivery-candidate": "python3 -m unittest discover -s tests -p test_delivery_candidate_collector.py -v",
     "dev": "vite",
     "build": "tsc && vite build",
     "preview": "vite preview",

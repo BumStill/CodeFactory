@@ -12,6 +12,11 @@
 //! unit-test EXE links no Tauri entrypoints (#166). It is constructed only in
 //! `run_openai`/`run_anthropic`, which the test EXE dead-strips.
 
+#[path = "shell_intent.rs"]
+pub(super) mod shell_intent;
+#[path = "content_provenance.rs"]
+pub(super) mod content_provenance;
+
 use codefactory_agent_core::ToolKind;
 use codefactory_agent_loop::tool::{
     ToolBackend, ToolCtx, ToolError, ToolExecutionStatus, ToolInvocationResult,
@@ -80,7 +85,7 @@ struct FileObservation {
     observed_digest: Option<String>,
 }
 
-fn canonical_json(value: &serde_json::Value) -> String {
+pub(crate) fn canonical_json(value: &serde_json::Value) -> String {
     match value {
         serde_json::Value::Null => "null".into(),
         serde_json::Value::Bool(value) => value.to_string(),
@@ -115,7 +120,7 @@ fn canonical_json(value: &serde_json::Value) -> String {
     }
 }
 
-fn opaque_digest(parts: &[&str]) -> String {
+pub(crate) fn opaque_digest(parts: &[&str]) -> String {
     let mut digest = Sha256::new();
     for part in parts {
         digest.update(part.as_bytes());
@@ -161,6 +166,15 @@ async fn prepare_file_observation(
     args: &serde_json::Value,
     cwd: &Path,
 ) -> FileObservationAdmission {
+    if tool_name == "bash" {
+        return args.get("command").and_then(serde_json::Value::as_str)
+            .and_then(|command| shell_intent::plan(cwd, command))
+            .map(|manifest| FileObservationAdmission::Plan(FileObservationPlan {
+                safe_locator_json: manifest.locator(),
+                precondition_digest: manifest.digest(false),
+                expected_postcondition_digest: manifest.digest(true),
+            })).unwrap_or(FileObservationAdmission::NotApplicable);
+    }
     if !matches!(tool_name, "write_file" | "edit_file") {
         return FileObservationAdmission::NotApplicable;
     }
@@ -344,6 +358,22 @@ async fn observe_file_contract(
     precondition_digest: &str,
     expected_postcondition_digest: &str,
 ) -> FileObservation {
+    if let Ok(locator) = serde_json::from_str::<serde_json::Value>(safe_locator_json) {
+        if let Some(value) = locator.get("shell_intent_v1") {
+            let observed = serde_json::from_value::<shell_intent::Manifest>(value.clone()).ok()
+                .filter(|manifest| manifest.valid()
+                    && manifest.digest(false) == precondition_digest
+                    && manifest.digest(true) == expected_postcondition_digest)
+                .and_then(|manifest| manifest.observe(cwd));
+            let state = match observed.as_deref() {
+                Some(value) if value == expected_postcondition_digest => ObservationState::Applied,
+                Some(value) if value == precondition_digest => ObservationState::DefinitelyNotApplied,
+                Some(_) => ObservationState::Conflict,
+                None => ObservationState::StillUnknown,
+            };
+            return FileObservation { state, observed_digest: observed };
+        }
+    }
     let relative = serde_json::from_str::<serde_json::Value>(safe_locator_json)
         .ok()
         .and_then(|locator| {
@@ -1355,9 +1385,9 @@ impl DesktopToolBackend {
         // existing receipt is authoritative even when the precondition can no
         // longer be rebuilt, so a restarted observer must still get its replay
         // instead of an argument error.
-        let file_admission =
+        let mut file_admission =
             prepare_file_observation(&call.function.name, args, &ctx.working_directory).await;
-        let file_observation = match &file_admission {
+        let mut file_observation = match &file_admission {
             FileObservationAdmission::Plan(plan) => Some(plan.clone()),
             FileObservationAdmission::Refused(_) | FileObservationAdmission::NotApplicable => None,
         };
@@ -1378,6 +1408,14 @@ impl DesktopToolBackend {
                 Err(_) => None,
             }
         };
+        // Shell manifests supplement content provenance, never replace the
+        // existing whole-command observer/admission or grant exact replay.
+        if call.function.name == "bash" && file_observation.is_some() {
+            if generic_observation.is_none() {
+                file_admission = FileObservationAdmission::NotApplicable;
+                file_observation = None;
+            }
+        }
         let specialized = matches!(
             call.function.name.as_str(),
             "browser_session" | "deliver_changes"
@@ -1929,7 +1967,9 @@ impl DesktopToolBackend {
                 .await
                 .map_err(|error| ToolError {
                     message: format!("load file observation contract: {error}"),
-                })? {
+                })?.filter(|contract| {
+                    !shell_intent::is_locator(&contract.get::<String,_>("safe_locator_json"))
+                }) {
                     let safe_locator_json: String = contract.get("safe_locator_json");
                     let precondition_digest: String = contract.get("precondition_digest");
                     let expected_postcondition_digest: String =
@@ -2077,7 +2117,7 @@ impl DesktopToolBackend {
                     }
                 }
                 if let Some(contract) = sqlx::query(
-                    "SELECT state, dispatch_claim_epoch
+                    "SELECT state, dispatch_claim_epoch, replay_policy
                      FROM tool_recovery_contracts WHERE receipt_id=?",
                 )
                 .bind(&existing_receipt_id)
@@ -2106,7 +2146,9 @@ impl DesktopToolBackend {
                     // `uncertain > 0` fence blocked every later mutation. The
                     // file observer already admits from any later epoch
                     // (`last_dispatch_epoch<?`); this is the same rule.
-                    if state == "observed_unchanged" && dispatch_claim_epoch <= permit.claim_epoch {
+                    let replay_policy: String = contract.get("replay_policy");
+                    if state == "observed_unchanged" && dispatch_claim_epoch <= permit.claim_epoch
+                        && replay_policy != "never_after_dispatch" {
                         let now = chrono::Utc::now().timestamp_millis();
                         let admitted = sqlx::query(
                             "UPDATE tool_recovery_contracts
@@ -2336,6 +2378,7 @@ impl DesktopToolBackend {
         } else {
             None
         };
+        let had_file_observation = file_observation.is_some();
         if let Some(observation) = file_observation {
             let dispatch_epoch = ctx
                 .mutation_permit
@@ -2366,7 +2409,8 @@ impl DesktopToolBackend {
             .map_err(|error| ToolError {
                 message: format!("persist file observation contract: {error}"),
             })?;
-        } else if let Some(observation) = generic_observation {
+        }
+        if let Some(observation) = generic_observation.filter(|_| !had_file_observation || call.function.name == "bash") {
             super::tool_recovery::ToolRecoveryStore::create_contract_in_tx(
                 &mut tx,
                 &receipt_id,
@@ -2478,6 +2522,44 @@ impl DesktopToolBackend {
                 {
                     return Ok(());
                 }
+            }
+        }
+        // Only a real foreground terminal result can settle supplemental
+        // shell content evidence. A matching file snapshot after a crash says
+        // nothing about other command effects and must not synthesize Done.
+        if let Some(contract) = sqlx::query(
+            "SELECT safe_locator_json, precondition_digest, expected_postcondition_digest, state
+             FROM side_effect_observation_contracts WHERE receipt_id=?")
+            .bind(receipt_id).fetch_optional(&self.db).await.map_err(|error| ToolError {
+                message: format!("load supplemental shell evidence: {error}"),
+            })?.filter(|row| shell_intent::is_locator(&row.get::<String,_>("safe_locator_json"))) {
+            let observation = observe_file_contract(&ctx.working_directory,
+                &contract.get::<String,_>("safe_locator_json"),
+                &contract.get::<String,_>("precondition_digest"),
+                &contract.get::<String,_>("expected_postcondition_digest")).await;
+            let state = if succeeded { observation.state } else { ObservationState::StillUnknown };
+            // Already-applied facts belong to the earlier dispatch. New
+            // actual dispatches have their own immutable content journal row.
+            if contract.get::<String,_>("state") != "applied" {
+            sqlx::query("UPDATE side_effect_observation_contracts SET state=?, observed_digest=?,
+                observation_count=observation_count+1, observed_at=? WHERE receipt_id=?")
+                .bind(state.as_str()).bind(observation.observed_digest)
+                .bind(chrono::Utc::now().timestamp_millis()).bind(receipt_id)
+                .execute(&self.db).await.map_err(|error| ToolError {
+                    message: format!("settle supplemental shell evidence: {error}"),
+                })?;
+            }
+            let generic_exists: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM tool_recovery_contracts WHERE receipt_id=?")
+                .bind(receipt_id).fetch_one(&self.db).await.map_err(|error| ToolError {
+                    message: format!("verify shell recovery authority: {error}"),
+                })?;
+            if generic_exists != 1 {
+                sqlx::query("UPDATE side_effect_receipts SET status='unknown' WHERE id=? AND status IN ('started','unknown')")
+                    .bind(receipt_id).execute(&self.db).await.map_err(|error| ToolError {
+                        message: format!("fence incomplete shell recovery evidence: {error}"),
+                    })?;
+                return Ok(());
             }
         }
         if recovery
@@ -2769,6 +2851,14 @@ impl ToolBackend for DesktopToolBackend {
                 }
             } else { None }
         } else { None };
+        // Supplemental evidence observes an actual host dispatch only. It
+        // does not authorize, block, retry, or settle the thin business run.
+        let content_dispatch = if !is_mcp_tool && native_tool_known {
+            match content_provenance::prepare(&self.db, call, args, ctx).await {
+                Ok(prepared) => prepared,
+                Err(error) => { tracing::warn!(%error, "content provenance unavailable; no proof minted"); None }
+            }
+        } else { None };
         let exec_ctx = crate::tools::ExecCtx {
             cwd: ctx.working_directory.clone(),
             #[cfg(not(test))]
@@ -2815,6 +2905,11 @@ impl ToolBackend for DesktopToolBackend {
         };
 
         let mut result = invocation_from_output(output, command, kind);
+        if let Some(prepared) = content_dispatch {
+            if let Err(error) = content_provenance::finish(&self.db, prepared, &result, ctx).await {
+                tracing::warn!(%error, "content observation did not settle; pending evidence is unusable");
+            }
+        }
         if let Some(reference) = local_backup {
             let metadata = result.metadata.get_or_insert_with(|| serde_json::json!({}));
             metadata["workspace_scope"] = serde_json::json!("own_task");
@@ -2900,8 +2995,8 @@ impl ToolBackend for DesktopToolBackend {
         match prepare_file_observation(&call.function.name, args, &ctx.working_directory).await {
             // R1: an argument verdict is settled before permission exists.
             FileObservationAdmission::Refused(reason) => return Some(reason),
-            FileObservationAdmission::Plan(_) => return None,
-            FileObservationAdmission::NotApplicable => {}
+            FileObservationAdmission::Plan(_) if call.function.name != "bash" => return None,
+            FileObservationAdmission::Plan(_) | FileObservationAdmission::NotApplicable => {}
         }
         if is_mcp_tool {
             return Some(unobservable_mutation_refusal(true, &call.function.name, &command).1);
@@ -2936,6 +3031,43 @@ impl ToolBackend for DesktopToolBackend {
 }
 
 #[cfg(test)]
+pub(crate) async fn r2_native_delivery_fixture(foreign_preimage: bool) -> (sqlx::SqlitePool, tempfile::TempDir, std::path::PathBuf, String) {
+    tests::r2_native_delivery_fixture_inner(foreign_preimage).await
+}
+
+#[cfg(test)]
+pub(crate) async fn r2_bash_delivery_fixture() -> (sqlx::SqlitePool, tempfile::TempDir, std::path::PathBuf, String) {
+    tests::r2_bash_delivery_fixture_inner().await
+}
+
+#[cfg(test)]
+pub(crate) async fn r2_shell_case_fixture(preexisting: &[(&str, &str)], commands: &[&str]) -> (sqlx::SqlitePool, tempfile::TempDir, std::path::PathBuf, String) {
+    tests::r2_shell_case_fixture_inner(preexisting, commands).await
+}
+
+#[cfg(test)]
+pub(crate) async fn r2_native_write_existing_fixture(
+    pool: &sqlx::SqlitePool, root: &std::path::Path, path: &str, content: &str,
+) {
+    tests::r2_native_write_existing_fixture_inner(pool, root, path, content).await
+}
+
+#[cfg(test)]
+pub(crate) async fn r2_fresh_thin_fixture() -> (sqlx::SqlitePool, tempfile::TempDir, std::path::PathBuf, String) {
+    tests::r2_fresh_thin_fixture_inner().await
+}
+
+#[cfg(test)]
+pub(crate) async fn r2_production_native_fixture() -> (sqlx::SqlitePool, tempfile::TempDir, std::path::PathBuf, String) {
+    tests::r2_production_native_fixture_inner().await
+}
+
+#[cfg(all(test, unix))]
+pub(crate) async fn r2_fresh_thin_shell_fixture(preexisting: &[(&str, &str)], commands: &[&str]) -> (sqlx::SqlitePool, tempfile::TempDir, std::path::PathBuf, String) {
+    tests::r2_fresh_thin_shell_fixture_inner(preexisting, commands).await
+}
+
+#[cfg(test)]
 mod tests {
     //! In `#[cfg(test)]` builds `DesktopToolBackend` has NO `app` field, so
     //! these construct the REAL backend with no `AppHandle` — that headless
@@ -2946,6 +3078,10 @@ mod tests {
     //! fallback, and an unknown tool is a clean `is_error` result, not a fatal
     //! `Err`.
     use super::*;
+    include!("delivery_scope_native_fixture.rs");
+    include!("delivery_legacy_backend_fixture.rs");
+    include!("shell_intent_recovery_tests.rs");
+    include!("content_provenance_tests.rs");
     use sqlx::sqlite::SqlitePoolOptions;
 
     const TEST_SESSION_ID: &str = "session-tool-fencing";
@@ -3014,7 +3150,13 @@ mod tests {
     /// backend seam: no test-only dispatcher or fake receipt store can make a
     /// duplicate external launch look safe.
     async fn objective_backend(waiting_with_foreign_lease: bool) -> DesktopToolBackend {
-        let backend = backend().await;
+        objective_backend_from_backend(waiting_with_foreign_lease, backend().await).await
+    }
+
+    async fn objective_backend_from_backend(
+        waiting_with_foreign_lease: bool,
+        backend: DesktopToolBackend,
+    ) -> DesktopToolBackend {
         sqlx::raw_sql(include_str!(
             "../../migrations/0007_unified_objective_control_plane.sql"
         ))

@@ -130,6 +130,108 @@ pub(crate) async fn objective_delivery_cwd(ctx: &ExecCtx) -> Result<std::path::P
     Ok(workspace.worktree_path)
 }
 
+#[path = "delivery_thin_commit.rs"]
+mod thin_commit;
+
+#[path = "delivery_thin_stop.rs"]
+mod thin_stop;
+
+pub(super) fn thin_stop_for_identity(db: sqlx::SqlitePool, session: String, objective: String, root: Option<String>) -> std::sync::Arc<dyn crate::agent::stop_fence::DeliveryStopGate> {
+    thin_stop::ThinStopGate::new(db, session, objective, root)
+}
+
+pub(super) async fn thin_foreground_stop_for_identity(db: sqlx::SqlitePool, session: String, objective: String, root: Option<String>) -> std::sync::Arc<dyn crate::agent::stop_fence::DeliveryStopGate> {
+    thin_stop::ThinStopGate::foreground(db, session, objective, root).await
+}
+
+pub(super) async fn thin_stop_gate(ctx: &ExecCtx) -> Result<std::sync::Arc<dyn crate::agent::stop_fence::DeliveryStopGate>> {
+    let db = ctx.db.as_ref().ok_or_else(|| crate::errors::AppError::Other("thin delivery needs persistent cancellation state".into()))?;
+    let session = ctx.session_id.clone().ok_or_else(|| crate::errors::AppError::Other("thin delivery needs a host session".into()))?;
+    let (objective, _) = durable_objective_identity(db, ctx).await?;
+    Ok(thin_foreground_stop_for_identity(db.clone(), session, objective, ctx.root_turn_id.clone()).await)
+}
+
+async fn load_task_delivery_scope(
+    ctx: &ExecCtx,
+    excludes: &[String],
+) -> Result<delivery::TaskDeliveryScope> {
+    let db = ctx.db.as_ref().ok_or_else(|| crate::errors::AppError::ToolArgument(
+        "TASK_OWNERSHIP_UNPROVEN: 没有持久化任务来源证明；未执行提交、推送或 PR 操作，工作区与暂存保持不变。".into(),
+    ))?;
+    let (objective_id, _) = durable_objective_identity(db, ctx).await?;
+    delivery::TaskDeliveryScope::load(db, &objective_id, &ctx.cwd, excludes)
+        .await.map_err(crate::errors::AppError::ToolArgument)
+}
+
+#[cfg(test)]
+pub(crate) async fn task_scope_thin_commit_fixture(
+    db: &sqlx::SqlitePool, objective: &str, root: &std::path::Path, scope: &delivery::TaskDeliveryScope,
+) -> Result<String> {
+    task_scope_thin_commit_args_fixture(db, objective, root, scope, &json!({"title":"fix: exact native task content"})).await
+}
+
+#[cfg(test)]
+pub(crate) async fn task_scope_thin_commit_args_fixture(
+    db: &sqlx::SqlitePool, objective: &str, root: &std::path::Path, scope: &delivery::TaskDeliveryScope, args: &Value,
+) -> Result<String> {
+    task_scope_thin_commit_bound_fixture(db, objective, root, scope, args, None).await
+}
+
+#[cfg(test)]
+pub(crate) async fn task_scope_thin_commit_bound_fixture(
+    db: &sqlx::SqlitePool, objective: &str, root: &std::path::Path, scope: &delivery::TaskDeliveryScope, args: &Value,
+    gate: Option<std::sync::Arc<dyn crate::agent::stop_fence::DeliveryStopGate>>,
+) -> Result<String> {
+    delivery_run::ensure_schema(db).await?;
+    crate::agent::stop_fence::ensure_schema(db).await?;
+    // This fixture is initialized through storage::db::connect. Validate the
+    // local admission/recovery field contract before any hook can run.
+    for statement in [
+        "SELECT id,cwd,release_urgency FROM sessions LIMIT 0",
+        "SELECT root_turn_id,session_id,objective_id,task_segment_id,revision FROM chat_turn_state LIMIT 0",
+        "SELECT id,session_id,root_turn_id,revision,status,delivery_run_id,failure_code,next_observation_at,remediation_id FROM objectives LIMIT 0",
+        "SELECT objective_id,session_id,worktree_path,repo_identity,worktree_identity,base_sha,head_sha,state FROM execution_workspaces LIMIT 0",
+        "SELECT id,objective_id,run_kind,session_id,task_id,workspace_path,worktree_identity,repo_identity,base_branch,head_branch,change_set_digest,expected_head_sha,requested_ceiling,claim_epoch,reconciled_claim_epoch,lease_owner,lease_expires_at,next_action_authorized FROM delivery_runs LIMIT 0",
+        "SELECT intent_id,run_id,claim_epoch,rung,operation_key,status,process_instance,evidence_json,started_at,updated_at FROM delivery_mutation_intents LIMIT 0",
+    ] { sqlx::query(statement).execute(db).await?; }
+    let (session, turn): (Option<String>, Option<String>) = sqlx::query_as("SELECT session_id, root_turn_id FROM objectives WHERE id=?")
+        .bind(objective).fetch_one(db).await?;
+    let mut ctx = ExecCtx::new(root.to_path_buf(), Some(db.clone()));
+    ctx.session_id = session;
+    ctx.root_turn_id = turn;
+    let gate = match gate { Some(gate) => gate, None => thin_stop_gate(&ctx).await? };
+    thin_commit::prepare(args, &ctx, scope, &[], gate).await?
+        .ok_or_else(|| crate::errors::AppError::Other("fixture expected a dirty commit".into()))
+}
+
+#[cfg(test)]
+pub(crate) async fn task_scope_thin_recover_fixture(db: &sqlx::SqlitePool) -> Result<()> {
+    let now = chrono::Utc::now().timestamp_millis();
+    sqlx::query("UPDATE delivery_runs SET lease_expires_at=? WHERE run_kind='thin_local_commit' AND status<>'completed'")
+        .bind(now - 1).execute(db).await?;
+    let process = ProcessIdentity::new("thin-recovery-fixture", "test", "test");
+    let plan = delivery_run::plan_startup_recovery(db, &process, now, DELIVERY_LEASE_TTL_MS).await?;
+    if plan.claimed.is_empty() { return Err(crate::errors::AppError::Other("no thin local recovery was claimed".into())); }
+    for claimed in plan.claimed {
+        resume_claimed_delivery(db.clone(), crate::config::settings::Settings::default(), claimed, process.clone()).await?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+pub(crate) fn task_scope_thin_stage_fixture(
+    cwd: &std::path::Path, scope: &delivery::TaskDeliveryScope,
+) -> std::result::Result<Vec<String>, String> {
+    super::delivery_thin::task_scope_stage_fixture(cwd, scope)
+}
+
+#[cfg(test)]
+pub(crate) fn task_scope_thin_native_fixture(
+    cwd: &std::path::Path, scope: &delivery::TaskDeliveryScope, args: &[&str],
+) -> std::result::Result<String, String> {
+    super::delivery_thin::task_scope_native_fixture(cwd, scope, args)
+}
+
 #[cfg(test)]
 pub(crate) fn m232_deliver_fixture(cwd: &std::path::Path) -> Value {
     super::delivery_thin::m232_deliver_fixture(cwd)
@@ -214,6 +316,7 @@ async fn execute_inner(args: Value, ctx: &ExecCtx) -> Result<ToolOutput> {
             .map(String::from),
         expected_identity: None,
         mutation_permit: None,
+        task_scope: None,
         release_force: args
             .get("release_force")
             .and_then(Value::as_bool)
@@ -268,13 +371,25 @@ async fn execute_inner(args: Value, ctx: &ExecCtx) -> Result<ToolOutput> {
         knowledge_library_ids: ctx.knowledge_library_ids.clone(), settings: ctx.settings.clone(),
     };
     let ctx = &routed;
-
     if let (Some(db), Some(session_id)) = (&ctx.db, &ctx.session_id) {
         if crate::agent::thin::is_thin(db, session_id).await {
             // Thin tasks finish the session-authorized delivery, even when a
             // model accidentally asks to stop at an earlier checkpoint.
             let ceiling = settings.delivery_ceiling;
-            return super::delivery_thin::execute(&args, ctx, ceiling, &settings.delivery_exclude_globs).await;
+            // Capture foreground identity once for this invocation: neither
+            // local hooks nor the remote phase may borrow a replacement run.
+            let stop_gate = thin_stop_gate(ctx).await?;
+            // Host ownership precedes both local and remote mutation adapters.
+            opts.task_scope = Some(load_task_delivery_scope(ctx, &opts.extra_excludes).await?);
+            let installed_head = if ceiling == DeliveryCeiling::Off { None } else {
+                thin_commit::prepare(&args, ctx, opts.task_scope.as_ref().expect("host scope retained"), &opts.extra_excludes, stop_gate.clone()).await?
+            };
+            return super::delivery_thin::execute(
+                &args, ctx, ceiling, &settings.delivery_exclude_globs,
+                opts.task_scope.as_ref().ok_or_else(|| crate::errors::AppError::Other(
+                    "TASK_OWNERSHIP_UNPROVEN: host scope was not retained".into()))?,
+                installed_head, stop_gate,
+            ).await;
         }
     }
 
@@ -349,6 +464,10 @@ async fn execute_inner(args: Value, ctx: &ExecCtx) -> Result<ToolOutput> {
         await_delivery_with_lease_heartbeat(db, run,
             reconcile_foreground_claim(db, run, remote.as_ref())).await??;
     }
+    // OWN-R1/R5: preserve read-only/durable receipt reconciliation above, then
+    // derive a fresh host proof before any new delivery mutation. Tool arguments
+    // cannot supply this scope or turn an unknown file into task-owned content.
+    opts.task_scope = Some(load_task_delivery_scope(ctx, &opts.extra_excludes).await?);
 
     loop {
         let delivery_future = delivery::deliver(
@@ -1224,6 +1343,17 @@ async fn prepare_durable_run(
     configured_ceiling: DeliveryCeiling,
     requested_ceiling: Option<DeliveryCeiling>,
 ) -> Result<Option<PreparedDurableRun>> {
+    prepare_durable_run_for_kind(args, ctx, configured_ceiling, requested_ceiling, "deliver_changes", None).await
+}
+
+async fn prepare_durable_run_for_kind(
+    args: &Value,
+    ctx: &ExecCtx,
+    configured_ceiling: DeliveryCeiling,
+    requested_ceiling: Option<DeliveryCeiling>,
+    run_kind: &str,
+    local_target_tree: Option<&str>,
+) -> Result<Option<PreparedDurableRun>> {
     let Some(db) = ctx.db.as_ref() else {
         return Ok(None);
     };
@@ -1254,7 +1384,11 @@ async fn prepare_durable_run(
     let expected_head_sha = identity.head_sha;
     let change_set_digest = identity.change_set_digest;
     let worktree_identity = identity.worktree_identity;
-    let id = durable_run_id(&objective_id, &repo_identity);
+    let base_id = durable_run_id(&objective_id, &repo_identity);
+    let id = if run_kind == "thin_local_commit" {
+        let tree = local_target_tree.ok_or_else(|| crate::errors::AppError::Other("thin local generation lacks frozen target".into()))?;
+        delivery::external_operation_key("thin_local_commit_generation", &[&base_id, &expected_head_sha, &change_set_digest, tree])
+    } else { base_id };
     let process = foreground_delivery_process_identity();
     let (selected_ceiling, _) = {
         delivery_run::ensure_schema(db).await?;
@@ -1278,7 +1412,7 @@ async fn prepare_durable_run(
     let run = NewDeliveryRun {
         id: id.clone(),
         objective_id,
-        run_kind: "deliver_changes".into(),
+        run_kind: run_kind.into(),
         session_id: ctx.session_id.clone(),
         root_turn_id: ctx.root_turn_id.clone(),
         task_segment_id,
@@ -2963,6 +3097,11 @@ async fn resume_claimed_delivery_with_remote<R: delivery::DeliveryRemote>(
     if !should_resume_claimed_delivery(&claimed) {
         return Ok(());
     }
+    let run_kind: String = sqlx::query_scalar("SELECT run_kind FROM delivery_runs WHERE id=?")
+        .bind(&claimed.run_id).fetch_one(&db).await?;
+    if run_kind == "thin_local_commit" {
+        return thin_commit::recover(&db, &mut claimed, &process).await;
+    }
     // CF-TRUTH-R7/R8/R9: remote truth precedes every local replay check.
     // Observing a merge grants settlement authority, never mutation authority.
     if let Some(number) = claimed.canonical_pr_number {
@@ -3373,6 +3512,9 @@ async fn resume_claimed_delivery_with_remote<R: delivery::DeliveryRemote>(
         },
     ));
     loop {
+        opts.task_scope = Some(delivery::TaskDeliveryScope::load(
+            &db, &claimed.objective_id, &cwd, &opts.extra_excludes,
+        ).await.map_err(crate::errors::AppError::Other)?);
         let delivery_future = delivery::deliver(
             &cwd,
             requested_ceiling,
@@ -6787,45 +6929,29 @@ mod tests {
 
     #[tokio::test]
     async fn post_commit_pre_persist_crash_reconciles_the_exact_receipted_head_once() {
-        let (fixture_root, worktree) = local_commit_recovery_repo();
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .unwrap();
+        // Exercise the original persistence-gap recovery with real host-derived
+        // write/edit provenance, rather than an unowned raw filesystem edit.
+        let (pool, fixture_root, worktree, objective_id) =
+            delivery::r2_native_delivery_fixture(false).await;
         delivery_run::ensure_schema(&pool).await.unwrap();
         sqlx::query(
-            "CREATE TABLE objectives (
-                id TEXT PRIMARY KEY,
-                delivery_run_id TEXT,
-                status TEXT NOT NULL,
-                failure_code TEXT,
-                recovery_owner TEXT,
-                remediation_id TEXT,
-                next_observation_at INTEGER,
-                requires_user_action INTEGER NOT NULL DEFAULT 0,
-                updated_at INTEGER NOT NULL
-            )",
+            "UPDATE objectives SET delivery_run_id='post-commit-crash-run', status='active' WHERE id=?",
         )
+        .bind(&objective_id)
         .execute(&pool)
         .await
         .unwrap();
-        sqlx::query(
-            "INSERT INTO objectives (id, delivery_run_id, status, updated_at)
-             VALUES ('objective-opaque-post-commit-crash',
-                     'post-commit-crash-run', 'active', 0)",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
+        let branch = recovery_git(&worktree, &["branch", "--show-current"]);
+        let task_scope = delivery::TaskDeliveryScope::load(&pool, &objective_id, &worktree, &[])
+            .await.unwrap();
         let (repo, _) =
-            delivery::resolve_delivery_repo(&worktree, Some("main"), Some("fix/local-recovery"))
+            delivery::resolve_delivery_repo(&worktree, Some("main"), Some(&branch))
                 .unwrap();
         let before = delivery::capture_delivery_identity(&repo).unwrap();
         let owner = ProcessIdentity::new("owner-before-crash", "test", "test");
         let run = NewDeliveryRun {
             id: "post-commit-crash-run".into(),
-            objective_id: "objective-opaque-post-commit-crash".into(),
+            objective_id: objective_id.clone(),
             run_kind: "deliver_changes".into(),
             session_id: Some("session".into()),
             root_turn_id: Some("turn".into()),
@@ -6835,7 +6961,7 @@ mod tests {
             worktree_identity: before.worktree_identity.clone(),
             repo_identity: before.repo_identity.clone(),
             base_branch: "main".into(),
-            head_branch: "fix/local-recovery".into(),
+            head_branch: branch.clone(),
             change_set_digest: before.change_set_digest.clone(),
             expected_head_sha: before.head_sha.clone(),
             canonical_pr_number: None,
@@ -6874,7 +7000,8 @@ mod tests {
             &DeliverOpts {
                 title: Some("fix: local commit recovery".into()),
                 requested_ceiling: Some(DeliveryCeiling::PrOnly),
-                expect_branch: Some("fix/local-recovery".into()),
+                expect_branch: Some(branch.clone()),
+                task_scope: Some(task_scope),
                 expected_identity: Some(before.clone()),
                 mutation_permit: Some(prepared.mutation_permit(&pool)),
                 ..DeliverOpts::default()
@@ -6985,7 +7112,7 @@ mod tests {
         );
         assert_eq!(recovery_git(&worktree, &["rev-parse", "HEAD"]), committed_head);
         assert_eq!(std::fs::read_to_string(worktree.join("recovery.txt")).unwrap(), "follow-up after restart\n");
-        std::fs::remove_dir_all(fixture_root).ok();
+        drop(fixture_root);
     }
 
     #[tokio::test]
@@ -8247,6 +8374,25 @@ mod tests {
             Some(DeliveryCeiling::PrOnly)).await.unwrap();
         assert_eq!(new_ceiling, DeliveryCeiling::PrOnly);
         assert!(note.is_none());
+    }
+
+    #[tokio::test]
+    async fn task_ownership_tool_arguments_cannot_replace_host_proof() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("t1.py"), "unrelated\n").unwrap();
+        let mut ctx = ExecCtx::new(dir.path().into(), None);
+        let mut settings = crate::config::settings::Settings::default();
+        settings.delivery_ceiling = DeliveryCeiling::PrOnly;
+        ctx.settings = Some(settings);
+        let output = execute(json!({
+            "ceiling":"pr_only", "title":"fix: synthetic task", "body":"Synthetic",
+            "task_scope":{"paths":["t1.py"],"verified":true},
+            "owned_paths":["t1.py"]
+        }), &ctx).await.unwrap();
+        assert!(output.is_error);
+        assert!(output.content.contains("TASK_OWNERSHIP_UNPROVEN"), "{}", output.content);
+        assert_eq!(std::fs::read_to_string(dir.path().join("t1.py")).unwrap(), "unrelated\n");
+        assert!(!dir.path().join(".git").exists());
     }
 
     #[tokio::test]
