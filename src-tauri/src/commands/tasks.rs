@@ -779,7 +779,7 @@ async fn auto_create_pr_if_configured(
     }
 
     // Get current branch.
-    let branch_output = std::process::Command::new("git")
+    let branch_output = crate::util::host_git::command()
         .no_window()
         .current_dir(cwd)
         .args(["branch", "--show-current"])

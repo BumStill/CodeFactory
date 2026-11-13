@@ -13,22 +13,94 @@
 //! - R6：门禁绕过命令（`--no-verify`、`CODEFACTORY_SKIP_SYNC_GATE`、改 `core.hooksPath`）
 //!   直接拒绝并给修复指引，不进审批。
 //!
-//! 阶段 1 的已知边界：只要 `NetworkPolicy::Enabled` 就允许联网（R4）；本模块尚未接入 bash 工具
-//! 的前台/后台启动点，接入工作单独进行（见 Implementation Notes）。
+//! 网络策略分三档：`Disabled`、`RegistryProxy`（自动放行命令只连宿主出口代理与回环）、
+//! `Full`（用户已批准的命令）。配置文件、mach 服务和启动器程序的收紧始终写在策略里。
 
 use std::path::{Path, PathBuf};
 
 /// Seatbelt 运行时在 macOS 上的固定路径。
 pub const MACOS_SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
 
-/// 阶段 1：网络策略（R4 只记录边界，不声称已隔离）。
+/// 网络策略。自动放行命令用 [`RegistryProxy`]；用户批准后的命令用 [`Full`]。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NetworkPolicy {
-    /// 允许联网（git fetch / cargo / pnpm 需要）。
-    Enabled,
     /// 拒绝联网。
     Disabled,
+    /// 只允许连到宿主出口代理端口，以及本机回环（测试里的本地服务）。
+    RegistryProxy { port: u16 },
+    /// 用户已批准的命令：网络不再由代理白名单限制。凭据仍不注入子进程。
+    Full,
 }
+
+/// 调用方按本次会话填入的额外拒绝项。路径可以尚不存在，策略仍写字面量。
+#[derive(Clone, Debug, Default)]
+pub struct SandboxConstraints {
+    /// `file-read*` 拒绝（目录用 subpath，文件同时写 literal）。
+    pub read_deny: Vec<PathBuf>,
+    /// dispatch 目录。`require_dispatch_deny` 为真且这里为空，或路径不是绝对路径时，构建失败。
+    pub dispatch_dirs: Vec<PathBuf>,
+    pub require_dispatch_deny: bool,
+    /// 需要拒绝 `network-outbound` 的本机套接字。
+    pub socket_paths: Vec<PathBuf>,
+    /// 即便在回环上也不许连接的宿主持有端口（例如浏览器桥）。
+    pub denied_loopback_ports: Vec<u16>,
+}
+
+/// mach-lookup 显式白名单。每一项都是工具链要能工作所必需的系统服务。
+/// 不在此列：LaunchServices / AppleEvents、launchd 作业提交、钥匙串 / SecurityServer、剪贴板。
+const MACH_LOOKUP_ALLOW: &[(&str, &str)] = &[
+    ("com.apple.system.logger", "系统日志"),
+    ("com.apple.logd", "统一日志"),
+    ("com.apple.syslogd", "syslog"),
+    ("com.apple.cfprefsd.agent", "用户偏好，工具链启动会读"),
+    ("com.apple.cfprefsd.daemon", "系统偏好"),
+    ("com.apple.distributed_notifications@Uv3", "进程内通知"),
+    ("com.apple.distributed_notifications@1v3", "进程内通知（另一代）"),
+    ("com.apple.CoreServices.coreservicesd", "文件元数据与目录服务，不是启动服务"),
+    ("com.apple.system.DirectoryService.libinfo_v1", "用户与组解析"),
+    ("com.apple.system.DirectoryService.membership_v1", "组成员解析"),
+    ("com.apple.bsd.dirhelper", "临时目录协助"),
+    ("com.apple.mDNSResponder", "DNS 解析"),
+    ("com.apple.mDNSResponder.reconfirm", "DNS 重新确认"),
+    ("com.apple.SystemConfiguration.configd", "网络配置只读查询"),
+    ("com.apple.SystemConfiguration.DNSConfiguration", "DNS 配置"),
+    ("com.apple.trustd", "证书信任评估"),
+    ("com.apple.trustd.agent", "证书信任评估（用户代理）"),
+    ("com.apple.ocspd", "证书吊销检查"),
+    ("com.apple.security.syspolicy", "Gatekeeper 策略查询，不读取钥匙串"),
+    ("com.apple.fonts", "字体枚举"),
+    ("com.apple.FontObjectsServer", "字体对象"),
+    ("com.apple.fontserver", "字体服务"),
+    ("com.apple.coreservices.quarantine-resolver", "下载隔离属性"),
+    ("com.apple.tccd", "隐私权限查询"),
+    ("com.apple.tccd.system", "系统隐私权限查询"),
+    ("com.apple.hiservices-xpcservice", "区域与输入法服务"),
+    ("com.apple.FSEvents", "测试运行器的文件监视"),
+    ("com.apple.fseventsd", "文件监视守护进程"),
+    ("com.apple.DiskArbitration.diskarbitrationd", "磁盘描述，构建工具会查询"),
+    ("com.apple.audio.coreaudiod", "部分运行时初始化会查询音频"),
+    ("com.apple.audio.AudioComponentRegistrar", "音频组件枚举"),
+    ("com.apple.MobileFileIntegrity", "代码签名查询"),
+    ("com.apple.cs.CodeSigningHelper", "代码签名查询"),
+    ("com.apple.networkd", "网络状态只读查询"),
+];
+
+/// 纵深防御：这些启动器即使用户命令写出来也不能被沙箱执行。不能代替 mach 白名单。
+const LAUNCHER_DENY: &[&str] = &["/usr/bin/open", "/usr/bin/osascript", "/bin/launchctl"];
+
+/// 这些 mach 服务名不得出现在白名单里。测试用它锁住边界。
+pub const MACH_LOOKUP_FORBIDDEN: &[&str] = &[
+    "com.apple.SecurityServer",
+    "com.apple.securityd",
+    "com.apple.coreservices.launchservicesd",
+    "com.apple.lsd.mapdb",
+    "com.apple.lsd.modifydb",
+    "com.apple.coreservices.appleevents",
+    "com.apple.AEServer",
+    "com.apple.pasteboard.1",
+    "com.apple.pboard",
+    "com.apple.xpc.launchd",
+];
 
 /// 一条写入白名单条目：整棵子树或单个文件（literal）。
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -90,6 +162,7 @@ impl CommandSandbox {
         writable: Vec<WritablePath>,
         blocked: Vec<WritablePath>,
         network: NetworkPolicy,
+        constraints: SandboxConstraints,
     ) -> Result<Self, String> {
         if !workspace.is_absolute() {
             return Err(format!(
@@ -107,11 +180,13 @@ impl CommandSandbox {
         for entry in blocked {
             canonical_blocked.push(canonical_entry(&entry.path, entry.recursive)?);
         }
+        let constraints = normalize_constraints(constraints)?;
         let profile = build_profile(
             &canonical_workspace,
             &canonical_writable,
             &canonical_blocked,
             network,
+            &constraints,
         );
         Ok(Self {
             workspace: canonical_workspace,
@@ -171,8 +246,23 @@ impl CommandSandbox {
         // macOS reports denied writes (shell, Git, Python) as EPERM;
         // sandbox-exec also uses this diagnostic when sandbox_apply fails.
         // Do not classify generic EACCES/Permission denied as Seatbelt evidence.
+        if stderr.contains("出口代理拒绝") {
+            return format!(
+                "出口代理拒绝了这次连接：自动放行的命令只能访问软件源白名单。\
+                 读取远端请使用 sync_remote；推送、标签、合并或发布请使用 deliver_changes。\
+                 本会话工作区仍是 {}。",
+                self.workspace.display()
+            );
+        }
         if !stderr.contains("Operation not permitted") {
             return String::new();
+        }
+        if stderr.to_ascii_lowercase().contains("network") {
+            return format!(
+                "沙箱拦截：这条命令的网络超出了自动放行范围（只允许经宿主出口代理访问软件源，以及本机回环）。\
+                 读取远端请使用 sync_remote；推送或发布请使用 deliver_changes。工作区 {}。",
+                self.workspace.display()
+            );
         }
         let workspace = self.workspace.display();
         match denied_path(stderr) {
@@ -402,18 +492,69 @@ fn escape(value: &str) -> String {
     out
 }
 
+fn normalize_constraints(constraints: SandboxConstraints) -> Result<SandboxConstraints, String> {
+    if constraints.require_dispatch_deny && constraints.dispatch_dirs.is_empty() {
+        return Err(
+            "沙箱策略无法确定 dispatch 目录，已拒绝生成放宽后的策略（fail-closed）".into(),
+        );
+    }
+    let mut dispatch_dirs = Vec::with_capacity(constraints.dispatch_dirs.len());
+    for path in &constraints.dispatch_dirs {
+        dispatch_dirs.push(literal_rule_path(path, "dispatch 目录")?);
+    }
+    let mut read_deny = Vec::with_capacity(constraints.read_deny.len());
+    for path in &constraints.read_deny {
+        read_deny.push(literal_rule_path(path, "读拒绝路径")?);
+    }
+    let mut socket_paths = Vec::with_capacity(constraints.socket_paths.len());
+    for path in &constraints.socket_paths {
+        socket_paths.push(literal_rule_path(path, "套接字路径")?);
+    }
+    Ok(SandboxConstraints {
+        read_deny,
+        dispatch_dirs,
+        require_dispatch_deny: constraints.require_dispatch_deny,
+        socket_paths,
+        denied_loopback_ports: constraints.denied_loopback_ports,
+    })
+}
+
+/// 存在则规范化；不存在但已是绝对路径则保留字面量。相对路径无法写成稳定规则，直接失败。
+fn literal_rule_path(path: &Path, label: &str) -> Result<PathBuf, String> {
+    if !path.is_absolute() {
+        return Err(format!(
+            "沙箱策略无法规范化{label}（{} 不是绝对路径）；策略生成失败即 fail-closed",
+            path.display()
+        ));
+    }
+    if path.exists() {
+        return canonical(path).map_err(|error| format!("{label}：{error}"));
+    }
+    Ok(path.to_path_buf())
+}
+
 fn build_profile(
     workspace: &Path,
     writable: &[WritablePath],
     blocked: &[WritablePath],
     network: NetworkPolicy,
+    constraints: &SandboxConstraints,
 ) -> String {
     let mut profile = String::new();
     profile.push_str("(version 1)\n");
     profile.push_str("(deny default)\n");
     profile.push_str("(allow process*)\n");
+    for launcher in LAUNCHER_DENY {
+        profile.push_str(&format!(
+            "(deny process-exec (literal \"{launcher}\"))\n"
+        ));
+    }
     profile.push_str("(allow sysctl-read)\n");
-    profile.push_str("(allow mach-lookup)\n");
+    profile.push_str("(allow mach-lookup\n");
+    for (name, _reason) in MACH_LOOKUP_ALLOW {
+        profile.push_str(&format!("    (global-name \"{name}\")\n"));
+    }
+    profile.push_str(")\n");
     // 构建/测试工具会结束自己的子进程（vitest worker、cargo 子任务），也会用
     // POSIX 信号量做 worker 协调。信号只放行到**同一沙箱内**的目标：子进程继承
     // 沙箱，所以够用；而同一用户下沙箱外的进程（编辑器、其它会话、系统服务）
@@ -421,6 +562,9 @@ fn build_profile(
     // 外进程，两者都不可接受。
     profile.push_str("(allow signal (target same-sandbox))\n");
     profile.push_str("(allow ipc-posix-sem)\n");
+    // clang/cc 在编译期用 POSIX 共享内存做临时缓冲。只放行这一类 IPC，
+    // 不放行 LaunchServices（lsd.mapdb）那条逃逸面。
+    profile.push_str("(allow ipc-posix-shm)\n");
     profile.push_str("(allow file-read*)\n");
     profile.push_str("(deny file-write*)\n");
     // R3：白名单先写"登记工作区"，再写调用方显式登记的支撑路径；写在 deny 之后才生效。
@@ -442,8 +586,46 @@ fn build_profile(
             profile.push_str(&format!("(deny file-write* (subpath \"{literal}\"))\n"));
         }
     }
-    if network == NetworkPolicy::Enabled {
-        profile.push_str("(allow network*)\n");
+    // 读拒绝写在写白名单之后：Seatbelt 后匹配者生效，这些路径即使落在某个写规则附近也不可读。
+    for path in constraints
+        .read_deny
+        .iter()
+        .chain(constraints.dispatch_dirs.iter())
+    {
+        let literal = escape(&path.to_string_lossy());
+        profile.push_str(&format!("(deny file-read* (literal \"{literal}\"))\n"));
+        profile.push_str(&format!("(deny file-read* (subpath \"{literal}\"))\n"));
+    }
+    match network {
+        NetworkPolicy::Disabled => {}
+        NetworkPolicy::Full => profile.push_str("(allow network*)\n"),
+        NetworkPolicy::RegistryProxy { port } => {
+            // 先拒绝全部网络，再放行回环，最后按端口和套接字收紧。后写的规则覆盖先写的规则。
+            // sandbox-exec 的 ip/tcp 主机只接受 `*` 或 `localhost`。写 `127.0.0.1` 会在
+            // 加载配置时直接失败（host must be * or localhost），命令根本进不了沙箱。
+            // 代理绑定的 127.0.0.1 就是 localhost 这个回环名。
+            profile.push_str("(deny network*)\n");
+            profile.push_str("(allow network-bind (local ip \"localhost:*\"))\n");
+            profile.push_str("(allow network-inbound (local ip \"localhost:*\"))\n");
+            profile.push_str("(allow network-outbound (remote ip \"localhost:*\"))\n");
+            profile.push_str(&format!(
+                "(allow network-outbound (remote tcp \"localhost:{port}\"))\n"
+            ));
+            for denied in &constraints.denied_loopback_ports {
+                profile.push_str(&format!(
+                    "(deny network-outbound (remote tcp \"localhost:{denied}\"))\n"
+                ));
+                profile.push_str(&format!(
+                    "(deny network-outbound (remote ip \"localhost:{denied}\"))\n"
+                ));
+            }
+            for socket in &constraints.socket_paths {
+                let literal = escape(&socket.to_string_lossy());
+                profile.push_str(&format!(
+                    "(deny network-outbound (remote unix-socket (path-literal \"{literal}\")))\n"
+                ));
+            }
+        }
     }
     profile
 }
@@ -546,11 +728,38 @@ mod tests {
     }
 
     #[test]
+    fn registry_proxy_profile_names_localhost_and_not_a_numeric_address() {
+        let mut constraints = SandboxConstraints::default();
+        constraints.denied_loopback_ports.push(1);
+        let profile = build_profile(
+            Path::new("/private/var/ws"),
+            &[],
+            &[],
+            NetworkPolicy::RegistryProxy { port: 9 },
+            &constraints,
+        );
+        assert!(!profile.contains("127.0.0.1"), "{profile}");
+        assert!(profile.contains("(allow network-outbound (remote ip \"localhost:*\"))"));
+        assert!(profile.contains("(allow network-outbound (remote tcp \"localhost:9\"))"));
+        assert!(profile.contains("(deny network-outbound (remote tcp \"localhost:1\"))"));
+    }
+
+    #[test]
     fn profile_keeps_writes_denied_by_default() {
-        let profile = build_profile(Path::new("/private/var/ws"), &[], &[], NetworkPolicy::Enabled);
+        let profile = build_profile(
+            Path::new("/private/var/ws"),
+            &[],
+            &[],
+            NetworkPolicy::Full,
+            &SandboxConstraints::default(),
+        );
         assert!(profile.contains("(deny file-write*)"));
         assert!(profile.contains("(allow file-write* (subpath \"/private/var/ws\"))"));
         assert!(profile.contains("(allow network*)"));
+        assert!(profile.contains("(deny process-exec (literal \"/usr/bin/open\"))"));
+        assert!(profile.contains("com.apple.trustd"));
+        assert!(!profile.contains("com.apple.SecurityServer"));
+        assert!(!profile.contains("(allow mach-lookup)\n"));
         assert!(
             profile.contains("(allow signal (target same-sandbox))"),
             "{profile}"
@@ -560,6 +769,7 @@ mod tests {
             "signal 不得无目标放行（会给同用户任意进程发信号）: {profile}"
         );
         assert!(profile.contains("(allow ipc-posix-sem)"), "{profile}");
+        assert!(profile.contains("(allow ipc-posix-shm)"), "{profile}");
     }
 
     #[test]

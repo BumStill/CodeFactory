@@ -3260,7 +3260,7 @@ mod tests {
 
     fn init_local_git_repo(path: &std::path::Path) {
         let run = |args: &[&str]| {
-            let output = std::process::Command::new("git")
+            let output = crate::util::host_git::command()
                 .no_window()
                 .args(args)
                 .current_dir(path)
@@ -5412,7 +5412,7 @@ mod tests {
             let source = temp.path().join("source");
             std::fs::create_dir_all(&source).unwrap();
             let run = |args: &[&str]| {
-                let output = std::process::Command::new("git")
+                let output = crate::util::host_git::command()
                     .no_window()
                     .args(args)
                     .current_dir(&source)

@@ -72,12 +72,27 @@ pub enum SandboxMode {
     Docker,
 }
 
+/// Docker 沙箱的网络。默认不联网；`bridge` 由用户在设置里显式打开。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SandboxNetwork {
+    #[default]
+    None,
+    Bridge,
+}
+
 fn default_trusted_command_sandbox() -> bool {
     true
 }
 
+pub const DEFAULT_SANDBOX_IMAGE: &str = "ubuntu:24.04@sha256:2198e4c65076e9cb0b3d695219df667c0e3b0072da64ca3c2648aca17dcecaf5";
+
 fn default_sandbox_image() -> String {
-    "ubuntu:24.04".to_string()
+    DEFAULT_SANDBOX_IMAGE.to_string()
+}
+
+fn default_sandbox_network() -> SandboxNetwork {
+    SandboxNetwork::None
 }
 
 fn default_model_policy() -> String {
@@ -163,6 +178,18 @@ pub struct Settings {
     /// Container image used when `sandbox_mode` is `Docker`.
     #[serde(default = "default_sandbox_image")]
     pub sandbox_image: String,
+    /// Docker 沙箱网络。默认 `none`。
+    #[serde(default = "default_sandbox_network")]
+    pub sandbox_network: SandboxNetwork,
+    /// 额外允许自动放行命令访问的注册表主机。forge 主机不应放在这里。
+    #[serde(default)]
+    pub sandbox_registry_hosts: Vec<String>,
+    /// 允许本地任务入口批准请求、切换到信任模式、授予交付权限。默认关闭，且只能在界面里改。
+    #[serde(default)]
+    pub dispatch_privileged_ops: bool,
+    /// 在本机保存一份未加密的密钥副本，用于钥匙串反复不可用的环境。默认关闭。
+    #[serde(default)]
+    pub macos_plaintext_key_fallback: bool,
     /// M224/R9：信任模式的系统沙箱（macOS Seatbelt）。默认开启，这是唯一的回退开关。
     /// 关闭后信任模式回到 M224 之前的文字证明审批路径，不会变成"无边界直接执行"。
     #[serde(default = "default_trusted_command_sandbox")]
@@ -851,6 +878,10 @@ impl Default for Settings {
             im_webhook_format: ImWebhookFormat::Wecom,
             sandbox_mode: SandboxMode::Off,
             sandbox_image: default_sandbox_image(),
+            sandbox_network: SandboxNetwork::None,
+            sandbox_registry_hosts: Vec::new(),
+            dispatch_privileged_ops: false,
+            macos_plaintext_key_fallback: false,
             trusted_command_sandbox: default_trusted_command_sandbox(),
             delivery_ceiling_explicit: false,
             delivery_merge_method: MergeMethod::Squash,
@@ -1396,6 +1427,9 @@ pub fn load() -> Settings {
         }
     }
 
+    if settings.sandbox_image == "ubuntu:24.04" {
+        settings.sandbox_image = default_sandbox_image();
+    }
     settings
 }
 

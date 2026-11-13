@@ -8020,7 +8020,7 @@ fn workspace_changes(
     use std::process::Command;
 
     let mut changes = Vec::new();
-    let mut numstat = Command::new("git").no_window();
+    let mut numstat = crate::util::host_git::command().no_window();
     numstat
         .arg("-C")
         .arg(root)
@@ -8046,7 +8046,7 @@ fn workspace_changes(
             }
         }
     }
-    let mut untracked = Command::new("git").no_window();
+    let mut untracked = crate::util::host_git::command().no_window();
     untracked
         .arg("-C")
         .arg(root)
@@ -8077,7 +8077,7 @@ fn workspace_changes(
 /// claim is only ever made on positive evidence.
 pub(crate) fn workspace_git_count(root: &std::path::Path, revision: &str, unpushed: bool) -> Option<i64> {
     use crate::util::no_window::NoWindow;
-    let mut command = std::process::Command::new("git").no_window();
+    let mut command = crate::util::host_git::command().no_window();
     command.arg("-C").arg(root).args(["rev-list", "--count", revision]);
     if unpushed {
         command.args(["--not", "--remotes"]);
@@ -8092,7 +8092,7 @@ pub(crate) fn workspace_git_count(root: &std::path::Path, revision: &str, unpush
 /// report must never invent that answer.
 pub(crate) fn workspace_uncommitted_count(root: &std::path::Path) -> Option<i64> {
     use crate::util::no_window::NoWindow;
-    let output = std::process::Command::new("git")
+    let output = crate::util::host_git::command()
         .no_window()
         .arg("-C")
         .arg(root)
@@ -8117,7 +8117,7 @@ pub(crate) fn workspace_latest_unpushed_subject(
     revision: &str,
 ) -> Option<String> {
     use crate::util::no_window::NoWindow;
-    let output = std::process::Command::new("git")
+    let output = crate::util::host_git::command()
         .no_window()
         .arg("-C")
         .arg(root)
@@ -8137,7 +8137,7 @@ fn workspace_commits_ahead(root: &std::path::Path, base_sha: &str) -> i64 {
     if base_sha.trim().is_empty() || !root.is_dir() {
         return 0;
     }
-    let output = Command::new("git")
+    let output = crate::util::host_git::command()
         .no_window()
         .arg("-C")
         .arg(root)
@@ -8468,7 +8468,7 @@ pub(crate) fn pending_delivery_local_work(
 ) -> Option<String> {
     use crate::util::no_window::NoWindow;
     let git = |args: &[&str]| -> Option<String> {
-        let output = std::process::Command::new("git")
+        let output = crate::util::host_git::command()
             .no_window()
             .current_dir(worktree)
             .args(args)
@@ -12296,7 +12296,7 @@ CREATE TABLE objectives (
         std::fs::create_dir_all(&root).unwrap();
         use crate::util::no_window::NoWindow;
         let git = |args: &[&str]| {
-            assert!(std::process::Command::new("git").no_window().current_dir(&root)
+            assert!(crate::util::host_git::command().no_window().current_dir(&root)
                 .args(args).output().unwrap().status.success());
         };
         git(&["init", "--initial-branch=main"]);
@@ -18420,7 +18420,7 @@ mod m104_ci_wake_tests {
 
     fn m109_git(cwd: &std::path::Path, args: &[&str]) -> String {
         use crate::util::no_window::NoWindow;
-        let output = std::process::Command::new("git")
+        let output = crate::util::host_git::command()
             .no_window()
             .current_dir(cwd)
             .args(args)

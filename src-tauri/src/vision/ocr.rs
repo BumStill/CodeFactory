@@ -215,41 +215,33 @@ for case let observation as VNRecognizedTextObservation in request.results ?? []
 print(lines.joined(separator: "\n"))
 "#;
 
-    fn cache_dir() -> PathBuf {
-        std::env::temp_dir().join("codefactory-vision-ocr")
-    }
-
-    /// 编译一次即可复用：源码与产物都在临时目录，不进仓库也不进用户配置。
+    /// 编译到应用私有 runtime 目录，并在每次执行前核对 SHA-256。不再用 mtime 决定复用。
     async fn shim_binary() -> Result<PathBuf, String> {
-        let dir = cache_dir();
-        std::fs::create_dir_all(&dir).map_err(|error| format!("SHIM_DIR: {error}"))?;
-        let source = dir.join("vision-ocr.swift");
-        let binary = dir.join("vision-ocr");
-        let needs_build = match (std::fs::metadata(&binary), std::fs::metadata(&source)) {
-            (Ok(bin), Ok(src)) => match (bin.modified(), src.modified()) {
-                (Ok(bin_time), Ok(src_time)) => bin_time < src_time,
-                _ => !binary.exists(),
-            },
-            _ => true,
-        };
-        if needs_build {
-            std::fs::write(&source, SHIM).map_err(|error| format!("SHIM_WRITE: {error}"))?;
-            let output = Command::new("swiftc")
-                .no_window()
-                .arg("-O")
-                .arg("-o")
-                .arg(&binary)
-                .arg(&source)
-                .output()
-                .await
-                .map_err(|error| format!("SHIM_COMPILE_SPAWN: {error}"))?;
-            if !output.status.success() {
-                return Err(format!(
-                    "SHIM_COMPILE: {}",
-                    String::from_utf8_lossy(&output.stderr).trim()
-                ));
-            }
-        }
+        crate::runtime_manifest::cleanup_legacy_temp_cache("codefactory-vision-ocr");
+        let source = SHIM.as_bytes().to_vec();
+        let binary = tokio::task::spawn_blocking(move || {
+            crate::runtime_manifest::ensure_built("vision-ocr", &source, |source_path, destination| {
+                let output = std::process::Command::new("swiftc")
+                    .no_window()
+                    .arg("-O")
+                    .arg("-o")
+                    .arg(destination)
+                    .arg(source_path)
+                    .output()
+                    .map_err(|error| format!("SHIM_COMPILE_SPAWN: {error}"))?;
+                if output.status.success() {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "SHIM_COMPILE: {}",
+                        String::from_utf8_lossy(&output.stderr).trim()
+                    ))
+                }
+            })
+        })
+        .await
+        .map_err(|error| format!("SHIM_COMPILE_TASK: {error}"))??;
+        crate::agent::trusted_sandbox::assert_host_may_execute(&binary, std::path::Path::new("/"))?;
         Ok(binary)
     }
 

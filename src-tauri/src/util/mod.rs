@@ -3,5 +3,7 @@ pub mod command_activity;
 pub mod command_env;
 pub mod fs_cleanup;
 pub mod github_cli;
+pub mod host_git;
 pub mod no_window;
 pub mod process_tree;
+pub mod sandbox_env;

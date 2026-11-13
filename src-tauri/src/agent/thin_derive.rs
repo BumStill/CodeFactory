@@ -861,10 +861,11 @@ async fn delivery_fact_belongs_to_earlier_objective(db: &SqlitePool, session: &s
 }
 
 fn workspace_path_is_dirty(path: &std::path::Path) -> bool {
-    let mut command = std::process::Command::new("git").no_window();
-    command.current_dir(path)
+    let mut git = crate::util::host_git::command();
+    git.current_dir(path)
         .env("GIT_TERMINAL_PROMPT", "0")
         .args(["status", "--porcelain=v1", "--untracked-files=all"]);
+    let mut command = git.into_std();
     // An unreadable or timed-out worktree is not evidence of cleanliness.
     crate::agent::delivery::bounded_delivery_output(&mut command)
         .map(|output| !output.is_empty()).unwrap_or(true)
@@ -880,10 +881,11 @@ fn pending_work_in(paths: &[String]) -> bool {
         let Ok(canonical) = path.canonicalize() else { return true; };
         let path = canonical.as_path();
         if workspace_path_is_dirty(path) { return true; }
-        let mut command = std::process::Command::new("git").no_window();
-        command.current_dir(path)
+        let mut git = crate::util::host_git::command();
+        git.current_dir(path)
             .env("GIT_TERMINAL_PROMPT", "0")
             .args(["worktree", "list", "--porcelain"]);
+        let mut command = git.into_std();
         let Ok(output) = crate::agent::delivery::bounded_delivery_output(&mut command) else { return true; };
         for block in output.split("\n\n") {
             let Some(nested) = block.lines().find_map(|line| line.strip_prefix("worktree ")) else { continue };
@@ -1172,11 +1174,11 @@ const CLOSEOUT_GH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
 const CLOSEOUT_PROBE_BUDGET: std::time::Duration = std::time::Duration::from_secs(45);
 
 fn closeout_git(root: &std::path::Path, args: &[&str]) -> Result<String, String> {
-    let mut command = std::process::Command::new("git").no_window();
-    command
-        .current_dir(root)
+    let mut git = crate::util::host_git::command();
+    git.current_dir(root)
         .env("GIT_TERMINAL_PROMPT", "0")
         .args(args);
+    let mut command = git.into_std();
     crate::agent::delivery::bounded_delivery_output_with_timeout(&mut command, CLOSEOUT_GIT_TIMEOUT)
 }
 
@@ -2453,7 +2455,7 @@ mod tests {
         let repo = temp.path().join("repo");
         std::fs::create_dir_all(&repo).unwrap();
         let run = |cwd: &std::path::Path, args: &[&str]| {
-            let out = std::process::Command::new("git").no_window().current_dir(cwd).args(args).output().unwrap();
+            let out = crate::util::host_git::command().no_window().current_dir(cwd).args(args).output().unwrap();
             assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
             String::from_utf8(out.stdout).unwrap().trim().to_owned()
         };
@@ -2477,7 +2479,7 @@ mod tests {
         let refs = run(&repo, &["for-each-ref", "--format=%(refname)", "refs/codefactory/rescue/"]);
         std::fs::remove_dir_all(&outer).unwrap();
         let restored = refs.lines().any(|reference| {
-            let out = std::process::Command::new("git").no_window().current_dir(&repo)
+            let out = crate::util::host_git::command().no_window().current_dir(&repo)
                 .args(["show", &format!("{reference}:continuation.txt")]).output().unwrap();
             out.status.success() && out.stdout == b"synthetic continuation work"
         });
@@ -4819,7 +4821,7 @@ pub(crate) mod merged_settlement {
         if patch.trim().is_empty() {
             return None;
         }
-        let mut child = Command::new("git")
+        let mut child = crate::util::host_git::command()
             .no_window()
             .current_dir(cwd)
             .env("GIT_TERMINAL_PROMPT", "0")
@@ -5048,18 +5050,20 @@ pub(crate) mod merged_settlement {
     }
 
     fn remote_branch_state(repo: &Path, branch: &str) -> Option<bool> {
-        let mut command = Command::new("git").no_window();
-        command.current_dir(repo)
+        let mut git = crate::util::host_git::command_with_host_credentials();
+        git.current_dir(repo)
             .env("GIT_TERMINAL_PROMPT", "0")
             .args(["ls-remote", "--heads", "origin", branch]);
+        let mut command = git.into_std();
         crate::agent::delivery::bounded_delivery_output(&mut command).ok()
             .map(|output| !output.is_empty())
     }
 
     fn git(cwd: &Path, args: &[&str]) -> Result<String, String> {
-        let mut command = Command::new("git").no_window();
-        command.current_dir(cwd)
+        let mut git = crate::util::host_git::command();
+        git.current_dir(cwd)
             .env("GIT_TERMINAL_PROMPT", "0").args(args);
+        let mut command = git.into_std();
         crate::agent::delivery::bounded_delivery_output(&mut command)
     }
 
@@ -5972,7 +5976,7 @@ mod m210_tests {
     // ---- M259：结束原因是当场核对的事实，不是固定清单 ----
 
     fn git_in(dir: &std::path::Path, args: &[&str]) -> String {
-        let out = std::process::Command::new("git").no_window()
+        let out = crate::util::host_git::command().no_window()
             .current_dir(dir)
             .env("GIT_AUTHOR_NAME", "m259")
             .env("GIT_AUTHOR_EMAIL", "m259@example.com")

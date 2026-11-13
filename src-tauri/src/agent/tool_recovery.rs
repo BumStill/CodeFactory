@@ -1387,7 +1387,7 @@ async fn remote_delivery_digest(cwd: &Path, observer: &[String]) -> Result<Strin
 async fn workspace_git_digest(cwd: &Path) -> Result<String> {
     let cwd = cwd.to_path_buf();
     tokio::task::spawn_blocking(move || -> Result<String> {
-        let root = std::process::Command::new("git")
+        let root = crate::util::host_git::command()
             .no_window()
             .args([
                 "-C",
@@ -1400,7 +1400,7 @@ async fn workspace_git_digest(cwd: &Path) -> Result<String> {
             return tree_digest(&cwd);
         }
         let root = PathBuf::from(String::from_utf8(root.stdout)?.trim());
-        let listed = std::process::Command::new("git")
+        let listed = crate::util::host_git::command()
             .no_window()
             .args([
                 "-C",
@@ -1414,7 +1414,7 @@ async fn workspace_git_digest(cwd: &Path) -> Result<String> {
         if !listed.status.success() {
             bail!("unable to enumerate observable workspace files");
         }
-        let head = std::process::Command::new("git")
+        let head = crate::util::host_git::command()
             .no_window()
             .args([
                 "-C",
@@ -1429,7 +1429,7 @@ async fn workspace_git_digest(cwd: &Path) -> Result<String> {
         if head.status.success() {
             hasher.update(head.stdout);
         }
-        let index = std::process::Command::new("git")
+        let index = crate::util::host_git::command()
             .no_window()
             .args([
                 "-C",
@@ -1628,11 +1628,11 @@ mod tests {
     async fn m130_remote_observer_tracks_actual_git_refs() {
         let root = tempfile::tempdir().unwrap();
         let remote = root.path().join("remote.git");
-        let init = std::process::Command::new("git").no_window().args(["init", "--bare"]).arg(&remote).output().unwrap();
+        let init = crate::util::host_git::command().no_window().args(["init", "--bare"]).arg(&remote).output().unwrap();
         assert!(init.status.success());
         let observer = vec!["git".to_owned(), "ls-remote".to_owned(), remote.to_string_lossy().into_owned()];
         let before = remote_delivery_digest(root.path(), &observer).await.unwrap();
-        let commit = std::process::Command::new("git").no_window().arg("-C").arg(&remote)
+        let commit = crate::util::host_git::command().no_window().arg("-C").arg(&remote)
             .args(["-c", "user.name=Synthetic", "-c", "user.email=synthetic@example.invalid", "hash-object", "-t", "blob", "-w", "--stdin"])
             .output().unwrap();
         assert!(commit.status.success());

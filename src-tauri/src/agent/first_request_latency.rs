@@ -48,7 +48,7 @@ pub async fn measure() -> anyhow::Result<serde_json::Value> {
     let project = root.path().join("project");
     std::fs::create_dir(&project)?;
     for args in [vec!["init", "-q"], vec!["-c", "user.name=Synthetic", "-c", "user.email=synthetic@example.invalid", "commit", "--allow-empty", "-qm", "synthetic"]] {
-        ensure!(std::process::Command::new("git").no_window().args(args).current_dir(&project).status()?.success(), "fixture git failed");
+        ensure!(crate::util::host_git::command().no_window().args(args).current_dir(&project).status()?.success(), "fixture git failed");
     }
     std::fs::write(project.join("README.md"), "# Synthetic latency fixture\n")?;
     let db_url = format!("sqlite:{}", root.path().join("fixture.db").display());

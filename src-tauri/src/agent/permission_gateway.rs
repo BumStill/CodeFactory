@@ -150,6 +150,19 @@ impl PermissionGateway for DesktopPermissionGateway {
         // M245/R4, M224/R6: a bypass is a policy denial, never an approval.
         // Check before receipt replay, heredoc proof, or owned-remote allows.
         if tool_call.function.name == "bash" {
+            if let Some(command) = bash_command {
+                if codefactory_agent_loop::policy::is_delivery_command(command) {
+                    if let Some(root) = self.managed_workspace_root().await {
+                        if super::trusted_sandbox::is_enforced(&root, None) {
+                            return PermissionOutcome::Deny(PermissionDenial {
+                                content: "请使用交付工具。推送、标签、合并和发布只能经 deliver_changes 完成，沙箱内的命令不会执行。读取远端请使用 sync_remote。".into(),
+                                reason: PermissionDenialReason::PolicyDenied,
+                                duration_ms: 0,
+                            });
+                        }
+                    }
+                }
+            }
             if let Some(reason) = bash_command.and_then(crate::command_sandbox::gate_bypass) {
                 return PermissionOutcome::Deny(PermissionDenial {
                     content: reason,
@@ -175,6 +188,14 @@ impl PermissionGateway for DesktopPermissionGateway {
             return outcome;
         }
         let policy = resolve_session_permission_policy(&self.db, &self.session_id).await;
+        if tool_call.function.name == "sync_remote" {
+            if policy.full_access {
+                return PermissionOutcome::Allow;
+            }
+            return self
+                .request_permission(tool_call, args.clone(), None)
+                .await;
+        }
         if policy.full_access && tool_call.function.name == "bash" {
             if let Some(actions) = bash_command.and_then(super::trusted_git::own_remote_actions) {
                 let command = bash_command.unwrap_or_default();
@@ -839,7 +860,12 @@ impl DesktopPermissionGateway {
                         .consume_exact_allow(key, chrono::Utc::now().timestamp_millis())
                         .await
                     {
-                        Ok(true) => PermissionOutcome::Allow,
+                        Ok(true) => {
+                            if let Some(command) = bash_command {
+                                super::trusted_sandbox::note_full_network(&self.session_id, command);
+                            }
+                            PermissionOutcome::Allow
+                        }
                         Ok(false) | Err(_) => PermissionOutcome::Deny(PermissionDenial {
                             content: "The recorded permission no longer owns this exact Objective revision. No action was executed.".into(),
                             reason: PermissionDenialReason::ChannelClosed,
@@ -847,6 +873,9 @@ impl DesktopPermissionGateway {
                         }),
                     }
                 } else {
+                    if let Some(command) = bash_command {
+                        super::trusted_sandbox::note_full_network(&self.session_id, command);
+                    }
                     PermissionOutcome::Allow
                 }
             }
@@ -1350,7 +1379,7 @@ mod tests {
 
     fn m159_git(root: &std::path::Path, args: &[&str]) -> String {
         use crate::util::no_window::NoWindow;
-        let output = std::process::Command::new("git")
+        let output = crate::util::host_git::command()
             .no_window()
             .current_dir(root)
             .args(args)
@@ -1451,7 +1480,8 @@ mod tests {
             &root,
             vec![crate::command_sandbox::WritablePath::tree(&root)],
             vec![],
-            crate::command_sandbox::NetworkPolicy::Enabled,
+            crate::command_sandbox::NetworkPolicy::Full,
+            crate::command_sandbox::SandboxConstraints::default(),
         )
         .unwrap();
         let launch = sandbox.wrap("/bin/sh", &["-c".into(), script]);
@@ -1986,7 +2016,7 @@ mod tests {
         // M204-R3: a real unmerged index makes write-tree fail. This is a
         // technical backup failure, not a decision that approval can repair.
         let blob = m159_git(&root, &["rev-parse", "HEAD:tracked.txt"]);
-        let mut child = std::process::Command::new("git")
+        let mut child = crate::util::host_git::command()
             .no_window()
             .current_dir(&root)
             .args(["update-index", "--index-info"])
@@ -2804,7 +2834,7 @@ mod tests {
         let remote = dir.path().join("remote.git");
         fn git(cwd: &std::path::Path, args: &[&str]) -> String {
             use crate::util::no_window::NoWindow;
-            let output = std::process::Command::new("git")
+            let output = crate::util::host_git::command()
                 .no_window()
                 .current_dir(cwd)
                 .args(args)
@@ -3689,7 +3719,7 @@ mod tests {
             matches!(authorize(outside).await, PermissionOutcome::Deny(_)),
             "{outside}"
         );
-        let untouched = std::process::Command::new("git")
+        let untouched = crate::util::host_git::command()
             .no_window()
             .current_dir(&elsewhere)
             .args(["rev-parse", "--verify", "HEAD"])

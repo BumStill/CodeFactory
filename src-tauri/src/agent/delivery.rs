@@ -1791,6 +1791,10 @@ pub trait DeliveryRemote {
 /// blocked" even though the CLI works from a terminal. EVERY production spawn of
 /// gh/git in this module MUST go through here (pinned by a source-text test).
 pub(crate) fn dev_command(program: &str) -> Command {
+    if program == "git" {
+        // 固定 -c 在构建器里。需要按工作目录跳过 hooks 的调用走 `git()`。
+        return crate::util::host_git::prepared_stdio(true);
+    }
     let mut command = Command::new(command_env::resolve_developer_command(program)).no_window();
     command_env::apply_developer_path_std(&mut command);
     command
@@ -1947,7 +1951,13 @@ pub(crate) fn git(cwd: &Path, args: &[&str]) -> Result<String, String> {
     let step = args.first().copied().unwrap_or("git");
     let remote = args.get(2).copied().unwrap_or("origin");
     let mut operation = || {
-        let result = bounded_delivery_output(dev_command("git").arg("-C").arg(cwd).args(args));
+        let mut git_cmd = if network {
+            crate::util::host_git::command_with_host_credentials()
+        } else {
+            crate::util::host_git::command()
+        };
+        git_cmd.current_dir(cwd).env("GIT_TERMINAL_PROMPT", "0").args(args);
+        let result = bounded_delivery_output(git_cmd.finalize_into());
         match result {
             // M258/R4: a push that hit the bound is diagnosed before anything
             // calls it a network problem.
@@ -12640,7 +12650,7 @@ mod tests {
     fn release_only_repo(tag: &str, subject: &str) -> PathBuf {
         let root = make_repo(tag);
         let origin = root.parent().unwrap().join("origin.git");
-        Command::new("git")
+        crate::util::host_git::command()
             .no_window()
             .args(["init", "--bare", "-q", origin.to_str().unwrap()])
             .status()
@@ -15935,7 +15945,7 @@ README-Update-Reason: synthetic fixture\n\nbody"
         // A bare origin under the same per-test parent so push targets a real
         // writable repo. `root.parent()` is the isolated per-test dir.
         let origin = root.parent().unwrap().join("origin.git");
-        Command::new("git")
+        crate::util::host_git::command()
             .no_window()
             .args(["init", "--bare", "-q", origin.to_str().unwrap()])
             .status()
@@ -19240,7 +19250,7 @@ README-Update-Reason: synthetic fixture\n\nRequires a companion change."
     fn repo_with_worktree_feature(tag: &str) -> (PathBuf, PathBuf) {
         let root = make_repo(tag);
         let origin = root.parent().unwrap().join("origin.git");
-        Command::new("git")
+        crate::util::host_git::command()
             .no_window()
             .args(["init", "--bare", "-q", origin.to_str().unwrap()])
             .status()
@@ -19507,7 +19517,7 @@ GITHUB.COM:
     // ── CF-TRUTH-R2: the delivery subject must be a real conventional title ──
 
     fn git_in(root: &std::path::Path, args: &[&str]) {
-        let status = std::process::Command::new("git").no_window()
+        let status = crate::util::host_git::command().no_window()
             .arg("-C")
             .arg(root)
             .args(args)
@@ -19715,7 +19725,7 @@ GITHUB.COM:
         git_in(root, &["add", "."]);
         git_in(root, &["commit", "-q", "-m", "chore: baseline"]);
         let base = String::from_utf8(
-            std::process::Command::new("git").no_window()
+            crate::util::host_git::command().no_window()
                 .arg("-C")
                 .arg(root)
                 .args(["rev-parse", "HEAD"])
