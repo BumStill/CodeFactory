@@ -333,6 +333,21 @@ jobs:
           if ($smoke.tool_count -lt 1) { throw "Headless tool surface was empty" }
           if ($smoke.events_recorded -ne 1) { throw "Headless event sink did not record" }
 
+      # First-request latency fixture: production admission, checkpoint, route
+      # plan and AgentLoop transport against a local fake provider, five rounds.
+      # It silently broke when route planning began excluding endpoints with no
+      # saved credential (M155) because nothing ran it; running it here keeps the
+      # "message admitted -> first model POST" path executable. Reuses the binary
+      # the smokes above already built.
+      - name: First-request latency fixture
+        if: ${{ !cancelled() }}
+        shell: pwsh
+        run: |
+          cargo build --manifest-path src-tauri/Cargo.toml --bin codefactory
+          if ($LASTEXITCODE -ne 0) { throw "codefactory build failed" }
+          node scripts/measure-first-request-latency.mjs src-tauri/target/debug/codefactory.exe
+          if ($LASTEXITCODE -ne 0) { throw "First-request latency fixture failed" }
+
       # Historical-session contract HLT-001. This is deliberately a formal
       # executable smoke instead of a reducer/unit test: it starts a real
       # AgentLoop process, commits one native file mutation, hard-kills that
