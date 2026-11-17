@@ -2437,6 +2437,23 @@ pub fn run() {
             agent::quota_cap::get_endpoint_spend_status,
             commands::costs::get_session_usage,
         ])
-        .run(context)
-        .expect("error while running CodeFactory");
+        .build(context)
+        .expect("error while building CodeFactory")
+        .run(|app, event| {
+            // M277 R1: every exit leaves one line in startup.log, with the real
+            // reason, so "the app just vanished" is never unobservable again.
+            match event {
+                tauri::RunEvent::ExitRequested { code, .. } => {
+                    if let Ok(dir) = app.path().app_data_dir() {
+                        startup_recovery::record_exit(&dir, &startup_recovery::exit_reason(code));
+                    }
+                }
+                tauri::RunEvent::Exit => {
+                    if let Ok(dir) = app.path().app_data_dir() {
+                        startup_recovery::record_exit(&dir, "exit");
+                    }
+                }
+                _ => {}
+            }
+        });
 }
