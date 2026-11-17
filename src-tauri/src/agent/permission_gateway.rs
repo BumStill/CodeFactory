@@ -700,8 +700,11 @@ impl DesktopPermissionGateway {
                 Ok(intent) => Some(intent),
                 Err(error) => {
                     tracing::error!(%error, "permission identity reconciliation exhausted one retry");
+                    // M283/R2: this is a system-side identity failure, not a user
+                    // refusal. The wording must say so, keep the turn running, and
+                    // forbid the blocker summary that ended the turn silently.
                     return PermissionOutcome::Deny(PermissionDenial {
-                        content: "权限请求暂时无法与当前任务对齐，尚未执行任何操作；系统自动重试/自愈，工作区和改动保留。".into(),
+                        content: "权限请求暂时无法与当前任务对齐：这是系统侧身份核对的暂时失败，不是用户拒绝，也不是任务结束。本次操作未执行，工作区和改动保留；系统自动重试/自愈并会继续本回合。请在同一回合内继续，不要写阻断总结、不要请用户做技术性操作；稍后用同样的参数重试这一次调用。".into(),
                         reason: PermissionDenialReason::ChannelClosed,
                         duration_ms: 0,
                     });
@@ -986,6 +989,39 @@ impl DesktopPermissionGateway {
         .bind(resource.1)
         .fetch_all(&self.db)
         .await?;
+        if row.is_empty() && resource.0 == "chat_root_turn" {
+            // M283/R1: the live root turn is the authority for its own identity.
+            // A system-side retirement (`legacy_orphan`) may land seconds after the
+            // Objective is created while this turn is still executing; denying then
+            // left the turn in `waiting` with no continuation (session 78d0fe52).
+            // Accept the binding only for THIS running turn, never for a settled one.
+            let live = sqlx::query(
+                "SELECT objective.id AS objective_id, objective.revision,
+                        binding.id AS binding_id, binding.resource_generation
+                 FROM objective_bindings binding
+                 JOIN objectives objective ON objective.id=binding.objective_id
+                 JOIN chat_turn_state turn
+                   ON turn.root_turn_id=binding.resource_id
+                  AND turn.objective_id=binding.objective_id
+                 WHERE binding.resource_kind='chat_root_turn' AND binding.resource_id=?
+                   AND turn.session_id=?
+                   AND turn.status IN ('working','waiting','finalizing')
+                   AND turn.terminal_reason IS NULL
+                 ORDER BY binding.resource_generation DESC LIMIT 2",
+            )
+            .bind(resource.1)
+            .bind(&self.session_id)
+            .fetch_all(&self.db)
+            .await?;
+            if live.len() == 1 {
+                return Ok(PermissionScope {
+                    objective_id: live[0].try_get("objective_id")?,
+                    objective_revision: live[0].try_get("revision")?,
+                    binding_id: live[0].try_get("binding_id")?,
+                    resource_generation: live[0].try_get("resource_generation")?,
+                });
+            }
+        }
         if row.is_empty() && resource.0 == "chat_root_turn" {
             // A synthetic wake message need not be the persisted root turn.
             // Recover only one active Objective in this session, never a task
