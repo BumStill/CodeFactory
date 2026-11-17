@@ -1026,7 +1026,14 @@ pub fn run_client_cli() -> bool {
         eprintln!("could not resolve the local task entry point path");
         std::process::exit(2);
     };
-    match client::request(&socket_path, &payload) {
+    match launch_retry::dispatch_with_launch(
+        &socket_path,
+        &payload,
+        client::request,
+        launch_retry::launch_app,
+        launch_retry::endpoint_ready,
+        launch_retry::READY_TIMEOUT,
+    ) {
         Ok(response) => {
             println!(
                 "{}",
@@ -1042,6 +1049,105 @@ pub fn run_client_cli() -> bool {
             eprintln!("{}: {}", error.code, error.message);
             std::process::exit(2);
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// M277 R2: launch the app when the task entry point is not listening
+// ---------------------------------------------------------------------------
+
+/// `--dispatch` used to fail with a bare `Connection refused` whenever the app
+/// was not running. R2: on a refused connection, start the app in the
+/// background, wait for the entry point to answer, and retry the exact same
+/// request once. Only *refused* connections trigger this — a request that was
+/// actually delivered never relaunches the app.
+#[cfg(unix)]
+pub mod launch_retry {
+    use super::{client, socket, ErrorBody, Response};
+    use std::path::Path;
+    use std::time::{Duration, Instant};
+
+    /// How long a freshly launched app gets to publish its entry point.
+    pub const READY_TIMEOUT: Duration = Duration::from_secs(60);
+    const POLL: Duration = Duration::from_millis(100);
+
+    /// True only for "nothing is listening on that path" failures.
+    pub fn is_connection_refused(error: &ErrorBody) -> bool {
+        const MARKERS: [&str; 5] = [
+            "Connection refused",
+            "No such file or directory",
+            "os error 2",
+            "os error 61",
+            "os error 111",
+        ];
+        MARKERS.iter().any(|marker| error.message.contains(marker))
+    }
+
+    /// Send the request; when the socket refuses it, launch once, wait for the
+    /// entry point, and retry once. Everything is injected so the retry contract
+    /// is testable without starting a real app.
+    pub fn dispatch_with_launch<Req, Launch, Ready>(
+        socket_path: &Path,
+        payload: &str,
+        mut request: Req,
+        mut launch: Launch,
+        ready: Ready,
+        ready_timeout: Duration,
+    ) -> Result<Response, ErrorBody>
+    where
+        Req: FnMut(&Path, &str) -> Result<Response, ErrorBody>,
+        Launch: FnMut() -> Result<(), String>,
+        Ready: Fn(&Path) -> bool,
+    {
+        let first = match request(socket_path, payload) {
+            Ok(response) => return Ok(response),
+            Err(error) => error,
+        };
+        if !is_connection_refused(&first) {
+            return Err(first);
+        }
+        let launch_note = match launch() {
+            Ok(()) => "launched CodeFactory in the background and retried once".to_string(),
+            Err(error) => format!(
+                "tried to launch CodeFactory in the background ({error}) and retried once"
+            ),
+        };
+        let deadline = Instant::now() + ready_timeout;
+        while Instant::now() < deadline && !ready(socket_path) {
+            std::thread::sleep(POLL);
+        }
+        match request(socket_path, payload) {
+            Ok(response) => Ok(response),
+            Err(retry) => Err(ErrorBody::internal(format!(
+                "{launch_note}; still not reachable at {}: first attempt: {}; retry: {}",
+                socket_path.display(),
+                first.message,
+                retry.message
+            ))),
+        }
+    }
+
+    /// Start this same executable with no arguments (the GUI entry point),
+    /// detached from the calling terminal.
+    pub fn launch_app() -> Result<(), String> {
+        use std::process::{Command, Stdio};
+        let exe = std::env::current_exe()
+            .map_err(|error| format!("could not resolve the app executable: {error}"))?;
+        let mut command = Command::new(&exe);
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        command
+            .spawn()
+            .map(|_child| ())
+            .map_err(|error| format!("could not start {}: {error}", exe.display()))
+    }
+
+    /// The entry point answers only after the app finished binding it.
+    pub fn endpoint_ready(socket_path: &Path) -> bool {
+        let uid = socket::current_uid();
+        socket::validate_socket(socket_path, uid, uid).is_ok()
     }
 }
 
@@ -1663,6 +1769,151 @@ mod unix_tests {
             logged.contains("status") && !logged.contains("\"operation\":\"exec\""),
             "only parsed requests are audited: {logged}"
         );
+    }
+}
+
+#[cfg(all(test, unix))]
+mod m277_launch_retry_tests {
+    use super::launch_retry::{dispatch_with_launch, is_connection_refused};
+    use super::{ErrorBody, Response};
+    use std::cell::Cell;
+    use std::path::Path;
+    use std::time::Duration;
+
+    const SOCKET: &str = "/tmp/m277-synthetic.sock";
+    const TIMEOUT: Duration = Duration::from_millis(20);
+
+    fn refused() -> ErrorBody {
+        ErrorBody::internal(format!(
+            "CodeFactory is not accepting local tasks ({SOCKET}): Connection refused (os error 61)"
+        ))
+    }
+
+    /// M277 R2 T3: a refused first connection launches the app once, waits for
+    /// the entry point and retries exactly once — then the request succeeds.
+    #[test]
+    fn m277_refused_connection_launches_and_retries_once() {
+        let attempts = Cell::new(0);
+        let launches = Cell::new(0);
+        let waited = Cell::new(0);
+        let result = dispatch_with_launch(
+            Path::new(SOCKET),
+            "{}",
+            |_, _| {
+                attempts.set(attempts.get() + 1);
+                if attempts.get() == 1 {
+                    Err(refused())
+                } else {
+                    Ok(Response::ok(serde_json::json!({ "dispatched": true })))
+                }
+            },
+            || {
+                launches.set(launches.get() + 1);
+                Ok(())
+            },
+            |_| {
+                waited.set(waited.get() + 1);
+                true
+            },
+            TIMEOUT,
+        );
+        let response = result.expect("retry after launch must succeed");
+        assert!(response.ok);
+        assert_eq!(attempts.get(), 2, "exactly one retry");
+        assert_eq!(launches.get(), 1, "the app is launched once");
+        assert!(waited.get() >= 1, "the retry waits for the entry point");
+    }
+
+    /// M277 R2 T4: when both attempts fail the error names the launch attempt
+    /// and keeps both causes instead of a bare `Connection refused`.
+    #[test]
+    fn m277_failure_after_launch_states_it_launched_and_retried() {
+        let attempts = Cell::new(0);
+        let launches = Cell::new(0);
+        let error = dispatch_with_launch(
+            Path::new(SOCKET),
+            "{}",
+            |_, _| {
+                attempts.set(attempts.get() + 1);
+                Err(refused())
+            },
+            || {
+                launches.set(launches.get() + 1);
+                Ok(())
+            },
+            |_| false,
+            TIMEOUT,
+        )
+        .expect_err("both attempts are refused");
+        assert_eq!(attempts.get(), 2);
+        assert_eq!(launches.get(), 1);
+        assert!(
+            error.message.contains("launched CodeFactory in the background and retried once"),
+            "must state the launch attempt: {}",
+            error.message
+        );
+        assert!(
+            error.message.contains("first attempt") && error.message.contains("retry"),
+            "must keep both causes: {}",
+            error.message
+        );
+    }
+
+    /// M277 R2 T5: an error that is not a refused connection (here a malformed
+    /// reply) must never launch the app or retry.
+    #[test]
+    fn m277_non_connection_error_never_launches() {
+        let attempts = Cell::new(0);
+        let launches = Cell::new(0);
+        let error = dispatch_with_launch(
+            Path::new(SOCKET),
+            "{}",
+            |_, _| {
+                attempts.set(attempts.get() + 1);
+                Err(ErrorBody::internal("malformed reply: expected value"))
+            },
+            || {
+                launches.set(launches.get() + 1);
+                Ok(())
+            },
+            |_| true,
+            TIMEOUT,
+        )
+        .expect_err("the request failed");
+        assert_eq!(attempts.get(), 1, "no retry for a delivered request");
+        assert_eq!(launches.get(), 0, "no launch for a delivered request");
+        assert_eq!(error.message, "malformed reply: expected value");
+    }
+
+    /// M277 R2 T6: a healthy first attempt has zero side effects.
+    #[test]
+    fn m277_healthy_first_attempt_does_not_launch() {
+        let launches = Cell::new(0);
+        let result = dispatch_with_launch(
+            Path::new(SOCKET),
+            "{}",
+            |_, _| Ok(Response::ok(serde_json::json!({ "dispatched": true }))),
+            || {
+                launches.set(launches.get() + 1);
+                Ok(())
+            },
+            |_| true,
+            TIMEOUT,
+        );
+        assert!(result.is_ok());
+        assert_eq!(launches.get(), 0);
+    }
+
+    /// M277 R2: only "the app is not listening" errors are retried, and the
+    /// classifier must not swallow business failures.
+    #[test]
+    fn m277_connection_refused_classifier() {
+        assert!(is_connection_refused(&refused()));
+        assert!(is_connection_refused(&ErrorBody::internal(
+            "could not connect (os error 2): No such file or directory"
+        )));
+        assert!(!is_connection_refused(&ErrorBody::internal("malformed reply: x")));
+        assert!(!is_connection_refused(&ErrorBody::denied("task was denied")));
     }
 }
 
