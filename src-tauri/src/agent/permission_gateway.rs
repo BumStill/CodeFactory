@@ -700,8 +700,11 @@ impl DesktopPermissionGateway {
                 Ok(intent) => Some(intent),
                 Err(error) => {
                     tracing::error!(%error, "permission identity reconciliation exhausted one retry");
+                    // M283/R2: this is a system-side identity failure, not a user
+                    // refusal. The wording must say so, keep the turn running, and
+                    // forbid the blocker summary that ended the turn silently.
                     return PermissionOutcome::Deny(PermissionDenial {
-                        content: "权限请求暂时无法与当前任务对齐，尚未执行任何操作；系统自动重试/自愈，工作区和改动保留。".into(),
+                        content: "权限请求暂时无法与当前任务对齐：这是系统侧身份核对的暂时失败，不是用户拒绝，也不是任务结束。本次操作未执行，工作区和改动保留；系统自动重试/自愈并会继续本回合。请在同一回合内继续，不要写阻断总结、不要请用户做技术性操作；稍后用同样的参数重试这一次调用。".into(),
                         reason: PermissionDenialReason::ChannelClosed,
                         duration_ms: 0,
                     });
