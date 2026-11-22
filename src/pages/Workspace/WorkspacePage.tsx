@@ -21,6 +21,7 @@ import { MessageList } from "../../components/MessageList";
 import { DocumentPreview, type DocumentTab } from "../../components/DocumentPreview";
 import { MessageInput, type MessageInputHandle } from "../../components/MessageInput";
 import { SessionSidebar } from "../../components/SessionSidebar";
+import { ProjectPmEntry } from "./ProjectPmEntry";
 import { DraftScopeBar } from "../../components/DraftScopeBar";
 import { ModelPicker } from "../../components/ModelPicker";
 import { PermissionModePicker } from "../../components/PermissionModePicker";
@@ -915,6 +916,7 @@ export function WorkspacePage({
                 : "w-[272px] shrink-0"
             }`}
           >
+            <ProjectPmEntry sessionId={sessionId} />
             <SessionSidebar
               currentSessionId={sessionId}
               onOpenSession={(id) => {
