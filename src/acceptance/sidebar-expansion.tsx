@@ -5,6 +5,7 @@ import React from "react";
 import { createRoot } from "react-dom/client";
 
 import "../styles/globals.css";
+import { ProjectPmEntry } from "../pages/Workspace/ProjectPmEntry";
 import { SessionSidebar } from "../components/SessionSidebar";
 import { useChatStore } from "../stores/chat";
 import type { Session } from "../lib/tauri";
@@ -44,14 +45,22 @@ useChatStore.setState({
 
 function SidebarExpansionAcceptance() {
   const [current, setCurrent] = React.useState("q1");
+  const [newConversations, setNewConversations] = React.useState(0);
+  const select = (id: string) => { useChatStore.setState({ draftSession: null }); setCurrent(id); };
   return (
-    <main className="h-screen w-[360px] bg-surface-0 text-gray-200" aria-label="Sidebar expansion acceptance">
+    <main className="flex h-screen w-[360px] max-w-full flex-col bg-surface-0 text-gray-200" aria-label="Sidebar expansion acceptance">
+      <ProjectPmEntry sessionId={current} />
       <SessionSidebar
         currentSessionId={current}
-        onOpenSession={(id) => setCurrent(id)}
-        onNewConversation={() => {}}
+        onOpenSession={select}
+        onNewConversation={() => setNewConversations((n) => n + 1)}
       />
-      <div aria-label="Sidebar expansion probe" data-current-session={current} />
+      <nav className="flex shrink-0 flex-wrap gap-2 p-2" aria-label="Synthetic boundary controls">
+        <button onClick={() => { const draft = useChatStore.getState().beginDraft(); setCurrent(draft.id); }}>无项目草稿</button>
+        <button onClick={() => { const draft = useChatStore.getState().beginDraft({cwd:"/code/CodeFactory",anonymous:true}); setCurrent(draft.id); }}>匿名草稿</button>
+        <button onClick={() => select("unbound-project")}>未绑定项目</button>
+      </nav>
+      <div aria-label="Sidebar expansion probe" data-current-session={current} data-new-conversations={newConversations} />
     </main>
   );
 }

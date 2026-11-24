@@ -3,7 +3,7 @@
 // Real-browser gate for preserving expanded project groups across session switches.
 
 import { spawn, spawnSync } from "node:child_process";
-import { access, mkdir, rm } from "node:fs/promises";
+import { access, mkdir, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import process from "node:process";
@@ -56,7 +56,7 @@ async function main() {
   let browser;
   try {
     await waitForServer(vite);
-    browser = await chromium.launch({ executablePath: await firstBrowser(), headless: true, args: ["--disable-gpu", "--no-sandbox"] });
+    browser = await chromium.launch({ executablePath: await firstBrowser(), headless: true, chromiumSandbox: true, args: ["--disable-gpu"] });
     const page = await browser.newPage({ viewport: { width: 420, height: 720 } });
     await gotoScenario(page, baseUrl, {
       landmark: page.getByRole("main", { name: "Sidebar expansion acceptance" }),
@@ -73,7 +73,48 @@ async function main() {
     assert((await page.getByText("CodeFactory 主线", { exact: true }).count()) === 1, "expanded project should remain open after switching to quick session");
     assert((await page.getByText("CodeFactory 旧会话", { exact: true }).count()) === 1, "expanded project should keep all child sessions visible");
     await page.screenshot({ path: path.join(artifactDir, "preserved-after-switch.png"), fullPage: true });
-    console.log(JSON.stringify({ status: "pass", artifactDir, checks: { expandedProjectSurvivesSessionSwitch: true } }, null, 2));
+    await page.close();
+    const viewports = [{width:1200,height:800},{width:800,height:600}];
+    for (const viewport of viewports) {
+      const pmPage = await browser.newPage({viewport});
+      await gotoScenario(pmPage, baseUrl, {landmark:pmPage.getByRole("main",{name:"Sidebar expansion acceptance"}),label:"project PM sidebar"});
+      const entry=pmPage.getByRole("button",{name:"打开当前项目 PM Bot"});
+      const panel=pmPage.getByRole("region",{name:"当前项目 PM Bot"});
+      assert(await entry.count()===0,"quick context must not expose project PM");
+      await pmPage.getByText("CodeFactory",{exact:true}).click();
+      await pmPage.getByText("CodeFactory 主线",{exact:true}).click();
+      await entry.focus(); await pmPage.keyboard.press("Enter"); await panel.waitFor();
+      assert(await entry.count()===1 && await panel.count()===1,"PM entry must be unique");
+      assert((await panel.innerText()).includes("/code/CodeFactory"),"wrong project A");
+      assert((await panel.innerText()).includes("运行时尚未接入"),"must disclose unavailable runtime");
+      assert(await pmPage.locator("textarea").count()===0,"must not introduce PM chat");
+      assert(await pmPage.getByRole("heading",{name:"当前项目 PM Bot"}).evaluate(el=>el===document.activeElement),"PM heading focus missing");
+      await pmPage.keyboard.press("Escape");
+      assert(await panel.count()===0 && await entry.evaluate(el=>el===document.activeElement),"Escape must close PM panel and restore focus");
+      await entry.press("Enter"); await panel.waitFor();
+      await pmPage.getByText("CodeFactory 旧会话",{exact:true}).click();
+      assert(await entry.count()===1 && await panel.count()===1,"same project must reuse entry");
+      await pmPage.getByText("记账 app",{exact:true}).click();
+      assert(await panel.count()===0,"project A panel leaked after B switch");
+      await entry.click(); await panel.waitFor();
+      assert((await panel.innerText()).includes("/code/ledger") && !(await panel.innerText()).includes("/code/CodeFactory"),"project B scope mismatch");
+      await pmPage.getByRole("searchbox",{name:"搜索会话"}).fill("no-matching-session");
+      assert(await entry.count()===1,"search must not duplicate or hide PM entry");
+      await pmPage.getByRole("searchbox",{name:"搜索会话"}).fill("");
+      assert(!await pmPage.evaluate(()=>document.documentElement.scrollWidth>innerWidth),"horizontal overflow");
+      await pmPage.screenshot({path:path.join(artifactDir,`pm-${viewport.width}x${viewport.height}.png`)});
+      for (const name of ["无项目草稿","匿名草稿","未绑定项目"]) {
+        await pmPage.getByRole("button",{name,exact:true}).click();
+        assert(await entry.count()===0 && await panel.count()===0,`${name} must not expose project PM`);
+      }
+      await pmPage.getByText("CodeFactory 主线",{exact:true}).click();
+      assert(await entry.count()===1 && await panel.count()===0,"return must not duplicate or restore stale panel");
+      assert(await pmPage.getByLabel("Sidebar expansion probe").getAttribute("data-new-conversations")==="0","PM must not create an ordinary conversation");
+      await pmPage.close();
+    }
+    const receipt={status:"pass",target:"pnpm:test:sidebar-expansion:headless",artifactDir,syntheticSessions:true,native:false,provider:false,permissionProof:false,chromiumSandbox:true,viewports,checks:{expandedProjectSurvivesSessionSwitch:true,projectPmUnique:true,projectSwitchIsolation:true,noProjectHidden:true,anonymousHidden:true,unboundProjectHidden:true,runtimeUnavailable:true,keyboardFocus:true,noChatCreation:true}};
+    await writeFile(path.join(artifactDir,"receipt.json"),JSON.stringify(receipt,null,2));
+    console.log(JSON.stringify(receipt,null,2));
   } finally {
     if (browser) await browser.close();
     await stopServer(vite);
