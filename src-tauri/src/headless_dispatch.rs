@@ -1133,7 +1133,8 @@ pub mod launch_retry {
         use std::process::{Command, Stdio};
         let exe = std::env::current_exe()
             .map_err(|error| format!("could not resolve the app executable: {error}"))?;
-        let mut command = Command::new(&exe);
+        use crate::util::no_window::NoWindow;
+        let mut command = Command::new(&exe).no_window();
         command
             .stdin(Stdio::null())
             .stdout(Stdio::null())

@@ -1817,6 +1817,26 @@ pub fn run() {
         .init();
 
     tauri::Builder::default()
+        .plugin(
+            tauri::plugin::Builder::<tauri::Wry, ()>::new("exit-observer")
+                .on_event(|app, event| match event {
+                    tauri::RunEvent::ExitRequested { code, .. } => {
+                        if let Ok(dir) = app.path().app_data_dir() {
+                            startup_recovery::record_exit(
+                                &dir,
+                                &startup_recovery::exit_reason(*code),
+                            );
+                        }
+                    }
+                    tauri::RunEvent::Exit => {
+                        if let Ok(dir) = app.path().app_data_dir() {
+                            startup_recovery::record_exit(&dir, "exit");
+                        }
+                    }
+                    _ => {}
+                })
+                .build(),
+        )
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
@@ -2437,23 +2457,6 @@ pub fn run() {
             agent::quota_cap::get_endpoint_spend_status,
             commands::costs::get_session_usage,
         ])
-        .build(context)
-        .expect("error while building CodeFactory")
-        .run(|app, event| {
-            // M277 R1: every exit leaves one line in startup.log, with the real
-            // reason, so "the app just vanished" is never unobservable again.
-            match event {
-                tauri::RunEvent::ExitRequested { code, .. } => {
-                    if let Ok(dir) = app.path().app_data_dir() {
-                        startup_recovery::record_exit(&dir, &startup_recovery::exit_reason(code));
-                    }
-                }
-                tauri::RunEvent::Exit => {
-                    if let Ok(dir) = app.path().app_data_dir() {
-                        startup_recovery::record_exit(&dir, "exit");
-                    }
-                }
-                _ => {}
-            }
-        });
+        .run(context)
+        .expect("error while running CodeFactory");
 }
