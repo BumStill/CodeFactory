@@ -34,8 +34,27 @@ pub(crate) async fn capture_restart_interruptions(db: &SqlitePool) -> sqlx::Resu
 /// M189：恢复资格必须来自未结束的旧进程回合，而非过期的 running 投影。
 async fn filter_restart_candidates(
     db: &SqlitePool,
+    now_ms: i64,
     rows: Vec<String>,
 ) -> sqlx::Result<Vec<String>> {
+    let has_intents: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='permission_intents'")
+        .fetch_one(db).await?;
+    // M281 R1.2：本轮正停在一条未过期的 pending 审批上，说明它在等**用户**，不是僵尸回合。
+    // 续跑扫描把它当「没有执行者」会把审批覆盖成「系统作废」（现场 2026-08-19 的
+    // 「审批已被取消」就是这么产生的）。已有决定或已过期则不再豁免。
+    let mut rows = rows;
+    if has_intents == 1 {
+        let mut waiting = Vec::new();
+        for session in &rows {
+            let pending: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM permission_intents WHERE session_id=? AND status='pending' AND expires_at>?",
+            )
+            .bind(session).bind(now_ms)
+            .fetch_one(db).await?;
+            if pending > 0 { waiting.push(session.clone()); }
+        }
+        rows.retain(|session| !waiting.contains(session));
+    }
     let full_schema: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='chat_run_controls'")
         .fetch_one(db).await?;
     if full_schema == 0 { return Ok(rows); }
@@ -71,7 +90,7 @@ pub(crate) async fn claim_restart(
 ) -> sqlx::Result<Option<String>> {
     sqlx::query("CREATE TABLE IF NOT EXISTS thin_restart_claims (claim_key TEXT PRIMARY KEY, session_id TEXT NOT NULL, root_turn_id TEXT NOT NULL, claimed_at INTEGER NOT NULL)")
         .execute(db).await?;
-    if filter_restart_candidates(db, vec![session.to_string()]).await?.is_empty() {
+    if filter_restart_candidates(db, chrono::Utc::now().timestamp_millis(), vec![session.to_string()]).await?.is_empty() {
         return Ok(None);
     }
     sqlx::query("CREATE UNIQUE INDEX IF NOT EXISTS thin_restart_claim_root ON thin_restart_claims(root_turn_id)").execute(db).await?;
@@ -130,7 +149,7 @@ pub(crate) async fn running_without_executor(
             .bind(now_ms.saturating_sub(grace_ms))
             .bind(now_ms.saturating_sub(grace_ms))
             .bind(now_ms.saturating_sub(grace_ms)).fetch_all(db).await?;
-        return filter_restart_candidates(db, rows.into_iter().filter(|session| !has_live_executor(session)).collect()).await;
+        return filter_restart_candidates(db, now_ms, rows.into_iter().filter(|session| !has_live_executor(session)).collect()).await;
     }
     crate::agent::thin_state::ensure(db).await?;
     let rows: Vec<String> = sqlx::query_scalar(
@@ -142,7 +161,7 @@ pub(crate) async fn running_without_executor(
     .bind(now_ms.saturating_sub(grace_ms))
     .fetch_all(db)
     .await?;
-    filter_restart_candidates(db, rows
+    filter_restart_candidates(db, now_ms, rows
         .into_iter()
         .filter(|session| !has_live_executor(session))
         .collect()).await
@@ -189,7 +208,7 @@ pub(crate) async fn running_interrupted_by_restart(
         .fetch_all(db)
         .await?
     };
-    filter_restart_candidates(db, rows
+    filter_restart_candidates(db, now_ms, rows
         .into_iter()
         .filter(|session| !has_live_executor(session))
         .collect()).await
@@ -684,6 +703,56 @@ mod tests {
             .await
             .unwrap()
             .is_empty());
+    }
+
+    /// M281 R1.2：会话正停在一条**未过期**的 pending 审批上时，启动/心跳续跑扫描都必须
+    /// 跳过它——它等的是用户，不是执行者。用户已有决定、或审批已过期，才重新成为候选。
+    #[tokio::test]
+    async fn m281_pending_approval_session_is_not_a_restart_candidate() {
+        let db = fixture().await;
+        let now = 10_000_000_i64;
+        session(&db, "awaiting", "running", now - 66_000).await;
+        sqlx::raw_sql("CREATE TABLE permission_intents (intent_id TEXT, session_id TEXT, status TEXT, expires_at INTEGER, created_at INTEGER);")
+            .execute(&db).await.unwrap();
+        sqlx::query("INSERT INTO permission_intents VALUES ('i1','awaiting','pending',?,1)")
+            .bind(now + 120_000).execute(&db).await.unwrap();
+        assert!(
+            running_interrupted_by_restart(&db, now, |_| false).await.unwrap().is_empty(),
+            "停在本轮审批上的会话不是僵尸回合，不得被重启扫描接管"
+        );
+        assert!(
+            running_without_executor(&db, now, RUNNING_WITHOUT_EXECUTOR_GRACE_MS, |_| false).await.unwrap().is_empty(),
+            "心跳扫描同样不该接管在等用户的会话"
+        );
+        // 用户已批：不再豁免，必须继续跑。
+        sqlx::query("UPDATE permission_intents SET status='allowed' WHERE intent_id='i1'")
+            .execute(&db).await.unwrap();
+        assert_eq!(
+            running_interrupted_by_restart(&db, now, |_| false).await.unwrap(),
+            vec!["awaiting".to_string()],
+            "审批有了结果后会话必须重新成为续跑候选"
+        );
+        // R1.3：审批被 `extend_pending` 续期后，过 2 分钟也不该被续跑扫描作废（虚拟时间）。
+        sqlx::query("UPDATE permission_intents SET status='pending', expires_at=? WHERE intent_id='i1'")
+            .bind(now + 180_000)
+            .execute(&db)
+            .await
+            .unwrap();
+        for later in [now + 60_000, now + 120_000] {
+            assert!(
+                running_interrupted_by_restart(&db, later, |_| false).await.unwrap().is_empty(),
+                "续期后的审批在原地等待两分钟不得被当成僵尸回合"
+            );
+            assert!(running_without_executor(&db, later, 0, |_| false).await.unwrap().is_empty());
+        }
+        // 审批已过期：也不再豁免。
+        sqlx::query("UPDATE permission_intents SET status='pending', expires_at=? WHERE intent_id='i1'")
+            .bind(now - 1).execute(&db).await.unwrap();
+        assert_eq!(
+            running_interrupted_by_restart(&db, now, |_| false).await.unwrap(),
+            vec!["awaiting".to_string()],
+            "过期审批不得把会话永久钉住"
+        );
     }
 
     /// R2：有活执行者、用户已要求停止、已经结束的会话都不在启动扫描里。

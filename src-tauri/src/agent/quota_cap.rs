@@ -1515,6 +1515,10 @@ pub mod daily_spend {
 
     // ------------------------------------------------------------------- ledger
 
+    /// M279 / R2：一笔请求在途预留的有效期。进程崩溃后内存自然清空；仍在运行
+    /// 但漏掉结算的预留由这个上限兜底回收。
+    pub(crate) const RESERVATION_TTL_MS: i64 = 10 * 60 * 1000;
+
     #[derive(Debug, Clone, Default)]
     struct EndpointLedger {
         day_start_ms: i64,
@@ -1523,6 +1527,10 @@ pub mod daily_spend {
         topped_up_cny: f64,
         current_balance_cny: Option<f64>,
         balance_available: bool,
+        /// M279：已经发出、尚未收到 usage 的请求预留总额。
+        reserved_cny: f64,
+        /// reservation token → (预留金额, 创建时间)。与 `estimated_cny` 同锁。
+        reservations: HashMap<u64, (f64, i64)>,
     }
 
     /// In-memory, per-endpoint, per-local-day spend. Recorded as usage events
@@ -1531,6 +1539,7 @@ pub mod daily_spend {
     #[derive(Debug, Default)]
     pub struct SpendLedger {
         entries: Mutex<HashMap<String, EndpointLedger>>,
+        next_reservation: std::sync::atomic::AtomicU64,
     }
 
     impl SpendLedger {
@@ -1594,6 +1603,79 @@ pub mod daily_spend {
             if let Some(entry) = guard.get_mut(endpoint) {
                 entry.estimated_cny += cost_cny;
             }
+        }
+
+        fn prune_reservations(entry: &mut EndpointLedger, now_ms: i64) {
+            let expired = entry
+                .reservations
+                .iter()
+                .filter(|(_, (_, at))| now_ms.saturating_sub(*at) >= RESERVATION_TTL_MS)
+                .map(|(token, _)| *token)
+                .collect::<Vec<_>>();
+            for token in expired {
+                if let Some((amount, _)) = entry.reservations.remove(&token) {
+                    entry.reserved_cny = (entry.reserved_cny - amount).max(0.0);
+                }
+            }
+        }
+
+        /// M279 / R2：在发请求前占用本次预估花费。检查与写入在同一把锁内完成，
+        /// 因此两单并发不会同时看到同一份余量。返回结算 token。
+        pub fn try_reserve(
+            &self,
+            endpoint: &str,
+            amount_cny: f64,
+            cap_cny: f64,
+            now_ms: i64,
+        ) -> Option<u64> {
+            if !amount_cny.is_finite() || amount_cny < 0.0 || !cap_cny.is_finite() {
+                return None;
+            }
+            let mut guard = self.entry(endpoint, now_ms);
+            let entry = guard.get_mut(endpoint)?;
+            Self::prune_reservations(entry, now_ms);
+            if entry.estimated_cny + entry.reserved_cny + amount_cny > cap_cny {
+                return None;
+            }
+            let token = self
+                .next_reservation
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                + 1;
+            entry.reserved_cny += amount_cny;
+            entry.reservations.insert(token, (amount_cny, now_ms));
+            Some(token)
+        }
+
+        /// M279 / R2：请求结束，用实际花费替换预留。
+        pub fn settle_reservation(&self, token: u64, actual_cny: f64, now_ms: i64) {
+            let mut guard = self.entries.lock().expect("spend ledger poisoned");
+            for entry in guard.values_mut() {
+                if let Some((reserved, _)) = entry.reservations.remove(&token) {
+                    entry.reserved_cny = (entry.reserved_cny - reserved).max(0.0);
+                    if actual_cny.is_finite() && actual_cny > 0.0 {
+                        entry.estimated_cny += actual_cny;
+                    }
+                    return;
+                }
+            }
+            let _ = now_ms;
+        }
+
+        /// M279 / R2：请求没有产生可计价用量时释放预留（不增加已花）。
+        pub fn release_reservation(&self, token: u64) {
+            let mut guard = self.entries.lock().expect("spend ledger poisoned");
+            for entry in guard.values_mut() {
+                if let Some((reserved, _)) = entry.reservations.remove(&token) {
+                    entry.reserved_cny = (entry.reserved_cny - reserved).max(0.0);
+                    return;
+                }
+            }
+        }
+
+        /// M279：当前在途预留金额，供状态与测试核对。
+        pub fn reserved_cny(&self, endpoint: &str, now_ms: i64) -> f64 {
+            let guard = self.entry(endpoint, now_ms);
+            guard.get(endpoint).map(|entry| entry.reserved_cny).unwrap_or(0.0)
         }
 
         /// Record a balance observation. The first observation of the day is the
@@ -1852,6 +1934,50 @@ pub mod daily_spend {
             assert_eq!(prices.estimate_cny(1_000, 5_000, 0), 0.0001);
         }
 
+        /// M279 / R2: two concurrent requests at ¥9.20 / ¥10 each needing a
+        /// ¥0.50 hold must not both pass. The check and the hold are one
+        /// critical section, so exactly one gets a token.
+        #[test]
+        fn m279_concurrent_requests_cannot_share_the_same_headroom() {
+            use std::sync::{Arc, Barrier};
+            let now = at("2026-10-30T02:00:00Z");
+            let ledger = Arc::new(SpendLedger::default());
+            ledger.record_estimated("deepseek-m279-race", 9.2, now);
+            // The production example: at ¥9.60 booked, a ¥0.50 hold is already
+            // over the ¥10 line, so it must be refused outright.
+            ledger.record_estimated("deepseek-m279-spec", 9.6, now);
+            assert!(
+                ledger.try_reserve("deepseek-m279-spec", 0.5, 10.0, now).is_none(),
+                "9.6 + 0.5 > 10 must not be sent"
+            );
+            let barrier = Arc::new(Barrier::new(3));
+            let mut handles = Vec::new();
+            for _ in 0..2 {
+                let ledger = ledger.clone();
+                let barrier = barrier.clone();
+                handles.push(std::thread::spawn(move || {
+                    barrier.wait();
+                    ledger.try_reserve("deepseek-m279-race", 0.5, 10.0, now)
+                }));
+            }
+            barrier.wait();
+            let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+            assert_eq!(
+                results.iter().filter(|token| token.is_some()).count(),
+                1,
+                "only one of two concurrent ¥0.50 holds fits under the ¥10 cap"
+            );
+            assert!((ledger.reserved_cny("deepseek-m279-race", now) - 0.5).abs() < 1e-9);
+            let winner = results.into_iter().flatten().next().expect("one reservation");
+            ledger.settle_reservation(winner, 0.3, now);
+            assert!(ledger.reserved_cny("deepseek-m279-race", now).abs() < 1e-9);
+            assert!(
+                (ledger.estimated_cny("deepseek-m279-race", now) - 9.5).abs() < 1e-9,
+                "settlement adds only the actual ¥0.30, not the ¥0.50 hold"
+            );
+            assert!(ledger.try_reserve("deepseek-m279-race", 0.39, 10.0, now).is_some());
+        }
+
         #[test]
         fn local_day_boundary_is_shanghai_midnight() {
             // 2026-10-30 00:00 +08:00 == 2026-10-29T16:00:00Z
@@ -2017,6 +2143,9 @@ pub mod daily_spend {
 pub struct EndpointSpendReport {
     pub currency: String,
     pub statuses: Vec<crate::agent::quota_cap::daily_spend::EndpointSpendStatus>,
+    /// M274/R5: USD budgets (the OpenAI API route) — a separate list because the
+    /// currency, the price list and the ledger are different from the CNY caps.
+    pub usd_statuses: Vec<crate::agent::openai_api::UsdSpendStatus>,
 }
 
 /// 只报告**有预算概念**的端点：显式配置过，或命中内置默认值（DeepSeek）。
@@ -2045,7 +2174,31 @@ pub fn endpoint_spend_report(
     EndpointSpendReport {
         currency: crate::agent::quota_cap::daily_spend::CURRENCY.to_string(),
         statuses,
+        usd_statuses: usd_spend_statuses(settings, now_ms),
     }
+}
+
+/// M274/R5: today's USD spend for every `openai*` endpoint, with the cap, the
+/// reset time and an explicit estimate marker.
+pub fn usd_spend_statuses(
+    settings: &crate::config::settings::Settings,
+    now_ms: i64,
+) -> Vec<crate::agent::openai_api::UsdSpendStatus> {
+    let mut names: Vec<String> = settings
+        .endpoints
+        .keys()
+        .filter(|name| crate::agent::openai_api::is_usd_endpoint(name))
+        .cloned()
+        .collect();
+    names.sort();
+    names
+        .into_iter()
+        .filter_map(|name| {
+            settings
+                .endpoint_openai_api_cap(&name)
+                .map(|cap| crate::agent::openai_api::ledger().status(&name, &cap, now_ms))
+        })
+        .collect()
 }
 
 /// 用法页面与只读入口共用：今日花了多少、上限多少、什么时候重置。

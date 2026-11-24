@@ -32,6 +32,7 @@
 - `repository-owned-specifications.md`: 仓库归属的长期规范、会话内计划与旧 Specs 产品模块退场合同。
 - `chat-continuity-conversational-evidence.md`: 用户目标跨内部执行分段连续完成、异常可恢复终态、自然对话式工具证据与历史密度规格。
 - `m169-followup-continuity-and-split-workspace-repair.md`: 等待态 Objective 下追问按状态续接回同一目标、跨会话隔离、身份歧义不拒答，以及会话分裂修复时工作区跟随 PR 归属的规格。
+- `m282-settle-final-honours-denial.md`: 回合结束结算（`settle_final`）与 `refresh` 共用「审批被拒且任务未交付 → 系统立即接续」判定的规格。
 - `m170-resume-interrupt-notice.md`: 回合因进程退出被中断后续跑时，对话里必须留下一条可见的人话说明（哪一步被打断、结果未知、系统已自动继续），只出现一次且不进模型上下文的规格。
 - `endpoint-capability-failover.md`: 首选模型服务不可用时，基于本机已配置端点、凭据与本轮能力做有界自动接管，保持上下文和工具连续性并提供可行动失败说明。
 - `settings-hooks-remotes-tabs.md`: Settings 中 Hooks 与 Git remotes 管理能力的历史规格。
@@ -48,6 +49,7 @@
 - `m221-local-commit-heredoc.md`: `git commit -F -`/`git tag -F -` 的 heredoc 正文按「数据」而非「脚本」判定，本工作区内的本地 commit 直接放行；远端段与工作区外仓库仍按 M208/M130 审批。
 - `m223-release-retry-transient-infra.md`: 发版链路上的 GitHub 瞬时故障（502/限流、runner 排不到、检查被判 cancelled）按有限次数自动重跑，真实失败仍 fail-closed；含可测的判定脚本与真实 workflow shell 的验收测试。
 - `m234-endpoint-cooldown-is-a-transient-wait.md`: 端点的瞬时失败冷却必须作为一条「时间会治好」的等待原因参与准入，唤醒按 M220 退避与 12 次上限交代真实端点，而不是静默跳过、把会话挂到另一个端点的额度/预算重置上；含文案与唤醒时间一致性、可审计 skipped 路由记录规格。
+- `m275-closeout-squash-and-scope.md`: 系统收尾把压缩合并识别为「内容已保存」（比较树与补丁内容，不只比提交号），只对上线后结束或仍在进行中的会话收尾，未保存内容以结束状态写清提交与分支而不进入 `waiting_user`。
 
 ## 模板
 - `requirements-traceability-template.md`

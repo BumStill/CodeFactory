@@ -50,6 +50,98 @@ use crate::openrouter::types::{
 /// The transport's slice of `AgentLoop` state. Built once per run by
 /// `AgentLoop::model_transport` (clones only Arc/Client handles + small
 /// Strings). Owns no `AppHandle` and no `db`/`settings`.
+/// M279 / R2: what the request path needs to reserve before sending.
+#[derive(Debug, Clone)]
+pub(super) struct BillingAdmission {
+    pub(super) endpoint: String,
+    pub(super) model: String,
+    pub(super) cny: Option<(crate::agent::quota_cap::daily_spend::PriceTable, f64)>,
+    pub(super) usd_cap: Option<f64>,
+}
+
+/// M279 / R2: an in-flight hold. It is released on drop when the request ends
+/// without a settlement (error, cancel, early return), so a failed call cannot
+/// keep headroom locked forever. The persisted usage event remains the single
+/// place that adds actual spend; this guard only owns the hold.
+struct BillingHold {
+    cny: Option<u64>,
+    usd: Option<u64>,
+}
+
+impl BillingHold {
+    fn reserve(
+        admission: &BillingAdmission,
+        body: &serde_json::Value,
+        max_output_tokens: Option<u32>,
+    ) -> Result<Self> {
+        // Conservative prompt estimate: one token per three bytes of the
+        // serialized request, and at least one token.
+        let bytes = serde_json::to_string(body).map(|body| body.len()).unwrap_or(0);
+        let input_tokens = (bytes / 3).max(1) as i64;
+        let output_tokens = max_output_tokens.unwrap_or(8192) as i64;
+        let now = chrono::Utc::now().timestamp_millis();
+        let mut hold = Self { cny: None, usd: None };
+        if let Some((prices, cap)) = &admission.cny {
+            let amount = prices.estimate_cny(input_tokens, 0, output_tokens);
+            match crate::agent::quota_cap::daily_spend::ledger().try_reserve(
+                &admission.endpoint,
+                amount,
+                *cap,
+                now,
+            ) {
+                Some(token) => hold.cny = Some(token),
+                None => return Err(daily_budget_exhausted(&admission.endpoint)),
+            }
+        }
+        if let Some(cap) = admission.usd_cap {
+            let amount = crate::agent::openai_api::estimate_cost_usd(
+                &admission.model,
+                input_tokens,
+                0,
+                output_tokens,
+            );
+            match crate::agent::openai_api::ledger().try_reserve(
+                &admission.endpoint,
+                amount,
+                cap,
+                now,
+            ) {
+                Some(token) => hold.usd = Some(token),
+                None => {
+                    if let Some(token) = hold.cny.take() {
+                        crate::agent::quota_cap::daily_spend::ledger()
+                            .release_reservation(token);
+                    }
+                    return Err(daily_budget_exhausted(&admission.endpoint));
+                }
+            }
+        }
+        Ok(hold)
+    }
+
+    fn release(&mut self) {
+        if let Some(token) = self.cny.take() {
+            crate::agent::quota_cap::daily_spend::ledger().release_reservation(token);
+        }
+        if let Some(token) = self.usd.take() {
+            crate::agent::openai_api::ledger().release_reservation(token);
+        }
+    }
+}
+
+impl Drop for BillingHold {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+fn daily_budget_exhausted(endpoint: &str) -> crate::errors::AppError {
+    crate::errors::AppError::Other(format!(
+        "DAILY_BUDGET_EXHAUSTED: {} 今日预算已用尽（含在途请求预留），系统自动重试/自愈，额度恢复后自动继续。",
+        crate::agent::failover::endpoint_label(endpoint)
+    ))
+}
+
 pub(super) struct DesktopModelTransport {
     pub(super) http: Client,
     pub(super) events: Arc<dyn EventSink>,
@@ -62,6 +154,8 @@ pub(super) struct DesktopModelTransport {
     /// Internal sidecars such as session-title generation need a strict output
     /// ceiling. `None` preserves the interactive transport's existing limits.
     pub(super) max_output_tokens: Option<u32>,
+    /// M279 / R2: budget admission for this route, if a CNY or USD daily cap applies.
+    pub(super) billing: Option<BillingAdmission>,
     /// Metadata sidecars must not pay for provider reasoning. A thinking route
     /// spends the whole output ceiling on hidden reasoning and returns an empty
     /// `content`, which is exactly how every session title generated through a
@@ -864,6 +958,32 @@ impl RoutedDesktopModelTransport {
             )));
         };
 
+        // M279 / R2: read the live caps once for this route. The reserve itself
+        // happens immediately before the POST, when max_tokens is known.
+        let billing = if let Some(settings) = self.route_state.usage_settings() {
+            let settings = settings.read().await;
+            let cny = settings
+                .endpoint_daily_spend_cap(&route.endpoint_name)
+                .filter(|config| config.is_enforcing())
+                .map(|config| (config.prices, config.daily_cap_cny));
+            let usd_cap = settings
+                .endpoint_openai_api_cap(&route.endpoint_name)
+                .filter(|cap| cap.is_enforcing())
+                .map(|cap| cap.daily_cap_usd);
+            if cny.is_some() || usd_cap.is_some() {
+                Some(BillingAdmission {
+                    endpoint: route.endpoint_name.clone(),
+                    model: route.model_id.clone(),
+                    cny,
+                    usd_cap,
+                })
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         Ok(DesktopModelTransport {
             http: self.http.clone(),
             events: Arc::new(TrackingEventSink {
@@ -880,6 +1000,7 @@ impl RoutedDesktopModelTransport {
             api_style: route.api_style.clone(),
             cancel: self.cancel.clone(),
             max_output_tokens: None,
+            billing,
             thinking_disabled: false,
             retry_response_body: crate::http_util::RetryResponseBody::Include,
             provider_attempt,
@@ -1374,6 +1495,11 @@ impl DesktopModelTransport {
             }
         }
 
+        let _billing_hold = self
+            .billing
+            .as_ref()
+            .map(|admission| BillingHold::reserve(admission, &body, self.max_output_tokens))
+            .transpose()?;
         self.admit_provider_post().await?;
         let mut response = crate::http_util::send_with_attempt_budget_and_notify_policy(
             "OpenAI-compatible chat stream request",
@@ -2941,6 +3067,7 @@ mod tests {
             api_style: ApiStyle::Openai,
             cancel: None,
             max_output_tokens: None,
+            billing: None,
             thinking_disabled: false,
             retry_response_body: crate::http_util::RetryResponseBody::Include,
             provider_attempt: None,

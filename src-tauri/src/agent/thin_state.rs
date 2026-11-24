@@ -377,6 +377,17 @@ pub async fn settle_final(
             None => WaitNeed::None,
         },
     };
+    // M282/R1：回合结束结算与 `refresh` 用同一个判定。审批被拒是用户当场给出的权限
+    // 事实，任务又没交付时由系统立即接续（现场 ebe54c65：被拒后助手以「需要你做
+    // 一件事」收尾，这里曾直接写成 `ended / 任务已结束`）。已有已覆盖的外部唤醒源
+    // 时按原规则结算，不另起接续。
+    if !matches!(&need, WaitNeed::External { covered: true, .. }) {
+        if let Some(state) = super::thin_derive::denial_continuation(db, session_id).await? {
+            save(db, session_id, &state).await?;
+            project_turn(db, root_turn_id, &state).await?;
+            return Ok(state);
+        }
+    }
     let state = after_final(need, "本会话记录与工作区改动");
     save(db, session_id, &state).await?;
     project_turn(db, root_turn_id, &state).await?;

@@ -41,9 +41,6 @@ const BRANCH_PREFIX: &str = "codefactory/task-";
 /// merge-back.
 const CONTEXT_BRIEF: &str = "_codefactory_brief.md";
 const CONTEXT_DIR: &str = ".codefactory";
-/// Subdirectories of `.codefactory/` that are never copied (bulky or
-/// meaningless outside the parent checkout).
-const CONTEXT_DIR_SKIP: &[&str] = &["evidence", "worktrees"];
 
 /// A live task worktree. Created by [`create`], consumed by
 /// [`merge_back`] + [`cleanup`].
@@ -190,39 +187,20 @@ pub fn create(base_cwd: &Path, task_id: &str, container: &Path) -> Result<TaskWo
     })
 }
 
-/// Snapshot-copy parent context (session brief + `.codefactory/`, minus bulky
-/// subdirs) into the worktree so the subagent keeps project memory. Best
-/// effort — missing context is not an error.
+/// Copy the parent's generated session brief into the worktree so the subagent
+/// keeps the task instructions. Only that one generated file travels.
+///
+/// M280/R1: this used to snapshot-copy the whole parent `.codefactory/`
+/// directory too. That directory is local, usually untracked state
+/// (attachments, evidence, caches) — copying it put the user's own files
+/// inside task worktrees, where they looked like task input and could be
+/// staged. A worktree is built from git objects only: tracked project context
+/// (including any tracked `.codefactory/` file) arrives with the checkout
+/// itself, so nothing is lost by not copying it.
 fn copy_context(base_cwd: &Path, effective_cwd: &Path) {
     let brief_src = base_cwd.join(CONTEXT_BRIEF);
     if brief_src.is_file() {
         let _ = std::fs::copy(&brief_src, effective_cwd.join(CONTEXT_BRIEF));
-    }
-    let ctx_src = base_cwd.join(CONTEXT_DIR);
-    if ctx_src.is_dir() {
-        copy_dir_shallow(&ctx_src, &effective_cwd.join(CONTEXT_DIR), CONTEXT_DIR_SKIP);
-    }
-}
-
-/// Recursive copy skipping `skip` top-level subdirectory names. Existing
-/// files in `dst` (from tracked checkout) are left as checked out.
-fn copy_dir_shallow(src: &Path, dst: &Path, skip: &[&str]) {
-    let Ok(entries) = std::fs::read_dir(src) else {
-        return;
-    };
-    let _ = std::fs::create_dir_all(dst);
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let from = entry.path();
-        let to = dst.join(&name);
-        if from.is_dir() {
-            if skip.iter().any(|s| name.to_string_lossy() == *s) {
-                continue;
-            }
-            copy_dir_shallow(&from, &to, &[]);
-        } else if !to.exists() {
-            let _ = std::fs::copy(&from, &to);
-        }
     }
 }
 
@@ -478,11 +456,16 @@ mod tests {
         destroy(&repo);
     }
 
+    /// Tracked project context arrives with the checkout; the parent's copy of
+    /// it is never merged back. (Untracked `.codefactory/` state no longer
+    /// travels at all — see `m280_worktree_gets_git_objects_and_brief_only`.)
     #[test]
     fn context_files_are_copied_in_but_never_merged_back() {
         let (repo, container) = make_repo("context");
         std::fs::create_dir_all(repo.join(".codefactory")).unwrap();
         std::fs::write(repo.join(".codefactory/memory.md"), "remember\n").unwrap();
+        git(&repo, &["add", "-A"]).unwrap();
+        git(&repo, &["commit", "-q", "-m", "tracked project memory"]).unwrap();
         std::fs::write(repo.join("_codefactory_brief.md"), "brief\n").unwrap();
 
         let wt = create(&repo, "t-ctx", &container).unwrap();
@@ -561,5 +544,32 @@ mod tests {
         assert_eq!(mapped[0], "/home/user/proj/src/a.rs");
         assert_eq!(mapped[1], "relative/b.rs");
         assert_eq!(mapped[2], "/elsewhere/c.rs");
+    }
+
+    /// M280/R1: a worktree is materialised from git objects only. The parent's
+    /// untracked local files (`.codefactory/attachments/...`, a stray script at
+    /// the root) must never appear inside the task worktree, while the
+    /// generated brief — task input, not user state — still travels.
+    #[test]
+    fn m280_worktree_gets_git_objects_and_brief_only() {
+        let (repo, container) = make_repo("m280-context");
+        std::fs::write(repo.join("_codefactory_brief.md"), "do the thing\n").unwrap();
+        std::fs::create_dir_all(repo.join(".codefactory/attachments")).unwrap();
+        std::fs::write(repo.join(".codefactory/attachments/pic.png"), "png").unwrap();
+        std::fs::create_dir_all(repo.join(".claude/deferred")).unwrap();
+        std::fs::write(repo.join(".claude/deferred/session.json"), "{}").unwrap();
+        std::fs::write(repo.join("t1.py"), "print('mine')\n").unwrap();
+
+        let wt = create(&repo, "m280-context", &container).unwrap();
+        assert!(wt.effective_cwd.join("_codefactory_brief.md").is_file(),
+            "the generated brief is task input and must still arrive");
+        for leaked in [".codefactory", ".claude", "t1.py"] {
+            assert!(
+                !wt.effective_cwd.join(leaked).exists(),
+                "untracked parent file {leaked} leaked into the task worktree"
+            );
+        }
+        cleanup(&wt, true);
+        destroy(&repo);
     }
 }

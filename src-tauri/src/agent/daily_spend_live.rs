@@ -31,6 +31,45 @@ pub async fn rebuild(pool: &SqlitePool, settings: &Settings, ledger: &SpendLedge
     for row in rows {
         ledger.restore_balance(&row.get::<String, _>("endpoint"), row.get("opening_cny"), row.get("topped_up_cny"), row.get("current_cny"), now);
     }
+    // M279 / R1：美元账本和人民币账本在同一个启动步骤重建。重启后当天已花的
+    // 美元必须从用量事件恢复，否则日上限在重启瞬间被清零。
+    rebuild_usd(pool, super::openai_api::ledger(), now).await?;
+    Ok(())
+}
+
+/// M279 / R1: rebuild today's USD totals from `model_usage_events`. The stored
+/// `estimated_cost_usd` wins; a legacy NULL row is priced from the same rate
+/// card the live recording path uses, and an unknown model stays conservative
+/// rather than free.
+pub async fn rebuild_usd(
+    pool: &SqlitePool,
+    ledger: &super::openai_api::UsdSpendLedger,
+    now: i64,
+) -> crate::errors::Result<()> {
+    let start = daily_spend::day_start_ms(now).unwrap_or(now);
+    let end = daily_spend::next_reset_ms(now).unwrap_or(now);
+    let rows = sqlx::query("SELECT endpoint, estimated_cost_usd, model, input_tokens, cached_tokens, output_tokens FROM model_usage_events WHERE julianday(created_at) >= julianday(? / 1000.0, 'unixepoch') AND julianday(created_at) < julianday(? / 1000.0, 'unixepoch')")
+        .bind(start).bind(end).fetch_all(pool).await?;
+    let mut totals = std::collections::HashMap::<String, f64>::new();
+    for row in rows {
+        let endpoint: String = row.try_get("endpoint")?;
+        if !super::openai_api::is_usd_endpoint(&endpoint) {
+            continue;
+        }
+        let cost: Option<f64> = row.try_get("estimated_cost_usd")?;
+        let cost = cost.unwrap_or_else(|| {
+            super::openai_api::estimate_cost_usd(
+                &row.get::<String, _>("model"),
+                row.get("input_tokens"),
+                row.get("cached_tokens"),
+                row.get("output_tokens"),
+            )
+        });
+        if cost.is_finite() && cost >= 0.0 {
+            *totals.entry(endpoint).or_default() += cost;
+        }
+    }
+    ledger.restore_estimates(totals, now);
     Ok(())
 }
 

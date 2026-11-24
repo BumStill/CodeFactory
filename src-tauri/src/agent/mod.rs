@@ -24,6 +24,8 @@ pub(crate) mod thin_restart;
 pub(crate) mod thin_state;
 pub(crate) use execution_workspace::workspace_recovery_budget;
 pub mod daily_spend_live;
+#[cfg(test)]
+mod daily_spend_live_m279_tests;
 mod fact_checker;
 pub mod failover;
 pub mod failure_summary;
@@ -37,6 +39,7 @@ mod lifecycle_hooks;
 pub mod memory_manifest;
 pub mod model_transport;
 pub mod objective;
+pub mod openai_api;
 /// M151：会话级诊断与状态重置（存量会话卡「正在做 · 等待中」）。
 pub mod objective_diagnostics;
 pub mod objective_supervisor;

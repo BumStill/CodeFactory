@@ -923,7 +923,12 @@ fn declares_unfinished(content: &str) -> bool {
         "尚未完成", "还没有完成", "还没完成", "任务未完成", "将继续", "会继续", "自动继续",
     ];
     let text = content.trim();
-    !text.is_empty() && MARKERS.iter().any(|marker| text.contains(marker))
+    if text.is_empty() {
+        return false;
+    }
+    // M276/R2: `尚未提交、未开 PR` declares the same thing as `尚未完成` — the
+    // work is not delivered yet — and the incident wording used exactly this.
+    MARKERS.iter().any(|marker| text.contains(marker)) || declares_undelivered_work(text)
 }
 
 async fn assistant_declared_unfinished(db: &SqlitePool, session: &str) -> sqlx::Result<Option<(i64, String)>> {
@@ -952,13 +957,56 @@ const BLOCKED_SUMMARY_MARKERS: &[&str] = &[
     "被阻塞",
     "审批被拒绝",
     "blocked",
+    // M276：会话 afc40ac6 的真实措辞（M269 的清单一个都没命中）。
+    "阻塞总结",
+    "停在哪一步",
+    "需要人工介入",
 ];
+
+/// M276/R2: how a turn says the work is still un-delivered. `尚未提交、未开 PR`
+/// is the incident wording; it declares unfinished work just as plainly as
+/// `尚未完成` does, and two separate settlement paths read it.
+const UNDELIVERED_WORK_MARKERS: &[&str] = &[
+    "尚未提交",
+    "没有提交",
+    "未提交",
+    "尚未开 pr",
+    "未开 pr",
+    "没有开 pr",
+    "未创建 pr",
+    "尚未交付",
+    "未交付",
+    "未完成",
+    "尚未完成",
+    "还没完成",
+];
+
+fn mentions_refusal(text: &str) -> bool {
+    ["被拒绝", "被拒", "拒绝执行", "拦下"]
+        .iter()
+        .any(|marker| text.contains(marker))
+}
+
+fn declares_undelivered_work(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    UNDELIVERED_WORK_MARKERS
+        .iter()
+        .any(|marker| lower.contains(marker))
+}
 
 fn is_blocked_summary(text: &str) -> bool {
     let lower = text.to_lowercase();
-    BLOCKED_SUMMARY_MARKERS
+    if BLOCKED_SUMMARY_MARKERS
         .iter()
         .any(|marker| lower.contains(&marker.to_lowercase()))
+    {
+        return true;
+    }
+    // M276/R2: `那次调用被拒绝` alone is not a blocker — a finished task can
+    // mention a refusal it routed around. It only marks a blocker when the same
+    // turn also says the work is still un-delivered; the caller already proved
+    // nothing was delivered before this is consulted.
+    mentions_refusal(&lower) && declares_undelivered_work(&lower)
 }
 
 /// M269/R3: the newest assistant message, read only by the terminal guard.
@@ -978,6 +1026,16 @@ async fn latest_assistant_text(db: &SqlitePool, session: &str) -> sqlx::Result<O
 /// 同一轮只挂一条（id 带消息时间戳），已存在的行不重排；连续续接按 60s 起的
 /// 指数退避，既不做 60 秒无限重排，也不把系统恢复改问成用户决定。
 async fn continue_state(db: &SqlitePool, session: &str, at: i64, why: &str) -> sqlx::Result<Option<ThinState>> {
+    continue_state_after(db, session, at, why, None).await
+}
+
+/// M278/R1：同一条续接，但不再等 60 秒。只用于「审批刚被拒、任务未交付」——用户
+/// 已经当场表态，系统没有理由再隔一分钟才动。
+async fn continue_state_now(db: &SqlitePool, session: &str, at: i64, why: &str) -> sqlx::Result<Option<ThinState>> {
+    continue_state_after(db, session, at, why, Some(0)).await
+}
+
+async fn continue_state_after(db: &SqlitePool, session: &str, at: i64, why: &str, fixed_delay: Option<i64>) -> sqlx::Result<Option<ThinState>> {
     super::background_tasks::ensure_wake_schema(db).await?;
     super::thin_state::ensure(db).await?;
     let why: String = why.chars().take(200).collect();
@@ -988,9 +1046,9 @@ async fn continue_state(db: &SqlitePool, session: &str, at: i64, why: &str) -> s
         let fired: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM wakeup_schedules WHERE session_id=? AND id LIKE 'thin-continue-%' AND COALESCE(last_fired_at,0)>=?",
         ).bind(session).bind(at / 1000 - 3600).fetch_one(db).await?;
-        let delay = 60i64 * (1i64 << fired.min(5));
+        let delay = fixed_delay.unwrap_or_else(|| 60i64 * (1i64 << fired.min(5)));
         let now = chrono::Utc::now().timestamp();
-        let prompt = format!("{why}。系统自动重试/自愈：上一回合明确表示任务尚未完成，继续原任务；先核对仓库/工作区的真实状态，再推进剩余验收项，不要重复已完成的部分。");
+        let prompt = format!("{why}。系统自动重试/自愈：继续原任务；先核对仓库/工作区的真实状态，再推进剩余验收项，不要重复已完成的部分。");
         sqlx::query("INSERT INTO wakeup_schedules(id,session_id,prompt,source,after_sec,next_at,status,created_at) VALUES (?,?,?,'agent_decided',?,?,'pending',?) ON CONFLICT(id) DO NOTHING")
             .bind(&id).bind(session).bind(prompt).bind(delay).bind(now + delay).bind(now).execute(db).await?;
     } else if existing.as_deref() != Some("pending") {
@@ -1003,6 +1061,74 @@ async fn continue_state(db: &SqlitePool, session: &str, at: i64, why: &str) -> s
         reason: Some(format!("{why}；系统自动重试/自愈：接续未完成的工作")),
         ..ThinState::running()
     }))
+}
+
+/// M278/R1：本会话里真实发生过的「审批被拒」——`permission_intents` 的 denied 行
+/// 是用户当场给出的权限答复，属于结构化事实；助手在回合末尾写了什么词一律不参与。
+/// 返回该行时间戳（只用于生成唯一的续接唤醒 id）。
+async fn denied_intent_at(db: &SqlitePool, session: &str) -> sqlx::Result<Option<i64>> {
+    if !has_table(db, "permission_intents").await? {
+        return Ok(None);
+    }
+    let denied: Option<i64> = sqlx::query_scalar(
+        "SELECT MAX(created_at) FROM permission_intents WHERE session_id=? AND status='denied'",
+    )
+    .bind(session)
+    .fetch_optional(db)
+    .await?
+    .flatten();
+    Ok(denied)
+}
+
+/// M282/R1：本会话是否已有真实交付事实（PR 已合并或已关闭）。已经交付的任务不再
+/// 因为一条旧的拒绝被反复接续。
+async fn delivery_settled(db: &SqlitePool, session: &str) -> sqlx::Result<bool> {
+    if !has_table(db, "thin_delivery_refs").await?
+        || !has_table(db, "thin_external_observations").await?
+    {
+        return Ok(false);
+    }
+    let settled: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM thin_external_observations observation JOIN thin_delivery_refs ref ON ref.session_id=observation.session_id AND ref.pr_number=observation.pr_number WHERE observation.session_id=? AND (observation.merged_at IS NOT NULL OR observation.completed_reason LIKE '%已关闭但未合并%')",
+    )
+    .bind(session)
+    .fetch_one(db)
+    .await?;
+    Ok(settled > 0)
+}
+
+/// M282/R1：`refresh` 与回合结束结算（`thin_state::settle_final`）共用的唯一判定。
+/// 用户主动停止、任务已经交付时按原规则结算；确有被拒的审批且任务未交付时，系统立即
+/// 接续——延迟 0，唤醒 id 绑定 denied 行时间戳，所以同一条拒绝只接续一次（M278/R2）。
+/// 这里只读结构化事实（`permission_intents` 的 denied 行），助手在回合末尾写了什么
+/// 词一律不参与判断（R5）。
+pub(crate) async fn denial_continuation(
+    db: &SqlitePool,
+    session: &str,
+) -> sqlx::Result<Option<ThinState>> {
+    if has_table(db, "chat_session_cancel_intents").await? {
+        let stop: Option<i64> =
+            sqlx::query_scalar("SELECT requested_at FROM chat_session_cancel_intents WHERE session_id=?")
+                .bind(session)
+                .fetch_optional(db)
+                .await?;
+        if stop.is_some() {
+            return Ok(None);
+        }
+    }
+    if delivery_settled(db, session).await? {
+        return Ok(None);
+    }
+    let Some(denied_at) = denied_intent_at(db, session).await? else {
+        return Ok(None);
+    };
+    continue_state_now(
+        db,
+        session,
+        denied_at,
+        "上一回合的审批被拒，任务未交付",
+    )
+    .await
 }
 
 /// M259：结束原因只写当场查到的事实。查得到的写结果，查不到的写「未核验」和原因；
@@ -1391,14 +1517,23 @@ async fn closeout_target(db: &SqlitePool, session: &str) -> Result<Option<Closeo
     {
         return Ok(None);
     }
-    let workspace: Option<(String, String)> = sqlx::query_as(
-        "SELECT worktree_path,branch_name FROM execution_workspaces WHERE session_id=? ORDER BY updated_at DESC LIMIT 1",
-    )
-    .bind(session)
-    .fetch_optional(db)
-    .await
-    .map_err(|e| e.to_string())?;
-    let Some((path, workspace_branch)) = workspace else { return Ok(None) };
+    // M273/R3：收尾已经删掉工作区时，核对仍要能从本会话记录的仓库根继续。
+    let select = if has_column(db, "execution_workspaces", "repo_root")
+        .await
+        .map_err(|e| e.to_string())?
+    {
+        "SELECT worktree_path,branch_name,COALESCE(repo_root,'') FROM execution_workspaces WHERE session_id=? ORDER BY updated_at DESC LIMIT 1"
+    } else {
+        "SELECT worktree_path,branch_name,'' FROM execution_workspaces WHERE session_id=? ORDER BY updated_at DESC LIMIT 1"
+    };
+    let workspace: Option<(String, String, String)> = sqlx::query_as(select)
+        .bind(session)
+        .fetch_optional(db)
+        .await
+        .map_err(|e| e.to_string())?;
+    let Some((path, workspace_branch, repo_root)) = workspace else {
+        return Ok(None);
+    };
     let recorded: Option<String> = if has_table(db, "thin_delivery_refs").await.map_err(|e| e.to_string())? {
         sqlx::query_scalar("SELECT branch FROM thin_delivery_refs WHERE session_id=? AND pr_number=?")
             .bind(session)
@@ -1414,6 +1549,13 @@ async fn closeout_target(db: &SqlitePool, session: &str) -> Result<Option<Closeo
         .as_deref()
         .is_some_and(|branch| !branch.trim().is_empty());
     let repo = crate::agent::delivery::resolve_repo(std::path::Path::new(&path), None)
+        .or_else(|first| {
+            if repo_root.trim().is_empty() {
+                return Err(first);
+            }
+            crate::agent::delivery::resolve_repo(std::path::Path::new(&repo_root), None)
+                .map_err(|_| first)
+        })
         .map_err(|error| format!("无法读取工作区的 git 信息（{path}）：{error}"))?;
     Ok(Some(CloseoutTarget {
         worktree: std::path::PathBuf::from(&path),
@@ -1883,6 +2025,12 @@ async fn derive_candidate(db: &SqlitePool, session: &str) -> sqlx::Result<ThinSt
             return Ok(state);
         }
     }
+    // M278/R1 + M282/R1：判定已下沉到 `denial_continuation`，回合结束结算走同一个函数。
+    if completed.is_none() && !stale_scope {
+        if let Some(state) = denial_continuation(db, session).await? {
+            return Ok(state);
+        }
+    }
     let mut pending_question_at = 0;
     if has_table(db, "thin_wait_notes").await? {
         pending_question_at = sqlx::query_scalar::<_, Option<i64>>("SELECT MAX(question.created_at) FROM thin_wait_notes note JOIN messages question ON question.id=note.root_turn_id WHERE note.session_id=? AND NOT EXISTS (SELECT 1 FROM messages answer WHERE answer.session_id=note.session_id AND answer.role='user' AND answer.created_at>question.created_at)")
@@ -2187,6 +2335,52 @@ mod tests {
     async fn m269_an_ordinary_completion_summary_still_ends() {
         let db = fixture().await;
         sqlx::query("INSERT INTO messages(id,session_id,role,content,created_at) VALUES ('m269-task','derive','user','回答一个问题',100),('m269-done','derive','assistant','已完成：测试全部通过，无遗留项。',200)")
+            .execute(&db).await.unwrap();
+        assert_eq!(refresh(&db, "derive").await.unwrap().state, SessionState::Ended);
+    }
+
+    /// M276/R2+R5: the wording of the real M274 incident (session afc40ac6) must
+    /// keep the session alive. Title `阻塞总结`, then `那次调用被拒绝` and
+    /// `尚未提交、未开 PR` — none of the M269 markers matched, so v1.115.0 settled
+    /// a merely-denied operation into `ended`.
+    #[tokio::test]
+    async fn m276_the_m274_blocker_summary_keeps_the_session_alive() {
+        let db = fixture().await;
+        let summary = "## 阻塞总结\n\n**停在哪一步**：交付前校验。`deliver_changes` 被 scenario 注册表门禁拒绝 ——\n需要为这个新文件声明 `Scenario-Test: <IDs>`；我读取注册表的那次调用被拒绝，因此没有可用的既有 ID 依据。代码本身已改完并验证，但**尚未提交、未开 PR**。";
+        sqlx::query("INSERT INTO messages(id,session_id,role,content,created_at) VALUES ('m276-task','derive','user','修复 M274',100),('m276-blocked','derive','assistant',?,200)")
+            .bind(summary)
+            .execute(&db).await.unwrap();
+        let state = refresh(&db, "derive").await.unwrap();
+        assert_ne!(state.state, SessionState::Ended, "a denied operation must not end undelivered work");
+        assert_eq!(state.state, SessionState::WaitingWake);
+        assert!(
+            state.wake_source.unwrap_or_default().contains("thin-continue-"),
+            "a real continuation wake is required"
+        );
+    }
+
+    /// M276/R2: the two independent settlement paths both recognise the incident
+    /// wording. M211's declared-unfinished check must read `尚未提交、未开 PR` as
+    /// unfinished work, not only `尚未完成`.
+    #[tokio::test]
+    async fn m276_undelivered_wording_counts_as_declared_unfinished() {
+        let db = fixture().await;
+        sqlx::query("INSERT INTO messages(id,session_id,role,content,created_at) VALUES ('m276-task','derive','user','修复 M274',100),('m276-blocked','derive','assistant','代码已改完并验证，但尚未提交、未开 PR。',200)")
+            .execute(&db).await.unwrap();
+        let declared = assistant_declared_unfinished(&db, "derive").await.unwrap();
+        assert!(
+            declared.as_ref().is_some_and(|(_, text)| text.contains("未开 PR")),
+            "undelivered wording must count as unfinished: {declared:?}"
+        );
+    }
+
+    /// M276/R2: a refusal that did not leave work undelivered is not a blocker.
+    /// A finished summary that mentions a denial must still settle, otherwise the
+    /// widened markers would resurrect completed work.
+    #[tokio::test]
+    async fn m276_a_resolved_refusal_still_ends() {
+        let db = fixture().await;
+        sqlx::query("INSERT INTO messages(id,session_id,role,content,created_at) VALUES ('m276-task','derive','user','整理一份说明',100),('m276-done','derive','assistant','已完成：读取注册表的调用被拒绝后改用工单接口，全部内容已整理并交付。',200)")
             .execute(&db).await.unwrap();
         assert_eq!(refresh(&db, "derive").await.unwrap().state, SessionState::Ended);
     }
@@ -3356,6 +3550,175 @@ mod tests {
         assert!(state.question.is_none());
     }
 
+    /// M278/R1：审批被拒是真实权限事实。助手随后用一句「需要你做一件事」收尾，不该被
+    /// 结算成等待用户，也不该再等 60 秒——系统立即接续，而且这份由系统事实触发，
+    /// 与助手写了什么词无关。
+    #[tokio::test]
+    async fn m278_denied_approval_continues_immediately_instead_of_asking_user() {
+        let db = fixture().await;
+        let now = chrono::Utc::now().timestamp_millis();
+        sqlx::query("INSERT INTO messages(id,session_id,role,content,created_at) VALUES ('q','derive','user','把这个改完',?)")
+            .bind(now - 60_000).execute(&db).await.unwrap();
+        sqlx::query("INSERT INTO messages(id,session_id,role,content,created_at) VALUES ('a','derive','assistant','当前权限被拒绝。需要你做一件事：手动跑一次登录，然后我继续。',?)")
+            .bind(now - 30_000).execute(&db).await.unwrap();
+        sqlx::raw_sql("DROP TABLE permission_intents; CREATE TABLE permission_intents(session_id TEXT, status TEXT, expires_at INTEGER, created_at INTEGER, tool_name TEXT, prompt_args_json TEXT);").execute(&db).await.unwrap();
+        sqlx::query("INSERT INTO permission_intents VALUES ('derive','denied',?,?,'bash','{}')")
+            .bind(now + 600_000).bind(now - 40_000).execute(&db).await.unwrap();
+        let state = refresh(&db, "derive").await.unwrap();
+        assert_eq!(state.state, SessionState::WaitingWake, "{state:?}");
+        assert!(
+            state.wake_source.as_deref().unwrap_or_default().contains("thin-continue-"),
+            "M278/R1: 被拒后应由系统接续，实际 {state:?}"
+        );
+        let (next_at, prompt): (i64, String) =
+            sqlx::query_as("SELECT next_at,prompt FROM wakeup_schedules WHERE session_id='derive'")
+                .fetch_one(&db).await.unwrap();
+        assert!(
+            next_at <= chrono::Utc::now().timestamp(),
+            "M278/R1: 被拒后不应再等 60 秒才动手（next_at={next_at}）"
+        );
+        assert!(
+            !prompt.contains("手动跑一次登录"),
+            "M278/R1: 唤醒词由系统事实拼出，不搬运助手措辞：{prompt}"
+        );
+    }
+
+    /// M278/R1 反证：没有审批被拒这件事时，不凭空造续接唤醒。
+    #[tokio::test]
+    async fn m278_question_without_denial_arms_no_wake() {
+        let db = fixture().await;
+        super::super::background_tasks::ensure_wake_schema(&db).await.unwrap();
+        let now = chrono::Utc::now().timestamp_millis();
+        sqlx::query("INSERT INTO messages(id,session_id,role,content,created_at) VALUES ('q2','derive','user','把这个改完',?)")
+            .bind(now - 60_000).execute(&db).await.unwrap();
+        sqlx::query("INSERT INTO messages(id,session_id,role,content,created_at) VALUES ('a2','derive','assistant','需要你做一件事：手动跑一次登录，然后我继续。',?)")
+            .bind(now - 30_000).execute(&db).await.unwrap();
+        let _ = refresh(&db, "derive").await.unwrap();
+        let wakes: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM wakeup_schedules WHERE session_id='derive' AND id LIKE 'thin-continue-%'")
+            .fetch_one(&db).await.unwrap();
+        assert_eq!(wakes, 0, "M278/R1: 没有被拒事实就不该自作主张接续");
+    }
+
+    /// M278/R1：同一条拒绝只接续一次——已兑现的唤醒不再重排，也不会把会话变成
+    /// 无限自动重试。
+    #[tokio::test]
+    async fn m278_denied_approval_continues_only_once() {
+        let db = fixture().await;
+        let now = chrono::Utc::now().timestamp_millis();
+        let denied_at = now - 40_000;
+        sqlx::query("INSERT INTO messages(id,session_id,role,content,created_at) VALUES ('q3','derive','user','把这个改完',?)")
+            .bind(now - 60_000).execute(&db).await.unwrap();
+        sqlx::query("INSERT INTO messages(id,session_id,role,content,created_at) VALUES ('a3','derive','assistant','当前权限被拒绝。需要你做一件事。',?)")
+            .bind(now - 30_000).execute(&db).await.unwrap();
+        super::super::background_tasks::ensure_wake_schema(&db).await.unwrap();
+        sqlx::raw_sql("DROP TABLE permission_intents; CREATE TABLE permission_intents(session_id TEXT, status TEXT, expires_at INTEGER, created_at INTEGER, tool_name TEXT, prompt_args_json TEXT);").execute(&db).await.unwrap();
+        sqlx::query("INSERT INTO permission_intents VALUES ('derive','denied',?,?,'bash','{}')")
+            .bind(now + 600_000).bind(denied_at).execute(&db).await.unwrap();
+        sqlx::query("INSERT INTO wakeup_schedules(id,session_id,prompt,source,next_at,status,created_at,last_fired_at) VALUES (?, 'derive', '继续原任务', 'agent_decided', ?, 'done', ?, ?)")
+            .bind(format!("thin-continue-derive-{denied_at}"))
+            .bind(now - 1000).bind(now - 2000).bind(now - 1000)
+            .execute(&db).await.unwrap();
+        let _ = refresh(&db, "derive").await.unwrap();
+        let rows: Vec<(String, String, i64)> = sqlx::query_as("SELECT id,status,next_at FROM wakeup_schedules WHERE session_id='derive' ORDER BY id")
+            .fetch_all(&db).await.unwrap();
+        let pending: Vec<&(String, String, i64)> = rows.iter()
+            .filter(|(id, status, _)| id.starts_with("thin-continue-") && status == "pending")
+            .collect();
+        assert!(pending.is_empty(), "M278/R1: 同一条拒绝只接续一次，已兑现的唤醒不应重排：{rows:?}");
+    }
+
+    /// M282/R3：回合结束的真实入口是 `settle_final`，不是 `refresh`。现场会话
+    /// ebe54c65：审批被拒、任务未交付、助手以「需要你做一件事」收尾，`settle_final`
+    /// 却写成 `ended / 任务已结束` 并让触发器取消全部 pending 唤醒。
+    #[tokio::test]
+    async fn m282_settle_final_continues_after_denied_approval() {
+        let db = fixture().await;
+        let now = chrono::Utc::now().timestamp_millis();
+        sqlx::query("INSERT INTO messages(id,session_id,role,content,created_at) VALUES ('m282-q','derive','user','把这个改完',?)")
+            .bind(now - 60_000).execute(&db).await.unwrap();
+        sqlx::query("INSERT INTO messages(id,session_id,role,content,created_at) VALUES ('m282-a','derive','assistant','阻断总结：需要你做一件事：手工补三行。',?)")
+            .bind(now - 30_000).execute(&db).await.unwrap();
+        sqlx::raw_sql("DROP TABLE permission_intents; CREATE TABLE permission_intents(session_id TEXT, status TEXT, expires_at INTEGER, created_at INTEGER, tool_name TEXT, prompt_args_json TEXT);").execute(&db).await.unwrap();
+        sqlx::query("INSERT INTO permission_intents VALUES ('derive','denied',?,?,'bash','{}')")
+            .bind(now + 600_000).bind(now - 40_000).execute(&db).await.unwrap();
+        let state = crate::agent::thin_state::settle_final(&db, "derive", "m282-turn", None).await.unwrap();
+        assert_eq!(state.state, SessionState::WaitingWake, "M282/R3: {state:?}");
+        assert!(
+            state.wake_source.as_deref().unwrap_or_default().contains("thin-continue-"),
+            "M282/R3: 回合结束结算也必须由系统接续，实际 {state:?}"
+        );
+        let (id, next_at, status): (String, i64, String) =
+            sqlx::query_as("SELECT id,next_at,status FROM wakeup_schedules WHERE session_id='derive' AND id LIKE 'thin-continue-%'")
+                .fetch_one(&db).await.unwrap();
+        assert!(id.starts_with("thin-continue-derive-"), "M282/R3: {id}");
+        assert!(
+            next_at <= chrono::Utc::now().timestamp(),
+            "M282/R3: 被拒后立即接续，next_at={next_at}"
+        );
+        assert_eq!(status, "pending", "M282/R3: ended 触发器不得取消这条接续唤醒");
+        let stored: String = sqlx::query_scalar("SELECT state FROM thin_session_state WHERE session_id='derive'")
+            .fetch_one(&db).await.unwrap();
+        assert_ne!(stored, "ended", "M282/R3: 被拒且未交付的回合不能被写成 ended");
+    }
+
+    /// M282/R4 反例：没有被拒事实时，`settle_final` 按原规则结算，不造接续唤醒。
+    #[tokio::test]
+    async fn m282_settle_final_without_denial_still_settles_by_rule() {
+        let db = fixture().await;
+        let now = chrono::Utc::now().timestamp_millis();
+        sqlx::query("INSERT INTO messages(id,session_id,role,content,created_at) VALUES ('m282-q4','derive','user','把这个改完',?)")
+            .bind(now - 60_000).execute(&db).await.unwrap();
+        sqlx::query("INSERT INTO messages(id,session_id,role,content,created_at) VALUES ('m282-a4','derive','assistant','需要你做一件事：手工补三行。',?)")
+            .bind(now - 30_000).execute(&db).await.unwrap();
+        let _ = crate::agent::thin_state::settle_final(&db, "derive", "m282-turn-4", None).await.unwrap();
+        let wakes: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM wakeup_schedules WHERE session_id='derive' AND id LIKE 'thin-continue-%'")
+            .fetch_one(&db).await.unwrap();
+        assert_eq!(wakes, 0, "M282/R4: 没有被拒事实就不该接续");
+    }
+
+    /// M282/R4 反例：用户主动停止会话后，被拒的历史不覆盖用户决定。
+    #[tokio::test]
+    async fn m282_settle_final_respects_user_stop() {
+        let db = fixture().await;
+        let now = chrono::Utc::now().timestamp_millis();
+        sqlx::query("INSERT INTO chat_session_cancel_intents(session_id,status,requested_at,updated_at) VALUES ('derive','requested',?,?)")
+            .bind(now - 10_000).bind(now - 10_000).execute(&db).await.unwrap();
+        sqlx::query("INSERT INTO messages(id,session_id,role,content,created_at) VALUES ('m282-q5','derive','user','停下',?)")
+            .bind(now - 60_000).execute(&db).await.unwrap();
+        sqlx::query("INSERT INTO messages(id,session_id,role,content,created_at) VALUES ('m282-a5','derive','assistant','需要你做一件事：手工补三行。',?)")
+            .bind(now - 30_000).execute(&db).await.unwrap();
+        sqlx::raw_sql("DROP TABLE permission_intents; CREATE TABLE permission_intents(session_id TEXT, status TEXT, expires_at INTEGER, created_at INTEGER, tool_name TEXT, prompt_args_json TEXT);").execute(&db).await.unwrap();
+        sqlx::query("INSERT INTO permission_intents VALUES ('derive','denied',?,?,'bash','{}')")
+            .bind(now + 600_000).bind(now - 40_000).execute(&db).await.unwrap();
+        let state = crate::agent::thin_state::settle_final(&db, "derive", "m282-turn-5", None).await.unwrap();
+        let wakes: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM wakeup_schedules WHERE session_id='derive' AND id LIKE 'thin-continue-%'")
+            .fetch_one(&db).await.unwrap();
+        assert_eq!(wakes, 0, "M282/R4: 用户已停止，不接续");
+        assert_eq!(state.state, SessionState::Ended, "M282/R4: {state:?}");
+    }
+
+    /// M282/R4 反例：已交付（PR 合并）之后，旧拒绝不再触发接续。
+    #[tokio::test]
+    async fn m282_settle_final_skips_continuation_after_delivery() {
+        let db = fixture().await;
+        let now = chrono::Utc::now().timestamp_millis();
+        sqlx::query("INSERT INTO messages(id,session_id,role,content,created_at) VALUES ('m282-q6','derive','user','把这个改完',?)")
+            .bind(now - 60_000).execute(&db).await.unwrap();
+        sqlx::query("INSERT INTO messages(id,session_id,role,content,created_at) VALUES ('m282-a6','derive','assistant','需要你做一件事：手工补三行。',?)")
+            .bind(now - 30_000).execute(&db).await.unwrap();
+        sqlx::raw_sql("DROP TABLE permission_intents; CREATE TABLE permission_intents(session_id TEXT, status TEXT, expires_at INTEGER, created_at INTEGER, tool_name TEXT, prompt_args_json TEXT);").execute(&db).await.unwrap();
+        sqlx::query("INSERT INTO permission_intents VALUES ('derive','denied',?,?,'bash','{}')")
+            .bind(now + 600_000).bind(now - 40_000).execute(&db).await.unwrap();
+        sqlx::query("INSERT INTO thin_delivery_refs VALUES ('derive','synthetic',73,'ThroughMerge')").execute(&db).await.unwrap();
+        ensure_external(&db).await.unwrap();
+        sqlx::query("INSERT INTO thin_external_observations(session_id,pr_number,ceiling,observed_at,completed_reason,merged_at) VALUES ('derive',73,'ThroughMerge',?,'PR #73 已合并',?)")
+            .bind(now - 5_000).bind(now - 5_000).execute(&db).await.unwrap();
+        let _ = crate::agent::thin_state::settle_final(&db, "derive", "m282-turn-6", None).await.unwrap();
+        let wakes: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM wakeup_schedules WHERE session_id='derive' AND id LIKE 'thin-continue-%'")
+            .fetch_one(&db).await.unwrap();
+        assert_eq!(wakes, 0, "M282/R4: 已交付的任务不再为旧拒绝接续");
+    }
+
     #[test]
     fn m142_closed_pr_is_failure_not_successful_closeout() {
         assert!(completion_reason(&serde_json::json!({"state":"CLOSED"}), "ThroughMerge", false, 73).is_none());
@@ -4078,7 +4441,14 @@ pub(crate) mod merged_settlement {
         session_id: &str,
         state: &thin_state::ThinState,
     ) -> Result<()> {
+        // M275/R2：收尾未核验的结束会在同一事务里取消 pending 唤醒，所以不能
+        // 被「有排队唤醒就不能结束」这一子守卫挡回 running；其余守卫保持原样。
+        let closeout_unverified = state
+            .reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("收尾未核验"));
         if state.state == thin_state::SessionState::Ended
+            && !closeout_unverified
             && state.reason.as_deref().is_some_and(|reason| reason.contains("PR #"))
             && !super::delivery_closeout_may_end(db, session_id).await? {
             thin_state::save(db, session_id, &thin_state::ThinState::running()).await?;
@@ -4154,7 +4524,10 @@ pub(crate) mod merged_settlement {
     #[derive(Debug, Default, PartialEq, Eq)]
     pub struct SettleSummary {
         pub settled: usize,
+        /// M275/R2：收尾路径不再提问；保留字段只用于旧日志兼容。
         pub asked_user: usize,
+        /// M275/R2：确有未保存内容，已以 ended 写明现场、需要保留的会话数。
+        pub unverified: usize,
         pub skipped: usize,
     }
 
@@ -4185,15 +4558,68 @@ pub(crate) mod merged_settlement {
             .is_ok()
     }
 
+    /// M275/R3：收尾范围的持久边界。首次扫描时写入，此后不前移——多次重启
+    /// 不能让「上次运行中刚结束、尚未收尾」的会话掉出范围。边界之前结束的
+    /// 历史会话永远不进候选，不会被重新打开。
+    ///
+    /// 回看 10 分钟覆盖「进程已起来、首次安全 tick 之前自己结束」的会话；
+    /// 历史残留（天级）依然被排除。
+    const CLOSEOUT_SCOPE_GRACE_MS: i64 = 10 * 60 * 1000;
+
+    pub(crate) async fn closeout_scope_boundary(pool: &SqlitePool) -> Result<i64> {
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS closeout_scope_boundary (id INTEGER PRIMARY KEY CHECK (id = 1), installed_at INTEGER NOT NULL)",
+        )
+        .execute(pool)
+        .await?;
+        let now = chrono::Utc::now().timestamp_millis();
+        sqlx::query("INSERT OR IGNORE INTO closeout_scope_boundary(id, installed_at) VALUES (1, ?)")
+            .bind(now.saturating_sub(CLOSEOUT_SCOPE_GRACE_MS))
+            .execute(pool)
+            .await?;
+        Ok(sqlx::query_scalar(
+            "SELECT installed_at FROM closeout_scope_boundary WHERE id = 1",
+        )
+        .fetch_one(pool)
+        .await?)
+    }
+
     /// R1/R2: settle every `waiting_wake` session whose external work concluded.
     /// Deterministic — this never asks a model to finish the task.
     pub async fn settle_merged_sessions(pool: &SqlitePool) -> Result<SettleSummary> {
         thin_state::ensure(pool).await?;
         super::reconcile_orphan_turns(pool).await?;
-        let sessions: Vec<String> =
+        let scope_boundary = closeout_scope_boundary(pool).await?;
+        let mut sessions: Vec<String> =
             sqlx::query_scalar("SELECT session_id FROM thin_session_state WHERE state IN ('waiting_wake','running')")
                 .fetch_all(pool)
                 .await?;
+        // M273/R2：会话自己写完报告就结束（状态是它自己投影的 ended）时，M264 清理
+        // 与 M259 逐项核对同样必须执行一次。用户主动停止的会话不在候选里。
+        if has_table(pool, "thin_external_observations").await? {
+            let unclosed: Vec<String> = sqlx::query_scalar(
+                "SELECT state.session_id FROM thin_session_state state
+                  WHERE state.state='ended'
+                    AND state.updated_at >= ?
+                    AND COALESCE(state.reason,'') NOT LIKE 'cancelled%'
+                    AND COALESCE(state.reason,'') NOT LIKE '%系统已自动完成收尾%'
+                    AND COALESCE(state.reason,'') NOT LIKE '%收尾已完成%'
+                    AND COALESCE(state.reason,'') NOT LIKE '%收尾未核验%'
+                    AND EXISTS (SELECT 1 FROM thin_external_observations observation
+                                WHERE observation.session_id=state.session_id
+                                  AND observation.completed_reason IS NOT NULL
+                                  AND (observation.completed_reason LIKE '%已合并%'
+                                       OR observation.completed_reason LIKE '%已关闭%'))",
+            )
+            .bind(scope_boundary)
+            .fetch_all(pool)
+            .await?;
+            for session in unclosed {
+                if !sessions.contains(&session) {
+                    sessions.push(session);
+                }
+            }
+        }
 
         let mut summary = SettleSummary::default();
         for session in sessions {
@@ -4211,6 +4637,10 @@ pub(crate) mod merged_settlement {
                 summary.skipped += 1;
                 continue;
             };
+            // M273/R2：已经由会话自己结束的行，要用 M259 的逐项事实改写原因。
+            let self_ended = thin_state::load(pool, &session)
+                .await?
+                .is_some_and(|state| state.state == thin_state::SessionState::Ended);
             // M230/R2/R4: gate before touching workspace rows or the filesystem.
             // Scan durable IDs, including history outside dispatch's 200-row list.
             if super::has_column(pool, "objectives", "session_id").await?
@@ -4238,7 +4668,13 @@ pub(crate) mod merged_settlement {
             };
             match result {
                 Ok(note) => {
-                    let text = format!("{reason}。系统已自动完成收尾：{note}。任务已结束。");
+                    let text = if self_ended {
+                        // M273/R2：自结束的会话也要逐项写明 M259 的核对结果。
+                        let verified = super::closeout_result(pool, &session, &reason).await;
+                        format!("{verified}系统已自动完成收尾：{note}。")
+                    } else {
+                        format!("{reason}。系统已自动完成收尾：{note}。任务已结束。")
+                    };
                     settle_ended_and_cancel(pool, &session, &text, &note).await?;
                     close_workspace_rows(pool, &session).await?;
                     tracing::info!(session, %note, "merged/closed session settled after restart");
@@ -4251,12 +4687,14 @@ pub(crate) mod merged_settlement {
                     summary.skipped += 1;
                 }
                 Err(failure) => {
-                    let question = format!(
-                        "{reason}，但系统自动收尾没有完成：{failure}。需要你决定如何处理这个工作区。"
+                    // M275/R2：收尾不能为了收尾去问用户。确实有内容不在默认分支时，
+                    // 写清楚现场，直接以结束状态写明；不再进入 waiting_user。
+                    let text = format!(
+                        "{reason}；收尾未核验：{failure}。任务已结束，系统未做删除，已保留本地工作区、分支与远端分支。"
                     );
-                    ask_user_and_cancel(pool, &session, &question).await?;
-                    tracing::warn!(session, %failure, "merged session closeout deferred to the user");
-                    summary.asked_user += 1;
+                    settle_ended_and_cancel(pool, &session, &text, &failure).await?;
+                    tracing::warn!(session, %failure, "merged session closeout ended with preserved evidence");
+                    summary.unverified += 1;
                 }
             }
         }
@@ -4366,6 +4804,118 @@ pub(crate) mod merged_settlement {
         Ok(count > 0)
     }
 
+    /// M275/R1：默认分支引用。真实安装先看 `origin/HEAD`，再用常见远端/本地
+    /// 名称；都取不到时上层退回「提交号可达」判定。
+    fn default_branch_ref(repo: &Path) -> Option<String> {
+        ["origin/HEAD", "origin/main", "origin/master", "main", "master"]
+            .into_iter()
+            .find(|name| super::closeout_git(repo, &["rev-parse", "--verify", "--quiet", name]).is_ok())
+            .map(str::to_string)
+    }
+
+    /// M275/R1：给一段补丁算稳定的 patch-id。空补丁或 git 失败返回 None。
+    fn closeout_patch_id(cwd: &Path, patch: &str) -> Option<String> {
+        use std::io::Write;
+        if patch.trim().is_empty() {
+            return None;
+        }
+        let mut child = Command::new("git")
+            .no_window()
+            .current_dir(cwd)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .args(["patch-id", "--stable"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .ok()?;
+        child.stdin.take()?.write_all(patch.as_bytes()).ok()?;
+        let output = child.wait_with_output().ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let text = String::from_utf8_lossy(&output.stdout);
+        text.split_whitespace().next().map(str::to_string)
+    }
+
+    /// M275/R1：压缩合并保留内容、丢弃提交号。先比整树（树相同即已保存）；
+    /// 树不同再比补丁内容：分支自合并基点的聚合补丁，与默认分支自同一基点起
+    /// 的某个非合并提交（GitHub 的 squash 提交）补丁相同，即说明分支内容已经
+    /// 在默认分支里。只比提交号会把压缩合并误报成「未推送」。
+    fn closeout_content_saved(
+        workspace: &TerminalWorkspace,
+        default_ref: &str,
+    ) -> Result<bool, String> {
+        if super::closeout_git(
+            &workspace.worktree_path,
+            &["diff", "--quiet", default_ref, "HEAD"],
+        )
+        .is_ok()
+        {
+            return Ok(true);
+        }
+        let base = super::closeout_git(
+            &workspace.worktree_path,
+            &["merge-base", default_ref, "HEAD"],
+        )?;
+        let branch_patch = super::closeout_git(
+            &workspace.worktree_path,
+            &["diff", &base, "HEAD"],
+        )?;
+        let Some(branch_id) = closeout_patch_id(&workspace.worktree_path, &branch_patch) else {
+            return Ok(false);
+        };
+        let range = format!("{base}..{default_ref}");
+        let commits = super::closeout_git(
+            &workspace.worktree_path,
+            &["rev-list", "--no-merges", "--max-count=200", &range],
+        )?;
+        for commit in commits.lines().map(str::trim).filter(|line| !line.is_empty()) {
+            let patch = super::closeout_git(
+                &workspace.worktree_path,
+                &["show", "--format=", "--patch", commit],
+            )?;
+            if closeout_patch_id(&workspace.worktree_path, &patch).as_deref()
+                == Some(branch_id.as_str())
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// M275/R2：确实没有进默认分支时，写清楚是哪些提交、在哪个分支。
+    fn unsaved_commit_listing(
+        workspace: &TerminalWorkspace,
+        default_ref: Option<&str>,
+    ) -> String {
+        let excluded = format!("--exclude={}", workspace.branch_name);
+        let listing = match default_ref {
+            Some(default_ref) => super::closeout_git(
+                &workspace.worktree_path,
+                &["log", "--oneline", "--max-count=5", "HEAD", "--not", default_ref],
+            ),
+            None => super::closeout_git(
+                &workspace.worktree_path,
+                &[
+                    "log",
+                    "--oneline",
+                    "--max-count=5",
+                    "HEAD",
+                    "--not",
+                    "--remotes",
+                    "--branches",
+                    &excluded,
+                ],
+            ),
+        };
+        match listing {
+            Ok(text) if !text.trim().is_empty() => text.replace('\n', "、"),
+            Ok(_) => "（提交列表为空）".to_string(),
+            Err(error) => format!("（提交列表不可用：{error}）"),
+        }
+    }
+
     /// R1: no workspace left → nothing to close out. R2: workspace still there →
     /// deterministic §8 closeout, or a plain reason for the user.
     fn closeout_all(workspaces: &[TerminalWorkspace]) -> Result<String, String> {
@@ -4413,14 +4963,35 @@ pub(crate) mod merged_settlement {
                     workspace.worktree_path.display()
                 ));
             }
-            // M187/R3: clean does not imply published. Preserve commits that
-            // have no surviving local branch or remote-tracking reference.
-            let unpublished = git(&workspace.worktree_path, &[
-                "rev-list", "--count", "HEAD", "--not", "--remotes",
-                &format!("--exclude={}", workspace.branch_name), "--branches",
-            ])?;
-            if unpublished.trim() != "0" {
-                return Err(format!("工作区还有 {unpublished} 个未推送且未被其他分支保存的提交，系统自动重试/自愈：保留工作区"));
+            // M187/R3: clean does not imply published. M275/R1: a squash merge
+            // keeps the branch content but not its commit ids, so compare content
+            // (tree, then patch) instead of commit ids alone.
+            let default_ref = default_branch_ref(&workspace.repo_root);
+            let content_saved = match default_ref.as_deref() {
+                Some(default_ref) => closeout_content_saved(workspace, default_ref)?,
+                None => false,
+            };
+            let preserved_by_other_ref = super::closeout_git(
+                &workspace.worktree_path,
+                &[
+                    "rev-list",
+                    "--count",
+                    "HEAD",
+                    "--not",
+                    "--remotes",
+                    &format!("--exclude={}", workspace.branch_name),
+                    "--branches",
+                ],
+            )
+            .map(|count| count.trim() == "0")
+            .unwrap_or(false);
+            if !content_saved && !preserved_by_other_ref {
+                let listing = unsaved_commit_listing(workspace, default_ref.as_deref());
+                let target = default_ref.as_deref().unwrap_or("默认分支");
+                return Err(format!(
+                    "分支 {} 还有未进入 {} 的提交：{listing}；系统未做删除，已保留工作区、本地分支与远端分支",
+                    workspace.branch_name, target
+                ));
             }
             let path = workspace.worktree_path.to_string_lossy().to_string();
             git(
@@ -4748,9 +5319,10 @@ pub(crate) mod merged_settlement {
             assert!(alive.exists(), "M187: unpublished worktree was removed");
         }
 
-        /// R2: a dirty workspace is not silently deleted and not silently waited on.
+        /// M275/R2：脏工作区不再提问，也不进 waiting_user；以 ended 写明未提交
+        /// 项，保留现场并取消唤醒（旧行为「需要你决定」正是 M275 的误报中间态）。
         #[tokio::test]
-        async fn r2_dirty_workspace_asks_user_with_a_reason() {
+        async fn r2_dirty_workspace_ends_with_a_clear_reason() {
             let dir = scratch_dir("dirty");
             let (repo, _branch_a, alive, branch_b) = build_fixture(&dir);
             std::fs::write(alive.join("scratch.txt"), "uncommitted").unwrap();
@@ -4781,19 +5353,20 @@ pub(crate) mod merged_settlement {
             .unwrap();
 
             let summary = settle_merged_sessions(&pool).await.unwrap();
-            assert_eq!(summary.asked_user, 1, "{summary:?}");
+            assert_eq!(summary.asked_user, 0, "收尾不得提问：{summary:?}");
+            assert_eq!(summary.unverified, 1, "脏工作区要记一笔未核验：{summary:?}");
             assert!(alive.exists(), "dirty worktree must be preserved");
             let state = thin_state::load(&pool, "sess-b").await.unwrap().unwrap();
-            assert_eq!(state.state, crate::agent::thin_state::SessionState::WaitingUser);
-            assert!(state.question.unwrap().contains("未提交"));
-            // M199/R3: a question is not explicit stop or terminal settlement;
-            // preserve the pending wake rather than silently killing closeout.
+            assert_eq!(state.state, crate::agent::thin_state::SessionState::Ended);
+            assert!(state.question.is_none(), "不得写入问题");
+            assert!(state.reason.unwrap().contains("未提交"));
+            // 结束后不得留下会起模型回合的唤醒。
             let pending: i64 =
                 sqlx::query_scalar("SELECT COUNT(*) FROM wakeup_schedules WHERE status='pending'")
                     .fetch_one(&pool)
                     .await
                     .unwrap();
-            assert_eq!(pending, 1);
+            assert_eq!(pending, 0);
             assert!(waiting_wake_without_wake_source(&pool).await.is_empty());
         }
 
@@ -4848,6 +5421,409 @@ pub(crate) mod merged_settlement {
                 waiting_wake_without_wake_source(&pool).await,
                 vec!["sess-d".to_string()]
             );
+        }
+
+        /// M273：真实裸远端。交付分支已推送（已合并 PR 的现场），会话自己有
+        /// 一个托管 worktree，分支在本仓库保留命名空间内。
+        fn self_ended_fixture(dir: &Path) -> (PathBuf, PathBuf, String) {
+            let remote = dir.join("origin.git");
+            std::fs::create_dir_all(&remote).unwrap();
+            git_ok(&remote, &["init", "--bare", "-q", "-b", "main"]);
+            let repo = dir.join("repo");
+            std::fs::create_dir_all(&repo).unwrap();
+            git_ok(&repo, &["init", "-q", "-b", "main"]);
+            git_ok(&repo, &["config", "user.name", "Synthetic"]);
+            git_ok(
+                &repo,
+                &["config", "user.email", "synthetic@example.invalid"],
+            );
+            std::fs::write(repo.join("tracked.txt"), "base").unwrap();
+            git_ok(&repo, &["add", "."]);
+            git_ok(&repo, &["commit", "-qm", "synthetic base"]);
+            git_ok(
+                &repo,
+                &["remote", "add", "origin", &remote.to_string_lossy()],
+            );
+            git_ok(&repo, &["push", "-q", "origin", "main"]);
+            let branch = "codefactory/objective-m273".to_string();
+            let worktree = dir.join("ws-m273");
+            git_ok(
+                &repo,
+                &[
+                    "worktree",
+                    "add",
+                    "-q",
+                    "-b",
+                    &branch,
+                    &worktree.to_string_lossy(),
+                    "HEAD",
+                ],
+            );
+            git_ok(&worktree, &["push", "-q", "-u", "origin", &branch]);
+            (repo, worktree, branch)
+        }
+
+        /// M273：真实 DB + 真实合并事实，会话状态由它自己写成 ended。
+        async fn seed_self_ended_session(
+            dir: &Path,
+            repo: &Path,
+            worktree: &Path,
+            branch: &str,
+            reason: &str,
+        ) -> SqlitePool {
+            let pool = seed_state(dir).await;
+            // seed_state 建的是历史库结构；M259/M264 需要真实观测列。
+            for column in [
+                "pr_number INTEGER NOT NULL DEFAULT 0",
+                "ceiling TEXT NOT NULL DEFAULT 'ThroughMerge'",
+                "closeout_queued INTEGER NOT NULL DEFAULT 1",
+                "merged_at INTEGER",
+            ] {
+                sqlx::query(&format!(
+                    "ALTER TABLE thin_external_observations ADD COLUMN {column}"
+                ))
+                .execute(&pool)
+                .await
+                .unwrap();
+            }
+            sqlx::query("INSERT INTO objectives(id,status) VALUES ('obj-m273','completed')")
+                .execute(&pool)
+                .await
+                .unwrap();
+            sqlx::query(
+                "INSERT INTO execution_workspaces
+                 (id, objective_id, session_id, repo_identity, repo_root, git_common_dir,
+                  worktree_path, branch_name, base_ref, base_sha, state, created_at, updated_at)
+                 VALUES ('ws-m273','obj-m273','sess-m273',?,?,?,?,?,'HEAD','deadbeef','active',1,1)",
+            )
+            .bind(repo.to_string_lossy().to_string())
+            .bind(repo.to_string_lossy().to_string())
+            .bind(repo.join(".git").to_string_lossy().to_string())
+            .bind(worktree.to_string_lossy().to_string())
+            .bind(branch)
+            .execute(&pool)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO thin_external_observations
+                 (session_id,completed_reason,observed_at,pr_number,ceiling,closeout_queued,merged_at)
+                 VALUES ('sess-m273','PR #1052 已合并',1,1052,'ThroughMerge',1,1)",
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+            thin_state::save(
+                &pool,
+                "sess-m273",
+                &thin_state::ThinState::ended(reason, "本会话记录"),
+            )
+            .await
+            .unwrap();
+            pool
+        }
+
+        /// M273/R2+R3：会话自己写完最终报告就 ended，也不能跳过 M264 清理与
+        /// M259 逐项核对；再跑一轮不重复清理。
+        #[tokio::test]
+        async fn m273_self_ended_session_still_gets_system_closeout() {
+            let dir = scratch_dir("m273-self-end");
+            let (repo, worktree, branch) = self_ended_fixture(&dir);
+            let pool = seed_self_ended_session(
+                &dir,
+                &repo,
+                &worktree,
+                &branch,
+                "PR #1052 已合并",
+            )
+            .await;
+            let before = thin_state::load(&pool, "sess-m273").await.unwrap().unwrap();
+            assert_eq!(before.state, crate::agent::thin_state::SessionState::Ended);
+            assert_eq!(before.reason.as_deref(), Some("PR #1052 已合并"));
+            assert!(
+                !git(&repo, &["ls-remote", "--heads", "origin", &branch])
+                    .unwrap()
+                    .is_empty(),
+                "fixture must leave the merged branch on the remote"
+            );
+
+            let summary = settle_merged_sessions(&pool).await.unwrap();
+            assert_eq!(summary.settled, 1, "{summary:?}");
+
+            assert!(
+                git(&repo, &["ls-remote", "--heads", "origin", &branch])
+                    .unwrap()
+                    .is_empty(),
+                "自结束会话的远端分支也必须由系统删除"
+            );
+            assert!(!worktree.exists(), "本地工作区应由系统删除");
+            assert!(
+                git(&repo, &["rev-parse", "--verify", &branch]).is_err(),
+                "本地分支应由系统删除"
+            );
+
+            let after = thin_state::load(&pool, "sess-m273").await.unwrap().unwrap();
+            assert_eq!(after.state, crate::agent::thin_state::SessionState::Ended);
+            let reason = after.reason.unwrap_or_default();
+            assert!(reason.contains("系统已自动完成收尾"), "{reason}");
+            assert!(reason.contains("已删除已合并远端分支"), "{reason}");
+            assert!(
+                reason.matches('；').count() >= 2,
+                "结束原因必须逐项写明核对与清理结果：{reason}"
+            );
+
+            let again = settle_merged_sessions(&pool).await.unwrap();
+            assert_eq!(again.settled, 0, "已收尾的会话不重复清理：{again:?}");
+        }
+
+        /// M273/R2 例外：用户主动停止的会话不清理、不改原因。
+        #[tokio::test]
+        async fn m273_user_stopped_session_is_not_cleaned_up() {
+            let dir = scratch_dir("m273-stop");
+            let (repo, worktree, branch) = self_ended_fixture(&dir);
+            let pool = seed_self_ended_session(
+                &dir,
+                &repo,
+                &worktree,
+                &branch,
+                "cancelled：用户已停止会话",
+            )
+            .await;
+            let summary = settle_merged_sessions(&pool).await.unwrap();
+            assert_eq!(summary.settled, 0, "{summary:?}");
+            assert!(worktree.exists(), "停止的会话工作区不得删除");
+            assert!(
+                !git(&repo, &["ls-remote", "--heads", "origin", &branch])
+                    .unwrap()
+                    .is_empty(),
+                "停止的会话远端分支不得删除"
+            );
+            let state = thin_state::load(&pool, "sess-m273").await.unwrap().unwrap();
+            assert_eq!(state.state, crate::agent::thin_state::SessionState::Ended);
+            assert_eq!(
+                state.reason.as_deref(),
+                Some("cancelled：用户已停止会话"),
+                "停止原因不得被收尾改写"
+            );
+        }
+
+        async fn seed_merged_workspace(
+            pool: &SqlitePool,
+            session: &str,
+            objective: &str,
+            repo: &Path,
+            worktree: &Path,
+            branch: &str,
+        ) {
+            sqlx::query("INSERT INTO objectives(id,status) VALUES (?, 'completed')")
+                .bind(objective)
+                .execute(pool)
+                .await
+                .unwrap();
+            sqlx::query(
+                "INSERT INTO execution_workspaces
+                 (id, objective_id, session_id, repo_identity, repo_root, git_common_dir,
+                  worktree_path, branch_name, base_ref, base_sha, state, created_at, updated_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'HEAD', 'deadbeef', 'active', 1, 1)",
+            )
+            .bind(format!("ws-{session}"))
+            .bind(objective)
+            .bind(session)
+            .bind(repo.to_string_lossy().to_string())
+            .bind(repo.to_string_lossy().to_string())
+            .bind(repo.join(".git").to_string_lossy().to_string())
+            .bind(worktree.to_string_lossy().to_string())
+            .bind(branch)
+            .execute(pool)
+            .await
+            .unwrap();
+        }
+
+        /// M275/R1：压缩合并保留内容、丢弃提交号。远端分支已被删除、默认分支
+        /// 又前移之后，本地原始提交仍必须判定为「已保存」。
+        #[test]
+        fn m275_squash_merged_branch_content_counts_as_saved() {
+            let dir = scratch_dir("m275-squash");
+            let remote = dir.join("origin.git");
+            std::fs::create_dir_all(&remote).unwrap();
+            git_ok(&remote, &["init", "--bare", "-q", "-b", "main"]);
+            let repo = dir.join("repo");
+            std::fs::create_dir_all(&repo).unwrap();
+            git_ok(&repo, &["init", "-q", "-b", "main"]);
+            git_ok(&repo, &["config", "user.name", "Synthetic"]);
+            git_ok(
+                &repo,
+                &["config", "user.email", "synthetic@example.invalid"],
+            );
+            std::fs::write(repo.join("tracked.txt"), "base\n").unwrap();
+            git_ok(&repo, &["add", "."]);
+            git_ok(&repo, &["commit", "-qm", "synthetic base"]);
+            git_ok(
+                &repo,
+                &["remote", "add", "origin", &remote.to_string_lossy()],
+            );
+            git_ok(&repo, &["push", "-q", "origin", "main"]);
+
+            let branch = "codefactory/objective-m275".to_string();
+            let worktree = dir.join("ws-m275");
+            git_ok(
+                &repo,
+                &[
+                    "worktree",
+                    "add",
+                    "-q",
+                    "-b",
+                    &branch,
+                    &worktree.to_string_lossy(),
+                    "HEAD",
+                ],
+            );
+            std::fs::write(worktree.join("feature.txt"), "feature one\n").unwrap();
+            git_ok(&worktree, &["add", "feature.txt"]);
+            git_ok(&worktree, &["commit", "-qm", "synthetic feature one"]);
+            std::fs::write(worktree.join("feature.txt"), "feature one\nfeature two\n").unwrap();
+            git_ok(&worktree, &["commit", "-qam", "synthetic feature two"]);
+            git_ok(&worktree, &["push", "-q", "-u", "origin", &branch]);
+
+            // 压缩合并：内容进 main，提交号不进；远端分支随后被删除。
+            git_ok(&repo, &["merge", "--squash", "-q", &branch]);
+            git_ok(&repo, &["commit", "-qm", "synthetic squash merge (#275)"]);
+            // main 前移，制造非空树差异，确保判定走补丁内容而不是整树相等。
+            std::fs::write(repo.join("unrelated.txt"), "later main work\n").unwrap();
+            git_ok(&repo, &["add", "unrelated.txt"]);
+            git_ok(&repo, &["commit", "-qm", "synthetic later main work"]);
+            git_ok(&repo, &["push", "-q", "origin", "main"]);
+            git_ok(&repo, &["push", "-q", "origin", "--delete", &branch]);
+
+            let result = closeout_workspace(&TerminalWorkspace {
+                worktree_path: worktree.clone(),
+                repo_root: repo.clone(),
+                branch_name: branch.clone(),
+            });
+            assert!(
+                result.is_ok(),
+                "压缩合并后的内容必须算已保存，而不是未推送提交：{result:?}"
+            );
+            assert!(!worktree.exists(), "压缩合并后工作区应被清理");
+            assert!(
+                git(&repo, &["rev-parse", "--verify", &branch]).is_err(),
+                "压缩合并后本地分支应被清理"
+            );
+        }
+
+        /// M275/R3：升级前就已经 ended 的历史会话不能被重新打开。
+        #[tokio::test]
+        async fn m275_historical_ended_session_is_not_reopened() {
+            let dir = scratch_dir("m275-history");
+            let (repo, _branch_a, alive, branch) = build_fixture(&dir);
+            let pool = seed_state(&dir).await;
+            sqlx::query(
+                "INSERT INTO thin_session_state(session_id,state,waiting_for,reason,updated_at)
+                 VALUES ('sess-old','ended',NULL,'PR #767 已合并',1)",
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO thin_external_observations(session_id, completed_reason, observed_at)
+                 VALUES ('sess-old','PR #767 已合并',1)",
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+            seed_merged_workspace(&pool, "sess-old", "obj-old", &repo, &alive, &branch).await;
+            let wakes_before: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM wakeup_schedules")
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+
+            let summary = settle_merged_sessions(&pool).await.unwrap();
+            assert_eq!(summary.settled, 0, "历史会话不得被收尾：{summary:?}");
+            assert_eq!(summary.asked_user, 0, "历史会话不得被提问：{summary:?}");
+            assert_eq!(summary.unverified, 0, "历史会话不得被改写：{summary:?}");
+            let state = thin_state::load(&pool, "sess-old").await.unwrap().unwrap();
+            assert_eq!(state.state, crate::agent::thin_state::SessionState::Ended);
+            assert_eq!(state.reason.as_deref(), Some("PR #767 已合并"));
+            assert!(state.question.is_none(), "历史会话不得被写入问题");
+            assert!(alive.exists(), "历史工作区不得被自动删除");
+            let open: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM execution_workspaces WHERE state<>'closed'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(open, 1, "历史工作区记录不得被改写");
+            let wakes_after: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM wakeup_schedules")
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            assert_eq!(wakes_before, wakes_after, "历史会话不得新增唤醒");
+        }
+
+        /// M275/R2+R4：确有内容没进默认分支时，以 ended 写明提交与分支，
+        /// 不问用户、不进入 waiting_user。
+        #[tokio::test]
+        async fn m275_unsaved_content_ends_session_without_asking() {
+            let dir = scratch_dir("m275-unsaved");
+            let (repo, _branch_a, alive, branch) = build_fixture(&dir);
+            std::fs::write(alive.join("local-only.txt"), "synthetic unpublished work").unwrap();
+            git_ok(&alive, &["add", "local-only.txt"]);
+            git_ok(&alive, &["commit", "-qm", "synthetic local-only commit"]);
+
+            let pool = seed_state(&dir).await;
+            sqlx::query(
+                "INSERT INTO thin_session_state(session_id,state,waiting_for,updated_at)
+                 VALUES ('sess-unsaved','waiting_wake','PR #276 合并',1)",
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO thin_external_observations(session_id, completed_reason, observed_at)
+                 VALUES ('sess-unsaved','PR #276 已合并',1)",
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO wakeup_schedules(id, session_id, prompt, source, next_at, status, created_at)
+                 VALUES ('w-unsaved','sess-unsaved','p','agent_decided',1,'pending',1)",
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+            seed_merged_workspace(&pool, "sess-unsaved", "obj-unsaved", &repo, &alive, &branch).await;
+
+            let summary = settle_merged_sessions(&pool).await.unwrap();
+            assert_eq!(summary.asked_user, 0, "收尾不得提问：{summary:?}");
+            assert_eq!(summary.settled, 0, "未核验的收尾不计入已收尾：{summary:?}");
+            assert_eq!(summary.unverified, 1, "要记一笔未核验收尾：{summary:?}");
+            let state = thin_state::load(&pool, "sess-unsaved")
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                state.state,
+                crate::agent::thin_state::SessionState::Ended,
+                "未合并内容也必须以结束状态写明：{state:?}"
+            );
+            assert!(state.question.is_none(), "不得写入 waiting_user 问题");
+            let reason = state.reason.unwrap_or_default();
+            assert!(reason.contains(&branch), "原因要写明分支：{reason}");
+            assert!(
+                reason.contains("local-only"),
+                "原因要写明哪些提交：{reason}"
+            );
+            assert!(!reason.contains("需要你决定"), "不得写中间态：{reason}");
+            assert!(alive.exists(), "未合并内容的工作区必须保留");
+            let pending: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM wakeup_schedules WHERE status='pending'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(pending, 0, "结束后不得留下会起模型回合的唤醒");
         }
     }
 }

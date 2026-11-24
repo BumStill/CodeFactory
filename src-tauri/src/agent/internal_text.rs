@@ -89,6 +89,7 @@ pub(crate) async fn generate_bounded_text(
             api_style: route_for_request.api_style.clone(),
             cancel: None,
             max_output_tokens: Some(max_output_tokens),
+            billing: None,
             // App-owned metadata is not a chat turn: paying for (and being
             // truncated by) hidden reasoning is what made every title request
             // through a thinking route return an empty answer.
