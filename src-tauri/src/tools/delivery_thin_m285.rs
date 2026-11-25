@@ -18,11 +18,11 @@ pub(crate) fn m232_deliver_fixture(cwd: &std::path::Path) -> Value {
     legacy::m232_deliver_fixture(cwd)
 }
 
-async fn guarded_args(args: &Value, ctx: &ExecCtx, ceiling: DeliveryCeiling) -> crate::errors::Result<Value> {
+async fn guarded_args(args: &Value, ctx: &ExecCtx, ceiling: DeliveryCeiling) -> crate::errors::Result<(Value, bool)> {
     let mut guarded = args.clone();
     let branch = match crate::agent::delivery::git(&ctx.cwd, &["branch", "--show-current"]) {
         Ok(branch) if !branch.trim().is_empty() => branch,
-        _ => return Ok(guarded),
+        _ => return Ok((guarded, false)),
     };
     let raw = match crate::agent::delivery::bounded_delivery_output(
         crate::agent::delivery::dev_command("gh").current_dir(&ctx.cwd).args([
@@ -31,10 +31,10 @@ async fn guarded_args(args: &Value, ctx: &ExecCtx, ceiling: DeliveryCeiling) -> 
         ]),
     ) {
         Ok(raw) => raw,
-        Err(_) => return Ok(guarded),
+        Err(_) => return Ok((guarded, false)),
     };
     let prs: Vec<Value> = serde_json::from_str(&raw).unwrap_or_default();
-    let Some(pr) = prs.first() else { return Ok(guarded); };
+    let Some(pr) = prs.first() else { return Ok((guarded, true)); };
     let is_draft = pr["isDraft"].as_bool().unwrap_or(false);
     let is_armed = pr["labels"].as_array().is_some_and(|labels| {
         labels.iter().any(|label| label["name"] == "merge-queue: armed")
@@ -57,6 +57,18 @@ async fn guarded_args(args: &Value, ctx: &ExecCtx, ceiling: DeliveryCeiling) -> 
         .as_deref()
         .is_some_and(super::delivery_m285_policy::ceiling_records_revocation);
     if recorded_revocation && !newly_authorized {
+        // 记录一次撤回事实（带时间戳），供心跳/重启后尊重
+        if let (Some(db), Some(session)) = (&ctx.db, &ctx.session_id) {
+            let _ = sqlx::query("CREATE TABLE IF NOT EXISTS thin_delivery_revocations(session_id TEXT PRIMARY KEY, pr_number INTEGER NOT NULL, revoked_at INTEGER NOT NULL, kind TEXT NOT NULL)").execute(db).await;
+            let now = chrono::Utc::now().timestamp_millis();
+            let number = pr["number"].as_i64().unwrap_or(0);
+            let _ = sqlx::query("INSERT INTO thin_delivery_revocations(session_id,pr_number,revoked_at,kind) VALUES (?,?,?,?) ON CONFLICT(session_id) DO UPDATE SET pr_number=excluded.pr_number,revoked_at=excluded.revoked_at,kind=excluded.kind")
+                .bind(session)
+                .bind(number)
+                .bind(now)
+                .bind("recorded_revocation")
+                .execute(db).await;
+        }
         return Err(crate::errors::AppError::ToolArgument(format!(
             "合并授权此前已由用户撤回；当前上限为 {}。需要用户新的明确授权，系统不会重复打标。",
             ceiling.label()
@@ -71,10 +83,20 @@ async fn guarded_args(args: &Value, ctx: &ExecCtx, ceiling: DeliveryCeiling) -> 
         if let (Some(db), Some(session)) = (&ctx.db, &ctx.session_id) {
             let marker = format!("revoked:{}", prior_ceiling.as_deref().unwrap_or(ceiling.label()));
             sqlx::query("UPDATE thin_delivery_refs SET ceiling=? WHERE session_id=?")
-                .bind(marker)
+                .bind(&marker)
                 .bind(session)
                 .execute(db)
                 .await?;
+            // 记录撤回事实与时间戳
+            let _ = sqlx::query("CREATE TABLE IF NOT EXISTS thin_delivery_revocations(session_id TEXT PRIMARY KEY, pr_number INTEGER NOT NULL, revoked_at INTEGER NOT NULL, kind TEXT NOT NULL)").execute(db).await;
+            let now = chrono::Utc::now().timestamp_millis();
+            let number = pr["number"].as_i64().unwrap_or(0);
+            sqlx::query("INSERT INTO thin_delivery_revocations(session_id,pr_number,revoked_at,kind) VALUES (?,?,?,?) ON CONFLICT(session_id) DO UPDATE SET pr_number=excluded.pr_number,revoked_at=excluded.revoked_at,kind=excluded.kind")
+                .bind(session)
+                .bind(number)
+                .bind(now)
+                .bind(if is_draft {"draft"} else {"armed_removed"})
+                .execute(db).await?;
             sqlx::query("UPDATE sessions SET delivery_authorized=0 WHERE id=?")
                 .bind(session)
                 .execute(db)
@@ -87,7 +109,7 @@ async fn guarded_args(args: &Value, ctx: &ExecCtx, ceiling: DeliveryCeiling) -> 
         guarded["title"] = Value::String(title.to_string());
         guarded["body"] = Value::String(body.to_string());
     }
-    Ok(guarded)
+    Ok((guarded, true))
 }
 
 pub(super) async fn execute(
@@ -97,8 +119,12 @@ pub(super) async fn execute(
     excludes: &[String],
 ) -> crate::errors::Result<ToolOutput> {
     let requested = args.get("ceiling").and_then(Value::as_str).and_then(DeliveryCeiling::from_label);
-    let ceiling = super::delivery_m285_policy::effective_delivery_ceiling(authorized_ceiling, requested);
-    let guarded = guarded_args(args, ctx, ceiling).await?;
+    let mut ceiling = super::delivery_m285_policy::effective_delivery_ceiling(authorized_ceiling, requested);
+    let (guarded, pr_checked) = guarded_args(args, ctx, ceiling).await?;
+    // F3：无法读取 PR 状态时不得打 armed/转 ready —— 本次执行降级为 pr_only
+    if !pr_checked && ceiling.rank() >= DeliveryCeiling::ThroughMerge.rank() {
+        ceiling = DeliveryCeiling::PrOnly;
+    }
     legacy::execute(&guarded, ctx, ceiling, excludes).await
 }
 
