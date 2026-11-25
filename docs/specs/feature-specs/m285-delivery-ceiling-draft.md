@@ -22,3 +22,21 @@ pr_only 不打 armed；through_release 授权 + pr_only 请求 → pr_only；草
 探针用隔离 HOME，不连正式 dispatch.sock。不碰 PR #1006、#1043、#1053、#1075。PR 正文用 `R | 是否完成 | 证据` 列 R1–R7；未全部完成则保持 draft、不打 armed。授权交付。
 
 Release-Urgency: default
+
+## Implementation Notes
+
+### R1 只读复盘结论（2026-11-25）
+
+只读查询 `/Users/leo/Library/Application Support/com.codefactory.app/codefactory.db` 与 `dispatch-audit.log`，未启动应用、未连接正式 `dispatch.sock`，也未操作 PR #1006、#1043、#1053、#1075：
+
+- 会话 `bd4ba210-b480-4cec-b776-3992254d30f2` 是 `thin` 模式，`sessions.delivery_authorized=1`，`sessions.delivery_ceiling=NULL`，`release_urgency=default`。
+- 该会话没有 durable `delivery_runs` 记录；#1075 的实际恢复依据是 `thin_delivery_refs`，其中 ceiling 为 `ThroughRelease`。因此首次和后续恢复的 armed 来源是全局默认 ceiling 经 thin 路径持久化为 `ThroughRelease`，不是会话内明确的 `pr_only`。
+- 两条续接派单都保留了 `delivery_authorized=true`，同时正文明确记录人工已摘掉 armed、完成前不得再次交付。旧实现只读取布尔交付授权，没有持久化“改回草稿/摘掉 armed 即撤回合并授权”，所以恢复与系统唤醒仍会沿用 `ThroughRelease` 再次 armed。
+- `Release-Urgency: immediate` 不是该 session 的结构化派单值；session 记录为 `default`。M285 保持 urgency 仅由结构化 `release_urgency` 字段进入交付，不从正文文字推断。
+
+### 实现边界
+
+- 在 thin 真实交付入口前统一计算 `min(会话授权, 本次请求)`。
+- 复用 PR 前只读取得 `isDraft`、labels、远端 title/body；草稿或已授权后被摘标会持久化 `revoked:<previous ceiling>` 并清除 `sessions.delivery_authorized`，重启后继续拒绝，直到新的明确授权重新置位。
+- 已有 PR 的远端 title/body 作为恢复输入，保留人工修改和 R 表；只允许现有治理组装逻辑做字段级补充。
+- 未改权限判定、validator、workflow 或 `docs/testing/scenario-registry.json`。
