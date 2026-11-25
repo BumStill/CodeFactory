@@ -83,7 +83,7 @@ case "$1 $2" in
     elif echo "$@" | grep -q number,url; then
       echo "{{\"number\":$NUMBER,\"url\":\"https://forge.invalid/pr/$NUMBER\"}}";
     else
-      echo '{"state":"OPEN","statusCheckRollup":[{"status":"IN_PROGRESS"}]}'
+      echo '{{"state":"OPEN","statusCheckRollup":[{{"status":"IN_PROGRESS"}}]}}'
     fi
     ;;
   "pr edit")
