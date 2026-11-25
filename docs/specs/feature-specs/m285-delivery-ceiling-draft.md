@@ -39,4 +39,4 @@ Release-Urgency: default
 - 在 thin 真实交付入口前统一计算 `min(会话授权, 本次请求)`。
 - 复用 PR 前只读取得 `isDraft`、labels、远端 title/body；草稿或已授权后被摘标会持久化 `revoked:<previous ceiling>` 并清除 `sessions.delivery_authorized`，重启后继续拒绝，直到新的明确授权重新置位。
 - 已有 PR 的远端 title/body 作为恢复输入，保留人工修改和 R 表；只允许现有治理组装逻辑做字段级补充。
-- 未改权限判定、validator、workflow 或 `docs/testing/scenario-registry.json`。
+- 未改权限判定、validator、workflow 或 `docs/testing/scenario-registry.json` 信任根；仅在 `docs/testing/scenario-mappings.json` 将新增 M285 交付文件最小映射到既有 `CXD-002`，不放宽任何 gate。

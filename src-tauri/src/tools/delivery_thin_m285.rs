@@ -58,7 +58,7 @@ async fn guarded_args(args: &Value, ctx: &ExecCtx, ceiling: DeliveryCeiling) -> 
         .is_some_and(super::delivery_m285_policy::ceiling_records_revocation);
     if recorded_revocation && !newly_authorized {
         return Err(crate::errors::AppError::ToolArgument(format!(
-            "合并授权此前已由用户撤回；当前上限为 {}。需要用户新的明确授权，系统不会重试打标。",
+            "合并授权此前已由用户撤回；当前上限为 {}。需要用户新的明确授权，系统不会重复打标。",
             ceiling.label()
         )));
     }
