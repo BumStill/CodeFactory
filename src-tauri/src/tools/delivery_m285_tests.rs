@@ -70,7 +70,7 @@ if [ "${{CF_TEST_GH_LIST_FAIL:-0}}" = 1 ] && [ "$1 $2" = "pr list" ]; then exit 
 case "$1 $2" in
   "pr list")
     if [ "$DRAFT" = true ]; then ISDRAFT=true; else ISDRAFT=false; fi
-    if [ "$ARMED" = true ]; then LABELS='[{"name":"merge-queue: armed"}]'; else LABELS='[]'; fi
+    if [ "$ARMED" = true ]; then LABELS='[{{"name":"merge-queue: armed"}}]'; else LABELS='[]'; fi
     echo "[{{\"number\":$NUMBER,\"title\":\"remote title\",\"body\":\"remote body\",\"isDraft\":$ISDRAFT,\"labels\":$LABELS}}]";
     ;;
   "pr create")
@@ -78,7 +78,7 @@ case "$1 $2" in
     ;;
   "pr view")
     if echo "$@" | grep -q labels; then
-      if [ "$ARMED" = true ]; then LABELS='[{"name":"merge-queue: armed"}]'; else LABELS='[]'; fi
+      if [ "$ARMED" = true ]; then LABELS='[{{"name":"merge-queue: armed"}}]'; else LABELS='[]'; fi
       echo "{{\"labels\":$LABELS}}";
     elif echo "$@" | grep -q number,url; then
       echo "{{\"number\":$NUMBER,\"url\":\"https://forge.invalid/pr/$NUMBER\"}}";
@@ -158,14 +158,25 @@ case "$1 $2" in
         sqlx::query("INSERT INTO sessions VALUES('s',1)").execute(&db).await.unwrap();
         sqlx::query("CREATE TABLE thin_delivery_refs(session_id TEXT PRIMARY KEY,branch TEXT,pr_number INTEGER,ceiling TEXT)").execute(&db).await.unwrap();
         sqlx::query("INSERT INTO thin_delivery_refs VALUES('s','feature',101,'ThroughMerge')").execute(&db).await.unwrap();
-        fs::write(&state, "{\"number\":101,\"armed\":false,\"draft\":true}").unwrap();
+        fs::write(state.with_extension("json.draft"), "true").unwrap();
         let mut ctx = crate::tools::ExecCtx::new(dir.path().to_path_buf(), Some(db.clone()));
         ctx.session_id = Some("s".into());
         let out = crate::tools::dispatch("deliver_changes", json!({"title":"fix: t","body":"b","ceiling":"through_merge"}), &ctx).await.unwrap();
         assert!(out.is_error && out.content.contains("草稿"), "{:#?}", out.content);
-        sqlx::query("CREATE TABLE IF NOT EXISTS thin_delivery_revocations(session_id TEXT PRIMARY KEY, pr_number INTEGER NOT NULL, revoked_at INTEGER NOT NULL, kind TEXT NOT NULL)").execute(&db).await.unwrap();
+        // simulate restart: build a new ctx on the same db and try through_merge again — should still refuse until newly authorized
+        let mut ctx2 = crate::tools::ExecCtx::new(dir.path().to_path_buf(), Some(db.clone()));
+        ctx2.session_id = Some("s".into());
+        let out2 = crate::tools::dispatch("deliver_changes", json!({"title":"fix: t2","body":"b2","ceiling":"through_merge"}), &ctx2).await.unwrap();
+        assert!(out2.is_error, "revocation must persist across restart");
+        // check durable session flag lowered
         let val: i64 = sqlx::query_scalar("SELECT delivery_authorized FROM sessions WHERE id='s'").fetch_one(&db).await.unwrap();
         assert_eq!(val, 0);
+        // allow normal path after explicit re-authorization by flipping the flag
+        sqlx::query("UPDATE sessions SET delivery_authorized=1 WHERE id='s'").execute(&db).await.unwrap();
+        // also remove draft to allow arming
+        fs::write(state.with_extension("json.draft"), "false").unwrap();
+        let ok = crate::tools::dispatch("deliver_changes", json!({"title":"fix: t3","body":"b3","ceiling":"through_merge"}), &ctx2).await.unwrap();
+        assert_eq!(ok.status, crate::tools::ToolExecutionStatus::Waiting);
     }
 
     #[tokio::test]
