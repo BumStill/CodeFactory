@@ -1791,6 +1791,17 @@ pub trait DeliveryRemote {
 /// blocked" even though the CLI works from a terminal. EVERY production spawn of
 /// gh/git in this module MUST go through here (pinned by a source-text test).
 pub(crate) fn dev_command(program: &str) -> Command {
+    // Test-only override: allow integration tests to point gh to a fake binary.
+    // No effect in production when the variable is unset.
+    if program == "gh" {
+        if let Ok(bin) = std::env::var("CODEFACTORY_TEST_GH_BIN") {
+            if !bin.is_empty() {
+                let mut command = Command::new(bin).no_window();
+                command_env::apply_developer_path_std(&mut command);
+                return command;
+            }
+        }
+    }
     let mut command = Command::new(command_env::resolve_developer_command(program)).no_window();
     command_env::apply_developer_path_std(&mut command);
     command
