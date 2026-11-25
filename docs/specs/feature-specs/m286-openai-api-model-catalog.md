@@ -23,9 +23,11 @@
 - R7：查清 2509e667 为何不尝试 openai，写清根因；若是路由或冷却缺陷则修复，否则说明。
 - R8：增加派单操作 `list_models`（只读，按端点返回可用模型及单价），支持锁屏使用；不返回凭据。
 - R9：不改日上限数值、周额度、路由顺序和权限判定。
+- R10：gpt-6.x（已核实 gpt-6.1-terra、gpt-6.2-sol）在 `/v1/chat/completions` 上返回 400「Function tools with reasoning_effort are not supported … use /v1/responses」。openai 端点对这类模型必须改走 `/v1/responses`（工具调用、思考强度、流式、用量计费都要对齐）；synthetic 服务器测试覆盖两种接口的选择与回落。
+- R11：openai 无工具请求不得发送 `tool_choice`，避免 400 `FIELD_UNSUPPORTED`。
 
 ## 测试
-本地 synthetic 服务器返回 OpenAI 格式列表：成功、失败、非对话模型混入、当前模型消失。单价：gpt-5.6 不落 gpt-5、gpt-6.x 正确、未知保守、缓存占比高的真实形状（133k 输入/129k 缓存/771 输出）。openai/… 解析到端点。反例：openrouter 的 owner/model 选择不受影响。不读真实 Key，探针用隔离 HOME。
+本地 synthetic 服务器返回 OpenAI 格式列表：成功、失败、非对话模型混入、当前模型消失。单价：gpt-5.6 不落 gpt-5、gpt-6.x 正确、未知保守、缓存占比高的真实形状（133k 输入/129k 缓存/771 输出）。openai/… 解析到端点。反例：openrouter 的 owner/model 选择不受影响。不读真实 Key，探针用隔离 HOME。gpt-6.x 带工具与思考强度时使用 Responses API；非 gpt-6 兼容模型保留 Chat Completions；无工具请求不发送 `tool_choice`。
 
 ## 验收（真机，编排方发版后做）
 `list_models` 返回真实列表；派单用默认「均衡」档跑一次最小请求走 openai，usage_status 金额与官方单价一致。
