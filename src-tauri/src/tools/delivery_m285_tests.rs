@@ -71,7 +71,7 @@ case "$1 $2" in
   "pr list")
     if [ "$DRAFT" = true ]; then ISDRAFT=true; else ISDRAFT=false; fi
     if [ "$ARMED" = true ]; then LABELS='[{"name":"merge-queue: armed"}]'; else LABELS='[]'; fi
-    echo "[{\"number\":$NUMBER,\"title\":\"remote title\",\"body\":\"remote body\",\"isDraft\":$ISDRAFT,\"labels\":$LABELS}]";
+    echo "[{{\"number\":$NUMBER,\"title\":\"remote title\",\"body\":\"remote body\",\"isDraft\":$ISDRAFT,\"labels\":$LABELS}}]";
     ;;
   "pr create")
     log pr_create "$@";
@@ -79,9 +79,9 @@ case "$1 $2" in
   "pr view")
     if echo "$@" | grep -q labels; then
       if [ "$ARMED" = true ]; then LABELS='[{"name":"merge-queue: armed"}]'; else LABELS='[]'; fi
-      echo "{\"labels\":$LABELS}";
+      echo "{{\"labels\":$LABELS}}";
     elif echo "$@" | grep -q number,url; then
-      echo "{\"number\":$NUMBER,\"url\":\"https://forge.invalid/pr/$NUMBER\"}";
+      echo "{{\"number\":$NUMBER,\"url\":\"https://forge.invalid/pr/$NUMBER\"}}";
     else
       echo '{"state":"OPEN","statusCheckRollup":[{"status":"IN_PROGRESS"}]}'
     fi
@@ -105,17 +105,19 @@ case "$1 $2" in
     async fn mk_pool() -> sqlx::SqlitePool { sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap() }
 
     fn init_repo(root: &std::path::Path, bare: &std::path::Path) {
-        crate::tools::delivery::git(root, &["init"]).unwrap();
-        crate::tools::delivery::git(root, &["config","user.name","Synthetic"]).unwrap();
-        crate::tools::delivery::git(root, &["config","user.email","synthetic@example.invalid"]).unwrap();
+        use std::process::Command;
+        Command::new("git").current_dir(root).args(["init"]).status().unwrap();
+        Command::new("git").current_dir(root).args(["config","user.name","Synthetic"]).status().unwrap();
+        Command::new("git").current_dir(root).args(["config","user.email","synthetic@example.invalid"]).status().unwrap();
         fs::write(root.join("README.md"), "x").unwrap();
-        crate::tools::delivery::git(root, &["add","."]).unwrap();
-        crate::tools::delivery::git(root, &["commit","-m","init"]).unwrap();
-        crate::tools::delivery::git(bare, &["init","--bare"]).unwrap();
-        crate::tools::delivery::git(root, &["remote","add","origin", bare.to_str().unwrap()]).unwrap();
-        let head = crate::tools::delivery::git(root, &["rev-parse","HEAD"]).unwrap();
-        crate::tools::delivery::git(root, &["update-ref","refs/remotes/origin/main", &head]).unwrap();
-        crate::tools::delivery::git(root, &["checkout","-b","feature"]).unwrap();
+        Command::new("git").current_dir(root).args(["add","."]).status().unwrap();
+        Command::new("git").current_dir(root).args(["commit","-m","init"]).status().unwrap();
+        Command::new("git").current_dir(bare).args(["init","--bare"]).status().unwrap();
+        Command::new("git").current_dir(root).args(["remote","add","origin", bare.to_str().unwrap()]).status().unwrap();
+        let head = String::from_utf8(Command::new("git").current_dir(root).args(["rev-parse","HEAD"]).output().unwrap().stdout).unwrap();
+        let head = head.trim();
+        Command::new("git").current_dir(root).args(["update-ref","refs/remotes/origin/main", head]).status().unwrap();
+        Command::new("git").current_dir(root).args(["checkout","-b","feature"]).status().unwrap();
         fs::write(root.join("file.txt"), "changed").unwrap();
     }
 
