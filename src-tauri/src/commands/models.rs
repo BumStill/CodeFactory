@@ -9,6 +9,7 @@ use crate::errors::AppError;
 use crate::openrouter::types::ModelInfo;
 use crate::AppState;
 
+const MODEL_CATALOG_TTL_MS: i64 = 24 * 60 * 60 * 1000;
 static MODELS_CACHE: Lazy<Mutex<HashMap<String, (i64, Vec<ModelInfo>)>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
@@ -20,11 +21,11 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
-fn cache_get(endpoint_name: &str) -> Option<Vec<ModelInfo>> {
-    const TTL_MS: i64 = 24 * 60 * 60 * 1000;
+fn cached_models(endpoint_name: &str, allow_stale: bool) -> Option<Vec<ModelInfo>> {
     let guard = MODELS_CACHE.lock().ok()?;
     let (stored_at, models) = guard.get(endpoint_name)?;
-    (now_ms() - *stored_at <= TTL_MS).then(|| models.clone())
+    (allow_stale || now_ms().saturating_sub(*stored_at) <= MODEL_CATALOG_TTL_MS)
+        .then(|| models.clone())
 }
 
 fn cache_put(endpoint_name: &str, models: Vec<ModelInfo>) {
@@ -73,7 +74,7 @@ pub async fn list_models(
         return Ok(custom);
     }
 
-    if let Some(cached) = cache_get(&endpoint_name) {
+    if let Some(cached) = cached_models(&endpoint_name, false) {
         return Ok(merge_models(custom, cached));
     }
 
@@ -94,8 +95,14 @@ pub async fn list_models(
             Ok(merge_models(custom, remote))
         }
         Err(error) => {
-            tracing::warn!("list_models: remote fetch failed for endpoint '{endpoint_name}': {error}");
-            Ok(custom)
+            if let Some(cached) = cached_models(&endpoint_name, true) {
+                tracing::warn!("list_models: remote refresh failed for endpoint '{endpoint_name}', serving last successful catalog: {error}");
+                Ok(merge_models(custom, cached))
+            } else {
+                Err(AppError::Other(format!(
+                    "MODEL_CATALOG_UNAVAILABLE: endpoint '{endpoint_name}' model catalog refresh failed and no cached list is available: {error}"
+                )))
+            }
         }
     }
 }
@@ -105,7 +112,14 @@ mod tests {
     use super::*;
 
     fn model(id: &str, is_custom: bool) -> ModelInfo {
-        ModelInfo { id: id.into(), name: id.into(), context_length: 0, pricing: None, supported_parameters: None, is_custom }
+        ModelInfo {
+            id: id.into(),
+            name: id.into(),
+            context_length: 0,
+            pricing: None,
+            supported_parameters: None,
+            is_custom,
+        }
     }
 
     #[test]
@@ -114,7 +128,10 @@ mod tests {
             vec![model("z", true), model("a", true)],
             vec![model("b", false), model("a", false), model("m", false)],
         );
-        let ids: Vec<_> = merged.into_iter().map(|model| (model.id, model.is_custom)).collect();
+        let ids: Vec<_> = merged
+            .into_iter()
+            .map(|model| (model.id, model.is_custom))
+            .collect();
         assert_eq!(ids, vec![
             ("z".to_string(), true),
             ("a".to_string(), true),
@@ -127,7 +144,18 @@ mod tests {
     fn cache_is_scoped_by_endpoint() {
         cache_put("openai-a", vec![model("gpt-a", false)]);
         cache_put("openai-b", vec![model("gpt-b", false)]);
-        assert_eq!(cache_get("openai-a").unwrap()[0].id, "gpt-a");
-        assert_eq!(cache_get("openai-b").unwrap()[0].id, "gpt-b");
+        assert_eq!(cached_models("openai-a", false).unwrap()[0].id, "gpt-a");
+        assert_eq!(cached_models("openai-b", false).unwrap()[0].id, "gpt-b");
+    }
+
+    #[test]
+    fn stale_catalog_is_available_for_failed_refresh() {
+        let endpoint = "openai-stale-fallback";
+        MODELS_CACHE.lock().unwrap().insert(
+            endpoint.into(),
+            (now_ms() - MODEL_CATALOG_TTL_MS - 1, vec![model("gpt-6.1-terra", false)]),
+        );
+        assert!(cached_models(endpoint, false).is_none());
+        assert_eq!(cached_models(endpoint, true).unwrap()[0].id, "gpt-6.1-terra");
     }
 }
