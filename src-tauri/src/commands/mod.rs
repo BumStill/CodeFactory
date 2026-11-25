@@ -30,6 +30,7 @@ pub mod objective_health;
 pub mod pending_approvals;
 pub mod preferences;
 pub mod session;
+pub mod session_liveness;
 #[cfg(test)]
 mod session_quick_tests;
 pub mod settings;
