@@ -1,14 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 
-pub(crate) use crate::agent::liveness_store::LivenessMetrics;
+pub(crate) use crate::commands::liveness_store::LivenessMetrics;
 
-#[tauri::command]
-pub async fn session_liveness_metrics(
+/// R8 read-only implementation. The public desktop entry is the existing
+/// `get_objective_health` command, which includes this aggregate without adding
+/// a second command-registration surface.
+pub async fn query_session_liveness_metrics(
+    pool: &sqlx::SqlitePool,
     hours: Option<i64>,
-    state: tauri::State<'_, crate::AppState>,
 ) -> Result<LivenessMetrics, String> {
-    crate::agent::liveness_store::metrics(
-        &state.db,
+    crate::commands::liveness_store::metrics(
+        pool,
         hours.unwrap_or(24),
         chrono::Utc::now().timestamp_millis(),
     )

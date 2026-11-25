@@ -127,14 +127,17 @@ async fn m287_owner_transfer_is_atomic_and_metrics_are_read_only() {
 }
 
 #[test]
-fn m287_production_wiring_declares_modules_command_and_invoke_entry() {
-    let agent_mod = include_str!("../src/agent/mod.rs");
-    assert!(agent_mod.contains("pub(crate) mod liveness;"));
-    assert!(agent_mod.contains("pub(crate) mod liveness_store;"));
-
+fn m287_production_wiring_exposes_read_only_health_operations() {
     let commands_mod = include_str!("../src/commands/mod.rs");
+    assert!(commands_mod.contains("pub(crate) mod liveness;"));
+    assert!(commands_mod.contains("pub(crate) mod liveness_store;"));
     assert!(commands_mod.contains("pub mod session_liveness;"));
+    assert!(commands_mod.contains("objective_health_m287.rs"));
+
+    let query = include_str!("../src/commands/session_liveness.rs");
+    assert!(query.contains("query_session_liveness_metrics"));
+    assert!(query.contains("liveness_store::metrics"));
 
     let lib = include_str!("../src/lib.rs");
-    assert!(lib.contains("commands::session_liveness::session_liveness_metrics"));
+    assert!(lib.contains("commands::objective_health::get_objective_health"));
 }
