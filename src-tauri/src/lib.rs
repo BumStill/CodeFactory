@@ -1817,6 +1817,26 @@ pub fn run() {
         .init();
 
     tauri::Builder::default()
+        .plugin(
+            tauri::plugin::Builder::<tauri::Wry, ()>::new("exit-observer")
+                .on_event(|app, event| match event {
+                    tauri::RunEvent::ExitRequested { code, .. } => {
+                        if let Ok(dir) = app.path().app_data_dir() {
+                            startup_recovery::record_exit(
+                                &dir,
+                                &startup_recovery::exit_reason(*code),
+                            );
+                        }
+                    }
+                    tauri::RunEvent::Exit => {
+                        if let Ok(dir) = app.path().app_data_dir() {
+                            startup_recovery::record_exit(&dir, "exit");
+                        }
+                    }
+                    _ => {}
+                })
+                .build(),
+        )
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
