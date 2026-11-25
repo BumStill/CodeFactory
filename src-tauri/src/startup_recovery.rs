@@ -33,6 +33,26 @@ pub fn record(dir: &std::path::Path, step: &str, status: &str, elapsed: Duration
     tracing::info!(step, status, elapsed_ms = elapsed.as_millis(), "startup stage");
 }
 
+/// M277 R1: map a Tauri `ExitRequested` payload to the recorded reason. Shared
+/// by the run loop and the tests so the wording cannot drift.
+pub fn exit_reason(code: Option<i32>) -> String {
+    match code {
+        Some(code) => format!("requested-exit-code-{code}"),
+        None => "window-closed".to_string(),
+    }
+}
+
+/// M277 R1: record how this process is leaving, in the same `startup.log` the
+/// startup stages use. Deliberately infallible: an unwritable directory must
+/// never block or abort the exit path.
+pub fn record_exit(dir: &std::path::Path, reason: &str) {
+    use std::io::Write;
+    if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("startup.log")) {
+        let _ = writeln!(file, "{} step=exit reason={reason}", chrono::Local::now().to_rfc3339());
+    }
+    tracing::info!(step = "exit", reason, "startup stage");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -87,6 +107,45 @@ mod tests {
         assert_eq!(count, 320);
         let log = std::fs::read_to_string(dir.path().join("startup.log")).unwrap();
         assert!(log.contains("step=recovery status=completed elapsed_ms="));
+    }
+
+    /// M277 R1: every exit leaves one `step=exit reason=…` line in the same
+    /// `startup.log` the startup stages use, so an orchestrator can tell how the
+    /// app went away without guessing.
+    #[test]
+    fn m277_exit_records_reason_alongside_startup_stages() {
+        let dir = tempfile::tempdir().unwrap();
+        record(dir.path(), "setup", "completed", Duration::from_millis(7));
+        record_exit(dir.path(), "window-closed");
+        record_exit(dir.path(), "requested-exit-code-3");
+        record_exit(dir.path(), "exit");
+        let log = std::fs::read_to_string(dir.path().join("startup.log")).unwrap();
+        assert!(log.contains("step=setup status=completed"), "startup stages stay intact: {log}");
+        let exits: Vec<&str> = log.lines().filter(|line| line.contains("step=exit")).collect();
+        assert_eq!(exits.len(), 3, "one exit line per exit record: {log}");
+        assert!(exits[0].contains("step=exit reason=window-closed"), "{}", exits[0]);
+        assert!(exits[1].contains("step=exit reason=requested-exit-code-3"), "{}", exits[1]);
+        assert!(exits[2].contains("step=exit reason=exit"), "{}", exits[2]);
+        assert!(exits.iter().all(|line| !line.contains("elapsed_ms=0 status=started")));
+    }
+
+    /// M277 R1: a write failure must not panic the exit path (worst case the
+    /// reason is only in tracing, the process still leaves).
+    #[test]
+    fn m277_exit_record_survives_unwritable_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("not-a-directory");
+        std::fs::write(&missing, b"x").unwrap();
+        record_exit(&missing, "exit");
+    }
+
+    /// M277 R1: the reason distinguishes a window close from a coded exit, and
+    /// the run loop records exactly these two strings.
+    #[test]
+    fn m277_exit_reason_matches_the_run_loop_paths() {
+        assert_eq!(exit_reason(None), "window-closed");
+        assert_eq!(exit_reason(Some(0)), "requested-exit-code-0");
+        assert_eq!(exit_reason(Some(3)), "requested-exit-code-3");
     }
 
     #[tokio::test]
