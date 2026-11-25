@@ -1,11 +1,50 @@
 // SPDX-License-Identifier: Apache-2.0
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::sync::Mutex;
 
+use once_cell::sync::Lazy;
 use tauri::State;
 
 use crate::errors::AppError;
 use crate::openrouter::types::ModelInfo;
 use crate::AppState;
+
+const MODEL_CATALOG_TTL_MS: i64 = 24 * 60 * 60 * 1000;
+static MODELS_CACHE: Lazy<Mutex<HashMap<String, (i64, Vec<ModelInfo>)>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+
+fn now_ms() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+fn cached_models(endpoint_name: &str, allow_stale: bool) -> Option<Vec<ModelInfo>> {
+    let guard = MODELS_CACHE.lock().ok()?;
+    let (stored_at, models) = guard.get(endpoint_name)?;
+    (allow_stale || now_ms().saturating_sub(*stored_at) <= MODEL_CATALOG_TTL_MS)
+        .then(|| models.clone())
+}
+
+fn cache_put(endpoint_name: &str, models: Vec<ModelInfo>) {
+    if let Ok(mut guard) = MODELS_CACHE.lock() {
+        guard.insert(endpoint_name.to_string(), (now_ms(), models));
+    }
+}
+
+fn merge_models(mut custom: Vec<ModelInfo>, remote: Vec<ModelInfo>) -> Vec<ModelInfo> {
+    let custom_ids: HashSet<String> = custom.iter().map(|model| model.id.clone()).collect();
+    let mut remote: Vec<ModelInfo> = remote
+        .into_iter()
+        .filter(|model| !custom_ids.contains(&model.id))
+        .map(|model| ModelInfo { is_custom: false, ..model })
+        .collect();
+    remote.sort_by(|left, right| left.id.cmp(&right.id));
+    custom.extend(remote);
+    custom
+}
 
 #[tauri::command]
 pub async fn list_models(
@@ -41,7 +80,12 @@ pub async fn list_models(
         return Ok(merged);
     }
 
-    // ── 2. Try to fetch remote /models — failures are non-fatal ──────────────
+    // ── 2. Try to fetch remote /models — failures are non-fatal, but
+    // cache is authoritative when available (R1: not silently empty).
+    if let Some(cached) = cached_models(&endpoint_name, false) {
+        return Ok(merge_models(merged, cached));
+    }
+
     let key_ref = endpoint
         .key_ref
         .clone()
@@ -55,24 +99,18 @@ pub async fn list_models(
     let client = crate::openrouter::OpenRouterClient::new(&endpoint.base_url, api_key);
     match client.list_models().await {
         Ok(remote) => {
-            // Custom entries take precedence — skip any remote id already covered.
-            for m in remote {
-                if !custom_ids.contains(&m.id) {
-                    merged.push(ModelInfo {
-                        is_custom: false,
-                        ..m
-                    });
-                }
+            cache_put(&endpoint_name, remote.clone());
+            Ok(merge_models(merged, remote))
+        }
+        Err(error) => {
+            if let Some(cached) = cached_models(&endpoint_name, true) {
+                tracing::warn!("list_models: remote refresh failed for endpoint '{endpoint_name}', serving last successful catalog: {error}");
+                Ok(merge_models(merged, cached))
+            } else {
+                Err(AppError::Other(format!(
+                    "MODEL_CATALOG_UNAVAILABLE: endpoint '{endpoint_name}' model catalog refresh failed and no cached list is available: {error}"
+                )))
             }
         }
-        Err(err) => {
-            // Endpoint may not implement /models (LMStudio, Ollama, private gateways).
-            // Log and return whatever custom models the user configured.
-            tracing::warn!(
-                "list_models: remote fetch failed for endpoint '{endpoint_name}': {err}"
-            );
-        }
     }
-
-    Ok(merged)
 }
