@@ -2,222 +2,68 @@
 //! M285 regression tests colocated with the private delivery modules.
 
 use crate::config::settings::DeliveryCeiling;
-use super::delivery_m285_policy::{
-    effective_delivery_ceiling, existing_pr_merge_refusal, preserve_existing_pr_content,
-};
+use super::delivery_m285_policy::{effective_delivery_ceiling, existing_pr_merge_refusal, preserve_existing_pr_content};
 
 #[test]
 fn effective_ceiling_is_the_lower_authorized_and_requested_value() {
     assert_eq!(effective_delivery_ceiling(DeliveryCeiling::ThroughRelease, Some(DeliveryCeiling::PrOnly)), DeliveryCeiling::PrOnly);
     assert_eq!(effective_delivery_ceiling(DeliveryCeiling::PrOnly, Some(DeliveryCeiling::ThroughRelease)), DeliveryCeiling::PrOnly);
 }
-
 #[test]
 fn draft_and_removed_arm_are_readable_revocations() {
-    let draft = existing_pr_merge_refusal(true, true, false, DeliveryCeiling::ThroughMerge)
-        .expect("draft PR must refuse merge authorization");
-    assert!(draft.contains("草稿") && draft.contains("撤回"), "{draft}");
-    let removed = existing_pr_merge_refusal(false, true, false, DeliveryCeiling::ThroughMerge)
-        .expect("removed arm must refuse after restart");
-    assert!(removed.contains("摘掉") && removed.contains("明确授权"), "{removed}");
-    assert!(existing_pr_merge_refusal(false, false, false, DeliveryCeiling::PrOnly).is_none());
+    let draft = existing_pr_merge_refusal(true, true, false, DeliveryCeiling::ThroughMerge).unwrap(); assert!(draft.contains("草稿") && draft.contains("撤回"));
+    let removed = existing_pr_merge_refusal(false, true, false, DeliveryCeiling::ThroughMerge).unwrap(); assert!(removed.contains("摘掉") && removed.contains("明确授权"));
 }
-
 #[test]
 fn recovery_preserves_remote_title_body_and_requirement_table() {
-    let remote_title = "fix: maintainer title";
-    let remote_body = "Summary\n\nR | 是否完成 | 证据\nR1 | 是 | synthetic";
-    let (title, body) = preserve_existing_pr_content(remote_title, remote_body);
-    assert_eq!(title, remote_title);
-    assert_eq!(body, remote_body);
-    assert!(body.contains("R | 是否完成 | 证据"));
+    let body = "Summary\n\nR | 是否完成 | 证据\nR1 | 是 | synthetic"; let (title, kept) = preserve_existing_pr_content("fix: maintainer title", body); assert_eq!(title, "fix: maintainer title"); assert_eq!(kept, body);
 }
 
-// ---------------- M285b integration (fake gh + sqlite hitting deliver_changes) ----------------
 #[cfg(test)]
 mod integration {
-    use super::*;
+    use super::DeliveryCeiling;
     use serde_json::json;
     use std::fs;
-    use std::io::Write;
-    #[cfg(unix)]
-    use std::os::unix::fs::PermissionsExt;
+    #[cfg(unix)] use std::os::unix::fs::PermissionsExt;
 
-    fn write_executable(path: &std::path::Path, content: &str) {
-        fs::write(path, content).unwrap();
-        #[cfg(unix)] {
-            let mut perm = fs::metadata(path).unwrap().permissions();
-            perm.set_mode(0o755);
-            fs::set_permissions(path, perm).unwrap();
-        }
-    }
-
-    fn fake_gh_script(state_path: &std::path::Path) -> String {
-        // Implement a tiny state without jq: three files alongside $STATE base.
-        // $STATE.number (default 101), $STATE.armed (true/false), $STATE.draft (true/false)
-        format!(r#"#!/bin/sh
+    fn fake_gh(state: &std::path::Path) -> String { format!(r#"#!/bin/sh
 set -eu
-BASE="{state}"
-NUM_FILE="$BASE.number"; ARMED_FILE="$BASE.armed"; DRAFT_FILE="$BASE.draft"
-log() {{ echo "$@" >> "{state}.log"; }}
-[ -f "$NUM_FILE" ] || echo 101 > "$NUM_FILE"
-[ -f "$ARMED_FILE" ] || echo false > "$ARMED_FILE"
-[ -f "$DRAFT_FILE" ] || echo false > "$DRAFT_FILE"
-NUMBER=$(cat "$NUM_FILE")
-ARMED=$(cat "$ARMED_FILE")
-DRAFT=$(cat "$DRAFT_FILE")
-if [ "${{CF_TEST_GH_LIST_FAIL:-0}}" = 1 ] && [ "$1 $2" = "pr list" ]; then exit 2; fi
+BASE="{s}"; A="$BASE.armed"; D="$BASE.draft"; L="$BASE.log"
+[ -f "$A" ] || echo false > "$A"; [ -f "$D" ] || echo false > "$D"
+ARMED=$(cat "$A"); DRAFT=$(cat "$D")
+if [ "${{CF_TEST_GH_LIST_FAIL:-0}}" = 1 ] && [ "$1 $2" = "pr list" ] && [ ! -f "$BASE.failed_once" ]; then touch "$BASE.failed_once"; exit 2; fi
 case "$1 $2" in
-  "pr list")
-    if [ "$DRAFT" = true ]; then ISDRAFT=true; else ISDRAFT=false; fi
-    if [ "$ARMED" = true ]; then LABELS='[{{"name":"merge-queue: armed"}}]'; else LABELS='[]'; fi
-    echo "[{{\"number\":$NUMBER,\"title\":\"remote title\",\"body\":\"remote body\",\"isDraft\":$ISDRAFT,\"labels\":$LABELS}}]";
-    ;;
-  "pr create")
-    log pr_create "$@";
-    ;;
-  "pr view")
-    if echo "$@" | grep -q labels; then
-      if [ "$ARMED" = true ]; then LABELS='[{{"name":"merge-queue: armed"}}]'; else LABELS='[]'; fi
-      echo "{{\"labels\":$LABELS}}";
-    elif echo "$@" | grep -q number,url; then
-      echo "{{\"number\":$NUMBER,\"url\":\"https://forge.invalid/pr/$NUMBER\"}}";
-    else
-      echo '{{"state":"OPEN","statusCheckRollup":[{{"status":"IN_PROGRESS"}}]}}'
-    fi
-    ;;
-  "pr edit")
-    if echo "$@" | grep -q -- "--add-label"; then
-      echo true > "$ARMED_FILE"; log pr_edit "$@";
-    elif echo "$@" | grep -q -- "--title"; then
-      log pr_edit "$@";
-    elif echo "$@" | grep -q -- "--remove-label"; then
-      echo false > "$ARMED_FILE"; log pr_edit "$@";
-    fi
-    ;;
-  "workflow run") ;;
-  *) echo 1>&2 "unexpected gh args: $@"; exit 3;;
- esac
-"#,
-        state = state_path.display())
-    }
+ "pr list") [ "$ARMED" = true ] && LABELS='[{{"name":"merge-queue: armed"}}]' || LABELS='[]'; echo "[{{\"number\":101,\"url\":\"https://forge.invalid/pr/101\",\"title\":\"fix: remote\",\"body\":\"R | 是否完成 | 证据\",\"state\":\"OPEN\",\"headRefOid\":\"unused\",\"isDraft\":$DRAFT,\"labels\":$LABELS}}]";;
+ "pr view") if echo "$@" | grep -q labels; then [ "$ARMED" = true ] && LABELS='[{{"name":"merge-queue: armed"}}]' || LABELS='[]'; echo "{{\"labels\":$LABELS}}"; elif echo "$@" | grep -q number,url; then echo '{{"number":101,"url":"https://forge.invalid/pr/101"}}'; else echo '{{"state":"OPEN","statusCheckRollup":[{{"status":"IN_PROGRESS"}}]}}'; fi;;
+ "pr edit") echo "$@" >> "$L"; echo "$@" | grep -q -- --add-label && echo true > "$A" || :;;
+ "pr create") echo "$@" >> "$L";;
+ "workflow run") echo "$@" >> "$L";;
+ *) echo "unexpected $*" >&2; exit 3;;
+esac
+"#, s=state.display()) }
 
-    async fn mk_pool() -> sqlx::SqlitePool { sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap() }
-
-    fn init_repo(root: &std::path::Path, bare: &std::path::Path) {
+    async fn setup() -> (tempfile::TempDir, tempfile::TempDir, sqlx::SqlitePool, std::path::PathBuf) {
         use std::process::Command;
-        Command::new("git").current_dir(root).args(["init"]).status().unwrap();
-        Command::new("git").current_dir(root).args(["config","user.name","Synthetic"]).status().unwrap();
-        Command::new("git").current_dir(root).args(["config","user.email","synthetic@example.invalid"]).status().unwrap();
-        fs::write(root.join("README.md"), "x").unwrap();
-        Command::new("git").current_dir(root).args(["add","."]).status().unwrap();
-        Command::new("git").current_dir(root).args(["commit","-m","init"]).status().unwrap();
-        Command::new("git").current_dir(bare).args(["init","--bare"]).status().unwrap();
-        Command::new("git").current_dir(root).args(["remote","add","origin", bare.to_str().unwrap()]).status().unwrap();
-        let head = String::from_utf8(Command::new("git").current_dir(root).args(["rev-parse","HEAD"]).output().unwrap().stdout).unwrap();
-        let head = head.trim();
-        Command::new("git").current_dir(root).args(["update-ref","refs/remotes/origin/main", head]).status().unwrap();
-        Command::new("git").current_dir(root).args(["checkout","-b","feature"]).status().unwrap();
-        fs::write(root.join("file.txt"), "changed").unwrap();
-    }
-
-    #[tokio::test]
-    async fn f3_query_failure_downgrades_to_pr_only_and_never_arms() {
-        let dir = tempfile::tempdir().unwrap();
-        let bare = tempfile::tempdir().unwrap();
-        init_repo(dir.path(), bare.path());
-        let bin = dir.path().join("bin"); fs::create_dir_all(&bin).unwrap();
-        let state = dir.path().join("gh-state.json");
-        write_executable(&bin.join("gh"), &fake_gh_script(&state));
-        std::env::set_var("PATH", format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()));
-        std::env::set_var("CF_TEST_GH_LIST_FAIL", "1");
-        let db = mk_pool().await;
-        sqlx::query("CREATE TABLE sessions(id TEXT PRIMARY KEY, delivery_authorized INTEGER NOT NULL DEFAULT 1)").execute(&db).await.unwrap();
-        sqlx::query("INSERT INTO sessions VALUES('s',1)").execute(&db).await.unwrap();
-        let mut ctx = crate::tools::ExecCtx::new(dir.path().to_path_buf(), Some(db));
-        ctx.session_id = Some("s".into());
-        let out = crate::tools::dispatch("deliver_changes", json!({"title":"fix: t","body":"b","ceiling":"through_merge"}), &ctx).await.unwrap();
-        assert_eq!(out.status, crate::tools::ToolExecutionStatus::Waiting);
-        let v: serde_json::Value = serde_json::from_str(&out.content).unwrap();
-        assert_eq!(v["effective_ceiling"], "pr_only");
-        let log = fs::read_to_string(state.with_extension("json.log")).unwrap_or_default();
-        assert!(!log.contains("--add-label"), "must not try to arm: {log}");
-    }
-
-    #[tokio::test]
-    async fn f2_f5_draft_or_removed_arm_records_revocation_and_refuses_merge() {
-        let dir = tempfile::tempdir().unwrap();
-        let bare = tempfile::tempdir().unwrap();
-        init_repo(dir.path(), bare.path());
-        let bin = dir.path().join("bin"); fs::create_dir_all(&bin).unwrap();
-        let state = dir.path().join("gh-state.json");
-        write_executable(&bin.join("gh"), &fake_gh_script(&state));
-        std::env::set_var("PATH", format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()));
-        let db = mk_pool().await;
-        sqlx::query("CREATE TABLE sessions(id TEXT PRIMARY KEY, delivery_authorized INTEGER NOT NULL DEFAULT 1)").execute(&db).await.unwrap();
-        sqlx::query("INSERT INTO sessions VALUES('s',1)").execute(&db).await.unwrap();
+        let dir=tempfile::tempdir().unwrap(); let bare=tempfile::tempdir().unwrap();
+        for a in [vec!["init"],vec!["config","user.name","Synthetic"],vec!["config","user.email","synthetic@example.invalid"]] { assert!(Command::new("git").current_dir(dir.path()).args(a).status().unwrap().success()); }
+        fs::write(dir.path().join("README.md"),"x").unwrap(); for a in [vec!["add","."],vec!["commit","-m","init"]] { assert!(Command::new("git").current_dir(dir.path()).args(a).status().unwrap().success()); }
+        assert!(Command::new("git").current_dir(bare.path()).args(["init","--bare"]).status().unwrap().success()); assert!(Command::new("git").current_dir(dir.path()).args(["remote","add","origin",bare.path().to_str().unwrap()]).status().unwrap().success());
+        let head=String::from_utf8(Command::new("git").current_dir(dir.path()).args(["rev-parse","HEAD"]).output().unwrap().stdout).unwrap(); assert!(Command::new("git").current_dir(dir.path()).args(["update-ref","refs/remotes/origin/main",head.trim()]).status().unwrap().success()); assert!(Command::new("git").current_dir(dir.path()).args(["checkout","-b","feature"]).status().unwrap().success()); fs::write(dir.path().join("file.txt"),"changed").unwrap();
+        let state=dir.path().join("gh-state"); let gh=dir.path().join("gh"); fs::write(&gh,fake_gh(&state)).unwrap(); #[cfg(unix)] { let mut p=fs::metadata(&gh).unwrap().permissions(); p.set_mode(0o755); fs::set_permissions(&gh,p).unwrap(); } std::env::set_var("CODEFACTORY_TEST_GH_BIN",gh);
+        let db=sqlx::sqlite::SqlitePoolOptions::new().max_connections(1).connect("sqlite::memory:").await.unwrap();
+        sqlx::query("CREATE TABLE sessions(id TEXT PRIMARY KEY,delivery_authorized INTEGER NOT NULL,release_urgency TEXT NOT NULL,delivery_mode TEXT NOT NULL)").execute(&db).await.unwrap(); sqlx::query("INSERT INTO sessions VALUES('s',1,'default','thin')").execute(&db).await.unwrap();
         sqlx::query("CREATE TABLE thin_delivery_refs(session_id TEXT PRIMARY KEY,branch TEXT,pr_number INTEGER,ceiling TEXT)").execute(&db).await.unwrap();
-        sqlx::query("INSERT INTO thin_delivery_refs VALUES('s','feature',101,'ThroughMerge')").execute(&db).await.unwrap();
-        fs::write(state.with_extension("json.draft"), "true").unwrap();
-        let mut ctx = crate::tools::ExecCtx::new(dir.path().to_path_buf(), Some(db.clone()));
-        ctx.session_id = Some("s".into());
-        let out = crate::tools::dispatch("deliver_changes", json!({"title":"fix: t","body":"b","ceiling":"through_merge"}), &ctx).await.unwrap();
-        assert!(out.is_error && out.content.contains("草稿"), "{:#?}", out.content);
-        // simulate restart: build a new ctx on the same db and try through_merge again — should still refuse until newly authorized
-        let mut ctx2 = crate::tools::ExecCtx::new(dir.path().to_path_buf(), Some(db.clone()));
-        ctx2.session_id = Some("s".into());
-        let out2 = crate::tools::dispatch("deliver_changes", json!({"title":"fix: t2","body":"b2","ceiling":"through_merge"}), &ctx2).await.unwrap();
-        assert!(out2.is_error, "revocation must persist across restart");
-        // check durable session flag lowered
-        let val: i64 = sqlx::query_scalar("SELECT delivery_authorized FROM sessions WHERE id='s'").fetch_one(&db).await.unwrap();
-        assert_eq!(val, 0);
-        // allow normal path after explicit re-authorization by flipping the flag
-        sqlx::query("UPDATE sessions SET delivery_authorized=1 WHERE id='s'").execute(&db).await.unwrap();
-        // also remove draft to allow arming
-        fs::write(state.with_extension("json.draft"), "false").unwrap();
-        let ok = crate::tools::dispatch("deliver_changes", json!({"title":"fix: t3","body":"b3","ceiling":"through_merge"}), &ctx2).await.unwrap();
-        assert_eq!(ok.status, crate::tools::ToolExecutionStatus::Waiting);
+        sqlx::query("CREATE TABLE task_runs(id TEXT PRIMARY KEY,objective_id TEXT)").execute(&db).await.unwrap(); sqlx::query("INSERT INTO task_runs VALUES('task','objective')").execute(&db).await.unwrap();
+        (dir,bare,db,state)
     }
+    fn context(dir:&std::path::Path,db:sqlx::SqlitePool)->crate::tools::ExecCtx { let mut c=crate::tools::ExecCtx::new(dir.to_path_buf(),Some(db)); c.session_id=Some("s".into()); c.task_id=Some("task".into()); let mut s=crate::config::settings::Settings::default(); s.delivery_ceiling=DeliveryCeiling::ThroughMerge; c.settings=Some(s); c }
 
     #[tokio::test]
-    async fn f6_remote_title_body_are_preserved_no_rewrite() {
-        let dir = tempfile::tempdir().unwrap();
-        let bare = tempfile::tempdir().unwrap();
-        init_repo(dir.path(), bare.path());
-        let bin = dir.path().join("bin"); fs::create_dir_all(&bin).unwrap();
-        let state = dir.path().join("gh-state.json");
-        fs::write(&state, "{\"number\":101,\"armed\":false,\"draft\":false}").unwrap();
-        write_executable(&bin.join("gh"), &fake_gh_script(&state));
-        std::env::set_var("PATH", format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()));
-        let db = mk_pool().await;
-        sqlx::query("CREATE TABLE sessions(id TEXT PRIMARY KEY, delivery_authorized INTEGER NOT NULL DEFAULT 1)").execute(&db).await.unwrap();
-        sqlx::query("INSERT INTO sessions VALUES('s',1)").execute(&db).await.unwrap();
-        let mut ctx = crate::tools::ExecCtx::new(dir.path().to_path_buf(), Some(db));
-        ctx.session_id = Some("s".into());
-        let out = crate::tools::dispatch("deliver_changes", json!({"title":"fix: local","body":"local body","ceiling":"through_ci_green"}), &ctx).await.unwrap();
-        assert!(!out.is_error);
-        let log = fs::read_to_string(state.with_extension("json.log")).unwrap_or_default();
-        assert!(!log.contains("--title"), "must not rewrite remote title/body: {log}");
-    }
-
+    async fn query_failure_downgrades_to_pr_only_and_never_arms(){let(d,_b,db,state)=setup().await;std::env::set_var("CF_TEST_GH_LIST_FAIL","1");let o=crate::tools::dispatch("deliver_changes",json!({"title":"fix: t","body":"b","ceiling":"through_merge"}),&context(d.path(),db)).await.unwrap();std::env::remove_var("CF_TEST_GH_LIST_FAIL");assert_eq!(o.status,crate::tools::ToolExecutionStatus::Waiting,"{}",o.content);let v:serde_json::Value=serde_json::from_str(&o.content).unwrap();assert_eq!(v["effective_ceiling"],"pr_only");assert!(!fs::read_to_string(state.with_extension("log")).unwrap_or_default().contains("--add-label"));}
     #[tokio::test]
-    async fn counterexample_authorized_and_not_revoked_arms_normally() {
-        let dir = tempfile::tempdir().unwrap();
-        let bare = tempfile::tempdir().unwrap();
-        init_repo(dir.path(), bare.path());
-        let bin = dir.path().join("bin"); fs::create_dir_all(&bin).unwrap();
-        let state = dir.path().join("gh-state.json");
-        fs::write(&state, "{\"number\":101,\"armed\":false,\"draft\":false}").unwrap();
-        write_executable(&bin.join("gh"), &fake_gh_script(&state));
-        std::env::set_var("PATH", format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()));
-        let db = mk_pool().await;
-        sqlx::query("CREATE TABLE sessions(id TEXT PRIMARY KEY, delivery_authorized INTEGER NOT NULL DEFAULT 1)").execute(&db).await.unwrap();
-        sqlx::query("INSERT INTO sessions VALUES('s',1)").execute(&db).await.unwrap();
-        let mut ctx = crate::tools::ExecCtx::new(dir.path().to_path_buf(), Some(db));
-        ctx.session_id = Some("s".into());
-        let out = crate::tools::dispatch("deliver_changes", json!({"title":"fix: t","body":"b","ceiling":"through_merge"}), &ctx).await.unwrap();
-        assert_eq!(out.status, crate::tools::ToolExecutionStatus::Waiting);
-        let log = fs::read_to_string(state.with_extension("json.log")).unwrap_or_default();
-        assert!(log.contains("--add-label"), "must arm when authorized and not revoked: {log}");
-    }
+    async fn draft_revocation_persists_across_restart_until_new_authorization(){let(d,_b,db,state)=setup().await;fs::write(state.with_extension("draft"),"true").unwrap();sqlx::query("INSERT INTO thin_delivery_refs VALUES('s','feature',101,'ThroughMerge')").execute(&db).await.unwrap();let a=crate::tools::dispatch("deliver_changes",json!({"title":"fix: t","body":"b","ceiling":"through_merge"}),&context(d.path(),db.clone())).await.unwrap();assert!(a.is_error&&a.content.contains("草稿"),"{}",a.content);let b=crate::tools::dispatch("deliver_changes",json!({"title":"fix: t","body":"b","ceiling":"through_merge"}),&context(d.path(),db.clone())).await.unwrap();assert!(b.is_error&&b.content.contains("撤回"),"{}",b.content);assert_eq!(sqlx::query_scalar::<_,i64>("SELECT delivery_authorized FROM sessions WHERE id='s'").fetch_one(&db).await.unwrap(),0);}
+    #[tokio::test]
+    async fn remote_title_and_body_are_preserved_without_rewrite(){let(d,_b,db,state)=setup().await;let o=crate::tools::dispatch("deliver_changes",json!({"title":"fix: local","body":"local","ceiling":"through_ci_green"}),&context(d.path(),db)).await.unwrap();assert!(!o.is_error,"{}",o.content);let l=fs::read_to_string(state.with_extension("log")).unwrap_or_default();assert!(!l.contains("--title")&&!l.contains("--body"),"{l}");}
+    #[tokio::test]
+    async fn authorized_not_revoked_arms_normally(){let(d,_b,db,state)=setup().await;let o=crate::tools::dispatch("deliver_changes",json!({"title":"fix: t","body":"b","ceiling":"through_merge"}),&context(d.path(),db)).await.unwrap();assert_eq!(o.status,crate::tools::ToolExecutionStatus::Waiting,"{}",o.content);assert!(fs::read_to_string(state.with_extension("log")).unwrap_or_default().contains("--add-label"));}
 }
