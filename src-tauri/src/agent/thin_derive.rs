@@ -1031,7 +1031,7 @@ async fn continue_state(db: &SqlitePool, session: &str, at: i64, why: &str) -> s
 
 /// M278/R1：同一条续接，但不再等 60 秒。只用于「审批刚被拒、任务未交付」——用户
 /// 已经当场表态，系统没有理由再隔一分钟才动。
-async fn continue_state_now(db: &SqlitePool, session: &str, at: i64, why: &str) -> sqlx::Result<Option<ThinState>> {
+pub(crate) async fn continue_state_now(db: &SqlitePool, session: &str, at: i64, why: &str) -> sqlx::Result<Option<ThinState>> {
     continue_state_after(db, session, at, why, Some(0)).await
 }
 
@@ -1095,6 +1095,26 @@ async fn delivery_settled(db: &SqlitePool, session: &str) -> sqlx::Result<bool> 
     .fetch_one(db)
     .await?;
     Ok(settled > 0)
+}
+
+/// M283/R2/R3: system recovery reuses the same bounded continuation path.
+pub(crate) async fn system_recovery_continuation(
+    db: &SqlitePool,
+    session: &str,
+    at: i64,
+    why: &str,
+) -> sqlx::Result<Option<ThinState>> {
+    if has_table(db, "chat_session_cancel_intents").await? {
+        let stopped: Option<i64> = sqlx::query_scalar(
+            "SELECT requested_at FROM chat_session_cancel_intents WHERE session_id=?",
+        )
+        .bind(session)
+        .fetch_optional(db)
+        .await?;
+        if stopped.is_some() { return Ok(None); }
+    }
+    if delivery_settled(db, session).await? { return Ok(None); }
+    continue_state_now(db, session, at, why).await
 }
 
 /// M282/R1：`refresh` 与回合结束结算（`thin_state::settle_final`）共用的唯一判定。
@@ -3659,6 +3679,36 @@ mod tests {
         let stored: String = sqlx::query_scalar("SELECT state FROM thin_session_state WHERE session_id='derive'")
             .fetch_one(&db).await.unwrap();
         assert_ne!(stored, "ended", "M282/R3: 被拒且未交付的回合不能被写成 ended");
+    }
+
+    /// M283/R2-R3: system recovery persists a real immediate wake for unfinished work.
+    #[tokio::test]
+    async fn m283_system_recovery_arms_bounded_continuation() {
+        let db = fixture().await;
+        let now = chrono::Utc::now().timestamp_millis();
+        let state = system_recovery_continuation(&db, "derive", now, "权限身份核对暂时失败")
+            .await.unwrap().expect("unfinished recovery must continue");
+        assert_eq!(state.state, SessionState::WaitingWake);
+        let (status, next_at): (String, i64) = sqlx::query_as(
+            "SELECT status,next_at FROM wakeup_schedules WHERE session_id='derive' AND id LIKE 'thin-continue-%'",
+        ).fetch_one(&db).await.unwrap();
+        assert_eq!(status, "pending");
+        assert!(next_at <= chrono::Utc::now().timestamp());
+    }
+
+    /// M283/R5 negative: an explicit user stop always wins over system recovery.
+    #[tokio::test]
+    async fn m283_system_recovery_respects_user_stop() {
+        let db = fixture().await;
+        let now = chrono::Utc::now().timestamp_millis();
+        sqlx::query("INSERT INTO chat_session_cancel_intents(session_id,status,requested_at,updated_at) VALUES ('derive','requested',?,?)")
+            .bind(now).bind(now).execute(&db).await.unwrap();
+        assert!(system_recovery_continuation(&db, "derive", now, "工作区救援已成功")
+            .await.unwrap().is_none());
+        let wake_table: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='wakeup_schedules'",
+        ).fetch_one(&db).await.unwrap();
+        assert_eq!(wake_table, 0, "user stop must not even arm the wake subsystem");
     }
 
     /// M282/R4 反例：没有被拒事实时，`settle_final` 按原规则结算，不造接续唤醒。

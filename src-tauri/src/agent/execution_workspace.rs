@@ -954,6 +954,17 @@ async fn restore_registered_branch(pool: &SqlitePool, row: &WorkspaceRow, worktr
     sqlx::query("UPDATE execution_workspace_rescues SET phase=?,updated_at=? WHERE rescue_ref=?")
         .bind(&phase).bind(Utc::now().timestamp_millis()).bind(&rescue_ref).execute(&mut *tx).await?;
     tx.commit().await?;
+    if let Some(session) = row.session_id.as_deref() {
+        if let Some(state) = super::thin_derive::system_recovery_continuation(
+            pool,
+            session,
+            Utc::now().timestamp_millis(),
+            "工作区救援已成功，任务尚未交付",
+        )
+        .await? {
+            super::thin_state::save(pool, session, &state).await?;
+        }
+    }
     tracing::info!(objective_id=%row.objective_id, %rescue_ref, %phase, "managed workspace rescue completed");
     Ok(())
 }
@@ -4154,6 +4165,16 @@ fn rescue_snapshot(row: &WorkspaceRow) -> Result<String> {
 /// M163/R2: startup and allocation share this recovery path. No directories or
 /// branches are removed; conflicts leave all originals and rescue refs intact.
 async fn repair_session_split_locked(pool: &SqlitePool, session: &str) -> Result<()> {
+    let has_turns: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='chat_turn_state'")
+        .fetch_one(pool).await?;
+    if has_turns > 0 {
+        let live_executors: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM chat_turn_state WHERE session_id=? AND status='working' AND terminal_reason IS NULL",
+        ).bind(session).fetch_one(pool).await?;
+        if live_executors > 0 {
+            bail!("split recovery deferred while session has a live executor");
+        }
+    }
     let mut rows: Vec<WorkspaceRow> = sqlx::query_as(
         "SELECT id, objective_id, session_id, repo_identity, repo_root, git_common_dir,
                 worktree_path, worktree_identity, branch_name, base_ref, base_sha,
@@ -4241,7 +4262,7 @@ async fn repair_session_split_locked(pool: &SqlitePool, session: &str) -> Result
             .bind(Utc::now().timestamp_millis()).bind(Utc::now().timestamp_millis()).bind(&row.id).execute(&mut *tx).await?;
         let has_turns: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='chat_turn_state'").fetch_one(&mut *tx).await?;
         if has_turns > 0 {
-            sqlx::query("UPDATE chat_turn_state SET objective_id=? WHERE objective_id=? AND session_id=?")
+            sqlx::query("UPDATE chat_turn_state SET objective_id=? WHERE objective_id=? AND session_id=? AND NOT (status='working' AND terminal_reason IS NULL)")
                 .bind(&keeper.objective_id).bind(&row.objective_id).bind(session).execute(&mut *tx).await?;
         }
         let full_objectives: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pragma_table_info('objectives') WHERE name='requires_user_action'")
@@ -4797,6 +4818,11 @@ mod tests {
         std::fs::write(path.join("half-done.txt"), [0, 255, 3]).unwrap();
         std::fs::remove_file(path.join("latest.txt")).unwrap();
         park_as_incident(&pool, &workspace.objective_id, "branch changed").await;
+        crate::agent::thin_state::save(
+            &pool,
+            "session-managed-workspace",
+            &crate::agent::thin_state::ThinState::ended("orphaned_by_restart", "rescue ref"),
+        ).await.unwrap();
         let recovered = attach_existing(&pool, &workspace.objective_id, "process-b")
             .await.unwrap().unwrap();
         assert_eq!(recovered.state, "active");
@@ -4806,6 +4832,11 @@ mod tests {
         assert_eq!(std::fs::read(path.join("base.txt")).unwrap(), b"unstaged\n");
         assert_eq!(std::fs::read(path.join("half-done.txt")).unwrap(), [0, 255, 3]);
         assert!(!path.join("latest.txt").exists());
+        let state = crate::agent::thin_state::load(&pool, "session-managed-workspace").await.unwrap().unwrap();
+        assert_eq!(state.state, crate::agent::thin_state::SessionState::WaitingWake, "{state:?}");
+        let wakes: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM wakeup_schedules WHERE session_id='session-managed-workspace' AND status='pending'")
+            .fetch_one(&pool).await.unwrap();
+        assert_eq!(wakes, 1, "successful rescue must own a real continuation");
         let refs = git(path, &["for-each-ref", "--format=%(refname)", "refs/codefactory/rescue/"]);
         assert!(refs.starts_with("refs/codefactory/rescue/objective-incident-stays/"));
         assert_eq!(git(path, &["show", &format!("{refs}^3:half-done.txt")]).as_bytes(), &[0, 239, 191, 189, 3]);
@@ -5850,6 +5881,29 @@ mod tests {
         assert!(a.worktree_path.join("latest.txt").is_file());
         assert!(b.worktree_path.join("latest.txt").is_file());
         assert_eq!(sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM execution_workspaces WHERE state='active'").fetch_one(&pool).await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn m283_split_recovery_preserves_live_executor_before_snapshot_or_retirement() {
+        let (_temp, root, _remote, container) = init_repo();
+        let pool = pool_with_objectives(&["m283-live-a", "m283-live-b"]).await;
+        let a = allocate_or_attach(&pool, request_for_session(&root, &container, "m283-live-a", "m283-session", "live-a")).await.unwrap();
+        let b = allocate_or_attach(&pool, request_for_session(&root, &container, "m283-live-b", "other-session", "live-b")).await.unwrap();
+        std::fs::write(a.worktree_path.join("live-a.txt"), "a still running\n").unwrap();
+        std::fs::write(b.worktree_path.join("live-b.txt"), "b preserved\n").unwrap();
+        sqlx::query("UPDATE execution_workspaces SET session_id='m283-session'").execute(&pool).await.unwrap();
+        sqlx::query("CREATE TABLE chat_turn_state(root_turn_id TEXT, session_id TEXT, objective_id TEXT, status TEXT, terminal_reason TEXT)")
+            .execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO chat_turn_state VALUES ('live-turn','m283-session','m283-live-b','working',NULL)")
+            .execute(&pool).await.unwrap();
+
+        let error = super::repair_session_split_locked(&pool, "m283-session").await.unwrap_err().to_string();
+        assert!(error.contains("live executor"), "{error}");
+        assert_eq!(workspace_state_of(&pool, "m283-live-a").await.as_deref(), Some("active"));
+        assert_eq!(workspace_state_of(&pool, "m283-live-b").await.as_deref(), Some("active"));
+        assert!(git(&root, &["for-each-ref", "--format=%(refname)", "refs/codefactory/rescue/"]).is_empty());
+        assert_eq!(text(&a.worktree_path.join("live-a.txt")), "a still running\n");
+        assert_eq!(text(&b.worktree_path.join("live-b.txt")), "b preserved\n");
     }
 
     #[tokio::test]

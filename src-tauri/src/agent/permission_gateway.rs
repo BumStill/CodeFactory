@@ -700,6 +700,9 @@ impl DesktopPermissionGateway {
                 Ok(intent) => Some(intent),
                 Err(error) => {
                     tracing::error!(%error, "permission identity reconciliation exhausted one retry");
+                    if let Err(audit_error) = self.persist_alignment_failure(&error.to_string(), now).await {
+                        tracing::error!(%audit_error, "cannot persist permission alignment recovery");
+                    }
                     // M283/R2: this is a system-side identity failure, not a user
                     // refusal. The wording must say so, keep the turn running, and
                     // forbid the blocker summary that ended the turn silently.
@@ -967,6 +970,37 @@ impl DesktopPermissionGateway {
         Err(failure.expect("two unsuccessful admission attempts"))
     }
 
+    async fn persist_alignment_failure(&self, error: &str, now: i64) -> anyhow::Result<()> {
+        use sqlx::Row;
+        let error = crate::trajectory::redact_text(error, 500);
+        if let Some(objective) = sqlx::query("SELECT id,revision,status,decision_type FROM objectives WHERE session_id=? AND status NOT IN ('completed','cancelled','failed','legacy_orphan') ORDER BY revision DESC,updated_at DESC LIMIT 1")
+            .bind(&self.session_id).fetch_optional(&self.db).await? {
+            let detail = serde_json::json!({
+                "summary": error,
+                "recovery": "bounded_wakeup",
+                "requires_user_action": false,
+            });
+            sqlx::query("INSERT INTO objective_events (id,objective_id,revision,event_type,status,decision_type,domain,failure_code,recovery_owner,detail_json,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)")
+                .bind(uuid::Uuid::new_v4().to_string())
+                .bind(objective.try_get::<String,_>("id")?)
+                .bind(objective.try_get::<i64,_>("revision")?)
+                .bind("permission_alignment_failed")
+                .bind(objective.try_get::<String,_>("status")?)
+                .bind(objective.try_get::<Option<String>,_>("decision_type")?)
+                .bind("permission").bind("permission_identity_alignment")
+                .bind("system").bind(detail.to_string()).bind(now)
+                .execute(&self.db).await?;
+        }
+        let _ = super::thin_derive::system_recovery_continuation(
+            &self.db,
+            &self.session_id,
+            now,
+            "权限身份核对暂时失败，任务尚未交付",
+        )
+        .await?;
+        Ok(())
+    }
+
     async fn resolve_scope(&self) -> anyhow::Result<PermissionScope> {
         use sqlx::Row;
         let resource = if let Some(task_id) = self.task_id.as_deref() {
@@ -1186,6 +1220,23 @@ mod tests {
             .unwrap();
         take_pending_sender(&gateway).await.send(allow()).unwrap();
         assert_eq!(task.await.unwrap(), PermissionOutcome::Allow);
+    }
+
+    #[tokio::test]
+    async fn m283_alignment_failure_persists_audit_and_real_wakeup() {
+        let gateway = durable_test_gateway().await;
+        sqlx::raw_sql("ALTER TABLE objectives ADD COLUMN session_id TEXT; ALTER TABLE objectives ADD COLUMN updated_at INTEGER NOT NULL DEFAULT 1; ALTER TABLE objectives ADD COLUMN decision_type TEXT; UPDATE objectives SET session_id='permission-test'; CREATE TABLE objective_events(id TEXT,objective_id TEXT,revision INTEGER,event_type TEXT,status TEXT,decision_type TEXT,domain TEXT,failure_code TEXT,recovery_owner TEXT,detail_json TEXT,created_at INTEGER);")
+            .execute(&gateway.db).await.unwrap();
+        gateway.persist_alignment_failure("synthetic stale binding; api_key=must-not-appear", 1000).await.unwrap();
+        let (event_type, failure_code, detail): (String,String,String) = sqlx::query_as("SELECT event_type,failure_code,detail_json FROM objective_events")
+            .fetch_one(&gateway.db).await.unwrap();
+        assert_eq!(event_type, "permission_alignment_failed");
+        assert_eq!(failure_code, "permission_identity_alignment");
+        assert!(detail.contains("bounded_wakeup") && !detail.contains("api_key=must-not-appear"), "{detail}");
+        let (status, next_at): (String,i64) = sqlx::query_as("SELECT status,next_at FROM wakeup_schedules WHERE session_id='permission-test' AND id LIKE 'thin-continue-%'")
+            .fetch_one(&gateway.db).await.unwrap();
+        assert_eq!(status, "pending");
+        assert!(next_at <= chrono::Utc::now().timestamp());
     }
 
     #[tokio::test]
