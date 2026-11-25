@@ -130,10 +130,44 @@ fn settings_for_session_route(
     policy: &str,
 ) -> Result<Settings, AppError> {
     let mut turn = settings.clone();
+
+    // M286 R6: explicit endpoint hint in the requested model — "endpoint/model" —
+    // takes precedence over inference. Only treat it as an endpoint hint when it
+    // has exactly one slash and the left part matches a configured endpoint name.
+    // Otherwise (including OpenRouter owner/model like "deepseek/deepseek-v4-pro")
+    // fall back to the legacy inference path.
+    let (hinted_endpoint, hinted_model) = if endpoint_id.is_none() {
+        if let Some((left, right)) = model_id.split_once('/') {
+            if !right.contains('/') && settings.endpoints.contains_key(left) {
+                (Some(left), Some(right))
+            } else {
+                (None, None)
+            }
+        } else {
+            (None, None)
+        }
+    } else {
+        (None, None)
+    };
+
     let endpoint = if let Some(endpoint) =
         endpoint_id.filter(|endpoint| settings.endpoints.contains_key(*endpoint))
     {
         endpoint
+    } else if let (Some(ep), Some(model)) = (hinted_endpoint, hinted_model) {
+        // If the endpoint hint is present but the endpoint does not offer the
+        // requested model, fail explicitly instead of silently falling through
+        // to another endpoint (or OpenRouter).
+        if turn
+            .resolve_model_for_endpoint(ep, model)
+            .is_none()
+        {
+            return Err(AppError::Other(format!(
+                "ENDPOINT_MODEL_UNAVAILABLE: 端点 '{ep}' 不提供模型 '{model}'，请在该端点选择可用模型"
+            )));
+        }
+        // Lock the endpoint for this turn; callers may still choose policy.
+        ep
     } else {
         let matching = settings
             .endpoints
@@ -162,6 +196,20 @@ fn settings_for_session_route(
     turn.default_endpoint = endpoint.to_string();
     if policy == "fixed" || policy.is_empty() {
         turn.endpoints.retain(|candidate, _| candidate == endpoint);
+    }
+
+    // When the endpoint hint was used, normalize the requested model for this
+    // endpoint so subsequent planning uses the endpoint-safe id.
+    if let (Some(ep), Some(model)) = (hinted_endpoint, hinted_model) {
+        if turn
+            .resolve_model_for_endpoint(ep, model)
+            .is_none()
+        {
+            // Defensive: the earlier check should have errored; keep legacy behavior.
+            return Err(AppError::Other(format!(
+                "ENDPOINT_MODEL_UNAVAILABLE: 端点 '{ep}' 不提供模型 '{model}'"
+            )));
+        }
     }
     Ok(turn)
 }
