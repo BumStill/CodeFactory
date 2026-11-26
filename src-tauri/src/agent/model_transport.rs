@@ -1278,6 +1278,9 @@ impl DesktopModelTransport {
             let chunk = match next_stream_item(&mut byte_stream, self.cancel.as_ref()).await {
                 StreamPoll::Item(Some(chunk)) => chunk,
                 StreamPoll::Item(None) | StreamPoll::Cancelled => break,
+                StreamPoll::TimedOut => return Err(crate::errors::AppError::Other(
+                    "provider_stream_interrupted_no_side_effect: ChatGPT Responses SSE idle deadline exceeded; retry the same turn".into(),
+                )),
             };
             let bytes = chunk?;
             byte_buffer.extend_from_slice(&bytes);
@@ -1614,6 +1617,9 @@ impl DesktopModelTransport {
             let chunk = match next_stream_item(&mut byte_stream, self.cancel.as_ref()).await {
                 StreamPoll::Item(Some(chunk)) => chunk,
                 StreamPoll::Item(None) | StreamPoll::Cancelled => break,
+                StreamPoll::TimedOut => return Err(crate::errors::AppError::Other(
+                    "provider_stream_interrupted_no_side_effect: OpenAI-compatible SSE idle deadline exceeded; retry the same turn".into(),
+                )),
             };
             let bytes = chunk?;
             byte_buffer.extend_from_slice(&bytes);
