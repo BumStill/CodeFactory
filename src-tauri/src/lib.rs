@@ -2345,6 +2345,7 @@ pub fn run() {
             commands::interjections::queue_interjection,
             commands::queued_delivery::enqueue_queued_dispatch_message,
             commands::queued_delivery::list_queued_dispatch_messages,
+            commands::queued_delivery::list_queued_dispatch_message_history,
             commands::queued_delivery::claim_next_queued_dispatch_message,
             commands::queued_delivery::mark_queued_dispatch_message_delivered,
             commands::queued_delivery::mark_queued_dispatch_message_failed,

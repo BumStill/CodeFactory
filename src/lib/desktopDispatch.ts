@@ -104,6 +104,7 @@ export interface DispatchHandlers {
   switchSession: (input: { sessionId: string }) => Promise<unknown>;
   stop: (input: { sessionId?: string }) => Promise<unknown>;
   listApprovals: () => Promise<DispatchApproval[]>;
+  listQueuedMessages?: (input: { sessionId?: string }) => Promise<unknown>;
   resolveApproval: (input: { approvalId: string; approve: boolean; note?: string }) => Promise<unknown>;
   /** CF-BLD-R4: the panel's one-click cleanup, reachable from the background. */
   /** CF-QUOTA-R2: same reads and persistence as Settings. */
@@ -266,6 +267,12 @@ export async function applyDispatchRequest(
         break;
       case "stop":
         result = await handlers.stop({
+          sessionId: optionalString(body.session_id, "session_id"),
+        });
+        break;
+      case "list_queued_messages":
+        if (!handlers.listQueuedMessages) return invalid("list_queued_messages is not available");
+        result = await handlers.listQueuedMessages({
           sessionId: optionalString(body.session_id, "session_id"),
         });
         break;

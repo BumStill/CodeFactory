@@ -24,6 +24,7 @@ export interface QueuedSendRecord {
   id: string;
   sessionId: string;
   content: string;
+  clientMessageId?: string;
   rootTurnId: string;
   status: QueuedSendStatus;
   attempts: number;
@@ -37,8 +38,9 @@ export interface QueuedSendRecord {
 /** Storage + delivery bookkeeping. Injectable so the drain logic is testable
  *  without a Tauri runtime. */
 export interface QueuedSendPort {
-  enqueue(sessionId: string, content: string, rootTurnId?: string): Promise<QueuedSendRecord>;
+  enqueue(sessionId: string, content: string, clientMessageId: string, rootTurnId?: string): Promise<QueuedSendRecord>;
   list(sessionId: string): Promise<QueuedSendRecord[]>;
+  listHistory?(sessionId?: string): Promise<QueuedSendRecord[]>;
   claimNext(sessionId: string): Promise<QueuedSendRecord | null>;
   markDelivered(sessionId: string, id: string): Promise<void>;
   markFailed(sessionId: string, id: string, reason: string): Promise<void>;
@@ -51,14 +53,19 @@ export const QUEUE_FULL_MESSAGE = "queue is full";
 export const SESSION_ENDED_MESSAGE = "session has ended; queued message was not delivered";
 
 export const tauriQueuedSendPort: QueuedSendPort = {
-  enqueue: (sessionId, content, rootTurnId) =>
+  enqueue: (sessionId, content, clientMessageId, rootTurnId) =>
     invoke<QueuedSendRecord>("enqueue_queued_dispatch_message", {
       sessionId,
       content,
+      clientMessageId,
       rootTurnId: rootTurnId ?? null,
     }),
   list: (sessionId) =>
     invoke<QueuedSendRecord[]>("list_queued_dispatch_messages", { sessionId }),
+  listHistory: (sessionId) =>
+    invoke<QueuedSendRecord[]>("list_queued_dispatch_message_history", {
+      sessionId: sessionId ?? null,
+    }),
   claimNext: (sessionId) =>
     invoke<QueuedSendRecord | null>("claim_next_queued_dispatch_message", { sessionId }),
   markDelivered: (sessionId, id) =>
@@ -86,7 +93,7 @@ export async function enqueueDurableQueuedSend(
   sessionId: string,
   content: string,
   rootTurnId?: string,
-  options: { sessionEnded?: boolean } = {},
+  options: { sessionEnded?: boolean; clientMessageId?: string } = {},
 ): Promise<EnqueueOutcome> {
   const text = content.trim();
   if (!text) return { ok: false, reason: "unknown", message: "message is empty" };
@@ -94,7 +101,8 @@ export async function enqueueDurableQueuedSend(
     return { ok: false, reason: "ended", message: SESSION_ENDED_MESSAGE };
   }
   try {
-    const record = await port.enqueue(sessionId, text, rootTurnId);
+    const clientMessageId = options.clientMessageId ?? rootTurnId ?? crypto.randomUUID();
+    const record = await port.enqueue(sessionId, text, clientMessageId, rootTurnId);
     return { ok: true, record };
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);

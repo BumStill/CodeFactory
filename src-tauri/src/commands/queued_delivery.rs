@@ -47,6 +47,7 @@ pub struct QueuedDispatchMessage {
     pub id: String,
     pub session_id: String,
     pub content: String,
+    pub client_message_id: String,
     pub root_turn_id: String,
     pub status: String,
     pub attempts: i64,
@@ -77,6 +78,23 @@ pub async fn ensure_schema(db: &SqlitePool) -> Result<(), AppError> {
     )
     .execute(db)
     .await?;
+    let _ = sqlx::query(
+        "ALTER TABLE queued_dispatch_messages ADD COLUMN client_message_id TEXT",
+    )
+    .execute(db)
+    .await;
+    sqlx::query(
+        "UPDATE queued_dispatch_messages SET client_message_id=root_turn_id \
+         WHERE client_message_id IS NULL OR client_message_id=''",
+    )
+    .execute(db)
+    .await?;
+    sqlx::raw_sql(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_queued_dispatch_client_message
+            ON queued_dispatch_messages(session_id, client_message_id);",
+    )
+    .execute(db)
+    .await?;
     Ok(())
 }
 
@@ -85,6 +103,7 @@ fn row_to_message(row: &sqlx::sqlite::SqliteRow, position: Option<i64>) -> Queue
         id: row.get("id"),
         session_id: row.get("session_id"),
         content: row.get("content"),
+        client_message_id: row.get("client_message_id"),
         root_turn_id: row.get("root_turn_id"),
         status: row.get("status"),
         attempts: row.get("attempts"),
@@ -104,13 +123,27 @@ pub async fn enqueue(
     db: &SqlitePool,
     session_id: &str,
     content: &str,
+    client_message_id: &str,
     root_turn_id: Option<&str>,
 ) -> Result<QueuedDispatchMessage, AppError> {
     let trimmed = content.trim();
     if trimmed.is_empty() {
         return Err(AppError::Other("queued message cannot be empty".into()));
     }
+    if client_message_id.trim().is_empty() {
+        return Err(AppError::Other("queued client message id cannot be empty".into()));
+    }
     ensure_schema(db).await?;
+    if let Some(row) = sqlx::query(
+        "SELECT * FROM queued_dispatch_messages WHERE session_id=? AND client_message_id=?",
+    )
+    .bind(session_id)
+    .bind(client_message_id)
+    .fetch_optional(db)
+    .await?
+    {
+        return Ok(row_to_message(&row, None));
+    }
     let pending: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM queued_dispatch_messages \
          WHERE session_id=? AND status IN ('queued','delivering')",
@@ -128,12 +161,13 @@ pub async fn enqueue(
     let at = now_ms();
     sqlx::query(
         "INSERT INTO queued_dispatch_messages \
-         (id, session_id, content, root_turn_id, status, attempts, created_at, updated_at) \
-         VALUES (?, ?, ?, ?, 'queued', 0, ?, ?)",
+         (id, session_id, content, client_message_id, root_turn_id, status, attempts, created_at, updated_at) \
+         VALUES (?, ?, ?, ?, ?, 'queued', 0, ?, ?)",
     )
     .bind(&id)
     .bind(session_id)
     .bind(trimmed)
+    .bind(client_message_id)
     .bind(&root_turn_id)
     .bind(at)
     .bind(at)
@@ -143,6 +177,7 @@ pub async fn enqueue(
         id,
         session_id: session_id.to_string(),
         content: trimmed.to_string(),
+        client_message_id: client_message_id.to_string(),
         root_turn_id,
         status: "queued".into(),
         attempts: 0,
@@ -362,11 +397,12 @@ pub const QUEUE_FULL: &str = "queue is full";
 pub async fn enqueue_queued_dispatch_message(
     session_id: String,
     content: String,
+    client_message_id: String,
     root_turn_id: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<QueuedDispatchMessage, AppError> {
     let db = state.db.read().await.clone();
-    enqueue(&db, &session_id, &content, root_turn_id.as_deref()).await
+    enqueue(&db, &session_id, &content, &client_message_id, root_turn_id.as_deref()).await
 }
 
 #[command]
@@ -376,6 +412,35 @@ pub async fn list_queued_dispatch_messages(
 ) -> Result<Vec<QueuedDispatchMessage>, AppError> {
     let db = state.db.read().await.clone();
     pending(&db, &session_id).await
+}
+
+pub async fn history(
+    db: &SqlitePool,
+    session_id: Option<&str>,
+) -> Result<Vec<QueuedDispatchMessage>, AppError> {
+    ensure_schema(db).await?;
+    let rows = if let Some(session_id) = session_id {
+        sqlx::query(
+            "SELECT * FROM queued_dispatch_messages WHERE session_id=? ORDER BY created_at, id",
+        )
+        .bind(session_id)
+        .fetch_all(db)
+        .await?
+    } else {
+        sqlx::query("SELECT * FROM queued_dispatch_messages ORDER BY created_at, id")
+            .fetch_all(db)
+            .await?
+    };
+    Ok(rows.iter().map(|row| row_to_message(row, None)).collect())
+}
+
+#[command]
+pub async fn list_queued_dispatch_message_history(
+    session_id: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<Vec<QueuedDispatchMessage>, AppError> {
+    let db = state.db.read().await.clone();
+    history(&db, session_id.as_deref()).await
 }
 
 #[command]
@@ -457,7 +522,7 @@ mod tests {
     async fn enqueue_persists_and_restart_keeps_message() {
         let dir = std::env::temp_dir().join(format!("m236-{}", uuid::Uuid::new_v4()));
         let db = temp_db(&dir).await;
-        let queued = enqueue(&db, "s1", " 不要合并 ", Some("root-1"))
+        let queued = enqueue(&db, "s1", " 不要合并 ", "client-1", Some("root-1"))
             .await
             .unwrap();
         assert_eq!(queued.status, "queued");
@@ -492,8 +557,8 @@ mod tests {
     async fn claim_is_fifo_and_never_double_claims() {
         let dir = std::env::temp_dir().join(format!("m236-{}", uuid::Uuid::new_v4()));
         let db = temp_db(&dir).await;
-        let first = enqueue(&db, "s1", "one", None).await.unwrap();
-        let second = enqueue(&db, "s1", "two", None).await.unwrap();
+        let first = enqueue(&db, "s1", "one", "client-1", None).await.unwrap();
+        let second = enqueue(&db, "s1", "two", "client-2", None).await.unwrap();
         let claimed = claim_next(&db, "s1").await.unwrap().unwrap();
         assert_eq!(claimed.id, first.id);
         // A second drain in the same state must not hand the same row over again.
@@ -508,9 +573,9 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("m236-{}", uuid::Uuid::new_v4()));
         let db = temp_db(&dir).await;
         for index in 0..QUEUED_DISPATCH_MAX {
-            enqueue(&db, "s1", &format!("msg-{index}"), None).await.unwrap();
+            enqueue(&db, "s1", &format!("msg-{index}"), &format!("client-{index}"), None).await.unwrap();
         }
-        let full = enqueue(&db, "s1", "overflow", None).await;
+        let full = enqueue(&db, "s1", "overflow", "client-overflow", None).await;
         assert!(full.is_err());
 
         let failed = fail_pending(&db, "s1", "session was stopped before delivery")
@@ -529,7 +594,7 @@ mod tests {
     async fn a_fresh_queued_message_outranks_a_wake_but_a_stale_one_does_not() {
         let dir = std::env::temp_dir().join(format!("m236-{}", uuid::Uuid::new_v4()));
         let db = temp_db(&dir).await;
-        let queued = enqueue(&db, "s1", "先听我的", None).await.unwrap();
+        let queued = enqueue(&db, "s1", "先听我的", "client-wake", None).await.unwrap();
         let now = now_ms();
         assert!(has_fresh_pending(&db, "s1", now, DELIVERING_STALE_MS * 2).await);
         assert!(!has_fresh_pending(&db, "s1", queued.created_at + DELIVERING_STALE_MS * 4, DELIVERING_STALE_MS * 2).await);
@@ -540,10 +605,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn client_message_id_is_idempotent_and_history_keeps_failures() {
+        let dir = std::env::temp_dir().join(format!("m291-{}", uuid::Uuid::new_v4()));
+        let db = temp_db(&dir).await;
+        let first = enqueue(&db, "s1", "one", "client-same", Some("root-1"))
+            .await
+            .unwrap();
+        let duplicate = enqueue(&db, "s1", "one", "client-same", Some("root-1"))
+            .await
+            .unwrap();
+        assert_eq!(duplicate.id, first.id);
+        assert_eq!(pending(&db, "s1").await.unwrap().len(), 1);
+        fail_pending(&db, "s1", "session deleted").await.unwrap();
+        let rows = history(&db, Some("s1")).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].status, "failed");
+        assert_eq!(rows[0].client_message_id, "client-same");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
     async fn stale_handoff_returns_to_queue() {
         let dir = std::env::temp_dir().join(format!("m236-{}", uuid::Uuid::new_v4()));
         let db = temp_db(&dir).await;
-        let queued = enqueue(&db, "s1", "retry me", None).await.unwrap();
+        let queued = enqueue(&db, "s1", "retry me", "client-retry", None).await.unwrap();
         claim_next(&db, "s1").await.unwrap().unwrap();
         sqlx::query("UPDATE queued_dispatch_messages SET updated_at=? WHERE id=?")
             .bind(now_ms() - DELIVERING_STALE_MS - 1_000)

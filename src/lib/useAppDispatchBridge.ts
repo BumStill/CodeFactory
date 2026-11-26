@@ -44,6 +44,9 @@ export function useAppDispatchBridge(showWorkspace: () => void): void {
     stop: dispatchStop,
     cleanBuildCache: () => invoke("build_cache_cleanup"),
     listApprovals: async () => invoke<DispatchApproval[]>("list_pending_approvals"),
+    listQueuedMessages: async ({ sessionId }) => invoke("list_queued_dispatch_message_history", {
+      sessionId: sessionId ?? null,
+    }),
     resolveApproval: async ({ approvalId, approve, note }) => {
       // M265: 判定和说明走同一次调用 —— 拒绝的理由不需要再另发一条消息。
       await invoke(

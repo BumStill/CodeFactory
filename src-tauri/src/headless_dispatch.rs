@@ -129,6 +129,11 @@ pub enum Request {
     },
     /// CF-HDE-R6: list pending approval requests.
     ListApprovals {},
+    /// M291/R4: inspect queued, delivered and failed messages, including deleted sessions.
+    ListQueuedMessages {
+        #[serde(default)]
+        session_id: Option<String>,
+    },
     /// CF-HDE-R6: approve/deny one pending request. Approving still goes
     /// through the same permission rules — this is not a blanket grant.
     ///
@@ -360,6 +365,11 @@ pub fn validate_request(request: &Request) -> Result<(), ErrorBody> {
             }
         }
         Request::ListApprovals {} => {}
+        Request::ListQueuedMessages { session_id } => {
+            if let Some(session_id) = session_id {
+                require_non_empty("session_id", session_id)?;
+            }
+        }
         Request::ResolveApproval { approval_id, note, .. } => {
             require_non_empty("approval_id", approval_id)?;
             crate::agent::permission_intent::normalize_permission_note(note.clone())
@@ -495,6 +505,7 @@ impl AuditEntry {
             Request::SetPermission { session_id, .. }
             | Request::CloseObjective { session_id, .. }
             | Request::Status { session_id }
+            | Request::ListQueuedMessages { session_id: Some(session_id) }
             | Request::SwitchSession { session_id } => {
                 entry.session_id = Some(session_id.clone());
             }
@@ -509,7 +520,7 @@ impl AuditEntry {
             Request::SetUsageWindow { endpoint, model, rule } => {
                 entry.message = Some(format!("endpoint={endpoint}; model={}; rule={}", model.as_deref().unwrap_or("<endpoint>"), serde_json::to_string(rule).unwrap_or_default()));
             }
-            Request::GetQuota {} | Request::UsageStatus {} | Request::ListModels { .. } | Request::ListMemories {} => {}
+            Request::GetQuota {} | Request::UsageStatus {} | Request::ListModels { .. } | Request::ListMemories {} | Request::ListQueuedMessages { session_id: None } => {}
             Request::DeleteMemory { id } => entry.message = Some(format!("id={id}")),
             Request::SetMemoryEnabled { enabled } => entry.message = Some(format!("enabled={enabled}")),
             Request::SetQuotaCap { endpoint, five_hour_percent, weekly_percent } => {
@@ -542,6 +553,7 @@ pub fn operation_of(request: &Request) -> &'static str {
         Request::SwitchSession { .. } => "switch_session",
         Request::Stop { .. } => "stop",
         Request::ListApprovals {} => "list_approvals",
+        Request::ListQueuedMessages { .. } => "list_queued_messages",
         Request::ResolveApproval { .. } => "resolve_approval",
         Request::FocusMainDisplay {} => "focus_main_display",
         Request::CleanBuildCache {} => "clean_build_cache",

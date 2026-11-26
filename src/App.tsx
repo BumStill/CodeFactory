@@ -79,6 +79,12 @@ export default function App() {
     return () => { cancelled = true; };
   }, [beginDraft, loadSessions, selectSession]);
 
+  useEffect(() => {
+    const run = () => { void resumePendingQueuedDelivery(); };
+    const interval = window.setInterval(run, 5_000);
+    return () => window.clearInterval(interval);
+  }, []);
+
   useEffect(() => { loadSettings(); }, [loadSettings]);
 
   useEffect(() => {

@@ -12,6 +12,7 @@
 
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import {
+  superviseQueuedDeliveryCycle,
   useChatStore,
   QUEUE_MAX,
   freshRuntime,
@@ -179,6 +180,66 @@ describe("chat message queue (per-session)", () => {
     expect(invokeMock).toHaveBeenCalledWith(
       "send_message",
       expect.objectContaining({ sessionId: SID, content: "queued after stop" }),
+    );
+  });
+
+  it("M291: dispatch queue survives renderer restart, waits behind a running turn, then delivers once", async () => {
+    seed({
+      streaming: true,
+      messages: [
+        { id: "running-root", role: "user", content: "current", createdAt: 1 },
+        { id: "running-assistant", role: "assistant", content: "", rootTurnId: "running-root", createdAt: 2 },
+      ],
+    });
+    const queued = await useChatStore.getState().enqueueMessage(SID, "after restart");
+    expect(queued).toBe("queued");
+    const durableId = queuedRows()[0].clientMessageId;
+
+    // Rebuild the renderer store while preserving the durable backend rows.
+    resetStore();
+    seed({ streaming: true });
+    await superviseQueuedDeliveryCycle();
+    expect(q().map((item) => item.clientMessageId)).toEqual([durableId]);
+    expect(invokeMock).not.toHaveBeenCalledWith(
+      "send_message",
+      expect.objectContaining({ content: "after restart" }),
+    );
+
+    seed({ streaming: false });
+    await superviseQueuedDeliveryCycle();
+    await superviseQueuedDeliveryCycle();
+    expect(invokeMock.mock.calls.filter(([command, args]) =>
+      command === "send_message" && (args as { content?: string })?.content === "after restart",
+    )).toHaveLength(1);
+    expect(queuedRows()[0].status).toBe("delivered");
+  });
+
+  it("M291: one supervision cycle starts an idle queued message", async () => {
+    seed({ streaming: true });
+    await useChatStore.getState().sendOrQueue("supervised message");
+    resetStore();
+
+    await superviseQueuedDeliveryCycle();
+
+    expect(invokeMock).toHaveBeenCalledWith(
+      "send_message",
+      expect.objectContaining({ sessionId: SID, content: "supervised message" }),
+    );
+  });
+
+  it("M291: a deleted session keeps a visible failed queue record", async () => {
+    seed({ streaming: true });
+    await useChatStore.getState().sendOrQueue("cannot disappear");
+
+    await useChatStore.getState().deleteSession(SID);
+
+    expect(queuedRows()[0]).toMatchObject({
+      status: "failed",
+      failureReason: "session was deleted before delivery",
+    });
+    expect(invokeMock).toHaveBeenCalledWith(
+      "list_queued_dispatch_message_history",
+      { sessionId: SID },
     );
   });
 
