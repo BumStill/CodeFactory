@@ -104,10 +104,15 @@ async fn guarded_args(args: &Value, ctx: &ExecCtx, ceiling: DeliveryCeiling) -> 
         }
         return Err(crate::errors::AppError::ToolArgument(reason));
     }
-    if let (Some(title), Some(body)) = (pr["title"].as_str(), pr["body"].as_str()) {
-        let (title, body) = super::delivery_m285_policy::preserve_existing_pr_content(title, body);
-        guarded["title"] = Value::String(title.to_string());
-        guarded["body"] = Value::String(body.to_string());
+    if pr["title"].as_str().is_some() || pr["body"].as_str().is_some() {
+        // F6/F7: Reuse existing PR verbatim when present — do NOT override remote title/body
+        // in the invocation args. Downstream legacy thin delivery only updates title/body
+        // when explicitly provided; stripping them here guarantees we never rewrite a
+        // maintainer-edited title/body on PR reuse.
+        if let Some(obj) = guarded.as_object_mut() {
+            obj.remove("title");
+            obj.remove("body");
+        }
     }
     Ok((guarded, true))
 }

@@ -1794,9 +1794,10 @@ pub(crate) fn dev_command(program: &str) -> Command {
     // Test-only override: allow integration tests to point gh to a fake binary.
     // No effect in production when the variable is unset.
     if program == "gh" {
-        if let Ok(bin) = std::env::var("CODEFACTORY_TEST_GH_BIN") {
-            if !bin.is_empty() {
-                let mut command = Command::new(bin).no_window();
+        if let Ok(override_bin) = std::env::var("CODEFACTORY_TEST_GH_BIN") {
+            if !override_bin.is_empty() {
+                // Test override: absolute path provided by tests; still apply developer PATH for child lookups.
+                let mut command = Command::new(override_bin).no_window();
                 command_env::apply_developer_path_std(&mut command);
                 return command;
             }
