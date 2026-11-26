@@ -89,7 +89,7 @@ describe("containsInternalVocabulary (CF-RSB-R1)", () => {
     "马上重试",
     "约 12 秒后重试",
     "系统正在等待自动重试",
-    "需要你先授权才能继续",
+    "等待你批准",
     "验证证据不足",
   ])("accepts %s", (text) => {
     expect(containsInternalVocabulary(text)).toBe(false);
@@ -187,7 +187,7 @@ describe("statusBannerView (CF-RSB-R3 / R4)", () => {
       },
     });
     expect(view?.tone).toBe("warning");
-    expect(view?.text).toBe("需要你先授权才能继续");
+    expect(view?.text).toBe("等待你批准");
     expect(view?.waitHint).toBeNull();
   });
 

@@ -63,6 +63,13 @@
     { "pattern": "src-tauri/src/agent/openai_api.rs", "scenario_id": "HLT-001" },
     { "pattern": "src-tauri/src/agent/daily_spend_live_m279_tests.rs", "scenario_id": "HLT-001" },
     { "pattern": "src-tauri/src/agent/worktree.rs", "scenario_id": "RTE-004" },
-    { "pattern": "src-tauri/src/agent/delivery.rs", "scenario_id": "CXD-002" }
+    { "pattern": "src-tauri/src/agent/delivery.rs", "scenario_id": "CXD-002" },
+    { "pattern": "src-tauri/migrations/0027_session_liveness.sql", "scenario_id": "HLT-001" },
+    { "pattern": "src-tauri/src/agent/liveness.rs", "scenario_id": "HLT-001" },
+    { "pattern": "src-tauri/src/agent/liveness_store.rs", "scenario_id": "HLT-001" },
+    { "pattern": "src-tauri/src/commands/session_liveness.rs", "scenario_id": "HLT-001" },
+    { "pattern": "src-tauri/src/commands/objective_health_m287.rs", "scenario_id": "HLT-001" },
+    { "pattern": "src-tauri/src/agent/anthropic_client.rs", "scenario_id": "HLT-001" },
+    { "pattern": "src/lib/waitingReason.ts", "scenario_id": "UI-008" }
   ]
 }

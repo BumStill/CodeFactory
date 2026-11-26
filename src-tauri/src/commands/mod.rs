@@ -25,11 +25,17 @@ pub mod learning;
 pub mod mcp;
 pub mod memory;
 pub mod models;
+#[path = "../agent/liveness.rs"]
+pub(crate) mod liveness;
+#[path = "../agent/liveness_store.rs"]
+pub(crate) mod liveness_store;
+#[path = "objective_health_m287.rs"]
 pub mod objective_health;
 // 后台审批列表与前端会话缓存解耦。
 pub mod pending_approvals;
 pub mod preferences;
 pub mod session;
+pub mod session_liveness;
 #[cfg(test)]
 mod session_quick_tests;
 pub mod settings;

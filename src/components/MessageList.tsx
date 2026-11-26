@@ -775,7 +775,7 @@ function inlineTurnPhase(
 const INLINE_TURN_PHASE = {
   thinking: { label: "Thinking", Icon: LoaderCircle },
   executing: { label: "执行中", Icon: SquareTerminal },
-  waiting: { label: "等待中", Icon: Clock3 },
+  waiting: { label: "等待推进", Icon: Clock3 },
   finalizing: { label: "整理结果", Icon: Sparkles },
 } satisfies Record<InlineTurnPhase, { label: string; Icon: typeof LoaderCircle }>;
 
@@ -968,7 +968,7 @@ function isLegacyToolAmplificationNotice(detail: string): boolean {
 
 // M151：卡住的会话必须能自己导出「为什么卡」的事实，并在没有活执行者时被拉回
 // 可用状态。入口就长在「正在做」这句话旁边——用户此刻看的正是这里。
-function StuckSessionRecovery({ sessionId }: { sessionId: string }) {
+export function StuckSessionRecovery({ sessionId }: { sessionId: string }) {
   const [notice, setNotice] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
@@ -1479,7 +1479,7 @@ const MessageRow = memo(function MessageRow({
               </span>
               <span className="break-words text-gray-500">{copy.replace(/^(需要你决定|等唤醒|正在做)[：:]?/, "")}</span>
             </div>
-            {conversationKey && <StuckSessionRecovery sessionId={conversationKey} />}
+
           </div>
         );
       })()}

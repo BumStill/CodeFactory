@@ -9301,7 +9301,7 @@ impl GhCliRemote {
             "--limit".into(),
             "200".into(),
             "--json".into(),
-            "number,state,headRefOid,mergeCommit,autoMergeRequest,labels".into(),
+            "number,state,isDraft,headRefOid,mergeCommit,autoMergeRequest,labels".into(),
         ])?;
         let value: serde_json::Value = serde_json::from_str(&raw)
             .map_err(|error| format!("gh pr list returned non-JSON: {error}"))?;
@@ -9315,15 +9315,19 @@ impl GhCliRemote {
             if !numbers.contains(&number) {
                 continue;
             }
-            let armed = row
+            let labels = row
                 .get("labels")
                 .and_then(serde_json::Value::as_array)
-                .is_some_and(|labels| {
-                    labels.iter().any(|label| {
+                .cloned()
+                .unwrap_or_default();
+            let has_label = |name: &str| {
+                labels.iter().any(|label| {
                         label.get("name").and_then(serde_json::Value::as_str)
-                            == Some(MERGE_QUEUE_ARM_LABEL)
-                    })
-                });
+                            == Some(name)
+                })
+            };
+            let armed = has_label(MERGE_QUEUE_ARM_LABEL);
+            let hold = has_label("merge-queue: hold");
             out.insert(
                 number,
                 BatchPrState {
@@ -9343,6 +9347,8 @@ impl GhCliRemote {
                         .and_then(serde_json::Value::as_str)
                         .map(str::to_string),
                     armed,
+                    is_draft: row.get("isDraft").and_then(serde_json::Value::as_bool).unwrap_or(false),
+                    hold,
                 },
             );
         }
@@ -9425,6 +9431,8 @@ pub(crate) struct BatchPrState {
     pub head_sha: String,
     pub merge_sha: Option<String>,
     pub armed: bool,
+    pub is_draft: bool,
+    pub hold: bool,
 }
 
 /// M115/R2: the pure half of the queue-sync proof. A provider sync merge has
