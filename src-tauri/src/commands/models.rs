@@ -45,6 +45,30 @@ fn merge_models(mut custom: Vec<ModelInfo>, remote: Vec<ModelInfo>) -> Vec<Model
     custom.extend(remote);
     custom
 }
+pub(crate) fn preferred_openai_model(models: &[ModelInfo], family: &str) -> Option<(String, bool)> {
+    let family = family.trim().to_ascii_lowercase();
+    let preferred = if family.is_empty() { "terra" } else { family.as_str() };
+    let mut candidates = models.iter().map(|m| m.id.as_str()).collect::<Vec<_>>();
+    candidates.sort_by(|a, b| natural_model_cmp(b, a));
+    if let Some(model) = candidates.iter().find(|id| id.to_ascii_lowercase().contains(preferred)) {
+        return Some(((*model).to_string(), false));
+    }
+    for fallback in ["terra", "sol", "gpt-6", "gpt-5.6", "gpt-5"] {
+        if let Some(model) = candidates.iter().find(|id| id.to_ascii_lowercase().contains(fallback)) {
+            return Some(((*model).to_string(), true));
+        }
+    }
+    candidates.first().map(|id| ((*id).to_string(), true))
+}
+
+fn natural_model_cmp(left: &str, right: &str) -> std::cmp::Ordering {
+    let numeric = |value: &str| value.split(|c: char| !c.is_ascii_digit()).filter(|p| !p.is_empty()).filter_map(|p| p.parse::<u64>().ok()).collect::<Vec<_>>();
+    numeric(left).cmp(&numeric(right)).then_with(|| left.cmp(right))
+}
+
+
+
+
 
 #[tauri::command]
 pub async fn list_models(
@@ -112,5 +136,38 @@ pub async fn list_models(
                 )))
             }
         }
+    }
+}
+#[cfg(test)]
+mod m286_tests {
+    use super::*;
+    fn model(id: &str, is_custom: bool) -> ModelInfo {
+        ModelInfo {
+            id: id.into(),
+            name: id.into(),
+            context_length: 0,
+            pricing: None,
+            supported_parameters: None,
+            is_custom,
+        }
+    }
+
+
+
+
+    #[test]
+    fn m286_balanced_prefers_latest_terra_and_falls_back_explicitly() {
+        let catalog = vec![model("gpt-6.0-terra", false), model("gpt-6.1-terra", false), model("gpt-6.2-sol", false)];
+        assert_eq!(preferred_openai_model(&catalog, "terra"), Some(("gpt-6.1-terra".into(), false)));
+        let no_terra = vec![model("gpt-6.1-sol", false), model("gpt-6.2-sol", false)];
+        assert_eq!(preferred_openai_model(&no_terra, "terra"), Some(("gpt-6.2-sol".into(), true)));
+    }
+
+    #[test]
+    fn m286_missing_current_model_repairs_to_catalog_choice() {
+        let catalog = vec![model("gpt-6.1-terra", false), model("gpt-6.2-sol", false)];
+        let current = "gpt-5";
+        let repaired = if catalog.iter().any(|model| model.id == current) { (current.to_string(), false) } else { preferred_openai_model(&catalog, "terra").unwrap() };
+        assert_eq!(repaired, ("gpt-6.1-terra".into(), false));
     }
 }
