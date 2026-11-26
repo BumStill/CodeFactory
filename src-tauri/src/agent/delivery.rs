@@ -1796,6 +1796,36 @@ pub(crate) fn dev_command(program: &str) -> Command {
     command
 }
 
+#[cfg(test)]
+fn test_gh_commands() -> &'static std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, std::path::PathBuf>> {
+    static COMMANDS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, std::path::PathBuf>>> = std::sync::OnceLock::new();
+    COMMANDS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+#[cfg(test)]
+pub(crate) fn register_test_gh(cwd: &Path, binary: std::path::PathBuf) {
+    test_gh_commands().lock().unwrap().insert(cwd.to_path_buf(), binary);
+}
+
+pub(crate) fn dev_command_in(program: &str, cwd: &Path) -> Command {
+    #[cfg(test)]
+    if program == "gh" {
+        if let Some(binary) = test_gh_commands().lock().unwrap().get(cwd).cloned() {
+            #[cfg(windows)]
+            if binary.extension().and_then(|value| value.to_str()).is_some_and(|value| value.eq_ignore_ascii_case("cmd")) {
+                let mut command = Command::new("cmd.exe").no_window();
+                command.arg("/C").arg(binary);
+                command_env::apply_developer_path_std(&mut command);
+                return command;
+            }
+            let mut command = Command::new(binary).no_window();
+            command_env::apply_developer_path_std(&mut command);
+            return command;
+        }
+    }
+    dev_command(program)
+}
+
 fn retry_delivery_network<T>(step: &str, mut operation: impl FnMut() -> Result<T, String>, mut sleep: impl FnMut(u64)) -> Result<T, String> {
     for attempt in 1..=3 {
         match operation() {

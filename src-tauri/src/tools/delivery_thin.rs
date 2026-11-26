@@ -26,7 +26,7 @@ struct Local<'a>(&'a Path);
 impl Commands for Local<'_> {
     fn git(&mut self, args: &[&str]) -> Result<String, String> { delivery::git(self.0, args) }
     fn gh(&mut self, args: &[&str]) -> Result<String, String> {
-        delivery::bounded_delivery_output(delivery::dev_command("gh").current_dir(self.0).args(args))
+        delivery::bounded_delivery_output(delivery::dev_command_in("gh", self.0).current_dir(self.0).args(args))
     }
     fn stage(&mut self, excludes: &[String]) -> Result<Vec<String>, String> { delivery::stage_scoped(self.0, excludes) }
     fn precheck_governance(&mut self) -> Result<(Vec<String>, u64), String> {
@@ -311,17 +311,29 @@ fn run(commands: &mut impl Commands, args: &Value, ceiling: DeliveryCeiling, exc
     }
     let pr = if let Some(pr) = existing {
         let number = pr["number"].as_u64().ok_or("PR number missing")?.to_string();
-        // M132 R3: update only with a title that says something, so a re-delivery
-        // can never turn a usable PR title back into the branch name.
-        let keep_title = !usable_title(&title, &branch)
-            && pr["title"].as_str().is_some_and(|existing| usable_title(existing, &branch));
-        let title = if keep_title {
-            pr["title"].as_str().unwrap_or_default().to_string()
+        // F6: preserve remote title/body when reusing an existing PR unless explicitly provided.
+        // Title: only update when caller passed a title; still avoid downgrading to a branch-echo.
+        if args.get("title").and_then(Value::as_str).is_some() {
+            let keep_title = !usable_title(&title, &branch)
+                && pr["title"].as_str().is_some_and(|existing| usable_title(existing, &branch));
+            let new_title = if keep_title {
+                pr["title"].as_str().unwrap_or_default().to_string()
+            } else {
+                title.clone()
+            };
+            if pr["title"].as_str() != Some(new_title.as_str()) {
+                log.gh(commands, &["pr", "edit", &number, "--title", &new_title])?;
+            }
         } else {
-            title
-        };
-        if pr["title"].as_str() != Some(title.as_str()) || pr["body"].as_str() != Some(body.as_str()) {
-            log.gh(commands, &["pr", "edit", &number, "--title", &title, "--body", &body])?;
+            // No explicit title in args: only improve a non-usable remote title when we have a usable derived one.
+            let remote_title_ok = pr["title"].as_str().is_some_and(|t| usable_title(t, &branch));
+            if !remote_title_ok && usable_title(&title, &branch) && pr["title"].as_str() != Some(title.as_str()) {
+                log.gh(commands, &["pr", "edit", &number, "--title", &title])?;
+            }
+        }
+        // Body: only update when caller passed a body; reconciled text is used on create.
+        if args.get("body").and_then(Value::as_str).is_some() && pr["body"].as_str() != Some(body.as_str()) {
+            log.gh(commands, &["pr", "edit", &number, "--body", &body])?;
         }
         log.step("pr", "reused");
         pr.clone()
