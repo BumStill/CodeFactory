@@ -130,10 +130,48 @@ fn settings_for_session_route(
     policy: &str,
 ) -> Result<Settings, AppError> {
     let mut turn = settings.clone();
+
+    // M286 R6: explicit endpoint hint in the requested model — "endpoint/model" —
+    // takes precedence over inference. Only treat it as an endpoint hint when it
+    // has exactly one slash and the left part matches a configured endpoint name.
+    // Otherwise (including OpenRouter owner/model like "deepseek/deepseek-v4-pro")
+    // fall back to the legacy inference path.
+    let (hinted_endpoint, hinted_model) = if endpoint_id.is_none() {
+        if let Some((left, right)) = model_id.split_once('/') {
+            if !right.contains('/') && settings.endpoints.contains_key(left) {
+                (Some(left), Some(right))
+            } else {
+                (None, None)
+            }
+        } else {
+            (None, None)
+        }
+    } else {
+        (None, None)
+    };
+
     let endpoint = if let Some(endpoint) =
         endpoint_id.filter(|endpoint| settings.endpoints.contains_key(*endpoint))
     {
         endpoint
+    } else if let (Some(ep), Some(model)) = (hinted_endpoint, hinted_model) {
+        // If the endpoint hint is present but the endpoint does not offer the
+        // requested model, fail explicitly instead of silently falling through.
+        let offers = settings
+            .endpoints
+            .get(ep)
+            .map(|endpoint| {
+                endpoint.active_model.as_deref() == Some(model)
+                    || endpoint.custom_models.iter().any(|m| m.id == model)
+            })
+            .unwrap_or(false);
+        if !offers {
+            return Err(AppError::Other(format!(
+                "ENDPOINT_MODEL_UNAVAILABLE: 端点 '{ep}' 不提供模型 '{model}'，请在该端点选择可用模型"
+            )));
+        }
+        // Lock the endpoint for this turn; callers may still choose policy.
+        ep
     } else {
         let matching = settings
             .endpoints
@@ -162,6 +200,20 @@ fn settings_for_session_route(
     turn.default_endpoint = endpoint.to_string();
     if policy == "fixed" || policy.is_empty() {
         turn.endpoints.retain(|candidate, _| candidate == endpoint);
+    }
+
+    // When the endpoint hint was used, normalize the requested model for this
+    // endpoint so subsequent planning uses the endpoint-safe id.
+    if let (Some(ep), Some(model)) = (hinted_endpoint, hinted_model) {
+        if turn
+            .resolve_model_for_endpoint(ep, model)
+            .is_none()
+        {
+            // Defensive: the earlier check should have errored; keep legacy behavior.
+            return Err(AppError::Other(format!(
+                "ENDPOINT_MODEL_UNAVAILABLE: 端点 '{ep}' 不提供模型 '{model}'"
+            )));
+        }
     }
     Ok(turn)
 }
@@ -8347,6 +8399,63 @@ mod tests {
             Some("openrouter-secret")
         );
         assert!(resolution.excluded.is_empty());
+    }
+
+    #[test]
+    fn endpoint_model_hint_errors_when_endpoint_lacks_the_model() {
+        let mut settings = crate::config::settings::Settings::default();
+        settings.default_endpoint = "chatgpt".into();
+        settings.default_model = "chatgpt/gpt-6.1-sol".into();
+        settings.endpoints.insert(
+            "chatgpt".into(),
+            Endpoint {
+                base_url: crate::codex_auth::CHATGPT_BASE_URL.into(),
+                key_ref: None,
+                api_style: ApiStyle::Chatgpt,
+                custom_models: vec![],
+                active_model: Some("gpt-6.1-sol".into()),
+            },
+        );
+        // DeepSeek endpoint exists but does NOT offer the hinted model id below.
+        settings.endpoints.insert(
+            "deepseek".into(),
+            Endpoint {
+                base_url: "https://api.deepseek.example/v1".into(),
+                key_ref: Some("secret".into()),
+                api_style: ApiStyle::Openai,
+                custom_models: vec![],
+                active_model: Some("deepseek-v4-pro".into()),
+            },
+        );
+        let err = settings_for_session_route(&settings, None, "deepseek/gpt-6.1-sol", "prefer")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("ENDPOINT_MODEL_UNAVAILABLE"), "{err}");
+    }
+
+    #[test]
+    fn owner_model_remains_for_openrouter_and_is_not_treated_as_endpoint_hint() {
+        let mut settings = crate::config::settings::Settings::default();
+        settings.default_endpoint = "openrouter".into();
+        settings.default_model = "deepseek/deepseek-v4-pro".into();
+        settings.endpoints.insert(
+            "openrouter".into(),
+            Endpoint {
+                base_url: "https://openrouter.example/v1".into(),
+                key_ref: Some("openrouter-secret".into()),
+                api_style: ApiStyle::Openai,
+                custom_models: vec![],
+                active_model: Some("deepseek/deepseek-v4-pro".into()),
+            },
+        );
+        let turn = settings_for_session_route(
+            &settings,
+            None,
+            "deepseek/deepseek-v4-pro",
+            "prefer",
+        )
+        .expect("owner/model must not be treated as endpoint hint");
+        assert_eq!(turn.default_endpoint, "openrouter");
     }
 
     #[test]

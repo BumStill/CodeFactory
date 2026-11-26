@@ -289,6 +289,11 @@ export async function applyDispatchRequest(
       case "usage_status":
         result = await invoke("get_endpoint_spend_status");
         break;
+      case "list_models": {
+        const endpoint = body.endpoint === undefined ? "openai" : requiredString(body.endpoint, "endpoint");
+        result = await invoke("list_models", { endpointName: endpoint });
+        break;
+      }
       case "list_memories":
         result = await invoke("list_long_term_memories");
         break;
