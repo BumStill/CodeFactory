@@ -53,7 +53,7 @@ const fixtures: Array<{
   {
     id: "running",
     title: "正在执行（正常）",
-    messages: turn({ objectiveStatus: "active", label: "正在执行命令" }),
+    messages: turn({ objectiveStatus: "active", label: "正在运行工具" }),
   },
   {
     // CF-HDE-R11（M53）：真机证据——会话已经在模型上连续调用，活动投影却还停在
@@ -102,7 +102,11 @@ const fixtures: Array<{
   {
     id: "authorization",
     title: "需要用户授权",
-    messages: turn({ objectiveStatus: "waiting_authorization", waitingReason: "authorization_required" }),
+    messages: turn({
+      objectiveStatus: "waiting_authorization",
+      label: "等待你批准",
+      waitingReason: "authorization_required",
+    }),
   },
   {
     id: "completed",

@@ -50,6 +50,23 @@ pub enum LivenessViolation {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PrWaitObservation {
+    pub is_draft: bool,
+    pub hold: bool,
+    pub state: String,
+}
+
+pub fn pr_wait_violation(observation: &PrWaitObservation) -> Option<&'static str> {
+    if observation.is_draft {
+        Some("draft_pr_cannot_progress")
+    } else if observation.hold {
+        Some("held_pr_cannot_progress")
+    } else {
+        None
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum LivenessEvaluation {
     Healthy(LivenessOwner),
     Violation(LivenessViolation),
@@ -199,5 +216,18 @@ mod tests {
                 LivenessEvaluation::Healthy(_)
             ));
         }
+    }
+
+    #[test]
+    fn draft_or_hold_pr_is_a_wait_violation_but_ready_open_pr_is_healthy() {
+        assert_eq!(pr_wait_violation(&PrWaitObservation {
+            is_draft: true, hold: false, state: "OPEN".into(),
+        }), Some("draft_pr_cannot_progress"));
+        assert_eq!(pr_wait_violation(&PrWaitObservation {
+            is_draft: false, hold: true, state: "OPEN".into(),
+        }), Some("held_pr_cannot_progress"));
+        assert_eq!(pr_wait_violation(&PrWaitObservation {
+            is_draft: false, hold: false, state: "OPEN".into(),
+        }), None);
     }
 }

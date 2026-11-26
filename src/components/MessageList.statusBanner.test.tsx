@@ -125,7 +125,7 @@ describe("session status banner speaks plain language (CF-RSB-R1..R4)", () => {
 
     const banner = screen.getByTestId("turn-activity-progress");
     expect(banner).toHaveAttribute("data-status-tone", "warning");
-    expect(banner).toHaveTextContent("需要你先授权才能继续");
+    expect(banner).toHaveTextContent("等待你批准");
     expect(banner).not.toHaveTextContent("authorization_required");
   });
 

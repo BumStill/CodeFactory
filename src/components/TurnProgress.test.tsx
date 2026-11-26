@@ -124,7 +124,7 @@ describe("TurnProgress", () => {
   });
 
   it.each([
-    ["authorization_required", /需要你先授权才能继续/],
+    ["authorization_required", /等待你批准/],
     ["needs_business_decision", /需要你先做一个决定才能继续/],
     ["objective_failed", /这件事没做成/],
   ] as const)("keeps a real warning for %s", (reason, expected) => {
