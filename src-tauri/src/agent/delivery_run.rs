@@ -2553,7 +2553,7 @@ pub async fn record_delivery_observation(
     }
     let mut tx = crate::storage::db::begin_write(pool).await?;
     let previous = sqlx::query(
-        "SELECT objective_id, repo_identity, worktree_identity, head_branch,
+        "SELECT objective_id, run_kind, repo_identity, worktree_identity, head_branch,
                 change_set_digest, stage, status, reached_ceiling, expected_head_sha,
                 canonical_pr_number, canonical_pr_url, canonical_head_sha, progress_revision,
                 lease_expires_at, failure_signature, stage_attempt
@@ -2840,6 +2840,21 @@ pub async fn record_delivery_observation(
         return Err(crate::errors::AppError::Other(
             "delivery observation lost its lease before the atomic update".into(),
         ));
+    }
+
+    // A thin-local run owns only the receipted commit rung. Hand its pointer
+    // back atomically with settlement; it must never become the authority for
+    // completing the thin Objective's PR workflow. Preserve status/revision.
+    if observation.status == "completed" && previous.try_get::<String, _>("run_kind")? == "thin_local_commit" {
+        sqlx::query(
+            "UPDATE objectives SET delivery_run_id=NULL
+             WHERE delivery_run_id=? AND EXISTS (
+                 SELECT 1 FROM delivery_runs run
+                 WHERE run.id=? AND run.objective_id=objectives.id
+                   AND run.run_kind='thin_local_commit' AND run.status='completed'
+                   AND run.lease_owner=? AND run.claim_epoch=?)",
+        ).bind(run_id).bind(run_id).bind(&process.instance_id).bind(claim_epoch)
+            .execute(&mut *tx).await?;
     }
 
     sqlx::query(
