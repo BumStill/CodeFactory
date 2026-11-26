@@ -17,11 +17,14 @@
 //! attachment size at 8 MB so a runaway link can't OOM the agent.
 
 use base64::{engine::general_purpose, Engine as _};
+use image::{codecs::jpeg::JpegEncoder, imageops::FilterType, GenericImageView};
 use std::path::Path;
 
 use crate::openrouter::types::{ContentPart, ImageUrl};
 
-const MAX_IMAGE_BYTES: usize = 8 * 1024 * 1024;
+const MAX_IMAGE_BYTES: usize = crate::clipboard_attachments::MAX_MODEL_IMAGE_BYTES;
+const MAX_IMAGE_DIMENSION: u32 = 4096;
+const JPEG_QUALITIES: &[u8] = &[88, 80, 70, 60, 50, 40];
 
 /// Image extensions OpenRouter / OpenAI / Anthropic widely support.
 /// Anything else stays as markdown text — better than silently failing.
@@ -153,16 +156,6 @@ fn read_as_data_url(path: &str) -> Option<String> {
 }
 
 fn read_as_base64(path: &str) -> Option<(String, String)> {
-    let meta = std::fs::metadata(path).ok()?;
-    if meta.len() as usize > MAX_IMAGE_BYTES {
-        tracing::warn!(
-            "skipping attachment {} ({} bytes > {} cap)",
-            path,
-            meta.len(),
-            MAX_IMAGE_BYTES
-        );
-        return None;
-    }
     let bytes = std::fs::read(path).ok()?;
     let ext = Path::new(path)
         .extension()
@@ -175,29 +168,60 @@ fn read_as_base64(path: &str) -> Option<(String, String)> {
         "webp" => "image/webp",
         _ => return None,
     };
-    Some((mime.into(), general_purpose::STANDARD.encode(&bytes)))
+    let decoded = image::load_from_memory(&bytes).ok()?;
+    let (width, height) = decoded.dimensions();
+    if bytes.len() <= MAX_IMAGE_BYTES && width <= MAX_IMAGE_DIMENSION && height <= MAX_IMAGE_DIMENSION {
+        return Some((mime.into(), general_purpose::STANDARD.encode(&bytes)));
+    }
+
+    let scale = (MAX_IMAGE_DIMENSION as f64 / width.max(height) as f64).min(1.0);
+    let mut candidate = if scale < 1.0 {
+        decoded.resize(
+            (width as f64 * scale).round().max(1.0) as u32,
+            (height as f64 * scale).round().max(1.0) as u32,
+            FilterType::Lanczos3,
+        )
+    } else {
+        decoded
+    };
+    for attempt in 0..8 {
+        for quality in JPEG_QUALITIES {
+            let mut compressed = Vec::new();
+            JpegEncoder::new_with_quality(&mut compressed, *quality)
+                .encode_image(&candidate)
+                .ok()?;
+            if compressed.len() <= MAX_IMAGE_BYTES {
+                tracing::info!(path, original_bytes = bytes.len(), model_bytes = compressed.len(), "compressed attachment image for model transport");
+                return Some(("image/jpeg".into(), general_purpose::STANDARD.encode(compressed)));
+            }
+        }
+        if attempt == 7 || candidate.width() <= 1 || candidate.height() <= 1 {
+            break;
+        }
+        candidate = candidate.resize(
+            (candidate.width() * 3 / 4).max(1),
+            (candidate.height() * 3 / 4).max(1),
+            FilterType::Lanczos3,
+        );
+    }
+    tracing::warn!(path, original_bytes = bytes.len(), "attachment image remains above model cap after compression");
+    None
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
 
     fn write_temp_png() -> String {
-        // 1×1 transparent PNG, the smallest valid file we can use.
-        let bytes: &[u8] = &[
-            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
-            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00,
-            0x00, 0x1F, 0x15, 0xC4, 0x89, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x44, 0x41, 0x54, 0x78,
-            0x9C, 0x63, 0x00, 0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00,
-            0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
-        ];
+        use image::{codecs::png::PngEncoder, ExtendedColorType, ImageEncoder};
         let path = std::env::temp_dir().join(format!(
             "codefactory-test-{}.png",
             uuid::Uuid::new_v4().simple()
         ));
-        let mut f = std::fs::File::create(&path).unwrap();
-        f.write_all(bytes).unwrap();
+        let file = std::fs::File::create(&path).unwrap();
+        PngEncoder::new(file)
+            .write_image(&[0, 0, 0, 0], 1, 1, ExtendedColorType::Rgba8)
+            .unwrap();
         path.to_string_lossy().to_string()
     }
 
@@ -258,6 +282,43 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 
+
+    fn write_large_png() -> String {
+        use image::{codecs::png::PngEncoder, ExtendedColorType, ImageEncoder};
+        let width = 3_200u32;
+        let height = 3_200u32;
+        let mut pixels = vec![0u8; width as usize * height as usize * 3];
+        for (index, byte) in pixels.iter_mut().enumerate() {
+            let x = index as u64;
+            *byte = x.wrapping_mul(1_103_515_245).wrapping_add(12_345).rotate_left((x % 31) as u32) as u8;
+        }
+        let path = std::env::temp_dir().join(format!(
+            "codefactory-large-test-{}.png",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let file = std::fs::File::create(&path).unwrap();
+        PngEncoder::new(file)
+            .write_image(&pixels, width, height, ExtendedColorType::Rgb8)
+            .unwrap();
+        assert!(std::fs::metadata(&path).unwrap().len() > MAX_IMAGE_BYTES as u64);
+        path.to_string_lossy().to_string()
+    }
+
+    #[test]
+    fn oversized_png_is_compressed_for_model_without_mutating_original() {
+        let path = write_large_png();
+        let original_len = std::fs::metadata(&path).unwrap().len();
+
+        let parts = extract_openai_parts(&format!("![large](file://{})", path));
+
+        assert_eq!(parts.len(), 1, "large valid image should reach the model after compression");
+        let url = &parts[0].image_url.as_ref().unwrap().url;
+        let (_, encoded) = url.split_once(",").unwrap();
+        let payload = general_purpose::STANDARD.decode(encoded).unwrap();
+        assert!(payload.len() <= MAX_IMAGE_BYTES, "model image payload must respect endpoint byte cap");
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), original_len, "compression must not replace the saved original");
+        std::fs::remove_file(&path).ok();
+    }
 
     #[test]
     fn angle_wrapped_file_urls_with_spaces_parse() {

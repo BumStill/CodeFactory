@@ -32,6 +32,8 @@ const messages: UIMessage[] = [
   invoke: async (_cmd: string, args?: { message?: { cmd?: string; payload?: Record<string, unknown> } }) => {
     const cmd = args?.message?.cmd ?? _cmd;
     switch (cmd) {
+      case "attachment_metadata":
+        return { max_bytes: 50 * 1024 * 1024, max_mebibytes: 50, max_model_image_bytes: 8 * 1024 * 1024, max_model_image_mebibytes: 8 };
       case "save_session_attachment":
         return { path: "/Users/leo/Projects/AI foundation/.codefactory/attachments/input preview.png", name: "input preview.png", size_bytes: pngBytes.length };
       case "plugin:event|listen": return 1;

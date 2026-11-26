@@ -292,7 +292,12 @@ pub fn classify_provider_failure(message: &str) -> ProviderFailureClass {
     {
         return ProviderFailureClass::CredentialUnavailable;
     }
-    if lower.contains("insufficient_quota") || lower.contains("quota exceeded") {
+    if lower.contains("http 402")
+        || lower.contains("402 payment required")
+        || lower.contains("insufficient balance")
+        || lower.contains("insufficient_balance")
+        || lower.contains("insufficient_quota")
+        || lower.contains("quota exceeded") {
         return ProviderFailureClass::QuotaExceeded;
     }
     if lower.contains("http 429")
@@ -1868,6 +1873,10 @@ mod tests {
             ProviderFailureClass::RateLimited
         );
         assert_eq!(
+            classify_provider_failure("HTTP 402 Payment Required: Insufficient Balance"),
+            ProviderFailureClass::QuotaExceeded
+        );
+        assert_eq!(
             classify_provider_failure("HTTP 401 Unauthorized"),
             ProviderFailureClass::AuthExpired
         );
@@ -2587,7 +2596,7 @@ mod m210_tests {
     fn m210_fatal_only_notice_names_provider_reason() {
         let state = state_with(vec![
             ("deepseek", "deepseek-v4-pro", "provider returned an unexpected error: HTTP 422 upstream returned 422"),
-            ("chatgpt", "gpt-5.5", "provider returned an unexpected error: HTTP 402 payment required"),
+            ("chatgpt", "gpt-5.5", "provider returned an unexpected error: HTTP 422 upstream rejected request"),
         ]);
         let message = state.exhausted_error("no_model_available");
         let unavailable = ModelUnavailable::parse(&message).expect("fatal-only must still be a model wait, not a retry loop");

@@ -4,7 +4,28 @@ use base64::{engine::general_purpose::STANDARD, Engine};
 use serde::{Deserialize, Serialize};
 use std::{io::Read, path::Path};
 
-pub const MAX_ATTACHMENT_BYTES: usize = 25 * 1024 * 1024;
+pub const MAX_ATTACHMENT_BYTES: usize = 50 * 1024 * 1024;
+pub const MAX_MODEL_IMAGE_BYTES: usize = 8 * 1024 * 1024;
+pub const MAX_ATTACHMENT_MEBIBYTES: usize = MAX_ATTACHMENT_BYTES / 1024 / 1024;
+pub const MAX_MODEL_IMAGE_MEBIBYTES: usize = MAX_MODEL_IMAGE_BYTES / 1024 / 1024;
+
+#[derive(Serialize)]
+pub struct AttachmentLimits {
+    max_bytes: usize,
+    max_mebibytes: usize,
+    max_model_image_bytes: usize,
+    max_model_image_mebibytes: usize,
+}
+
+#[tauri::command]
+pub fn attachment_limits() -> AttachmentLimits {
+    AttachmentLimits {
+        max_bytes: MAX_ATTACHMENT_BYTES,
+        max_mebibytes: MAX_ATTACHMENT_MEBIBYTES,
+        max_model_image_bytes: MAX_MODEL_IMAGE_BYTES,
+        max_model_image_mebibytes: MAX_MODEL_IMAGE_MEBIBYTES,
+    }
+}
 
 #[derive(Deserialize)]
 struct ClipboardItem {
@@ -22,13 +43,13 @@ pub struct PasteResult {
 
 pub fn check_size(name: &str, size: usize) -> Result<(), String> {
     if size > MAX_ATTACHMENT_BYTES {
-        Err(format!("{name} 超过 25MB 上限，已跳过"))
+        Err(format!("{name} 超过 {MAX_ATTACHMENT_MEBIBYTES}MiB 上限，已跳过"))
     } else { Ok(()) }
 }
 
 // All filenames/paths are clipboard data, never interpolated into commands.
 #[cfg(target_os = "macos")]
-const SCRIPT: &str = r#"
+const SCRIPT_TEMPLATE: &str = r#"
 ObjC.import('AppKit');
 ObjC.import('Foundation');
 function run() {
@@ -47,7 +68,7 @@ function run() {
         if (image && !image.isNil()) {
             const bitmap = $.NSBitmapImageRep.alloc.initWithData(image.TIFFRepresentation);
             const png = bitmap.representationUsingTypeProperties($.NSPNGFileType, $({}));
-            if (png.length > 26214400) throw new Error('粘贴图片 超过 25MB 上限，已跳过');
+            if (png.length > __MAX_ATTACHMENT_BYTES__) throw new Error('粘贴图片超过附件上限，已跳过');
             result.push({name: '粘贴图片-' + Date.now() + '.png', data: ObjC.unwrap(png.base64EncodedStringWithOptions(0))});
         }
     }
@@ -55,7 +76,7 @@ function run() {
 }
 "#;
 #[cfg(target_os = "windows")]
-const SCRIPT: &str = r#"
+const SCRIPT_TEMPLATE: &str = r#"
 $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)
 Add-Type -AssemblyName System.Windows.Forms
@@ -70,7 +91,7 @@ if ([System.Windows.Forms.Clipboard]::ContainsFileDropList()) {
   $stream = New-Object IO.MemoryStream
   try {
     $image.Save($stream, [System.Drawing.Imaging.ImageFormat]::Png)
-    if ($stream.Length -gt 26214400) { throw '粘贴图片 超过 25MB 上限，已跳过' }
+    if ($stream.Length -gt __MAX_ATTACHMENT_BYTES__) { throw '粘贴图片超过附件上限，已跳过' }
     $result += @{ name = ('粘贴图片-' + [DateTimeOffset]::Now.ToUnixTimeMilliseconds() + '.png'); data = [Convert]::ToBase64String($stream.ToArray()) }
   } finally { $stream.Dispose(); $image.Dispose() }
 }
@@ -79,10 +100,11 @@ ConvertTo-Json -InputObject @($result) -Compress
 
 fn read_native() -> Result<Vec<ClipboardItem>, String> {
     use crate::util::no_window::NoWindow;
+    let script = SCRIPT_TEMPLATE.replace("__MAX_ATTACHMENT_BYTES__", &MAX_ATTACHMENT_BYTES.to_string());
     #[cfg(target_os = "macos")]
-    let command = { let mut c = std::process::Command::new("/usr/bin/osascript"); c.args(["-l", "JavaScript", "-e", SCRIPT]); c };
+    let command = { let mut c = std::process::Command::new("/usr/bin/osascript"); c.args(["-l", "JavaScript", "-e", &script]); c };
     #[cfg(target_os = "windows")]
-    let mut command = { let mut c = std::process::Command::new("powershell.exe"); c.args(["-NoProfile", "-NonInteractive", "-STA", "-Command", SCRIPT]); c };
+    let mut command = { let mut c = std::process::Command::new("powershell.exe"); c.args(["-NoProfile", "-NonInteractive", "-STA", "-Command", &script]); c };
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     return Err("当前平台不支持原生剪贴板附件，请使用拖放或选择文件".into());
     #[cfg(any(target_os = "macos", target_os = "windows"))]
@@ -103,7 +125,7 @@ fn item_bytes(item: &ClipboardItem) -> Result<Vec<u8>, String> {
         Ok(bytes)
     } else {
         let data = item.data.as_deref().ok_or("剪贴板图片数据为空")?;
-        if data.len() > (MAX_ATTACHMENT_BYTES + 2) / 3 * 4 { return Err(format!("{} 超过 25MB 上限，已跳过", item.name)); }
+        if data.len() > (MAX_ATTACHMENT_BYTES + 2) / 3 * 4 { return Err(format!("{} 超过 {}MiB 上限，已跳过", item.name, MAX_ATTACHMENT_MEBIBYTES)); }
         let bytes = STANDARD.decode(data).map_err(|e| e.to_string())?;
         check_size(&item.name, bytes.len())?;
         Ok(bytes)
@@ -112,8 +134,14 @@ fn item_bytes(item: &ClipboardItem) -> Result<Vec<u8>, String> {
 
 /// Public IPC entry also usable by the local dispatch channel without GUI focus.
 #[tauri::command]
-pub async fn paste_session_attachments(app: tauri::AppHandle, cwd: Option<String>, session_id: Option<String>) -> Result<Vec<PasteResult>, String> {
-    let items = tauri::async_runtime::spawn_blocking(read_native).await.map_err(|e| e.to_string())??;
+pub async fn paste_session_attachments(app: tauri::AppHandle, cwd: Option<String>, session_id: Option<String>, paths: Option<Vec<String>>) -> Result<Vec<PasteResult>, String> {
+    let items = match paths {
+        Some(paths) => paths.into_iter().map(|path| {
+            let name = Path::new(&path).file_name().and_then(|value| value.to_str()).unwrap_or("文件").to_string();
+            ClipboardItem { name, path: Some(path), data: None }
+        }).collect(),
+        None => tauri::async_runtime::spawn_blocking(read_native).await.map_err(|e| e.to_string())??,
+    };
     let mut result = Vec::new();
     for item in items {
         let name = item.name.clone();
@@ -131,12 +159,30 @@ pub async fn paste_session_attachments(app: tauri::AppHandle, cwd: Option<String
 }
 
 #[derive(Serialize)]
-pub struct AttachmentMetadata { size_bytes: u64 }
+pub struct AttachmentMetadata {
+    size_bytes: Option<u64>,
+    max_bytes: usize,
+    max_mebibytes: usize,
+    max_model_image_bytes: usize,
+    max_model_image_mebibytes: usize,
+}
 #[tauri::command]
-pub fn attachment_metadata(path: String) -> Result<AttachmentMetadata, String> {
-    let metadata = std::fs::metadata(Path::new(&path)).map_err(|e| format!("文件不存在、已被删除或无法访问：{e}"))?;
-    if !metadata.is_file() { return Err("不是可预览的文件".into()); }
-    Ok(AttachmentMetadata { size_bytes: metadata.len() })
+pub fn attachment_metadata(path: Option<String>) -> Result<AttachmentMetadata, String> {
+    let size_bytes = match path {
+        Some(path) => {
+            let metadata = std::fs::metadata(Path::new(&path)).map_err(|e| format!("文件不存在、已被删除或无法访问：{e}"))?;
+            if !metadata.is_file() { return Err("不是可预览的文件".into()); }
+            Some(metadata.len())
+        }
+        None => None,
+    };
+    Ok(AttachmentMetadata {
+        size_bytes,
+        max_bytes: MAX_ATTACHMENT_BYTES,
+        max_mebibytes: MAX_ATTACHMENT_MEBIBYTES,
+        max_model_image_bytes: MAX_MODEL_IMAGE_BYTES,
+        max_model_image_mebibytes: MAX_MODEL_IMAGE_MEBIBYTES,
+    })
 }
 
 #[cfg(test)]
@@ -144,8 +190,18 @@ mod tests {
     use super::*;
     #[test]
     fn m190_clipboard_limits_and_file_list() {
-        assert!(check_size("edge.png", MAX_ATTACHMENT_BYTES).is_ok());
-        assert!(check_size("large.png", MAX_ATTACHMENT_BYTES + 1).unwrap_err().contains("25MB"));
+        assert!(check_size("edge.bin", 50 * 1024 * 1024).is_ok());
+        assert!(check_size("large.bin", 50 * 1024 * 1024 + 1).unwrap_err().contains("50MiB"));
+        assert!(check_size("large.png", 20 * 1024 * 1024).is_ok());
+        let limits = attachment_limits();
+        assert_eq!(limits.max_bytes, 50 * 1024 * 1024);
+        assert_eq!(limits.max_model_image_bytes, 8 * 1024 * 1024);
+        let metadata_limits = attachment_metadata(None).unwrap();
+        assert_eq!(metadata_limits.max_bytes, limits.max_bytes);
+        assert_eq!(metadata_limits.max_model_image_bytes, limits.max_model_image_bytes);
+        assert!(SCRIPT_TEMPLATE.contains("__MAX_ATTACHMENT_BYTES__"));
+        assert!(!SCRIPT_TEMPLATE.contains("26214400"));
+        assert!(!SCRIPT_TEMPLATE.contains("25MB"));
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("synthetic.txt");
         std::fs::write(&path, b"clipboard synthetic bytes").unwrap();
@@ -154,7 +210,7 @@ mod tests {
         ])).unwrap();
         assert_eq!(item_bytes(&items[0]).unwrap(), b"clipboard synthetic bytes");
         assert_eq!(item_bytes(&items[1]).unwrap(), b"image");
-        assert_eq!(attachment_metadata(path.to_string_lossy().into()).unwrap().size_bytes, 25);
+        assert_eq!(attachment_metadata(Some(path.to_string_lossy().into())).unwrap().size_bytes, Some(25));
         std::fs::remove_file(path).unwrap();
         assert!(item_bytes(&items[0]).is_err());
     }

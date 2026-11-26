@@ -453,6 +453,17 @@ fn canonical_state_from_batch(
     summary: &crate::agent::delivery::BatchPrState,
     expected_head_sha: &str,
 ) -> CanonicalPrState {
+    if let Some(code) = crate::commands::liveness::pr_wait_violation(
+        &crate::commands::liveness::PrWaitObservation {
+            is_draft: summary.is_draft,
+            hold: summary.hold,
+            state: summary.state.clone(),
+        },
+    ) {
+        return CanonicalPrState::Unknown(format!(
+            "session_liveness_violation:{code}"
+        ));
+    }
     match summary.state.to_ascii_uppercase().as_str() {
         // Positive merge evidence is authoritative; the queue may advance the
         // head before merging, so a merged row never needs a head match.
@@ -4433,6 +4444,31 @@ pub async fn verify_objective_workspace(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn m287_canonical_pr_wait_rejects_draft_and_hold_but_accepts_ready_open() {
+        let state = |is_draft, hold, state: &str| crate::agent::delivery::BatchPrState {
+            state: state.into(),
+            head_sha: "head".into(),
+            merge_sha: None,
+            armed: false,
+            is_draft,
+            hold,
+        };
+        assert!(matches!(
+            super::canonical_state_from_batch(&state(true, false, "OPEN"), "head"),
+            super::CanonicalPrState::Unknown(reason)
+                if reason.contains("draft_pr_cannot_progress")
+        ));
+        assert!(matches!(
+            super::canonical_state_from_batch(&state(false, true, "OPEN"), "head"),
+            super::CanonicalPrState::Unknown(reason)
+                if reason.contains("held_pr_cannot_progress")
+        ));
+        assert!(matches!(
+            super::canonical_state_from_batch(&state(false, false, "OPEN"), "head"),
+            super::CanonicalPrState::Open
+        ));
+    }
     use super::{
         acquire_repo_allocation_lock, allocate_or_attach, attach_existing, ensure_schema,
         external_path, external_path_str, heal_incident_workspaces,

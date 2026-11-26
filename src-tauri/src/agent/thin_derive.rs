@@ -602,6 +602,11 @@ pub(crate) async fn heartbeat_external(db: &SqlitePool, session: &str) -> sqlx::
     let reference: Option<(i64, String, String)> = sqlx::query_as("SELECT ref.pr_number,ref.ceiling,session.cwd FROM thin_delivery_refs ref JOIN sessions session ON session.id=ref.session_id WHERE ref.session_id=?")
         .bind(session).fetch_optional(db).await?;
     let Some((number, ceiling, cwd)) = reference else { return Ok(()); };
+    let revoked = if has_table(db, "thin_delivery_revocations").await? {
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM thin_delivery_revocations WHERE session_id=?")
+            .bind(session).fetch_one(db).await? > 0
+    } else { false };
+    let arm_allowed = !revoked && !matches!(ceiling.as_str(), "PrOnly" | "pr_only");
     sqlx::query("INSERT INTO thin_external_observations(session_id,pr_number,ceiling) VALUES (?,?,?) ON CONFLICT(session_id) DO UPDATE SET pr_number=excluded.pr_number,ceiling=excluded.ceiling,observed_at=0,completed_reason=NULL,closeout_queued=0 WHERE pr_number<>excluded.pr_number OR ceiling<>excluded.ceiling")
         .bind(session).bind(number).bind(&ceiling).execute(db).await?;
     let at = chrono::Utc::now().timestamp_millis();
@@ -651,10 +656,10 @@ pub(crate) async fn heartbeat_external(db: &SqlitePool, session: &str) -> sqlx::
             if !closeout_slot_free(db, at).await? { return Ok(()); }
         }
     }
-    queue_observed_wake(db, session, number, &reason, at).await
+    queue_observed_wake(db, session, number, &reason, at, arm_allowed).await
 }
 
-async fn queue_observed_wake(db: &SqlitePool, session: &str, number: i64, reason: &str, at: i64) -> sqlx::Result<()> {
+async fn queue_observed_wake(db: &SqlitePool, session: &str, number: i64, reason: &str, at: i64, arm_allowed: bool) -> sqlx::Result<()> {
     {
         super::background_tasks::wake_source_cover(db, session).await;
         // 同一事务写唤醒与去重事实，不留下“标记成功但没排唤醒”的崩溃窗口。
@@ -670,8 +675,10 @@ async fn queue_observed_wake(db: &SqlitePool, session: &str, number: i64, reason
             }
             let failed = is_external_failure(&reason);
             let prefix = if failed { "thin-repair" } else { "thin-closeout" };
-            let prompt = if reason.contains("检查已全绿") {
+            let prompt = if reason.contains("检查已全绿") && arm_allowed {
                 format!("{reason}。系统自动重试/自愈：核对必需检查与交付授权，满足条件后标记 merge-queue: armed，由合并队列合并并继续监视；不要手工合并。")
+            } else if reason.contains("检查已全绿") {
+                format!("{reason}。当前交付上限为 pr_only 或合并授权已撤回；继续保留 PR 并等待用户新的明确授权，不得重新打 armed。")
             } else if failed {
                 format!("{reason}。系统自动重试/自愈：诊断失败检查，修复后在同一分支重新交付并继续监视；修到当前 head 必需检查全绿后移除 merge-queue: blocked，重新标记 merge-queue: armed，由队列合并，不得结束成已交付；PR 关闭时先核查原因再恢复交付。不向用户询问是否继续监视。")
             } else {
@@ -4142,6 +4149,18 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn m285_revoked_or_pr_only_green_wake_never_requests_armed() {
+        let db = fixture().await;
+        ensure_external(&db).await.unwrap();
+        super::super::background_tasks::ensure_wake_schema(&db).await.unwrap();
+        sqlx::query("INSERT INTO thin_external_observations(session_id,pr_number,ceiling,completed_reason) VALUES ('derive',91,'pr_only','PR #91 检查已全绿')").execute(&db).await.unwrap();
+        queue_observed_wake(&db, "derive", 91, "PR #91 检查已全绿", 180_000, false).await.unwrap();
+        let prompt: String = sqlx::query_scalar("SELECT prompt FROM wakeup_schedules WHERE session_id='derive' ORDER BY created_at DESC LIMIT 1").fetch_one(&db).await.unwrap();
+        assert!(prompt.contains("不得重新打 armed"), "{prompt}");
+        assert!(!prompt.contains("满足条件后标记 merge-queue: armed"), "{prompt}");
+    }
+
+    #[tokio::test]
     async fn m229_pending_to_blocked_wakes_once_and_new_head_rearms() {
         let db = fixture().await;
         ensure_external(&db).await.unwrap();
@@ -4157,7 +4176,7 @@ mod tests {
         for expected in [1_i64, 1] {
             apply_pr_observation(&db, "derive", 91, "ThroughMerge", &pr, false).await.unwrap();
             let reason = failure_reason(&pr, 91).unwrap();
-            queue_observed_wake(&db, "derive", 91, &reason, 180_000).await.unwrap();
+            queue_observed_wake(&db, "derive", 91, &reason, 180_000, true).await.unwrap();
             let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM wakeup_schedules WHERE id LIKE 'thin-repair-%'").fetch_one(&db).await.unwrap();
             assert_eq!(count, expected);
         }
@@ -4172,7 +4191,7 @@ mod tests {
         assert_eq!(queued, 1);
         pr["headRefOid"] = serde_json::json!("head-b");
         apply_pr_observation(&db, "derive", 91, "ThroughMerge", &pr, false).await.unwrap();
-        queue_observed_wake(&db, "derive", 91, &failure_reason(&pr, 91).unwrap(), 360_000).await.unwrap();
+        queue_observed_wake(&db, "derive", 91, &failure_reason(&pr, 91).unwrap(), 360_000, true).await.unwrap();
         let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM wakeup_schedules WHERE id LIKE 'thin-repair-%'").fetch_one(&db).await.unwrap();
         assert_eq!(count, 2, "a new head must get a fresh repair turn");
         let keys: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM thin_pr_failure_wakes").fetch_one(&db).await.unwrap();

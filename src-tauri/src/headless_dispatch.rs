@@ -129,6 +129,11 @@ pub enum Request {
     },
     /// CF-HDE-R6: list pending approval requests.
     ListApprovals {},
+    /// M291/R4: inspect queued, delivered and failed messages, including deleted sessions.
+    ListQueuedMessages {
+        #[serde(default)]
+        session_id: Option<String>,
+    },
     /// CF-HDE-R6: approve/deny one pending request. Approving still goes
     /// through the same permission rules — this is not a blanket grant.
     ///
@@ -157,6 +162,9 @@ pub enum Request {
     SetUsageWindow { endpoint: String, #[serde(default)] model: Option<String>, rule: Option<crate::agent::usage_windows::UsageWindow> },
     GetQuota {},
     UsageStatus {},
+    /// M286/R8: read-only model catalog through the lock-screen-safe local entry.
+    /// The response contains model ids and prices only.
+    ListModels { #[serde(default)] endpoint: Option<String> },
     /// M235: same data and actions as the Settings memory page.
     ListMemories {},
     DeleteMemory { id: String },
@@ -357,6 +365,11 @@ pub fn validate_request(request: &Request) -> Result<(), ErrorBody> {
             }
         }
         Request::ListApprovals {} => {}
+        Request::ListQueuedMessages { session_id } => {
+            if let Some(session_id) = session_id {
+                require_non_empty("session_id", session_id)?;
+            }
+        }
         Request::ResolveApproval { approval_id, note, .. } => {
             require_non_empty("approval_id", approval_id)?;
             crate::agent::permission_intent::normalize_permission_note(note.clone())
@@ -371,6 +384,9 @@ pub fn validate_request(request: &Request) -> Result<(), ErrorBody> {
             if let Some(rule) = rule { rule.validate().map_err(ErrorBody::invalid)?; }
         }
         Request::CleanBuildCache {} | Request::GetQuota {} | Request::UsageStatus {} => {}
+        Request::ListModels { endpoint } => {
+            if let Some(endpoint) = endpoint { require_non_empty("endpoint", endpoint)?; }
+        }
         Request::ListMemories {} | Request::SetMemoryEnabled { .. } => {}
         Request::DeleteMemory { id } => require_non_empty("id", id)?,
         Request::SetQuotaCap { endpoint, five_hour_percent, weekly_percent } => {
@@ -502,6 +518,7 @@ impl AuditEntry {
             Request::SetPermission { session_id, .. }
             | Request::CloseObjective { session_id, .. }
             | Request::Status { session_id }
+            | Request::ListQueuedMessages { session_id: Some(session_id) }
             | Request::SwitchSession { session_id } => {
                 entry.session_id = Some(session_id.clone());
             }
@@ -516,7 +533,7 @@ impl AuditEntry {
             Request::SetUsageWindow { endpoint, model, rule } => {
                 entry.message = Some(format!("endpoint={endpoint}; model={}; rule={}", model.as_deref().unwrap_or("<endpoint>"), serde_json::to_string(rule).unwrap_or_default()));
             }
-            Request::GetQuota {} | Request::UsageStatus {} | Request::ListMemories {} => {}
+            Request::GetQuota {} | Request::UsageStatus {} | Request::ListModels { .. } | Request::ListMemories {} | Request::ListQueuedMessages { session_id: None } => {}
             Request::DeleteMemory { id } => entry.message = Some(format!("id={id}")),
             Request::SetMemoryEnabled { enabled } => entry.message = Some(format!("enabled={enabled}")),
             Request::SetQuotaCap { endpoint, five_hour_percent, weekly_percent } => {
@@ -549,6 +566,7 @@ pub fn operation_of(request: &Request) -> &'static str {
         Request::SwitchSession { .. } => "switch_session",
         Request::Stop { .. } => "stop",
         Request::ListApprovals {} => "list_approvals",
+        Request::ListQueuedMessages { .. } => "list_queued_messages",
         Request::ResolveApproval { .. } => "resolve_approval",
         Request::FocusMainDisplay {} => "focus_main_display",
         Request::CleanBuildCache {} => "clean_build_cache",
@@ -557,6 +575,7 @@ pub fn operation_of(request: &Request) -> &'static str {
         Request::SetUsageWindow { .. } => "set_usage_window",
         Request::GetQuota {} => "get_quota",
         Request::UsageStatus {} => "usage_status",
+        Request::ListModels { .. } => "list_models",
         Request::ListMemories {} => "list_memories",
         Request::DeleteMemory { .. } => "delete_memory",
         Request::SetMemoryEnabled { .. } => "set_memory_enabled",
@@ -1711,6 +1730,14 @@ mod tests {
             ))
             .is_ok());
         }
+    }
+
+    #[test]
+    fn m286_list_models_dispatch_is_read_only_and_credential_free() {
+        let request = parse_request(r#"{"operation":"list_models","endpoint":"openai"}"#).unwrap();
+        assert_eq!(operation_of(&request), "list_models");
+        let serialized = serde_json::to_string(&AuditEntry::for_request(&request, chrono::Utc::now())).unwrap();
+        assert!(!serialized.contains("api_key"));
     }
 
     #[test]

@@ -1037,6 +1037,18 @@ pub(crate) async fn persist_model_wakeup(
     super::thin_state::ensure(pool).await?;
     let base = format!("model-availability-{session}");
     let mut tx = crate::storage::db::begin_write(pool).await?;
+    let wait_table: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='model_availability_waits'",
+    ).fetch_one(&mut *tx).await?;
+    let real_resume_at: Option<i64> = if wait_table > 0 {
+        sqlx::query_scalar(
+            "SELECT resume_at_ms FROM model_availability_waits WHERE session_id=?",
+        ).bind(session).fetch_optional(&mut *tx).await?.flatten()
+    } else { None };
+    // The durable wait is the truth. A caller may carry an earlier retry guess
+    // or a stale later restriction; neither may move the wake away from the
+    // earliest real recovery time recorded for this session.
+    let at_ms = real_resume_at.unwrap_or(at_ms);
     let ended: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM thin_session_state WHERE session_id=? AND state='ended'")
         .bind(session).fetch_one(&mut *tx).await?;
     if ended > 0 { return Ok(base); }
@@ -2648,6 +2660,7 @@ mod tests {
             &pool,
             "s1",
             "先按我的方案走",
+            "client-user",
             Some("turn-user"),
         )
         .await
@@ -2837,6 +2850,34 @@ mod tests {
         assert_eq!(drain_pending_wakes(&reopened, sink(&Arc::new(Recorder::default()))).await, 0);
         reopened.close().await;
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn m287_model_wake_uses_real_persisted_earliest_recovery() {
+        let pool = memory_pool().await;
+        super::super::usage_windows::model_wait::ensure(&pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO model_availability_waits(session_id,reason,resume_at_ms,attempts,updated_at)
+             VALUES ('m287-wake','真实路由数据',5000,1,1)",
+        ).execute(&pool).await.unwrap();
+
+        persist_model_wakeup(&pool, "m287-wake", "root", 1000, "caller too early")
+            .await.unwrap();
+        let early: i64 = sqlx::query_scalar(
+            "SELECT next_at FROM wakeup_schedules WHERE session_id='m287-wake' AND status='pending'",
+        ).fetch_one(&pool).await.unwrap();
+        assert_eq!(early, 5, "wake seconds must come from durable resume_at_ms");
+
+        persist_model_wakeup(&pool, "m287-wake", "root", 9000, "caller stale late")
+            .await.unwrap();
+        let late: i64 = sqlx::query_scalar(
+            "SELECT next_at FROM wakeup_schedules WHERE session_id='m287-wake' AND status='pending'",
+        ).fetch_one(&pool).await.unwrap();
+        assert_eq!(late, 5, "a stale later caller value must not delay earliest recovery");
+        let pending: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM wakeup_schedules WHERE session_id='m287-wake' AND status='pending'",
+        ).fetch_one(&pool).await.unwrap();
+        assert_eq!(pending, 1);
     }
 
     #[tokio::test]

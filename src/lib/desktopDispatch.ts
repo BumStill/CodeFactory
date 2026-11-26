@@ -104,6 +104,7 @@ export interface DispatchHandlers {
   switchSession: (input: { sessionId: string }) => Promise<unknown>;
   stop: (input: { sessionId?: string }) => Promise<unknown>;
   listApprovals: () => Promise<DispatchApproval[]>;
+  listQueuedMessages?: (input: { sessionId?: string }) => Promise<unknown>;
   resolveApproval: (input: { approvalId: string; approve: boolean; note?: string }) => Promise<unknown>;
   /** CF-BLD-R4: the panel's one-click cleanup, reachable from the background. */
   /** CF-QUOTA-R2: same reads and persistence as Settings. */
@@ -269,6 +270,12 @@ export async function applyDispatchRequest(
           sessionId: optionalString(body.session_id, "session_id"),
         });
         break;
+      case "list_queued_messages":
+        if (!handlers.listQueuedMessages) return invalid("list_queued_messages is not available");
+        result = await handlers.listQueuedMessages({
+          sessionId: optionalString(body.session_id, "session_id"),
+        });
+        break;
       case "list_approvals":
         result = await handlers.listApprovals();
         break;
@@ -289,6 +296,11 @@ export async function applyDispatchRequest(
       case "usage_status":
         result = await invoke("get_endpoint_spend_status");
         break;
+      case "list_models": {
+        const endpoint = body.endpoint === undefined ? "openai" : requiredString(body.endpoint, "endpoint");
+        result = await invoke("list_models", { endpointName: endpoint });
+        break;
+      }
       case "list_memories":
         result = await invoke("list_long_term_memories");
         break;

@@ -1800,6 +1800,36 @@ pub(crate) fn dev_command(program: &str) -> Command {
     command
 }
 
+#[cfg(test)]
+fn test_gh_commands() -> &'static std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, std::path::PathBuf>> {
+    static COMMANDS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, std::path::PathBuf>>> = std::sync::OnceLock::new();
+    COMMANDS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+#[cfg(test)]
+pub(crate) fn register_test_gh(cwd: &Path, binary: std::path::PathBuf) {
+    test_gh_commands().lock().unwrap().insert(cwd.to_path_buf(), binary);
+}
+
+pub(crate) fn dev_command_in(program: &str, cwd: &Path) -> Command {
+    #[cfg(test)]
+    if program == "gh" {
+        if let Some(binary) = test_gh_commands().lock().unwrap().get(cwd).cloned() {
+            #[cfg(windows)]
+            if binary.extension().and_then(|value| value.to_str()).is_some_and(|value| value.eq_ignore_ascii_case("cmd")) {
+                let mut command = Command::new("cmd.exe").no_window();
+                command.arg("/C").arg(binary);
+                command_env::apply_developer_path_std(&mut command);
+                return command;
+            }
+            let mut command = Command::new(binary).no_window();
+            command_env::apply_developer_path_std(&mut command);
+            return command;
+        }
+    }
+    dev_command(program)
+}
+
 fn retry_delivery_network<T>(step: &str, mut operation: impl FnMut() -> Result<T, String>, mut sleep: impl FnMut(u64)) -> Result<T, String> {
     for attempt in 1..=3 {
         match operation() {
@@ -9311,7 +9341,7 @@ impl GhCliRemote {
             "--limit".into(),
             "200".into(),
             "--json".into(),
-            "number,state,headRefOid,mergeCommit,autoMergeRequest,labels".into(),
+            "number,state,isDraft,headRefOid,mergeCommit,autoMergeRequest,labels".into(),
         ])?;
         let value: serde_json::Value = serde_json::from_str(&raw)
             .map_err(|error| format!("gh pr list returned non-JSON: {error}"))?;
@@ -9325,15 +9355,19 @@ impl GhCliRemote {
             if !numbers.contains(&number) {
                 continue;
             }
-            let armed = row
+            let labels = row
                 .get("labels")
                 .and_then(serde_json::Value::as_array)
-                .is_some_and(|labels| {
-                    labels.iter().any(|label| {
+                .cloned()
+                .unwrap_or_default();
+            let has_label = |name: &str| {
+                labels.iter().any(|label| {
                         label.get("name").and_then(serde_json::Value::as_str)
-                            == Some(MERGE_QUEUE_ARM_LABEL)
-                    })
-                });
+                            == Some(name)
+                })
+            };
+            let armed = has_label(MERGE_QUEUE_ARM_LABEL);
+            let hold = has_label("merge-queue: hold");
             out.insert(
                 number,
                 BatchPrState {
@@ -9353,6 +9387,8 @@ impl GhCliRemote {
                         .and_then(serde_json::Value::as_str)
                         .map(str::to_string),
                     armed,
+                    is_draft: row.get("isDraft").and_then(serde_json::Value::as_bool).unwrap_or(false),
+                    hold,
                 },
             );
         }
@@ -9435,6 +9471,8 @@ pub(crate) struct BatchPrState {
     pub head_sha: String,
     pub merge_sha: Option<String>,
     pub armed: bool,
+    pub is_draft: bool,
+    pub hold: bool,
 }
 
 /// M115/R2: the pure half of the queue-sync proof. A provider sync merge has

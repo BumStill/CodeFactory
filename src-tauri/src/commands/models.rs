@@ -1,11 +1,84 @@
 // SPDX-License-Identifier: Apache-2.0
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::sync::Mutex;
 
+use once_cell::sync::Lazy;
 use tauri::State;
 
 use crate::errors::AppError;
 use crate::openrouter::types::ModelInfo;
 use crate::AppState;
+
+const MODEL_CATALOG_TTL_MS: i64 = 24 * 60 * 60 * 1000;
+static MODELS_CACHE: Lazy<Mutex<HashMap<String, (i64, Vec<ModelInfo>)>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+
+fn now_ms() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+fn cached_models(endpoint_name: &str, allow_stale: bool) -> Option<Vec<ModelInfo>> {
+    let guard = MODELS_CACHE.lock().ok()?;
+    let (stored_at, models) = guard.get(endpoint_name)?;
+    (allow_stale || now_ms().saturating_sub(*stored_at) <= MODEL_CATALOG_TTL_MS)
+        .then(|| models.clone())
+}
+
+fn cache_put(endpoint_name: &str, models: Vec<ModelInfo>) {
+    if let Ok(mut guard) = MODELS_CACHE.lock() {
+        guard.insert(endpoint_name.to_string(), (now_ms(), models));
+    }
+}
+
+fn merge_models(mut custom: Vec<ModelInfo>, remote: Vec<ModelInfo>) -> Vec<ModelInfo> {
+    let custom_ids: HashSet<String> = custom.iter().map(|model| model.id.clone()).collect();
+    let mut remote: Vec<ModelInfo> = remote
+        .into_iter()
+        .filter(|model| !custom_ids.contains(&model.id))
+        .map(|mut model| { if model.pricing.is_none() && model.id.starts_with("gpt-") { let rate = crate::agent::openai_api::rate_for_model(&model.id); model.pricing = Some(crate::openrouter::types::ModelPricing { prompt: rate.input_usd_per_mtok.to_string(), completion: rate.output_usd_per_mtok.to_string() }); } ModelInfo { is_custom: false, ..model } })
+        .collect();
+    remote.sort_by(|left, right| left.id.cmp(&right.id));
+    custom.extend(remote);
+    custom
+}
+pub(crate) fn preferred_openai_model(models: &[ModelInfo], family: &str) -> Option<(String, bool)> {
+    let family = family.trim().to_ascii_lowercase();
+    let preferred = if family.is_empty() { "terra" } else { family.as_str() };
+    let mut candidates = models.iter().map(|m| m.id.as_str()).collect::<Vec<_>>();
+    candidates.sort_by(|a, b| natural_model_cmp(b, a));
+    if let Some(model) = candidates.iter().find(|id| id.to_ascii_lowercase().contains(preferred)) {
+        return Some(((*model).to_string(), false));
+    }
+    for fallback in ["terra", "sol", "gpt-6", "gpt-5.6", "gpt-5"] {
+        if let Some(model) = candidates.iter().find(|id| id.to_ascii_lowercase().contains(fallback)) {
+            return Some(((*model).to_string(), true));
+        }
+    }
+    candidates.first().map(|id| ((*id).to_string(), true))
+}
+
+fn natural_model_cmp(left: &str, right: &str) -> std::cmp::Ordering {
+    let numeric = |value: &str| value.split(|c: char| !c.is_ascii_digit()).filter(|p| !p.is_empty()).filter_map(|p| p.parse::<u64>().ok()).collect::<Vec<_>>();
+    numeric(left).cmp(&numeric(right)).then_with(|| left.cmp(right))
+}
+
+/// Reorder the OpenAI catalog so the preferred family pick comes first (R2).
+fn reorder_openai_default(models: &mut Vec<ModelInfo>, family: &str) {
+    if let Some((pick, _)) = preferred_openai_model(models, family) {
+        if let Some(pos) = models.iter().position(|m| m.id == pick) {
+            let model = models.remove(pos);
+            models.insert(0, model);
+        }
+    }
+}
+
+
+
+
 
 #[tauri::command]
 pub async fn list_models(
@@ -41,7 +114,12 @@ pub async fn list_models(
         return Ok(merged);
     }
 
-    // ── 2. Try to fetch remote /models — failures are non-fatal ──────────────
+    // ── 2. Try to fetch remote /models — failures are non-fatal, but
+    // cache is authoritative when available (R1: not silently empty).
+    if let Some(cached) = cached_models(&endpoint_name, false) {
+        return Ok(merge_models(merged, cached));
+    }
+
     let key_ref = endpoint
         .key_ref
         .clone()
@@ -55,24 +133,85 @@ pub async fn list_models(
     let client = crate::openrouter::OpenRouterClient::new(&endpoint.base_url, api_key);
     match client.list_models().await {
         Ok(remote) => {
-            // Custom entries take precedence — skip any remote id already covered.
-            for m in remote {
-                if !custom_ids.contains(&m.id) {
-                    merged.push(ModelInfo {
-                        is_custom: false,
-                        ..m
-                    });
+            cache_put(&endpoint_name, remote.clone());
+            let mut merged = merge_models(merged, remote);
+            if endpoint_name == "openai" {
+                reorder_openai_default(&mut merged, &settings.openai_model_family);
+            }
+            Ok(merged)
+        }
+        Err(error) => {
+            if let Some(cached) = cached_models(&endpoint_name, true) {
+                tracing::warn!("list_models: remote refresh failed for endpoint '{endpoint_name}', serving last successful catalog: {error}");
+                let mut merged = merge_models(merged, cached);
+                if endpoint_name == "openai" {
+                    reorder_openai_default(&mut merged, &settings.openai_model_family);
                 }
+                Ok(merged)
+            } else {
+                Err(AppError::Other(format!(
+                    "MODEL_CATALOG_UNAVAILABLE: endpoint '{endpoint_name}' model catalog refresh failed and no cached list is available: {error}"
+                )))
             }
         }
-        Err(err) => {
-            // Endpoint may not implement /models (LMStudio, Ollama, private gateways).
-            // Log and return whatever custom models the user configured.
-            tracing::warn!(
-                "list_models: remote fetch failed for endpoint '{endpoint_name}': {err}"
-            );
+    }
+}
+#[cfg(test)]
+mod m286_tests {
+    use super::*;
+    fn model(id: &str, is_custom: bool) -> ModelInfo {
+        ModelInfo {
+            id: id.into(),
+            name: id.into(),
+            context_length: 0,
+            pricing: None,
+            supported_parameters: None,
+            is_custom,
         }
     }
 
-    Ok(merged)
+
+
+
+    #[test]
+    fn m286_stale_catalog_is_available_only_for_failed_refresh() {
+        let endpoint = "m286-stale-catalog";
+        MODELS_CACHE.lock().unwrap().insert(
+            endpoint.into(),
+            (
+                now_ms() - MODEL_CATALOG_TTL_MS - 1,
+                vec![model("gpt-6.1-terra", false)],
+            ),
+        );
+        assert!(cached_models(endpoint, false).is_none());
+        assert_eq!(cached_models(endpoint, true).unwrap()[0].id, "gpt-6.1-terra");
+    }
+
+    #[test]
+    fn m286_missing_catalog_keeps_refresh_failure_visible() {
+        let endpoint = "m286-no-catalog";
+        MODELS_CACHE.lock().unwrap().remove(endpoint);
+        assert!(cached_models(endpoint, true).is_none());
+        let message = format!(
+            "MODEL_CATALOG_UNAVAILABLE: endpoint '{endpoint}' model catalog refresh failed and no cached list is available"
+        );
+        assert!(message.contains("MODEL_CATALOG_UNAVAILABLE"));
+        assert!(message.contains(endpoint));
+    }
+
+    #[test]
+    fn m286_balanced_prefers_latest_terra_and_falls_back_explicitly() {
+        let catalog = vec![model("gpt-6.0-terra", false), model("gpt-6.1-terra", false), model("gpt-6.2-sol", false)];
+        assert_eq!(preferred_openai_model(&catalog, "terra"), Some(("gpt-6.1-terra".into(), false)));
+        let no_terra = vec![model("gpt-6.1-sol", false), model("gpt-6.2-sol", false)];
+        assert_eq!(preferred_openai_model(&no_terra, "terra"), Some(("gpt-6.2-sol".into(), true)));
+    }
+
+    #[test]
+    fn m286_missing_current_model_repairs_to_catalog_choice() {
+        let catalog = vec![model("gpt-6.1-terra", false), model("gpt-6.2-sol", false)];
+        let current = "gpt-5";
+        let repaired = if catalog.iter().any(|model| model.id == current) { (current.to_string(), false) } else { preferred_openai_model(&catalog, "terra").unwrap() };
+        assert_eq!(repaired, ("gpt-6.1-terra".into(), false));
+    }
 }

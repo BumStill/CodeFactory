@@ -1418,6 +1418,55 @@ pub fn spawn_objective_recovery_supervisor(app: AppHandle, pool: SqlitePool) {
             {
                 tracing::warn!(%error, "objective supervisor poll failed");
             }
+            // M287 R1/R2: the session-level lease is the cross-domain liveness
+            // invariant. Expiry is observed on every 5s supervisor pass, well
+            // inside the 60s maximum. Each violation is persisted before the
+            // related Objective is handed to the existing recovery ladder.
+            let liveness_now = chrono::Utc::now().timestamp_millis();
+            match crate::commands::liveness_store::run_supervision_cycle(&pool, liveness_now).await {
+                Ok(recoveries) => {
+                    crate::commands::liveness_store::record_supervision_success();
+                    for recovery in recoveries {
+                        let Some(objective_id) = recovery.objective_id.as_deref() else {
+                            let _ = crate::commands::liveness_store::resolve_event(
+                                &pool, &recovery.event_id, "no_recovery_path", "missing_objective", liveness_now,
+                            ).await;
+                            continue;
+                        };
+                        let resolution = match store.get(objective_id).await {
+                            Ok(Some(current)) if current.status == ObjectiveStatus::Active => {
+                                match DecisionRouter::route(
+                                    &current,
+                                    RouteSignal::TechnicalFailure {
+                                        domain: current.domain,
+                                        failure_code: "session_liveness_deadline_exceeded".into(),
+                                        failure_signature: format!("session_liveness_deadline_exceeded:{}", current.id),
+                                        next_observation_at: liveness_now + POLL_INTERVAL.as_millis() as i64,
+                                        resume_cursor: current.resume_cursor.clone().or_else(|| current.root_turn_id.clone()),
+                                    },
+                                ) {
+                                    Ok(decision) => match store.apply_decision(current.revision, decision.as_convergence()).await {
+                                        Ok(_) => ("recovered", "decision_applied"),
+                                        Err(error) if error.to_string().contains("revision conflict") => ("revision_conflict", "objective_revision_conflict"),
+                                        Err(_) => ("decision_rejected", "apply_decision_failed"),
+                                    },
+                                    Err(_) => ("no_recovery_path", "decision_route_rejected"),
+                                }
+                            }
+                            Ok(Some(_)) => ("no_recovery_path", "objective_not_active"),
+                            Ok(None) => ("no_recovery_path", "objective_missing"),
+                            Err(_) => ("decision_rejected", "objective_read_failed"),
+                        };
+                        let _ = crate::commands::liveness_store::resolve_event(
+                            &pool, &recovery.event_id, resolution.0, resolution.1, liveness_now,
+                        ).await;
+                    }
+                }
+                Err(error) => {
+                    crate::commands::liveness_store::record_supervision_failure(&error);
+                    tracing::warn!(%error, "session liveness supervision failed; health state records the continuing failure");
+                }
+            }
             // Everything above claims DUE REMEDIATIONS. An Objective that
             // stopped while `active` owns none, so no poll can ever see it —
             // that is precisely how a session becomes invisible rather than

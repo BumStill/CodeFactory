@@ -660,7 +660,7 @@ impl Persistence for SqlitePersistence {
         if self.anonymous {
             return Ok(false);
         }
-        let event = crate::commands::costs::UsageEventInput {
+        let mut event = crate::commands::costs::UsageEventInput {
             request_id: row.request_id,
             session_id: row.session_id.to_string(),
             task_id: row.task_id,
@@ -677,6 +677,24 @@ impl Persistence for SqlitePersistence {
             cost_source: row.cost_source,
             created_at: None,
         };
+        // M286 R5: For the OpenAI USD-billed API route, persist a price-table
+        // estimate into the usage row when the provider did not send an actual
+        // cost. This keeps the USD ledger, the dashboard and the per-request
+        // event in sync, and replaces the previous 'unknown' source.
+        if event.actual_cost_usd.is_none()
+            && crate::agent::openai_api::is_usd_endpoint(&event.endpoint)
+        {
+            let est = crate::agent::openai_api::estimate_cost_usd(
+                &event.model,
+                event.input_tokens,
+                event.cached_tokens,
+                event.output_tokens,
+            );
+            event.estimated_cost_usd = Some(est);
+            if event.cost_source == "unknown" {
+                event.cost_source = "model_price_estimate".into();
+            }
+        }
         let inserted = crate::commands::costs::record_usage_event(&self.db, event)
             .await
             .map_err(perr)?;

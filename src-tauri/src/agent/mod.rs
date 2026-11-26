@@ -166,7 +166,11 @@ enum PermissionResponse {
 enum StreamPoll<T> {
     Item(Option<T>),
     Cancelled,
+    TimedOut,
 }
+
+const MODEL_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
+const MODEL_CALL_TOTAL_TIMEOUT: Duration = Duration::from_secs(20 * 60);
 
 async fn wait_for_cancellation(cancel: Option<&Arc<AtomicBool>>) {
     loop {
@@ -184,10 +188,26 @@ async fn next_stream_item<S>(
 where
     S: Stream + Unpin,
 {
+    next_stream_item_with_timeout(stream, cancel, MODEL_STREAM_IDLE_TIMEOUT).await
+}
+
+async fn next_stream_item_with_timeout<S>(
+    stream: &mut S,
+    cancel: Option<&Arc<AtomicBool>>,
+    idle_timeout: Duration,
+) -> StreamPoll<S::Item>
+where
+    S: Stream + Unpin,
+{
     tokio::select! {
         item = stream.next() => StreamPoll::Item(item),
         _ = wait_for_cancellation(cancel), if cancel.is_some() => StreamPoll::Cancelled,
+        _ = tokio::time::sleep(idle_timeout) => StreamPoll::TimedOut,
     }
+}
+
+fn model_http_client_with_timeout(total_timeout: Duration) -> Client {
+    Client::builder().timeout(total_timeout).build().expect("build bounded model HTTP client")
 }
 
 async fn await_permission_response(
@@ -1000,7 +1020,7 @@ impl AgentLoop {
             api_style,
             route_state,
             cwd,
-            http: Client::new(),
+            http: model_http_client_with_timeout(MODEL_CALL_TOTAL_TIMEOUT),
             settings,
             pending_permissions,
             mcp_manager,
@@ -1088,7 +1108,7 @@ impl AgentLoop {
             api_style,
             route_state,
             cwd,
-            http: Client::new(),
+            http: model_http_client_with_timeout(MODEL_CALL_TOTAL_TIMEOUT),
             settings,
             pending_permissions,
             mcp_manager,
@@ -3673,6 +3693,41 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn m287_pending_stream_hits_the_idle_deadline() {
+        let mut stream = futures_util::stream::pending::<u8>();
+        assert!(matches!(
+            next_stream_item_with_timeout(&mut stream, None, Duration::from_millis(5)).await,
+            StreamPoll::TimedOut
+        ));
+    }
+
+    #[tokio::test]
+    async fn m287_model_http_client_has_a_total_deadline() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind hanging fixture");
+        let url = format!("http://{}", listener.local_addr().expect("fixture addr"));
+        let fixture = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept fixture request");
+            let mut request = [0_u8; 1024];
+            let _ = stream.read(&mut request);
+            std::thread::sleep(Duration::from_millis(100));
+            let _ = stream.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+            );
+        });
+
+        let error = model_http_client_with_timeout(Duration::from_millis(10))
+            .get(url)
+            .send()
+            .await
+            .expect_err("hanging model request must hit the total deadline");
+        assert!(error.is_timeout(), "expected reqwest timeout, got {error:#}");
+        fixture.join().expect("fixture thread");
+    }
+
     #[test]
     fn cancellation_selects_only_the_unstarted_tool_suffix() {
         let cancel = Arc::new(AtomicBool::new(true));
@@ -3861,14 +3916,12 @@ mod tests {
     fn chatgpt_responses_payload_contains_bytes_from_a_local_image_attachment() {
         let dir = tempfile::tempdir().unwrap();
         let image_path = dir.path().join("screen.png");
-        let png_bytes = [
-            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
-            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00,
-            0x00, 0x1F, 0x15, 0xC4, 0x89, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x44, 0x41, 0x54, 0x78,
-            0x9C, 0x63, 0x00, 0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00,
-            0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
-        ];
-        std::fs::write(&image_path, png_bytes).unwrap();
+        use image::{codecs::png::PngEncoder, ExtendedColorType, ImageEncoder};
+        let mut png_bytes = Vec::new();
+        PngEncoder::new(&mut png_bytes)
+            .write_image(&[0, 0, 0, 0], 1, 1, ExtendedColorType::Rgba8)
+            .unwrap();
+        std::fs::write(&image_path, &png_bytes).unwrap();
         let markdown = format!(
             "识别这张图：\n![screen](file://{})\n只回答图中内容",
             image_path.display()

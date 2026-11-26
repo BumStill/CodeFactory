@@ -148,6 +148,14 @@ pub struct Settings {
     /// Settings and via the chat header quick-control.
     #[serde(default)]
     pub reasoning_effort: ReasoningEffort,
+    /// M286/R2: configurable OpenAI model preference. Values are family/tier
+    /// preferences, never a pinned concrete model version.
+    #[serde(default = "default_openai_model_family")]
+    pub openai_model_family: String,
+    #[serde(default = "default_openai_model_tier")]
+    pub openai_model_tier: String,
+
+
     /// Max concurrent subagents for parallel task execution. The scheduler
     /// clamps this to 1..=8 at run time, so out-of-range persisted values
     /// never stall or overload a session.
@@ -686,9 +694,15 @@ mod git_remote_secret_tests {
     }
 }
 
-fn default_font_family() -> String {
-    "inter".into()
-}
+fn default_font_family() -> String { "inter".into() }
+
+fn default_openai_model_family() -> String { "terra".into() }
+
+fn default_openai_model_tier() -> String { "balanced".into() }
+
+
+
+
 
 fn default_mono_font_family() -> String {
     "jetbrains-mono".into()
@@ -872,6 +886,8 @@ impl Default for Settings {
             onboarded: false,
             reasoning_effort: ReasoningEffort::Medium,
             max_parallel_tasks: default_max_parallel_tasks(),
+            openai_model_family: default_openai_model_family(),
+            openai_model_tier: default_openai_model_tier(),
             subagent_isolation: SubagentIsolation::Shared,
             delivery_ceiling: DeliveryCeiling::ThroughRelease,
             im_webhook_url: String::new(),

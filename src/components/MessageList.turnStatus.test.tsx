@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { UIMessage } from "../stores/chatEvents";
@@ -56,7 +56,7 @@ describe("inline active-turn status", () => {
       }),
     ],
     [
-      "等待中",
+      "等待推进",
       assistant({
         toolCalls: [{ id: "tool", name: "bash", args: "{}", status: "waiting_permission" }],
       }),
@@ -103,7 +103,7 @@ describe("inline active-turn status", () => {
     );
 
     expect(screen.getByTestId("inline-turn-status")).toHaveTextContent(
-      "等待中 · 01:24",
+      "等待推进 · 01:24",
     );
   });
 
@@ -164,7 +164,7 @@ describe("inline active-turn status", () => {
     );
 
     expect(screen.getByTestId("inline-turn-status")).toHaveTextContent(
-      "等待中 · 01:24",
+      "等待推进 · 01:24",
     );
   });
 
@@ -195,7 +195,7 @@ describe("inline active-turn status", () => {
     );
 
     expect(screen.getByTestId("inline-turn-status")).toHaveTextContent(
-      "等待中 · 01:24",
+      "等待推进 · 01:24",
     );
   });
 
@@ -210,7 +210,7 @@ describe("inline active-turn status", () => {
     );
 
     expect(screen.getByTestId("inline-turn-status")).toHaveTextContent(
-      "等待中 · 00:00",
+      "等待推进 · 00:00",
     );
   });
 
@@ -495,27 +495,13 @@ describe("stuck session recovery", () => {
     },
   });
 
-  it("exports diagnostics and reports a refused reset instead of claiming success", async () => {
+  it("does not render recovery controls in message row", async () => {
     invokeMock.mockReset();
-    invokeMock
-      .mockResolvedValueOnce({ session_id: "s1", derived_state: { state: "running" }, cache_matches_facts: false })
-      .mockResolvedValueOnce({ reset: false, reason: "会话仍有活着的执行者，请先停止该回合再重置" });
 
     render(<MessageList messages={[stuck]} streaming={false} cwd={null} conversationKey="s1" />);
 
     expect(screen.getByTestId("thin-state")).toHaveTextContent("正在做");
-    fireEvent.click(screen.getByRole("button", { name: "会话诊断" }));
-    await waitFor(() =>
-      expect(invokeMock).toHaveBeenCalledWith("session_diagnostics", { sessionId: "s1" }),
-    );
-
-    fireEvent.click(screen.getByRole("button", { name: "重置会话状态" }));
-    await waitFor(() =>
-      expect(invokeMock).toHaveBeenCalledWith("reset_session_state", { sessionId: "s1" }),
-    );
-    expect(
-      await screen.findByText("会话仍有活着的执行者，请先停止该回合再重置"),
-    ).toBeInTheDocument();
-    expect(screen.queryByText(/已重置为/)).toBeNull();
+    expect(screen.queryByRole("button", { name: "会话诊断" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "重置会话状态" })).toBeNull();
   });
 });
