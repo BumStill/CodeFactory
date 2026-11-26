@@ -89,11 +89,11 @@ if exist "!BASE!.fail_list_once" if "%1 %2"=="pr list" if not exist "!BASE!.fail
 if "%1 %2"=="pr list" (
   echo %*>>"!L!"
   if "!HOLD!"=="true" (
-    echo [{"number":101,"url":"https://forge.invalid/pr/101","title":"fix: remote","body":"R table","state":"OPEN","headRefOid":"unused","isDraft":!DRAFT!,"labels":[{""name"":""merge-queue: hold""}]}]
+    echo [{"number":101,"url":"https://forge.invalid/pr/101","title":"fix: remote","body":"R table","state":"OPEN","headRefOid":"unused","isDraft":!DRAFT!,"labels":[{"name":"merge-queue: hold"}]}]
     exit /b 0
   )
   if "!ARMED!"=="true" (
-    echo [{"number":101,"url":"https://forge.invalid/pr/101","title":"fix: remote","body":"R table","state":"OPEN","headRefOid":"unused","isDraft":!DRAFT!,"labels":[{""name"":""merge-queue: armed""}]}]
+    echo [{"number":101,"url":"https://forge.invalid/pr/101","title":"fix: remote","body":"R table","state":"OPEN","headRefOid":"unused","isDraft":!DRAFT!,"labels":[{"name":"merge-queue: armed"}]}]
     exit /b 0
   )
   echo [{"number":101,"url":"https://forge.invalid/pr/101","title":"fix: remote","body":"R table","state":"OPEN","headRefOid":"unused","isDraft":!DRAFT!,"labels":[]}]
@@ -274,6 +274,14 @@ exit /b 3
         let l = fs::read_to_string(state.with_extension("log")).unwrap_or_default();
         assert!(!l.contains("--title") && !l.contains("--body"), "{l}");
     }
+    #[test]
+    fn windows_fake_gh_emits_valid_literal_label_json() {
+        let script = fake_gh_windows(std::path::Path::new("C:\\synthetic\\gh-state"));
+        assert!(script.contains(r#""labels":[{"name":"merge-queue: hold"}]"#));
+        assert!(script.contains(r#""labels":[{"name":"merge-queue: armed"}]"#));
+        assert!(!script.contains(r#""labels":[{""name"""#));
+    }
+
     #[tokio::test]
     async fn merge_hold_blocks_ready_arm_and_existing_pr_rewrite() {
         let (d, _b, db, state) = setup().await;
