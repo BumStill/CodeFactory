@@ -18,8 +18,13 @@ pub fn run() -> bool {
     ) {
         return false;
     }
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
+    let mut runtime_builder = tokio::runtime::Builder::new_multi_thread();
+    runtime_builder.enable_all();
+    // Windows' default worker-thread stack is too small for the formal
+    // cross-process smoke's deeply nested recovery future (0xc00000fd).
+    #[cfg(windows)]
+    runtime_builder.thread_stack_size(8 * 1024 * 1024);
+    let runtime = runtime_builder
         .build()
         .unwrap_or_else(|error| {
             eprintln!("Unattended long-task smoke could not start: {error}");
