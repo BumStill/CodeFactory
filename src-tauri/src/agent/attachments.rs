@@ -211,23 +211,17 @@ fn read_as_base64(path: &str) -> Option<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
 
     fn write_temp_png() -> String {
-        // 1×1 transparent PNG, the smallest valid file we can use.
-        let bytes: &[u8] = &[
-            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
-            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00,
-            0x00, 0x1F, 0x15, 0xC4, 0x89, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x44, 0x41, 0x54, 0x78,
-            0x9C, 0x63, 0x00, 0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00,
-            0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
-        ];
+        use image::{codecs::png::PngEncoder, ExtendedColorType, ImageEncoder};
         let path = std::env::temp_dir().join(format!(
             "codefactory-test-{}.png",
             uuid::Uuid::new_v4().simple()
         ));
-        let mut f = std::fs::File::create(&path).unwrap();
-        f.write_all(bytes).unwrap();
+        let file = std::fs::File::create(&path).unwrap();
+        PngEncoder::new(file)
+            .write_image(&[0, 0, 0, 0], 1, 1, ExtendedColorType::Rgba8)
+            .unwrap();
         path.to_string_lossy().to_string()
     }
 
