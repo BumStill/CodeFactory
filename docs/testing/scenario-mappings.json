@@ -66,6 +66,7 @@
     { "pattern": "src-tauri/src/agent/liveness_store.rs", "scenario_id": "HLT-001" },
     { "pattern": "src-tauri/src/commands/session_liveness.rs", "scenario_id": "HLT-001" },
     { "pattern": "src-tauri/src/commands/objective_health_m287.rs", "scenario_id": "HLT-001" },
-    { "pattern": "src-tauri/src/agent/anthropic_client.rs", "scenario_id": "HLT-001" }
+    { "pattern": "src-tauri/src/agent/anthropic_client.rs", "scenario_id": "HLT-001" },
+    { "pattern": "src/lib/waitingReason.ts", "scenario_id": "UI-008" }
   ]
 }
