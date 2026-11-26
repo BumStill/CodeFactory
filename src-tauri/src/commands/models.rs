@@ -66,6 +66,16 @@ fn natural_model_cmp(left: &str, right: &str) -> std::cmp::Ordering {
     numeric(left).cmp(&numeric(right)).then_with(|| left.cmp(right))
 }
 
+/// Reorder the OpenAI catalog so the preferred family pick comes first (R2).
+fn reorder_openai_default(models: &mut Vec<ModelInfo>, family: &str) {
+    if let Some((pick, _)) = preferred_openai_model(models, family) {
+        if let Some(pos) = models.iter().position(|m| m.id == pick) {
+            let model = models.remove(pos);
+            models.insert(0, model);
+        }
+    }
+}
+
 
 
 
@@ -124,12 +134,20 @@ pub async fn list_models(
     match client.list_models().await {
         Ok(remote) => {
             cache_put(&endpoint_name, remote.clone());
-            Ok(merge_models(merged, remote))
+            let mut merged = merge_models(merged, remote);
+            if endpoint_name == "openai" {
+                reorder_openai_default(&mut merged, &settings.openai_model_family);
+            }
+            Ok(merged)
         }
         Err(error) => {
             if let Some(cached) = cached_models(&endpoint_name, true) {
                 tracing::warn!("list_models: remote refresh failed for endpoint '{endpoint_name}', serving last successful catalog: {error}");
-                Ok(merge_models(merged, cached))
+                let mut merged = merge_models(merged, cached);
+                if endpoint_name == "openai" {
+                    reorder_openai_default(&mut merged, &settings.openai_model_family);
+                }
+                Ok(merged)
             } else {
                 Err(AppError::Other(format!(
                     "MODEL_CATALOG_UNAVAILABLE: endpoint '{endpoint_name}' model catalog refresh failed and no cached list is available: {error}"
