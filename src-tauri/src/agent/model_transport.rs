@@ -2113,15 +2113,20 @@ impl ModelTransport for DesktopModelTransport {
                 Ok(anthropic_response_to_model_response(resp))
             }
             _ => {
-                let (text, tool_calls, usage, reasoning) = self
-                    .call_openai_transport(
+                // Box the entire OpenAI transport future, not only its
+                // Responses child branch. On Windows the formal unattended
+                // worker runs this async-trait method from a 1 MiB main thread;
+                // the unboxed transport enum overflowed before fault injection.
+                let (text, tool_calls, usage, reasoning) = Box::pin(
+                    self.call_openai_transport(
                         messages,
                         tools,
                         opts.require_tool,
                         &opts.reasoning_effort,
-                    )
-                    .await
-                    .map_err(|e| classify_transport_error(e.to_string()))?;
+                    ),
+                )
+                .await
+                .map_err(|e| classify_transport_error(e.to_string()))?;
                 Ok(ModelResponse {
                     text,
                     tool_calls,
