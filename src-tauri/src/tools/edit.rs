@@ -97,17 +97,25 @@ pub(crate) fn plan_from_args(args: &Value) -> std::result::Result<EditPlan, Stri
         )
     })?;
 
-    match (a.edits, a.old_string, a.new_string) {
-        (Some(edits), None, None) if !edits.is_empty() => Ok(EditPlan { ops: edits, batch: true }),
-        (Some(edits), None, None) => {
-            let _ = edits;
-            Err("Invalid arguments for edit_file: `edits` is empty — list at least one \
-{old_string, new_string} entry, or use write_file to rewrite the whole file."
-                .into())
-        }
-        (Some(_), _, _) => Err("Invalid arguments for edit_file: send either `edits` (batch) \
-or `old_string`/`new_string` (single) — not both."
-            .into()),
+    // Some strict-schema clients and models populate every declared property.
+    // Treat only the unused mode's canonical empty placeholders as absent:
+    // an empty batch never selects batch mode, while empty single strings are
+    // placeholders only beside a real batch. In single mode, new_string=""
+    // remains a legitimate deletion.
+    let effective_edits = a.edits.filter(|edits| !edits.is_empty());
+    let (effective_old, effective_new) = if effective_edits.is_some()
+        && a.old_string.as_deref() == Some("")
+        && a.new_string.as_deref() == Some("")
+    {
+        (None, None)
+    } else {
+        (a.old_string, a.new_string)
+    };
+
+    match (effective_edits, effective_old, effective_new) {
+        (Some(edits), None, None) => Ok(EditPlan { ops: edits, batch: true }),
+        (Some(_), Some(_), Some(_)) => Err("Invalid arguments for edit_file: received effective fields: `edits`, `old_string`, `new_string`; send exactly one mode. Single: {\"path\":\"file\",\"old_string\":\"before\",\"new_string\":\"after\"}. Batch: {\"path\":\"file\",\"edits\":[{\"old_string\":\"before\",\"new_string\":\"after\"}]}".into()),
+        (Some(_), _, _) => Err("Invalid arguments for edit_file: a non-empty `edits` batch cannot be combined with a partial single edit. Send only {\"path\":\"file\",\"edits\":[{\"old_string\":\"before\",\"new_string\":\"after\"}]}".into()),
         (None, Some(old_string), Some(new_string)) => Ok(EditPlan {
             ops: vec![EditOp {
                 old_string,
@@ -121,8 +129,7 @@ or `old_string`/`new_string` (single) — not both."
 together (or send `edits` for several changes)."
                 .into(),
         ),
-        (None, None, None) => Err("Invalid arguments for edit_file: missing `old_string` and \
-`new_string` (or send `edits` for several changes)."
+        (None, None, None) => Err("Invalid arguments for edit_file: missing effective edit arguments; send non-empty `edits`, or send `old_string` and `new_string`."
             .into()),
     }
 }
@@ -277,6 +284,20 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("codefactory-edit-test-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&dir).expect("create temp dir");
         dir
+    }
+
+    #[test]
+    fn m288_edit_file_schema_keeps_mode_fields_optional() {
+        let schema = definition().function.parameters;
+        assert_eq!(schema["required"], json!(["path"]));
+        for optional in ["edits", "old_string", "new_string", "replace_all"] {
+            assert!(
+                !schema["required"].as_array().expect("required array").iter()
+                    .any(|field| field == optional),
+                "{optional} must remain optional: {schema}"
+            );
+        }
+        assert!(schema.get("oneOf").is_none(), "oneOf would reject tolerated placeholders");
     }
 
     #[tokio::test]
@@ -435,6 +456,134 @@ mod tests {
 
         assert!(output.is_error, "{}", output.content);
         assert_eq!(content, seeded);
+    }
+
+    // M288 R1: production single-edit payload with an unused empty batch.
+    #[tokio::test]
+    async fn edit_file_single_mode_ignores_empty_batch_placeholder() {
+        let cwd = temp_dir();
+        let file_path = cwd.join("app.rs");
+        std::fs::write(&file_path, "pub mod journal;\npub mod tools;\n").expect("seed file");
+
+        let output = execute(
+            json!({
+                "path": "app.rs",
+                "old_string": "pub mod journal;\n",
+                "new_string": "pub mod journal;\npub mod recovery;\n",
+                "replace_all": false,
+                "edits": []
+            }),
+            &ExecCtx::new(cwd.clone(), None),
+        ).await.expect("tool returns output");
+
+        let content = std::fs::read_to_string(&file_path).expect("read file");
+        let _ = std::fs::remove_dir_all(cwd);
+        assert!(!output.is_error, "{}", output.content);
+        assert_eq!(content, "pub mod journal;\npub mod recovery;\npub mod tools;\n");
+    }
+
+    // M288 R1: inverse production payload with empty single placeholders.
+    #[tokio::test]
+    async fn edit_file_batch_mode_ignores_empty_single_placeholders() {
+        let cwd = temp_dir();
+        let file_path = cwd.join("app.rs");
+        std::fs::write(&file_path, "alpha\nbeta\n").expect("seed file");
+
+        let output = execute(
+            json!({
+                "path": "app.rs",
+                "edits": [
+                    { "old_string": "alpha", "new_string": "ALPHA", "replace_all": false },
+                    { "old_string": "beta", "new_string": "BETA", "replace_all": false }
+                ],
+                "old_string": "",
+                "new_string": "",
+                "replace_all": false
+            }),
+            &ExecCtx::new(cwd.clone(), None),
+        ).await.expect("tool returns output");
+
+        let content = std::fs::read_to_string(&file_path).expect("read file");
+        let _ = std::fs::remove_dir_all(cwd);
+        assert!(!output.is_error, "{}", output.content);
+        assert_eq!(content, "ALPHA\nBETA\n");
+        assert!(output.content.contains("Applied 2 changes"));
+    }
+
+    // M288 R1: empty new_string remains a legitimate single-mode deletion.
+    #[tokio::test]
+    async fn edit_file_single_mode_keeps_empty_new_string_as_deletion() {
+        let cwd = temp_dir();
+        let file_path = cwd.join("app.rs");
+        std::fs::write(&file_path, "keep\ndelete me\nkeep too\n").expect("seed file");
+
+        let output = execute(
+            json!({
+                "path": "app.rs",
+                "old_string": "delete me\n",
+                "new_string": "",
+                "edits": []
+            }),
+            &ExecCtx::new(cwd.clone(), None),
+        ).await.expect("tool returns output");
+
+        let content = std::fs::read_to_string(&file_path).expect("read file");
+        let _ = std::fs::remove_dir_all(cwd);
+        assert!(!output.is_error, "{}", output.content);
+        assert_eq!(content, "keep\nkeep too\n");
+    }
+
+    // M288 R2: genuine mixed modes remain invalid and get copyable repairs.
+    #[tokio::test]
+    async fn edit_file_mixed_effective_modes_reports_fields_and_repair_shapes() {
+        let cwd = temp_dir();
+        let file_path = cwd.join("app.rs");
+        let seeded = "alpha\n";
+        std::fs::write(&file_path, seeded).expect("seed file");
+
+        let output = execute(
+            json!({
+                "path": "app.rs",
+                "old_string": "alpha",
+                "new_string": "ALPHA",
+                "edits": [{ "old_string": "alpha", "new_string": "ALPHA" }]
+            }),
+            &ExecCtx::new(cwd.clone(), None),
+        ).await.expect("tool returns output");
+
+        let content = std::fs::read_to_string(&file_path).expect("read file");
+        let _ = std::fs::remove_dir_all(cwd);
+        assert!(output.is_error, "{}", output.content);
+        assert!(
+            output.content.contains("received effective fields: `edits`, `old_string`, `new_string`"),
+            "{}", output.content
+        );
+        assert!(
+            output.content.contains(r#"{"path":"file","old_string":"before","new_string":"after"}"#),
+            "{}", output.content
+        );
+        assert!(
+            output.content.contains(r#"{"path":"file","edits":[{"old_string":"before","new_string":"after"}]}"#),
+            "{}", output.content
+        );
+        assert_eq!(content, seeded);
+    }
+
+    // M288 R2: an empty batch alone means no effective edit was supplied.
+    #[tokio::test]
+    async fn edit_file_empty_batch_without_single_args_reports_missing_effective_edit() {
+        let cwd = temp_dir();
+        let file_path = cwd.join("app.rs");
+        std::fs::write(&file_path, "alpha\n").expect("seed file");
+
+        let output = execute(
+            json!({"path": "app.rs", "edits": []}),
+            &ExecCtx::new(cwd.clone(), None),
+        ).await.expect("tool returns output");
+        let _ = std::fs::remove_dir_all(cwd);
+
+        assert!(output.is_error, "{}", output.content);
+        assert!(output.content.contains("missing effective edit arguments"), "{}", output.content);
     }
 
     #[tokio::test]
