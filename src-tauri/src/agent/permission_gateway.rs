@@ -3067,7 +3067,7 @@ mod tests {
     #[tokio::test]
     async fn m290_trusted_gateway_denies_real_incident_commands_without_prompt() {
         for command in [
-            r#"gh issue edit 1084 --remove-label \"merge-queue: hold\""#,
+            r#"gh issue edit 1084 --remove-label "merge-queue: hold""#,
             "gh api -X DELETE repos/BumStill/CodeFactory/issues/1090/labels/merge-queue%3A%20hold",
         ] {
             let gateway = test_gateway("trusted").await;

@@ -57,9 +57,10 @@ BASE="{s}"; A="$BASE.armed"; D="$BASE.draft"; H="$BASE.hold"; L="$BASE.log"
 ARMED=$(cat "$A"); DRAFT=$(cat "$D"); HOLD=$(cat "$H")
 if [ -f "$BASE.fail_list_once" ] && [ "$1 $2" = "pr list" ] && [ ! -f "$BASE.failed_once" ]; then touch "$BASE.failed_once"; exit 2; fi
 case "$1 $2" in
- "pr list") LABELS='[]'; [ "$ARMED" = true ] && LABELS='[{{"name":"merge-queue: armed"}}]'; [ "$HOLD" = true ] && LABELS='[{{"name":"merge-queue: hold"}}]'; echo "[{{\"number\":101,\"url\":\"https://forge.invalid/pr/101\",\"title\":\"fix: remote\",\"body\":\"R | 是否完成 | 证据\",\"state\":\"OPEN\",\"headRefOid\":\"unused\",\"isDraft\":$DRAFT,\"labels\":$LABELS}}]";;
- "pr view") if echo "$@" | grep -q labels; then [ "$ARMED" = true ] && LABELS='[{{"name":"merge-queue: armed"}}]' || LABELS='[]'; echo "{{\"labels\":$LABELS}}"; elif echo "$@" | grep -q number,url; then echo '{{"number":101,"url":"https://forge.invalid/pr/101"}}'; else echo '{{"state":"OPEN","statusCheckRollup":[{{"status":"IN_PROGRESS"}}]}}'; fi;;
+ "pr list") echo "$@" >> "$L"; LABELS='[]'; [ "$ARMED" = true ] && LABELS='[{{"name":"merge-queue: armed"}}]'; [ "$HOLD" = true ] && LABELS='[{{"name":"merge-queue: hold"}}]'; echo "[{{\"number\":101,\"url\":\"https://forge.invalid/pr/101\",\"title\":\"fix: remote\",\"body\":\"R | 是否完成 | 证据\",\"state\":\"OPEN\",\"headRefOid\":\"unused\",\"isDraft\":$DRAFT,\"labels\":$LABELS}}]";;
+ "pr view") echo "$@" >> "$L"; if echo "$@" | grep -q labels; then [ "$ARMED" = true ] && LABELS='[{{"name":"merge-queue: armed"}}]' || LABELS='[]'; echo "{{\"labels\":$LABELS}}"; elif echo "$@" | grep -q number,url; then echo '{{"number":101,"url":"https://forge.invalid/pr/101"}}'; else echo '{{"state":"OPEN","statusCheckRollup":[{{"status":"IN_PROGRESS"}}]}}'; fi;;
  "pr edit") echo "$@" >> "$L"; echo "$@" | grep -q -- --add-label && echo true > "$A" || :;;
+ "pr ready") echo "$@" >> "$L";;
  "pr create") echo "$@" >> "$L";;
  "workflow run") echo "$@" >> "$L";;
  *) echo "unexpected $*" >&2; exit 3;;
@@ -86,6 +87,7 @@ set /p DRAFT=<"!D!"
 set /p HOLD=<"!H!"
 if exist "!BASE!.fail_list_once" if "%1 %2"=="pr list" if not exist "!BASE!.failed_once" (type nul>"!BASE!.failed_once" & exit /b 2)
 if "%1 %2"=="pr list" (
+  echo %*>>"!L!"
   set "LABELS=[]"
   if "!ARMED!"=="true" set "LABELS=[{""name"":""merge-queue: armed""}]"
   if "!HOLD!"=="true" set "LABELS=[{""name"":""merge-queue: hold""}]"
@@ -93,6 +95,7 @@ if "%1 %2"=="pr list" (
   exit /b 0
 )
 if "%1 %2"=="pr view" (
+  echo %*>>"!L!"
   echo %*| findstr /C:"labels" >nul && (set "LABELS=[]" & if "!ARMED!"=="true" set "LABELS=[{""name"":""merge-queue: armed""}]" & echo {"labels":!LABELS!} & exit /b 0)
   echo %*| findstr /C:"number,url" >nul && (echo {"number":101,"url":"https://forge.invalid/pr/101"} & exit /b 0)
   echo {"state":"OPEN","statusCheckRollup":[{"status":"IN_PROGRESS"}]}
@@ -103,6 +106,7 @@ if "%1 %2"=="pr edit" (
   echo %*| findstr /C:"--add-label" >nul && echo true>"!A!"
   exit /b 0
 )
+if "%1 %2"=="pr ready" (echo %*>>"!L!" & exit /b 0)
 if "%1 %2"=="pr create" (echo %*>>"!L!" & exit /b 0)
 if "%1 %2"=="workflow run" (echo %*>>"!L!" & exit /b 0)
 exit /b 3
@@ -279,7 +283,10 @@ exit /b 3
         assert!(output.is_error, "{}", output.content);
         assert!(output.content.contains("合并阻断由人工/编排方解除"), "{}", output.content);
         let log = fs::read_to_string(state.with_extension("log")).unwrap_or_default();
-        assert!(!log.contains("--add-label") && !log.contains("--title") && !log.contains("--body") && !log.contains("pr ready"), "{log}");
+        assert!(log.contains("pr list"), "the real existing-PR probe must run: {log}");
+        assert!(!log.lines().any(|line| line.starts_with("pr ready")), "hold must block ready: {log}");
+        assert!(!log.contains("--add-label"), "hold must block armed: {log}");
+        assert!(!log.contains("--title") && !log.contains("--body"), "hold must preserve title/body: {log}");
     }
 
     #[tokio::test]
