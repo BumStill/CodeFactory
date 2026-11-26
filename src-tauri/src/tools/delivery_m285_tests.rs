@@ -42,6 +42,42 @@ case "$1 $2" in
 esac
 "#, s=state.display()) }
 
+    fn fake_gh_windows(state_path: &std::path::Path) -> String {
+        let base = state_path.display().to_string().replace('\\', "\\\\");
+        format!(r#"@echo off
+setlocal EnableDelayedExpansion
+set "BASE={base}"
+set "A=!BASE!.armed"
+set "D=!BASE!.draft"
+set "L=!BASE!.log"
+if not exist "!A!" echo false>"!A!"
+if not exist "!D!" echo false>"!D!"
+set /p ARMED=<"!A!"
+set /p DRAFT=<"!D!"
+if exist "!BASE!.fail_list_once" if "%1 %2"=="pr list" if not exist "!BASE!.failed_once" (type nul>"!BASE!.failed_once" & exit /b 2)
+if "%1 %2"=="pr list" (
+  set "LABELS=[]"
+  if "!ARMED!"=="true" set "LABELS=[{{\"name\":\"merge-queue: armed\"}}]"
+  echo [{{\"number\":101,\"url\":\"https://forge.invalid/pr/101\",\"title\":\"fix: remote\",\"body\":\"R table\",\"state\":\"OPEN\",\"headRefOid\":\"unused\",\"isDraft\":!DRAFT!,\"labels\":!LABELS!}}]
+  exit /b 0
+)
+if "%1 %2"=="pr view" (
+  echo %*| findstr /C:"labels" >nul && (set "LABELS=[]" & if "!ARMED!"=="true" set "LABELS=[{{\"name\":\"merge-queue: armed\"}}]" & echo {{\"labels\":!LABELS!}} & exit /b 0)
+  echo %*| findstr /C:"number,url" >nul && (echo {{\"number\":101,\"url\":\"https://forge.invalid/pr/101\"}} & exit /b 0)
+  echo {{\"state\":\"OPEN\",\"statusCheckRollup\":[{{\"status\":\"IN_PROGRESS\"}}]}}
+  exit /b 0
+)
+if "%1 %2"=="pr edit" (
+  echo %*>>"!L!"
+  echo %*| findstr /C:"--add-label" >nul && echo true>"!A!"
+  exit /b 0
+)
+if "%1 %2"=="pr create" (echo %*>>"!L!" & exit /b 0)
+if "%1 %2"=="workflow run" (echo %*>>"!L!" & exit /b 0)
+exit /b 3
+"#)
+    }
+
     async fn setup() -> (tempfile::TempDir, tempfile::TempDir, sqlx::SqlitePool, std::path::PathBuf) {
         let dir=tempfile::tempdir().unwrap(); let bare=tempfile::tempdir().unwrap();
         let git = |cwd: &std::path::Path, args: &[&str]| crate::agent::delivery::git(cwd,args).unwrap();
@@ -49,7 +85,11 @@ esac
         fs::write(dir.path().join("README.md"),"x").unwrap(); for a in [vec!["add","."],vec!["commit","-m","init"]] { git(dir.path(), &a); }
         git(bare.path(), &["init","--bare"]); git(dir.path(), &["remote","add","origin",bare.path().to_str().unwrap()]);
         let head=git(dir.path(), &["rev-parse","HEAD"]); git(dir.path(), &["update-ref","refs/remotes/origin/main",head.trim()]); git(dir.path(), &["checkout","-b","feature"]); fs::write(dir.path().join("file.txt"),"changed").unwrap();
-        let state=dir.path().join("gh-state"); let gh=dir.path().join("gh"); fs::write(&gh,fake_gh(&state)).unwrap(); #[cfg(unix)] { let mut p=fs::metadata(&gh).unwrap().permissions(); p.set_mode(0o755); fs::set_permissions(&gh,p).unwrap(); } crate::agent::delivery::register_test_gh(dir.path(), gh);
+        let state=dir.path().join("gh-state");
+        let gh=if cfg!(windows) { dir.path().join("gh.cmd") } else { dir.path().join("gh") };
+        fs::write(&gh,if cfg!(windows) { fake_gh_windows(&state) } else { fake_gh(&state) }).unwrap();
+        #[cfg(unix)] { let mut p=fs::metadata(&gh).unwrap().permissions(); p.set_mode(0o755); fs::set_permissions(&gh,p).unwrap(); }
+        crate::agent::delivery::register_test_gh(dir.path(), gh);
         let db=sqlx::sqlite::SqlitePoolOptions::new().max_connections(1).connect("sqlite::memory:").await.unwrap();
         sqlx::query("CREATE TABLE sessions(id TEXT PRIMARY KEY,delivery_authorized INTEGER NOT NULL,release_urgency TEXT NOT NULL,delivery_mode TEXT NOT NULL)").execute(&db).await.unwrap(); sqlx::query("INSERT INTO sessions VALUES('s',1,'default','thin')").execute(&db).await.unwrap();
         sqlx::query("CREATE TABLE thin_delivery_refs(session_id TEXT PRIMARY KEY,branch TEXT,pr_number INTEGER,ceiling TEXT)").execute(&db).await.unwrap();

@@ -1811,6 +1811,13 @@ pub(crate) fn dev_command_in(program: &str, cwd: &Path) -> Command {
     #[cfg(test)]
     if program == "gh" {
         if let Some(binary) = test_gh_commands().lock().unwrap().get(cwd).cloned() {
+            #[cfg(windows)]
+            if binary.extension().and_then(|value| value.to_str()).is_some_and(|value| value.eq_ignore_ascii_case("cmd")) {
+                let mut command = Command::new("cmd.exe").no_window();
+                command.arg("/C").arg(binary);
+                command_env::apply_developer_path_std(&mut command);
+                return command;
+            }
             let mut command = Command::new(binary).no_window();
             command_env::apply_developer_path_std(&mut command);
             return command;
