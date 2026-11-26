@@ -5241,22 +5241,9 @@ fn precheck_thin_pr_body(
         if with_title {
             environment.arg("--title").arg(title).arg("--ci");
         }
-        match bounded_delivery_output(&mut environment) {
-            Ok(_) => {}
-            Err(detail) => {
-                let lower = detail.to_ascii_lowercase();
-                // Infrastructure timeouts are treated as validator unavailability: do not block thin delivery.
-                if detail.contains(DELIVERY_TIMEOUT_MARKER)
-                    || lower.contains("timeout")
-                    || lower.contains("timed out")
-                {
-                    continue;
-                }
-                return Err(format!(
-                    "PR 正文未通过 {label} 的 CI 校验，未推送任何提交：{detail}"
-                ));
-            }
-        }
+        bounded_delivery_output(&mut environment).map_err(|detail| {
+            format!("PR 正文未通过 {label} 的 CI 校验，未推送任何提交：{detail}")
+        })?;
     }
     Ok(())
 }
