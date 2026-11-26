@@ -44,9 +44,9 @@ esac
 
     fn fake_gh_windows(state_path: &std::path::Path) -> String {
         let base = state_path.display().to_string().replace('\\', "\\\\");
-        format!(r#"@echo off
+        let script = r#"@echo off
 setlocal EnableDelayedExpansion
-set "BASE={base}"
+set "BASE=__BASE__"
 set "A=!BASE!.armed"
 set "D=!BASE!.draft"
 set "L=!BASE!.log"
@@ -75,7 +75,7 @@ if "%1 %2"=="pr edit" (
 if "%1 %2"=="pr create" (echo %*>>"!L!" & exit /b 0)
 if "%1 %2"=="workflow run" (echo %*>>"!L!" & exit /b 0)
 exit /b 3
-"#)
+"#.replace("__BASE__", &base)
     }
 
     async fn setup() -> (tempfile::TempDir, tempfile::TempDir, sqlx::SqlitePool, std::path::PathBuf) {
