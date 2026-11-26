@@ -52,12 +52,12 @@ mod integration {
         format!(
             r#"#!/bin/sh
 set -eu
-BASE="{s}"; A="$BASE.armed"; D="$BASE.draft"; L="$BASE.log"
-[ -f "$A" ] || echo false > "$A"; [ -f "$D" ] || echo false > "$D"
-ARMED=$(cat "$A"); DRAFT=$(cat "$D")
+BASE="{s}"; A="$BASE.armed"; D="$BASE.draft"; H="$BASE.hold"; L="$BASE.log"
+[ -f "$A" ] || echo false > "$A"; [ -f "$D" ] || echo false > "$D"; [ -f "$H" ] || echo false > "$H"
+ARMED=$(cat "$A"); DRAFT=$(cat "$D"); HOLD=$(cat "$H")
 if [ -f "$BASE.fail_list_once" ] && [ "$1 $2" = "pr list" ] && [ ! -f "$BASE.failed_once" ]; then touch "$BASE.failed_once"; exit 2; fi
 case "$1 $2" in
- "pr list") [ "$ARMED" = true ] && LABELS='[{{"name":"merge-queue: armed"}}]' || LABELS='[]'; echo "[{{\"number\":101,\"url\":\"https://forge.invalid/pr/101\",\"title\":\"fix: remote\",\"body\":\"R | 是否完成 | 证据\",\"state\":\"OPEN\",\"headRefOid\":\"unused\",\"isDraft\":$DRAFT,\"labels\":$LABELS}}]";;
+ "pr list") LABELS='[]'; [ "$ARMED" = true ] && LABELS='[{{"name":"merge-queue: armed"}}]'; [ "$HOLD" = true ] && LABELS='[{{"name":"merge-queue: hold"}}]'; echo "[{{\"number\":101,\"url\":\"https://forge.invalid/pr/101\",\"title\":\"fix: remote\",\"body\":\"R | 是否完成 | 证据\",\"state\":\"OPEN\",\"headRefOid\":\"unused\",\"isDraft\":$DRAFT,\"labels\":$LABELS}}]";;
  "pr view") if echo "$@" | grep -q labels; then [ "$ARMED" = true ] && LABELS='[{{"name":"merge-queue: armed"}}]' || LABELS='[]'; echo "{{\"labels\":$LABELS}}"; elif echo "$@" | grep -q number,url; then echo '{{"number":101,"url":"https://forge.invalid/pr/101"}}'; else echo '{{"state":"OPEN","statusCheckRollup":[{{"status":"IN_PROGRESS"}}]}}'; fi;;
  "pr edit") echo "$@" >> "$L"; echo "$@" | grep -q -- --add-label && echo true > "$A" || :;;
  "pr create") echo "$@" >> "$L";;
@@ -76,15 +76,19 @@ setlocal EnableDelayedExpansion
 set "BASE=__BASE__"
 set "A=!BASE!.armed"
 set "D=!BASE!.draft"
+set "H=!BASE!.hold"
 set "L=!BASE!.log"
 if not exist "!A!" echo false>"!A!"
 if not exist "!D!" echo false>"!D!"
+if not exist "!H!" echo false>"!H!"
 set /p ARMED=<"!A!"
 set /p DRAFT=<"!D!"
+set /p HOLD=<"!H!"
 if exist "!BASE!.fail_list_once" if "%1 %2"=="pr list" if not exist "!BASE!.failed_once" (type nul>"!BASE!.failed_once" & exit /b 2)
 if "%1 %2"=="pr list" (
   set "LABELS=[]"
   if "!ARMED!"=="true" set "LABELS=[{""name"":""merge-queue: armed""}]"
+  if "!HOLD!"=="true" set "LABELS=[{""name"":""merge-queue: hold""}]"
   echo [{"number":101,"url":"https://forge.invalid/pr/101","title":"fix: remote","body":"R table","state":"OPEN","headRefOid":"unused","isDraft":!DRAFT!,"labels":!LABELS!}]
   exit /b 0
 )
@@ -261,6 +265,23 @@ exit /b 3
         let l = fs::read_to_string(state.with_extension("log")).unwrap_or_default();
         assert!(!l.contains("--title") && !l.contains("--body"), "{l}");
     }
+    #[tokio::test]
+    async fn merge_hold_blocks_ready_arm_and_existing_pr_rewrite() {
+        let (d, _b, db, state) = setup().await;
+        fs::write(state.with_extension("hold"), "true").unwrap();
+        let output = crate::tools::dispatch(
+            "deliver_changes",
+            json!({"title":"fix: must stay remote","body":"must stay remote","ceiling":"through_merge","update_pr_body":"replace"}),
+            &context(d.path(), db),
+        )
+        .await
+        .unwrap();
+        assert!(output.is_error, "{}", output.content);
+        assert!(output.content.contains("合并阻断由人工/编排方解除"), "{}", output.content);
+        let log = fs::read_to_string(state.with_extension("log")).unwrap_or_default();
+        assert!(!log.contains("--add-label") && !log.contains("--title") && !log.contains("--body") && !log.contains("pr ready"), "{log}");
+    }
+
     #[tokio::test]
     async fn authorized_not_revoked_arms_normally() {
         let (d, _b, db, state) = setup().await;

@@ -39,6 +39,18 @@ async fn guarded_args(args: &Value, ctx: &ExecCtx, ceiling: DeliveryCeiling) -> 
     let is_armed = pr["labels"].as_array().is_some_and(|labels| {
         labels.iter().any(|label| label["name"] == "merge-queue: armed")
     });
+    let has_merge_block = pr["labels"].as_array().is_some_and(|labels| {
+        labels.iter().any(|label| {
+            label["name"].as_str().is_some_and(|name| {
+                name == "merge-queue: hold" || name.starts_with("merge-queue: blocked")
+            })
+        })
+    });
+    if has_merge_block {
+        return Err(crate::errors::AppError::ToolArgument(
+            "PR 带有 merge-queue: hold / merge-queue: blocked*；未转 ready、未打 armed、未改写标题或正文。合并阻断由人工/编排方解除。".into(),
+        ));
+    }
     let (prior_ceiling, newly_authorized) = if let (Some(db), Some(session)) = (&ctx.db, &ctx.session_id) {
         let prior = sqlx::query_scalar::<_, String>("SELECT ceiling FROM thin_delivery_refs WHERE session_id=?")
             .bind(session)

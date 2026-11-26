@@ -46,6 +46,16 @@ pub fn classify_command(command: &str) -> ShellCommandPolicy {
     // (`bash -c "…"`, `python -c "…"`) are code and stay in the judged text.
     let judged = shell_judged_text(&normalized);
 
+    if let Some(reason) = merge_block_removal_denial(&normalized) {
+        return deny(reason);
+    }
+
+    if is_unproved_gh_api_write(&normalized) {
+        return ask(
+            "GitHub API write cannot prove that protected merge-block labels are untouched",
+        );
+    }
+
     if is_direct_playwright_command(&normalized) {
         return deny("direct Playwright CLI is not allowed; use the native browser_session tool so CodeFactory can own and clean up the browser process");
     }
@@ -313,6 +323,74 @@ fn normalize(command: &str) -> String {
     command.to_lowercase().replace('`', "")
 }
 
+const MERGE_BLOCK_DENIAL: &str =
+    "禁止移除 merge-queue: hold / merge-queue: blocked*；合并阻断由人工/编排方解除。";
+
+fn merge_block_removal_denial(command: &str) -> Option<&'static str> {
+    let expanded = expand_common_shell_variables(command);
+    let decoded = expanded
+        .replace("%3a", ":")
+        .replace("%20", " ")
+        .replace("\\\"", "\"")
+        .replace("\\'", "'");
+    let semantic = decoded.replace(['\"', '\''], "");
+    let protected =
+        semantic.contains("merge-queue: hold") || semantic.contains("merge-queue: blocked");
+    if !protected {
+        return None;
+    }
+    let removes_label = semantic.contains("--remove-label")
+        || ((semantic.contains("gh api ") || semantic.contains("gh api graphql"))
+            && (semantic.contains("-x delete")
+                || semantic.contains("--method delete")
+                || semantic.contains("removelabelsfromlabelable")));
+    removes_label.then_some(MERGE_BLOCK_DENIAL)
+}
+
+fn expand_common_shell_variables(command: &str) -> String {
+    let mut expanded = command.to_string();
+    for segment in command.split([';', '\n']) {
+        let assignment = segment.trim();
+        let Some((name, raw_value)) = assignment.split_once('=') else {
+            continue;
+        };
+        let name = name.trim().trim_start_matches("export ");
+        if name.is_empty()
+            || !name
+                .chars()
+                .all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+        {
+            continue;
+        }
+        let value = raw_value.trim().trim_matches(|ch| ch == '\'' || ch == '"');
+        expanded = expanded
+            .replace(&format!("${{{name}}}"), value)
+            .replace(&format!("${name}"), value);
+    }
+    expanded
+}
+
+fn is_unproved_gh_api_write(command: &str) -> bool {
+    if !command.contains("gh api ") {
+        return false;
+    }
+    let expanded = expand_common_shell_variables(command).replace(['\"', '\''], "");
+    let explicit_write = [
+        "-x post",
+        "-x put",
+        "-x patch",
+        "-x delete",
+        "--method post",
+        "--method put",
+        "--method patch",
+        "--method delete",
+    ]
+    .iter()
+    .any(|method| expanded.contains(method));
+    let graphql_mutation = expanded.contains("gh api graphql") && expanded.contains("mutation");
+    explicit_write || graphql_mutation
+}
+
 /// M266 R2: the text the destructive-phrase scans may judge. Quoted spans are
 /// replaced by a placeholder because a shell never runs a quoted string — unless
 /// the span is the inline payload of an interpreter, which is code and is
@@ -521,6 +599,49 @@ mod tests {
             "M266/R2 quoted-word bypasses:\n{}",
             failures.join("\n")
         );
+    }
+
+    #[test]
+    fn m290_merge_block_removal_is_denied_semantically() {
+        let denied = [
+            r#"gh issue edit 1084 --remove-label \"merge-queue: hold\""#,
+            "gh api -X DELETE repos/BumStill/CodeFactory/issues/1090/labels/merge-queue%3A%20hold",
+            "gh api --method DELETE repos/BumStill/CodeFactory/issues/1090/labels/merge-queue%3A%20blocked%3A%20ci",
+            r#"LABEL='merge-queue: hold'; gh pr edit 1090 --remove-label \"$LABEL\""#,
+            r#"METHOD=DELETE; LABEL='merge-queue%3A%20hold'; gh api -X \"$METHOD\" repos/BumStill/CodeFactory/issues/1090/labels/\"$LABEL\""#,
+            r#"gh api graphql -f query='mutation { removeLabelsFromLabelable(input:{labelableId:\"PR\",labelIds:[\"merge-queue: blocked\"]}) { clientMutationId } }'"#,
+        ];
+        for command in denied {
+            let ShellCommandPolicy::Deny { reason } = classify_command(command) else {
+                panic!("M290 command must be denied: {command}");
+            };
+            assert!(reason.contains("合并阻断由人工/编排方解除"), "{reason}");
+        }
+    }
+
+    #[test]
+    fn m290_uncertain_gh_api_writes_ask_but_safe_counterexamples_remain_available() {
+        for command in [
+            "gh api -X POST repos/BumStill/CodeFactory/issues/1090/labels -f labels[]=triage",
+            "gh api graphql -f query='mutation { updateIssue(input:{id:\"I\"}) { issue { id } } }'",
+        ] {
+            assert!(
+                matches!(classify_command(command), ShellCommandPolicy::Ask { .. }),
+                "{command}"
+            );
+        }
+        for command in [
+            "gh pr edit 1090 --add-label 'merge-queue: hold'",
+            "gh pr view 1090 --json labels",
+            "gh pr edit 1090 --add-label 'merge-queue: armed'",
+            "gh pr edit 1090 --remove-label 'merge-queue: armed'",
+            "gh api repos/BumStill/CodeFactory/issues/1090/labels",
+        ] {
+            assert!(
+                !matches!(classify_command(command), ShellCommandPolicy::Deny { .. }),
+                "{command}"
+            );
+        }
     }
 
     #[test]

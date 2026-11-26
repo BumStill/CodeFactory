@@ -3065,6 +3065,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn m290_trusted_gateway_denies_real_incident_commands_without_prompt() {
+        for command in [
+            r#"gh issue edit 1084 --remove-label \"merge-queue: hold\""#,
+            "gh api -X DELETE repos/BumStill/CodeFactory/issues/1090/labels/merge-queue%3A%20hold",
+        ] {
+            let gateway = test_gateway("trusted").await;
+            let args = serde_json::json!({"command": command});
+            let call = ToolCall {
+                id: "m290-deny".into(),
+                r#type: "function".into(),
+                function: FunctionCall {
+                    name: "bash".into(),
+                    arguments: args.to_string(),
+                },
+            };
+            match gateway.authorize(&call, &args, Some(command)).await {
+                PermissionOutcome::Deny(denial) => {
+                    assert_eq!(denial.reason, PermissionDenialReason::PolicyDenied);
+                    assert!(
+                        denial.content.contains("合并阻断由人工/编排方解除"),
+                        "{}",
+                        denial.content
+                    );
+                }
+                other => panic!("expected policy denial for {command}, got {other:?}"),
+            }
+            assert!(gateway.pending_permissions.lock().await.is_empty());
+        }
+    }
+
+    #[tokio::test]
     async fn session_permission_policy_is_read_from_session_row() {
         let db = SqlitePoolOptions::new()
             .max_connections(1)
