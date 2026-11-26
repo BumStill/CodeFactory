@@ -1103,7 +1103,17 @@ impl DesktopModelTransport {
             }
             _ => {
                 if should_use_openai_responses(&self.base_url, &self.model_id) {
-                    self.call_openai_responses_model(messages, tool_defs, require_tool, reasoning_effort).await
+                    // Keep the large Responses transport future off the caller's
+                    // stack. The formal Windows worker starts on a 1 MiB main
+                    // thread stack; embedding this future in the transport enum
+                    // overflowed it before fault injection (0xc00000fd).
+                    Box::pin(self.call_openai_responses_model(
+                        messages,
+                        tool_defs,
+                        require_tool,
+                        reasoning_effort,
+                    ))
+                    .await
                 } else {
                     self.call_openai_model(messages, tool_defs, require_tool, reasoning_effort).await
                 }

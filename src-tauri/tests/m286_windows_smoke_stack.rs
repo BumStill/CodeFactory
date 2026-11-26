@@ -2,11 +2,9 @@
 use std::fs;
 
 #[test]
-fn windows_msvc_binary_reserves_enough_main_thread_stack_for_unattended_smoke() {
-    let build = fs::read_to_string("build.rs").expect("read build.rs");
-    assert!(build.contains("CARGO_CFG_TARGET_OS"));
-    assert!(build.contains("CARGO_CFG_TARGET_ENV"));
-    assert!(build.contains("/STACK:8388608"));
-    assert!(build.contains("Ok(\"windows\")"));
-    assert!(build.contains("Ok(\"msvc\")"));
+fn responses_transport_future_is_boxed_off_the_windows_worker_stack() {
+    let source = fs::read_to_string("src/agent/model_transport.rs")
+        .expect("read model transport source");
+    assert!(source.contains("Box::pin(self.call_openai_responses_model("));
+    assert!(source.contains("0xc00000fd"));
 }
