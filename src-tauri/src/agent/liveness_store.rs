@@ -3,7 +3,10 @@
 use serde::{Deserialize, Serialize};
 use sqlx::{Row, SqlitePool};
 
-use super::liveness::{LivenessOwner, LivenessOwnerKind, LivenessViolation};
+use super::liveness::{
+    evaluate_session_liveness, LivenessEvaluation, LivenessOwner, LivenessOwnerKind,
+    LivenessViolation, SessionLivenessSnapshot,
+};
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct LivenessEventInput {
@@ -195,7 +198,19 @@ pub async fn project_unfinished_objectives(
                 deadline_at,
                 not_before_at: next_observation,
                 channel_alive: None,
-                display_summary: status.clone(),
+                display_summary: match status.as_str() {
+                    "waiting_authorization" => "等待你批准".into(),
+                    "waiting_core_input" => "等待你回答".into(),
+                    "waiting_business_decision" => "等待你决定".into(),
+                    "waiting_system" => match next_observation {
+                        Some(at) => format!("系统自动重试/自愈，{at} 自动继续"),
+                        None => "系统自动重试/自愈，稍后自动继续".into(),
+                    },
+                    _ if domain == "tool" => "正在运行工具".into(),
+                    _ if domain == "task" => "后台任务正在运行".into(),
+                    _ if domain == "delivery" => "正在核对交付状态".into(),
+                    _ => "正在连接模型".into(),
+                },
             },
             &status,
             None,
@@ -204,6 +219,62 @@ pub async fn project_unfinished_objectives(
         projected += 1;
     }
     Ok(projected)
+}
+
+pub async fn scan_liveness_violations(
+    pool: &SqlitePool,
+    now_ms: i64,
+) -> anyhow::Result<Vec<String>> {
+    let rows = sqlx::query(
+        "SELECT session_id, objective_id, owner_kind, owner_id, heartbeat_at,
+                deadline_at, not_before_at, display_summary
+         FROM session_liveness_leases WHERE status='active' ORDER BY session_id",
+    ).fetch_all(pool).await?;
+    let permission_table: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='permission_intents'",
+    ).fetch_one(pool).await?;
+    let mut objectives = Vec::new();
+    for row in rows {
+        let session_id: String = row.get("session_id");
+        let objective_id: Option<String> = row.get("objective_id");
+        let kind_text: String = row.get("owner_kind");
+        let kind: LivenessOwnerKind = serde_json::from_value(serde_json::Value::String(kind_text))?;
+        let channel_alive = if kind == LivenessOwnerKind::Permission && permission_table > 0 {
+            let objective = objective_id.as_deref().unwrap_or("");
+            Some(sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM permission_intents WHERE objective_id=? AND status='pending'",
+            ).bind(objective).fetch_one(pool).await? > 0)
+        } else { None };
+        let owner = LivenessOwner {
+            kind: kind.clone(), owner_id: row.get("owner_id"),
+            heartbeat_at: row.get("heartbeat_at"), deadline_at: row.get("deadline_at"),
+            not_before_at: row.get("not_before_at"), channel_alive,
+            display_summary: row.get("display_summary"),
+        };
+        let snapshot = SessionLivenessSnapshot {
+            session_id: session_id.clone(), objective_id: objective_id.clone(), owners: vec![owner.clone()],
+        };
+        let LivenessEvaluation::Violation(violation) = evaluate_session_liveness(&snapshot, now_ms) else { continue; };
+        record_event(pool, &LivenessEventInput {
+            session_id: session_id.clone(), objective_id: objective_id.clone(),
+            owner_kind: Some(kind), violation: violation.clone(),
+            idle_ms: now_ms.saturating_sub(owner.heartbeat_at), deadline_at: Some(owner.deadline_at),
+            detected_at: now_ms, action: "resume_original_objective".into(), outcome: "recovered".into(),
+            detail_code: Some(match violation {
+                LivenessViolation::DeadChannel => "permission_channel_dead",
+                LivenessViolation::WakeBeforeNotBefore => "wake_before_not_before",
+                LivenessViolation::WakeTooLate => "wake_too_late",
+                LivenessViolation::DeadlineExceeded => "liveness_deadline_exceeded",
+                LivenessViolation::MissingOwner => "missing_owner",
+                LivenessViolation::MultipleOwners => "multiple_owners",
+            }.into()),
+        }).await?;
+        sqlx::query(
+            "UPDATE session_liveness_leases SET status='settled', updated_at=? WHERE session_id=? AND status='active'",
+        ).bind(now_ms).bind(&session_id).execute(pool).await?;
+        if let Some(id) = objective_id { objectives.push(id); }
+    }
+    Ok(objectives)
 }
 
 pub async fn supervise_expired_leases(
@@ -478,5 +549,79 @@ mod tests {
              WHERE session_id='session-1' AND status='active'",
         ).fetch_one(&pool).await.unwrap();
         assert_eq!(count, 1);
+    }
+
+    #[tokio::test]
+    async fn r2_production_scanner_detects_dead_permission_and_bad_wake_boundaries() {
+        let pool = pool().await;
+        sqlx::query(
+            "CREATE TABLE permission_intents(objective_id TEXT, status TEXT)",
+        ).execute(&pool).await.unwrap();
+        for (session, objective, owner) in [
+            ("permission", "objective-permission", LivenessOwner {
+                kind: LivenessOwnerKind::Permission,
+                owner_id: "prompt-1".into(), heartbeat_at: 90, deadline_at: 200,
+                not_before_at: None, channel_alive: None,
+                display_summary: "等待你批准".into(),
+            }),
+            ("wake", "objective-wake", LivenessOwner {
+                kind: LivenessOwnerKind::Wake,
+                owner_id: "wake-1".into(), heartbeat_at: 90, deadline_at: 110,
+                not_before_at: Some(120), channel_alive: None,
+                display_summary: "系统自动重试/自愈，120 自动继续".into(),
+            }),
+        ] {
+            claim_owner(
+                &pool, session, Some(objective), Some("turn-1"), &owner,
+                "waiting", Some("process-1"), 90,
+            ).await.unwrap();
+        }
+
+        let mut recovered = scan_liveness_violations(&pool, 100).await.unwrap();
+        recovered.sort();
+        assert_eq!(
+            recovered,
+            vec!["objective-permission".to_string(), "objective-wake".to_string()]
+        );
+        let events: Vec<(String, String)> = sqlx::query_as(
+            "SELECT violation_kind, detail_code FROM session_liveness_events ORDER BY violation_kind",
+        ).fetch_all(&pool).await.unwrap();
+        assert_eq!(
+            events,
+            vec![
+                ("dead_channel".into(), "permission_channel_dead".into()),
+                ("wake_before_not_before".into(), "wake_before_not_before".into()),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn r3_objective_projection_emits_standard_user_wording() {
+        let pool = pool().await;
+        sqlx::query(
+            "CREATE TABLE objectives(
+                id TEXT PRIMARY KEY, session_id TEXT, root_turn_id TEXT, status TEXT,
+                domain TEXT, recovery_owner TEXT, lease_owner TEXT,
+                lease_expires_at INTEGER, next_observation_at INTEGER, updated_at INTEGER)",
+        ).execute(&pool).await.unwrap();
+        for (id, session, status, domain, next_at) in [
+            ("objective-model", "model", "active", "chat", None),
+            ("objective-tool", "tool", "active", "tool", None),
+            ("objective-permit", "permit", "waiting_authorization", "permission", None),
+            ("objective-wake", "wake", "waiting_system", "chat", Some(12_000)),
+        ] {
+            sqlx::query(
+                "INSERT INTO objectives VALUES(?,?,NULL,?,?,NULL,NULL,NULL,?,100)",
+            ).bind(id).bind(session).bind(status).bind(domain).bind(next_at)
+             .execute(&pool).await.unwrap();
+        }
+        project_unfinished_objectives(&pool, 1_000).await.unwrap();
+        let summaries: Vec<String> = sqlx::query_scalar(
+            "SELECT display_summary FROM session_liveness_leases ORDER BY session_id",
+        ).fetch_all(&pool).await.unwrap();
+        assert!(summaries.iter().any(|text| text == "正在连接模型"));
+        assert!(summaries.iter().any(|text| text == "正在运行工具"));
+        assert!(summaries.iter().any(|text| text == "等待你批准"));
+        assert!(summaries.iter().any(|text| text.contains("自动继续")));
     }
 }

@@ -1426,7 +1426,7 @@ pub fn spawn_objective_recovery_supervisor(app: AppHandle, pool: SqlitePool) {
             if let Err(error) = crate::commands::liveness_store::project_unfinished_objectives(&pool, liveness_now).await {
                 tracing::warn!(%error, "session liveness projection failed");
             }
-            match crate::commands::liveness_store::supervise_expired_leases(&pool, liveness_now).await {
+            match crate::commands::liveness_store::scan_liveness_violations(&pool, liveness_now).await {
                 Ok(objective_ids) => {
                     for objective_id in objective_ids {
                         if let Ok(Some(current)) = store.get(&objective_id).await {
