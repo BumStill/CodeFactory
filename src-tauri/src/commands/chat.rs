@@ -8434,7 +8434,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
     fn owner_model_remains_for_openrouter_and_is_not_treated_as_endpoint_hint() {
         let mut settings = crate::config::settings::Settings::default();
         settings.default_endpoint = "openrouter".into();

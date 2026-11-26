@@ -319,6 +319,35 @@ fn build_chatgpt_responses_body(
     }
     body
 }
+fn parse_openai_responses_sse(payload: &str) -> Result<(String, Vec<ToolCall>, Option<Usage>, Option<String>)> {
+    let mut text = String::new();
+    let mut reasoning = String::new();
+    let mut calls = Vec::new();
+    let mut usage = None;
+    for line in payload.lines() {
+        let Some(data) = line.strip_prefix("data: ") else { continue };
+        if data == "[DONE]" { break; }
+        let Ok(event) = serde_json::from_str::<serde_json::Value>(data) else { continue };
+        match event.get("type").and_then(|v| v.as_str()).unwrap_or("") {
+            "response.output_text.delta" => if let Some(delta) = event.get("delta").and_then(|v| v.as_str()) { text.push_str(delta); },
+            "response.reasoning_summary_text.delta" | "response.reasoning_text.delta" => if let Some(delta) = event.get("delta").and_then(|v| v.as_str()) { reasoning.push_str(delta); },
+            "response.output_item.done" => if let Some(item) = event.get("item") {
+                if item.get("type").and_then(|v| v.as_str()) == Some("function_call") {
+                    calls.push(ToolCall { id:item.get("call_id").and_then(|v|v.as_str()).unwrap_or("").into(), r#type:"function".into(), function:FunctionCall { name:item.get("name").and_then(|v|v.as_str()).unwrap_or("").into(), arguments:item.get("arguments").and_then(|v|v.as_str()).unwrap_or("{}").into() } });
+                }
+            },
+            "response.completed" => if let Some(u) = event.pointer("/response/usage") {
+                let input = u.get("input_tokens").and_then(|v|v.as_u64()).unwrap_or(0) as u32;
+                let output = u.get("output_tokens").and_then(|v|v.as_u64()).unwrap_or(0) as u32;
+                usage = Some(Usage { prompt_tokens:input, completion_tokens:output, total_tokens:input+output, cost:u.get("cost").and_then(|v|v.as_f64()), prompt_tokens_details:Some(crate::openrouter::types::PromptTokenDetails { cached_tokens:u.pointer("/input_tokens_details/cached_tokens").and_then(|v|v.as_u64()).unwrap_or(0) as u32 }), completion_tokens_details:Some(crate::openrouter::types::CompletionTokenDetails { reasoning_tokens:u.pointer("/output_tokens_details/reasoning_tokens").and_then(|v|v.as_u64()).unwrap_or(0) as u32 }) });
+            },
+            "response.failed" => return Err(crate::errors::AppError::Other(event.pointer("/response/error/message").and_then(|v|v.as_str()).unwrap_or("OpenAI Responses failed").into())),
+            _ => {}
+        }
+    }
+    Ok((text, calls, usage, (!reasoning.is_empty()).then_some(reasoning)))
+}
+
 
 fn classify_transport_error(message: String) -> TransportError {
     if classify_provider_failure(&message).permits_endpoint_failover() {
@@ -1067,8 +1096,11 @@ impl DesktopModelTransport {
                     .await
             }
             _ => {
-                self.call_openai_model(messages, tool_defs, require_tool, reasoning_effort)
-                    .await
+                if self.model_id.to_ascii_lowercase().starts_with("gpt-6") && self.base_url.contains("api.openai.com") {
+                    self.call_openai_responses_model(messages, tool_defs, require_tool, reasoning_effort).await
+                } else {
+                    self.call_openai_model(messages, tool_defs, require_tool, reasoning_effort).await
+                }
             }
         };
         let required_choice_unsupported = first.as_ref().err().is_some_and(|error| {
@@ -1429,6 +1461,34 @@ impl DesktopModelTransport {
         };
         Ok((text_buf, tool_calls, usage, reasoning))
     }
+    async fn call_openai_responses_model(
+        &self,
+        messages: &[ChatMessage],
+        tool_defs: &[ToolDefinition],
+        require_tool: bool,
+        reasoning_effort: &str,
+    ) -> Result<(String, Vec<ToolCall>, Option<Usage>, Option<String>)> {
+        let url = format!("{}/responses", self.base_url.trim_end_matches('/'));
+        let mut instructions = String::new();
+        let mut input = Vec::new();
+        for message in messages {
+            let text = super::AgentLoop::content_to_text(&message.content);
+            if message.role == "system" { instructions = text; } else { input.push(serde_json::json!({"type":"message","role":message.role,"content":[{"type":"input_text","text":text}]})); }
+        }
+        let tools = tool_defs.iter().map(|tool| serde_json::json!({"type":"function","name":tool.function.name,"description":tool.function.description,"parameters":tool.function.parameters})).collect::<Vec<_>>();
+        let body = build_chatgpt_responses_body(&self.model_id, instructions, input, tools, require_tool, reasoning_effort, self.max_output_tokens);
+        let _billing_hold = self.billing.as_ref().map(|admission| BillingHold::reserve(admission, &body, self.max_output_tokens)).transpose()?;
+        self.admit_provider_post().await?;
+        let response = crate::http_util::send_with_attempt_budget_and_notify_policy(
+            "OpenAI Responses stream request",
+            || self.http.post(&url).bearer_auth(&self.api_key).header("Content-Type", "application/json").json(&body),
+            |notice| super::AgentLoop::emit_transport_retry(self.events.as_ref(), notice), self.retry_response_body, self.provider_http_attempt_budget(),
+        ).await?;
+        let response = crate::http_util::check_status(response).await?;
+        let payload = response.text().await?;
+        parse_openai_responses_sse(&payload)
+    }
+
 
     async fn call_openai_model(
         &self,
@@ -1447,11 +1507,12 @@ impl DesktopModelTransport {
             crate::config::settings::normalize_model_id(&self.model_id, &self.base_url);
 
         let (tools, tool_choice) = openai_tool_controls(tool_defs, require_tool);
+        let has_tools = tools.is_some();
         let mut req = ChatRequest {
             model: outbound_model,
             messages: messages.to_vec(),
             tools,
-            tool_choice: Some(tool_choice),
+            tool_choice: has_tools.then_some(tool_choice),
             stream: true,
             temperature: 0.2,
             max_tokens: self.max_output_tokens.unwrap_or(8192),
@@ -2628,6 +2689,24 @@ mod tests {
             .iter()
             .filter(|m| m["role"] == "assistant")
             .collect()
+    }
+
+    #[test]
+    fn m286_openai_request_omits_tool_choice_when_tools_are_absent() {
+        let (tools, tool_choice) = openai_tool_controls(&[], false);
+        let request = ChatRequest {
+            model: "gpt-5.6-sol".into(),
+            messages: Vec::new(),
+            tool_choice: tools.as_ref().map(|_| tool_choice),
+            tools,
+            stream: true,
+            temperature: 0.2,
+            max_tokens: 8192,
+            stream_options: Some(StreamOptions { include_usage: true }),
+        };
+        let body = serde_json::to_value(request).expect("request serializes");
+        assert!(!body.as_object().unwrap().contains_key("tools"));
+        assert!(!body.as_object().unwrap().contains_key("tool_choice"));
     }
 
     #[test]
