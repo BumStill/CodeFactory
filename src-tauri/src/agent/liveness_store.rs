@@ -3,6 +3,20 @@
 use serde::{Deserialize, Serialize};
 use sqlx::{Row, SqlitePool};
 
+use std::sync::{Mutex, OnceLock};
+
+const DEFAULT_STALE_OBJECTIVE_DAYS: i64 = 7;
+const EVENT_RETENTION_LIMIT: i64 = 10_000;
+const EVENT_RETENTION_AGE_MS: i64 = 30 * 24 * 60 * 60 * 1_000;
+pub const STALE_OBJECTIVE_AGE_MS: i64 = DEFAULT_STALE_OBJECTIVE_DAYS * 24 * 60 * 60 * 1_000;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LivenessRecovery {
+    pub event_id: String,
+    pub session_id: String,
+    pub objective_id: Option<String>,
+}
+
 use super::liveness::{
     evaluate_session_liveness, LivenessEvaluation, LivenessOwner, LivenessOwnerKind,
     LivenessViolation, SessionLivenessSnapshot,
@@ -34,6 +48,29 @@ pub struct LivenessMetrics {
     pub total_violations: i64,
     pub longest_idle_ms: i64,
     pub by_kind: Vec<LivenessViolationCount>,
+    pub supervision_consecutive_failures: u64,
+    pub supervision_last_error: Option<String>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct SupervisionHealth {
+    consecutive_failures: u64,
+    last_error: Option<String>,
+}
+
+fn supervision_health() -> &'static Mutex<SupervisionHealth> {
+    static HEALTH: OnceLock<Mutex<SupervisionHealth>> = OnceLock::new();
+    HEALTH.get_or_init(|| Mutex::new(SupervisionHealth::default()))
+}
+
+pub fn record_supervision_success() {
+    *supervision_health().lock().expect("liveness health lock") = SupervisionHealth::default();
+}
+
+pub fn record_supervision_failure(error: &anyhow::Error) {
+    let mut health = supervision_health().lock().expect("liveness health lock");
+    health.consecutive_failures = health.consecutive_failures.saturating_add(1);
+    health.last_error = Some(error.to_string());
 }
 
 pub async fn claim_owner(
@@ -114,8 +151,8 @@ pub async fn record_event(pool: &SqlitePool, event: &LivenessEventInput) -> anyh
     .bind(&id)
     .bind(&event.session_id)
     .bind(&event.objective_id)
-    .bind(owner_kind)
-    .bind(violation_kind)
+    .bind(owner_kind.as_deref())
+    .bind(&violation_kind)
     .bind(event.idle_ms.max(0))
     .bind(event.deadline_at)
     .bind(event.detected_at)
@@ -125,7 +162,45 @@ pub async fn record_event(pool: &SqlitePool, event: &LivenessEventInput) -> anyh
     .bind(&event.detail_code)
     .execute(pool)
     .await?;
+    sqlx::query("DELETE FROM session_liveness_events WHERE detected_at < ?")
+        .bind(event.detected_at.saturating_sub(EVENT_RETENTION_AGE_MS))
+        .execute(pool).await?;
+    sqlx::query(
+        "DELETE FROM session_liveness_events WHERE id IN (
+             SELECT id FROM session_liveness_events ORDER BY detected_at DESC, id DESC
+             LIMIT -1 OFFSET ?
+         )",
+    ).bind(EVENT_RETENTION_LIMIT).execute(pool).await?;
     Ok(id)
+}
+
+pub async fn resolve_event(
+    pool: &SqlitePool,
+    event_id: &str,
+    outcome: &str,
+    detail_code: &str,
+    resolved_at: i64,
+) -> anyhow::Result<()> {
+    sqlx::query(
+        "UPDATE session_liveness_events
+         SET outcome=?, detail_code=?, resolved_at=? WHERE id=? AND outcome='detected'",
+    ).bind(outcome).bind(detail_code).bind(resolved_at).bind(event_id)
+     .execute(pool).await?;
+    Ok(())
+}
+
+async fn table_exists(pool: &SqlitePool, table: &str) -> anyhow::Result<bool> {
+    Ok(sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?",
+    ).bind(table).fetch_one(pool).await? > 0)
+}
+
+fn stale_objective_age_ms() -> i64 {
+    std::env::var("CODEFACTORY_LIVENESS_STALE_DAYS")
+        .ok().and_then(|value| value.parse::<i64>().ok())
+        .filter(|days| *days > 0)
+        .unwrap_or(DEFAULT_STALE_OBJECTIVE_DAYS)
+        .saturating_mul(24 * 60 * 60 * 1_000)
 }
 
 pub async fn project_unfinished_objectives(
@@ -142,6 +217,10 @@ pub async fn project_unfinished_objectives(
     )
     .fetch_all(pool)
     .await?;
+    let has_background_tasks = table_exists(pool, "background_tasks").await?;
+    let has_wakeups = table_exists(pool, "wakeup_schedules").await?;
+    let has_delivery_observations = table_exists(pool, "thin_external_observations").await?;
+    let stale_age_ms = stale_objective_age_ms();
     let mut projected = 0_u64;
     let mut seen = std::collections::HashSet::new();
     for row in rows {
@@ -165,7 +244,51 @@ pub async fn project_unfinished_objectives(
             }).await?;
             continue;
         }
-        let owner_kind = match status.as_str() {
+        if now_ms.saturating_sub(updated_at) > stale_age_ms {
+            let settled = sqlx::query(
+                "UPDATE objectives SET status='legacy_orphan', requires_user_action=0,
+                        completed_at=COALESCE(completed_at,?), updated_at=?
+                 WHERE id=? AND status NOT IN ('completed','cancelled','failed','legacy_orphan')
+                   AND updated_at=?",
+            ).bind(now_ms).bind(now_ms).bind(&objective_id).bind(updated_at)
+             .execute(pool).await?.rows_affected();
+            if settled > 0 {
+                record_event(pool, &LivenessEventInput {
+                    session_id, objective_id: Some(objective_id), owner_kind: None,
+                    violation: LivenessViolation::DeadlineExceeded,
+                    idle_ms: now_ms.saturating_sub(updated_at), deadline_at: None,
+                    detected_at: now_ms, action: "settle_stale_objective".into(),
+                    outcome: "settled_stale".into(), detail_code: Some("stale_objective".into()),
+                }).await?;
+            }
+            continue;
+        }
+        let background_owner: Option<(String, i64, i64)> = if has_background_tasks {
+            sqlx::query_as(
+                "SELECT id,created_at,timeout_sec FROM background_tasks
+                 WHERE session_id=? AND status='running' ORDER BY created_at DESC LIMIT 1",
+            ).bind(&session_id).fetch_optional(pool).await?
+        } else { None };
+        let wake_owner: Option<(String, i64)> = if background_owner.is_none() && has_wakeups {
+            sqlx::query_as(
+                "SELECT id,next_at FROM wakeup_schedules
+                 WHERE session_id=? AND status='pending' ORDER BY next_at LIMIT 1",
+            ).bind(&session_id).fetch_optional(pool).await?
+        } else { None };
+        let delivery_owner: Option<(i64, i64)> = if background_owner.is_none()
+            && wake_owner.is_none() && has_delivery_observations {
+            sqlx::query_as(
+                "SELECT pr_number,next_check_at FROM thin_external_observations
+                 WHERE session_id=? AND completed_reason IS NULL LIMIT 1",
+            ).bind(&session_id).fetch_optional(pool).await?
+        } else { None };
+        let owner_kind = if background_owner.is_some() {
+            LivenessOwnerKind::BackgroundTask
+        } else if wake_owner.is_some() {
+            LivenessOwnerKind::Wake
+        } else if delivery_owner.is_some() {
+            LivenessOwnerKind::Delivery
+        } else { match status.as_str() {
             "waiting_authorization" => LivenessOwnerKind::Permission,
             "waiting_core_input" | "waiting_business_decision" => LivenessOwnerKind::UserInput,
             "waiting_system" => LivenessOwnerKind::Wake,
@@ -173,16 +296,22 @@ pub async fn project_unfinished_objectives(
             _ if domain == "task" => LivenessOwnerKind::BackgroundTask,
             _ if domain == "delivery" => LivenessOwnerKind::Delivery,
             _ => LivenessOwnerKind::Model,
-        };
+        }};
         let lease_expires: Option<i64> = row.get("lease_expires_at");
         let next_observation: Option<i64> = row.get("next_observation_at");
-        let deadline_at = match status.as_str() {
+        let deadline_at = if let Some((_, created_at, timeout_sec)) = background_owner.as_ref() {
+            created_at.saturating_add(*timeout_sec).saturating_mul(1_000)
+        } else if let Some((_, next_at)) = wake_owner.as_ref() {
+            next_at.saturating_mul(1_000).saturating_add(super::liveness::LIVENESS_SUPERVISOR_INTERVAL_MS)
+        } else if let Some((_, next_check_at)) = delivery_owner.as_ref() {
+            *next_check_at
+        } else { match status.as_str() {
             "waiting_core_input" | "waiting_business_decision" => now_ms.saturating_add(60_000),
             "waiting_system" => next_observation.unwrap_or_else(|| now_ms.saturating_add(60_000)),
             _ => lease_expires
                 .or(next_observation)
                 .unwrap_or_else(|| updated_at.saturating_add(60_000)),
-        };
+        }};
         let owner_id: Option<String> = row.get("lease_owner");
         let recovery_owner: Option<String> = row.get("recovery_owner");
         let root_turn_id: Option<String> = row.get("root_turn_id");
@@ -193,8 +322,15 @@ pub async fn project_unfinished_objectives(
             root_turn_id.as_deref(),
             &LivenessOwner {
                 kind: owner_kind,
-                owner_id: owner_id.or(recovery_owner).unwrap_or_else(|| format!("objective:{objective_id}")),
-                heartbeat_at: if matches!(status.as_str(), "waiting_core_input" | "waiting_business_decision") { now_ms } else { updated_at },
+                owner_id: background_owner.as_ref().map(|owner| owner.0.clone())
+                    .or_else(|| wake_owner.as_ref().map(|owner| owner.0.clone()))
+                    .or_else(|| delivery_owner.as_ref().map(|owner| format!("pr:{}", owner.0)))
+                    .or(owner_id).or(recovery_owner)
+                    .unwrap_or_else(|| format!("objective:{objective_id}")),
+                heartbeat_at: if background_owner.is_some() || wake_owner.is_some() || delivery_owner.is_some()
+                    || matches!(status.as_str(), "waiting_core_input" | "waiting_business_decision") {
+                    now_ms
+                } else { updated_at },
                 deadline_at,
                 not_before_at: next_observation,
                 channel_alive: None,
@@ -206,6 +342,9 @@ pub async fn project_unfinished_objectives(
                         Some(at) => format!("系统自动重试/自愈，{at} 自动继续"),
                         None => "系统自动重试/自愈，稍后自动继续".into(),
                     },
+                    _ if background_owner.is_some() => "后台任务正在运行".into(),
+                    _ if wake_owner.is_some() => "系统自动重试/自愈，稍后自动继续".into(),
+                    _ if delivery_owner.is_some() => "正在核对交付状态".into(),
                     _ if domain == "tool" => "正在运行工具".into(),
                     _ if domain == "task" => "后台任务正在运行".into(),
                     _ if domain == "delivery" => "正在核对交付状态".into(),
@@ -224,7 +363,7 @@ pub async fn project_unfinished_objectives(
 pub async fn scan_liveness_violations(
     pool: &SqlitePool,
     now_ms: i64,
-) -> anyhow::Result<Vec<String>> {
+) -> anyhow::Result<Vec<LivenessRecovery>> {
     let rows = sqlx::query(
         "SELECT session_id, objective_id, owner_kind, owner_id, heartbeat_at,
                 deadline_at, not_before_at, display_summary
@@ -238,7 +377,7 @@ pub async fn scan_liveness_violations(
         let session_id: String = row.get("session_id");
         let objective_id: Option<String> = row.get("objective_id");
         let kind_text: String = row.get("owner_kind");
-        let kind: LivenessOwnerKind = serde_json::from_value(serde_json::Value::String(kind_text))?;
+        let kind: LivenessOwnerKind = serde_json::from_value(serde_json::Value::String(kind_text.clone()))?;
         let channel_alive = if kind == LivenessOwnerKind::Permission && permission_table > 0 {
             let objective = objective_id.as_deref().unwrap_or("");
             Some(sqlx::query_scalar::<_, i64>(
@@ -255,11 +394,26 @@ pub async fn scan_liveness_violations(
             session_id: session_id.clone(), objective_id: objective_id.clone(), owners: vec![owner.clone()],
         };
         let LivenessEvaluation::Violation(violation) = evaluate_session_liveness(&snapshot, now_ms) else { continue; };
-        record_event(pool, &LivenessEventInput {
+        let violation_kind = serde_json::to_value(&violation)?
+            .as_str().unwrap_or("unknown").to_owned();
+        let already_recorded: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM session_liveness_events
+             WHERE session_id=? AND owner_kind=? AND deadline_at=? AND violation_kind=?",
+        ).bind(&session_id).bind(&kind_text).bind(owner.deadline_at).bind(&violation_kind)
+         .fetch_one(pool).await?;
+        if already_recorded > 0 {
+            sqlx::query(
+                "UPDATE session_liveness_leases SET status='settled', updated_at=?
+                 WHERE session_id=? AND status='active' AND owner_id=? AND deadline_at=?",
+            ).bind(now_ms).bind(&session_id).bind(&owner.owner_id).bind(owner.deadline_at)
+             .execute(pool).await?;
+            continue;
+        }
+        let event_id = record_event(pool, &LivenessEventInput {
             session_id: session_id.clone(), objective_id: objective_id.clone(),
             owner_kind: Some(kind), violation: violation.clone(),
             idle_ms: now_ms.saturating_sub(owner.heartbeat_at), deadline_at: Some(owner.deadline_at),
-            detected_at: now_ms, action: "resume_original_objective".into(), outcome: "recovered".into(),
+            detected_at: now_ms, action: "resume_original_objective".into(), outcome: "detected".into(),
             detail_code: Some(match violation {
                 LivenessViolation::DeadChannel => "permission_channel_dead",
                 LivenessViolation::WakeBeforeNotBefore => "wake_before_not_before",
@@ -272,7 +426,9 @@ pub async fn scan_liveness_violations(
         sqlx::query(
             "UPDATE session_liveness_leases SET status='settled', updated_at=? WHERE session_id=? AND status='active'",
         ).bind(now_ms).bind(&session_id).execute(pool).await?;
-        if let Some(id) = objective_id { objectives.push(id); }
+        if objective_id.is_some() {
+            objectives.push(LivenessRecovery { event_id, session_id, objective_id });
+        }
     }
     Ok(objectives)
 }
@@ -326,6 +482,14 @@ pub async fn supervise_expired_leases(
     Ok(objectives)
 }
 
+pub async fn run_supervision_cycle(
+    pool: &SqlitePool,
+    now_ms: i64,
+) -> anyhow::Result<Vec<LivenessRecovery>> {
+    project_unfinished_objectives(pool, now_ms).await?;
+    scan_liveness_violations(pool, now_ms).await
+}
+
 pub async fn metrics(pool: &SqlitePool, hours: i64, now_ms: i64) -> anyhow::Result<LivenessMetrics> {
     let bounded_hours = hours.clamp(1, 24 * 30);
     let since = now_ms.saturating_sub(bounded_hours.saturating_mul(3_600_000));
@@ -354,11 +518,14 @@ pub async fn metrics(pool: &SqlitePool, hours: i64, now_ms: i64) -> anyhow::Resu
     .bind(since)
     .fetch_one(pool)
     .await?;
+    let health = supervision_health().lock().expect("liveness health lock").clone();
     Ok(LivenessMetrics {
         hours: bounded_hours,
         total_violations,
         longest_idle_ms,
         by_kind,
+        supervision_consecutive_failures: health.consecutive_failures,
+        supervision_last_error: health.last_error,
     })
 }
 
@@ -443,6 +610,8 @@ mod tests {
         let metrics = metrics(&pool, 1, 100_000).await.unwrap();
         assert_eq!(metrics.total_violations, 3);
         assert_eq!(metrics.longest_idle_ms, 45_000);
+        assert_eq!(metrics.supervision_consecutive_failures, 0);
+        assert_eq!(metrics.supervision_last_error, None);
         assert_eq!(
             metrics.by_kind,
             vec![
@@ -456,6 +625,26 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn m287b_r2_repeated_supervision_failure_is_visible_and_recovery_clears_it() {
+        record_supervision_success();
+        let error = anyhow::anyhow!("synthetic liveness schema failure");
+        record_supervision_failure(&error);
+        record_supervision_failure(&error);
+        let pool = pool().await;
+        let degraded = metrics(&pool, 24, 100_000).await.unwrap();
+        assert_eq!(degraded.supervision_consecutive_failures, 2);
+        assert_eq!(
+            degraded.supervision_last_error.as_deref(),
+            Some("synthetic liveness schema failure")
+        );
+
+        record_supervision_success();
+        let recovered = metrics(&pool, 24, 100_000).await.unwrap();
+        assert_eq!(recovered.supervision_consecutive_failures, 0);
+        assert_eq!(recovered.supervision_last_error, None);
     }
 
     #[tokio::test]
@@ -578,9 +767,9 @@ mod tests {
         }
 
         let mut recovered = scan_liveness_violations(&pool, 100).await.unwrap();
-        recovered.sort();
+        recovered.sort_by(|left, right| left.objective_id.cmp(&right.objective_id));
         assert_eq!(
-            recovered,
+            recovered.into_iter().filter_map(|item| item.objective_id).collect::<Vec<_>>(),
             vec!["objective-permission".to_string(), "objective-wake".to_string()]
         );
         let events: Vec<(String, String)> = sqlx::query_as(
@@ -623,5 +812,105 @@ mod tests {
         assert!(summaries.iter().any(|text| text == "正在运行工具"));
         assert!(summaries.iter().any(|text| text == "等待你批准"));
         assert!(summaries.iter().any(|text| text.contains("自动继续")));
+    }
+
+    #[tokio::test]
+    async fn m287c_r1_running_background_task_owns_its_real_timeout_deadline() {
+        let pool = pool().await;
+        sqlx::query(
+            "CREATE TABLE objectives(
+                id TEXT PRIMARY KEY, session_id TEXT, root_turn_id TEXT, status TEXT,
+                domain TEXT, recovery_owner TEXT, lease_owner TEXT,
+                lease_expires_at INTEGER, next_observation_at INTEGER, updated_at INTEGER)",
+        ).execute(&pool).await.unwrap();
+        sqlx::query(
+            "CREATE TABLE background_tasks(
+                id TEXT PRIMARY KEY, session_id TEXT, status TEXT,
+                created_at INTEGER, timeout_sec INTEGER)",
+        ).execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO objectives VALUES('objective-bg','session-bg','turn-bg','active','chat',NULL,NULL,NULL,NULL,1000)")
+            .execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO background_tasks VALUES('task-bg','session-bg','running',10,120)")
+            .execute(&pool).await.unwrap();
+
+        project_unfinished_objectives(&pool, 61_000).await.unwrap();
+        let owner: (String, String, i64) = sqlx::query_as(
+            "SELECT owner_kind,owner_id,deadline_at FROM session_liveness_leases WHERE session_id='session-bg'",
+        ).fetch_one(&pool).await.unwrap();
+        assert_eq!(owner, ("background_task".into(), "task-bg".into(), 130_000));
+        assert!(scan_liveness_violations(&pool, 61_000).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn m287c_r2_same_owner_deadline_violation_is_recorded_only_once() {
+        let pool = pool().await;
+        claim_owner(
+            &pool, "session-expired", Some("objective-expired"), Some("turn-1"),
+            &LivenessOwner {
+                kind: LivenessOwnerKind::Model, owner_id: "model-attempt-1".into(),
+                heartbeat_at: 10, deadline_at: 20, not_before_at: None,
+                channel_alive: None, display_summary: "正在连接模型".into(),
+            }, "model_connecting", Some("process-1"), 10,
+        ).await.unwrap();
+
+        assert_eq!(scan_liveness_violations(&pool, 30).await.unwrap().len(), 1);
+        assert!(scan_liveness_violations(&pool, 40).await.unwrap().is_empty());
+        let event: (i64, String) = sqlx::query_as(
+            "SELECT COUNT(*),MAX(outcome) FROM session_liveness_events WHERE session_id='session-expired'",
+        ).fetch_one(&pool).await.unwrap();
+        assert_eq!(event, (1, "detected".into()));
+    }
+
+    #[tokio::test]
+    async fn m287c_r4_stale_objective_is_settled_once_without_recovery() {
+        let pool = pool().await;
+        sqlx::query(
+            "CREATE TABLE objectives(
+                id TEXT PRIMARY KEY, session_id TEXT, root_turn_id TEXT, status TEXT,
+                domain TEXT, recovery_owner TEXT, lease_owner TEXT,
+                lease_expires_at INTEGER, next_observation_at INTEGER, updated_at INTEGER,
+                requires_user_action INTEGER DEFAULT 0, completed_at INTEGER)",
+        ).execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO objectives(id,session_id,root_turn_id,status,domain,updated_at) VALUES('objective-stale','session-stale','turn-stale','active','chat',1)")
+            .execute(&pool).await.unwrap();
+
+        assert_eq!(project_unfinished_objectives(&pool, STALE_OBJECTIVE_AGE_MS + 2).await.unwrap(), 0);
+        assert_eq!(project_unfinished_objectives(&pool, STALE_OBJECTIVE_AGE_MS + 3).await.unwrap(), 0);
+        let status: String = sqlx::query_scalar("SELECT status FROM objectives WHERE id='objective-stale'")
+            .fetch_one(&pool).await.unwrap();
+        let events: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM session_liveness_events WHERE session_id='session-stale' AND action='settle_stale_objective'",
+        ).fetch_one(&pool).await.unwrap();
+        assert_eq!(status, "legacy_orphan");
+        assert_eq!(events, 1);
+    }
+
+    #[tokio::test]
+    async fn m287c_r3_detection_does_not_claim_recovery_before_apply_succeeds() {
+        let pool = pool().await;
+        claim_owner(
+            &pool, "session-failed-apply", Some("objective-failed-apply"), Some("turn-1"),
+            &LivenessOwner {
+                kind: LivenessOwnerKind::Model, owner_id: "attempt".into(),
+                heartbeat_at: 10, deadline_at: 20, not_before_at: None,
+                channel_alive: None, display_summary: "正在连接模型".into(),
+            }, "model_connecting", Some("process-1"), 10,
+        ).await.unwrap();
+
+        let recoveries = scan_liveness_violations(&pool, 30).await.unwrap();
+        assert_eq!(recoveries.len(), 1);
+        let recovery = recoveries.into_iter().next().unwrap();
+        let outcome: String = sqlx::query_scalar(
+            "SELECT outcome FROM session_liveness_events WHERE session_id='session-failed-apply'",
+        ).fetch_one(&pool).await.unwrap();
+        assert_eq!(outcome, "detected");
+
+        resolve_event(
+            &pool, &recovery.event_id, "decision_rejected", "apply_decision_failed", 31,
+        ).await.unwrap();
+        let resolved: (String, String, i64) = sqlx::query_as(
+            "SELECT outcome,detail_code,resolved_at FROM session_liveness_events WHERE id=?",
+        ).bind(recovery.event_id).fetch_one(&pool).await.unwrap();
+        assert_eq!(resolved, ("decision_rejected".into(), "apply_decision_failed".into(), 31));
     }
 }

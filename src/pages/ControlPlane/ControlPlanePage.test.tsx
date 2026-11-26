@@ -284,8 +284,9 @@ describe("ControlPlanePage", () => {
     await act(async () => {
       await vi.advanceTimersByTimeAsync(1);
     });
-    expect(mocks.invoke).toHaveBeenCalledTimes(3);
+    expect(mocks.invoke).toHaveBeenCalledTimes(4);
     expect(mocks.invoke).toHaveBeenNthCalledWith(3, "get_objective_health");
+    expect(mocks.invoke).toHaveBeenNthCalledWith(4, "query_session_liveness_metrics", { hours: 24 });
     expect(screen.getAllByText("main").length).toBeGreaterThan(0);
     expect(screen.getByText("complete")).toBeInTheDocument();
 

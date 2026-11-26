@@ -195,3 +195,58 @@ Snapshot 由 Objective、run control、provider attempt、tool call、background
 - 构建与临时文件仅放 `.codefactory-cache/`。
 - R1–R8 未全部完成前不准备 PR 正文、不调用交付；不完整 PR 保持 draft 且不 armed。
 - 全部完成后 PR 使用 `Release-Urgency: immediate`；真机安装版 24 小时验收由编排方发版后执行。
+
+## 8. M287b：正式程序生产 schema 与监督可观测性修复
+
+# M287b：M287 的活性表在正式程序里从未创建，统一监督在生产中整体失效
+
+## 现场（2026-11-26 22:1x，v1.128.0 真机，只读核实）
+- 生产库 `~/Library/Application Support/com.codefactory.app/codefactory.db` 中不存在 `session_liveness_leases`、`session_liveness_events`（`.tables` 无任何 liveness 表）。
+- `migrations/0027_session_liveness.sql` 只在 `src-tauri/src/agent/liveness_store.rs:371` 的 `#[cfg(test)] mod tests` 里通过 `include_str!` 执行；生产路径没有任何地方执行它（对比 `thin.rs:120` 生产代码会执行 0022）。
+- `objective_supervisor.rs` 约 1425–1430 行每 5 秒调用 `project_unfinished_objectives` / `scan_liveness_violations`，在生产中必然因 no such table 失败，只记 `tracing::warn`，R1/R2/R7/R8 在真实应用里全部未生效；测试全绿是因为测试自建内存库。
+- 合并后审计结论：为何合并前没发现——所有 M287 测试都自建 schema，没有任何测试走「真实应用启动 → 生产 schema 初始化 → 监督周期」路径。
+
+## 规格（追加到 `docs/specs/feature-specs/m287-session-liveness.md` 的 M287b 小节）
+- R1：应用启动时（与其他模块 ensure_schema 同一初始化路径）幂等创建 0027 的全部表与索引；已有库升级与全新库都覆盖。
+- R2：`project_unfinished_objectives` / `scan_liveness_violations` 失败时不得只 warn 后静默：同一错误持续出现时要有可观测信号（结构化事件或健康状态），且不得影响其他监督逻辑。
+- R3：查清 M287 其余新增的生产依赖（命令注册、只读度量查询 `query_session_liveness_metrics`、前端调用）在真实应用里是否都已接线；未接线的一并接上，并列出清单。
+- R4：补一条「真实启动路径」测试：用生产初始化函数打开一个全新文件库（临时目录），断言 liveness 表存在、一次监督周期能写入 lease、制造过期能写入 violation 事件；再用一个旧版本 schema 的库升级同样断言。不得在测试里手动执行 0027 SQL 来凑绿。
+
+## 约束
+改文件只用 edit_file / write_file。不改信任根；场景缺口只追加 `docs/testing/scenario-mappings.json`。不碰凭据、settings.json、其他会话的 PR，不动任何 merge-queue: hold 标签。规格文件在工作区外，用 bash cat 只读查看。
+
+## 交付
+PR 正文 `R | 是否完成 | 证据` 列 R1–R4；`Release-Urgency: immediate`（M287 核心能力在生产中未生效）。全部完成、CI 全绿后正常交付。
+
+## 验收（真机，发版后编排方做）
+安装后生产库出现 liveness 表；运行中的会话在 `session_liveness_leases` 有 owner 行；度量查询返回数据。
+
+Release-Urgency: immediate
+
+## 9. M287c：活性监督在生产中空转——误判、重复记违例、"recovered" 名不副实
+
+## 现场（v1.129.0 真机，2026-11-27 00:19–00:46，只读核实）
+- `session_liveness_events` 26 分钟写入 1931 行（约每 5 秒 8 行），全部 `violation_kind=deadline_exceeded, action=resume_original_objective, outcome=recovered`，但对应 lease 的 `deadline_at` 不变，下一周期再次判违例 → 无限循环，约 10 万行/天。
+- 被判违例的 8 个会话中：
+  - 5 个是 10–11 月的遗留非终态 objective（0808ca03 active 11-07、48864195/7ac1e453/d91f9d3a waiting_system delivered_awaiting_ci 10-18、af7763ba/afc40ac6 active 11-07/11-11），早已无人推进。
+  - 2 个是正在运行的会话 6e140abf、96c4e911：它们此刻有 `background_tasks.status='running'` 的后台任务，却被投影成 `owner_kind=model`、deadline 已过 → 误判。
+  - `2da3e2a0`、`e2de2968` 为 `waiting_core_input`（等用户），owner=user_input，正常续租。
+- objectives 表在 00:31 后没有任何变化（revision 未增），说明 "resume_original_objective" 实际未生效，但事件仍写 `outcome=recovered`。
+
+## 规格（追加到 `docs/specs/feature-specs/m287-session-liveness.md` 的 M287c 小节）
+- R1：owner 投影必须识别全部合法推进者并取正确截止时间：运行中的后台任务（deadline=任务超时）、待触发唤醒（deadline=next_at+余量）、PR/CI 监视订阅（deadline=订阅约定的复查时间）、待审批、等用户。存在合法推进者时不得投影成过期的 model owner。
+- R2：违例去重：同一 (session, owner, deadline) 只记一次违例；处置后必须续租或改写 lease（新的 owner/deadline）或把 objective 结算到终态，否则下一周期不得重复写同一违例。事件表加保留上限或聚合（写明策略）。
+- R3：`outcome` 必须反映真实结果：apply_decision 成功才记 recovered；revision 冲突、决策被拒、无可恢复路径分别记明确的失败结果与原因，并进入 R8 度量。
+- R4：遗留非终态 objective（超过可配置天数无任何推进，如 >7 天）不纳入每周期恢复：一次性结算为明确终态（或标记 stale 并停止投影），写一条结构化事件；不得把它们重新唤醒去消耗模型额度。
+- R5：用本次现场形状写测试（先红后绿）：运行中后台任务不误判；遗留 objective 不循环；同一违例不重复写；apply 失败不记 recovered；反例：真正过期且无推进者的会话仍被接手一次。
+
+## 约束
+改文件只用 edit_file / write_file。不改信任根；场景缺口只追加 `docs/testing/scenario-mappings.json`。不碰凭据、settings.json、其他会话 PR，不动任何 merge-queue: hold 标签。规格文件在工作区外，用 bash cat 只读查看。
+
+## 交付
+PR 正文 `R | 是否完成 | 证据` 列 R1–R5；`Release-Urgency: immediate`（生产中每天约 10 万行无效事件、真实卡顿无法接手）。
+
+## 验收（真机，发版后）
+安装后 10 分钟内 `session_liveness_events` 新增行数 ≤ 违例会话数；运行后台任务的会话不出现违例；遗留 objective 被一次性结算。
+
+Release-Urgency: immediate
