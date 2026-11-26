@@ -9,7 +9,7 @@ import { createRoot } from "react-dom/client";
 
 import "../styles/globals.css";
 import { MessageList } from "../components/MessageList";
-import type { UIMessage } from "../stores/chatEvents";
+import { statusBannerView } from "../lib/statusBanner";
 
 type Activity = NonNullable<UIMessage["turnActivity"]>;
 
@@ -153,14 +153,20 @@ function Panel({ title, children }: { title: string; children: React.ReactNode }
 }
 
 function AcceptanceApp() {
+  const selected = new URLSearchParams(window.location.search).get("fixture");
+  const visibleFixtures = selected
+    ? fixtures.filter((fixture) => fixture.id === selected)
+    : fixtures;
   return (
     <main className="min-h-screen bg-bg p-6 text-gray-200" aria-label="Status banner acceptance">
       <h1 className="mb-4 text-heading font-semibold">会话顶部状态横幅验收</h1>
-      <div className="mb-4">
-        <BeforePanel />
-      </div>
-      <div className="grid gap-4 md:grid-cols-2">
-        {fixtures.map((fixture) => (
+      {!selected && (
+        <div className="mb-4">
+          <BeforePanel />
+        </div>
+      )}
+      <div className={selected ? "max-w-3xl" : "grid gap-4 md:grid-cols-2"}>
+        {visibleFixtures.map((fixture) => (
           <Panel key={fixture.id} title={fixture.title}>
             <div data-fixture={fixture.id} className="h-full">
               <MessageList
@@ -170,6 +176,22 @@ function AcceptanceApp() {
                 cwd={null}
                 conversationKey={`status-banner-${fixture.id}`}
               />
+              {(() => {
+                const act = fixture.messages.find((m) => m.role === "assistant")?.turnActivity as Activity | undefined;
+                const view = act
+                  ? statusBannerView({
+                      activity: act,
+                      nowMs: Date.now(),
+                      startedAt: (fixture.messages[0]?.createdAt as number) ?? Date.now() - 25_000,
+                      systemRunning: fixture.streaming === true || fixture.sessionIsRunning === true,
+                    })
+                  : null;
+                return (
+                  <div data-proof="status-text" className="mt-2 text-body text-gray-100">
+                    {view?.text ?? ""}
+                  </div>
+                );
+              })()}
             </div>
           </Panel>
         ))}
