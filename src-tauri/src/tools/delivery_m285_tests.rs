@@ -88,10 +88,15 @@ set /p HOLD=<"!H!"
 if exist "!BASE!.fail_list_once" if "%1 %2"=="pr list" if not exist "!BASE!.failed_once" (type nul>"!BASE!.failed_once" & exit /b 2)
 if "%1 %2"=="pr list" (
   echo %*>>"!L!"
-  set "LABELS=[]"
-  if "!ARMED!"=="true" set "LABELS=[{""name"":""merge-queue: armed""}]"
-  if "!HOLD!"=="true" set "LABELS=[{""name"":""merge-queue: hold""}]"
-  echo [{"number":101,"url":"https://forge.invalid/pr/101","title":"fix: remote","body":"R table","state":"OPEN","headRefOid":"unused","isDraft":!DRAFT!,"labels":!LABELS!}]
+  if "!HOLD!"=="true" (
+    echo [{"number":101,"url":"https://forge.invalid/pr/101","title":"fix: remote","body":"R table","state":"OPEN","headRefOid":"unused","isDraft":!DRAFT!,"labels":[{""name"":""merge-queue: hold""}]}]
+    exit /b 0
+  )
+  if "!ARMED!"=="true" (
+    echo [{"number":101,"url":"https://forge.invalid/pr/101","title":"fix: remote","body":"R table","state":"OPEN","headRefOid":"unused","isDraft":!DRAFT!,"labels":[{""name"":""merge-queue: armed""}]}]
+    exit /b 0
+  )
+  echo [{"number":101,"url":"https://forge.invalid/pr/101","title":"fix: remote","body":"R table","state":"OPEN","headRefOid":"unused","isDraft":!DRAFT!,"labels":[]}]
   exit /b 0
 )
 if "%1 %2"=="pr view" (
