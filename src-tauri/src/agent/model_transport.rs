@@ -349,6 +349,12 @@ fn parse_openai_responses_sse(payload: &str) -> Result<(String, Vec<ToolCall>, O
 }
 
 
+fn should_use_openai_responses(base_url: &str, model_id: &str) -> bool {
+    let base = base_url.to_ascii_lowercase();
+    let model = model_id.to_ascii_lowercase();
+    model.starts_with("gpt-6") && !base.contains("openrouter")
+}
+
 fn classify_transport_error(message: String) -> TransportError {
     if classify_provider_failure(&message).permits_endpoint_failover() {
         TransportError::Retryable(message)
@@ -1096,7 +1102,7 @@ impl DesktopModelTransport {
                     .await
             }
             _ => {
-                if self.model_id.to_ascii_lowercase().starts_with("gpt-6") && self.base_url.contains("api.openai.com") {
+                if should_use_openai_responses(&self.base_url, &self.model_id) {
                     self.call_openai_responses_model(messages, tool_defs, require_tool, reasoning_effort).await
                 } else {
                     self.call_openai_model(messages, tool_defs, require_tool, reasoning_effort).await
@@ -2680,6 +2686,14 @@ mod tests {
             &mut req.messages,
         );
         serde_json::to_value(&req).expect("wire body serializes")
+    }
+
+    #[test]
+    fn m286_responses_selection_covers_synthetic_openai_and_preserves_openrouter() {
+        assert!(should_use_openai_responses("http://127.0.0.1:19091/v1", "gpt-6.1-terra"));
+        assert!(should_use_openai_responses("https://api.openai.com/v1", "gpt-6.2-sol"));
+        assert!(!should_use_openai_responses("https://openrouter.ai/api/v1", "gpt-6.2-sol"));
+        assert!(!should_use_openai_responses("http://127.0.0.1:19091/v1", "gpt-5.6-sol"));
     }
 
     fn assistant_turns(body: &serde_json::Value) -> Vec<&serde_json::Value> {
