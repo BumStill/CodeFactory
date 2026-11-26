@@ -157,6 +157,9 @@ pub enum Request {
     SetUsageWindow { endpoint: String, #[serde(default)] model: Option<String>, rule: Option<crate::agent::usage_windows::UsageWindow> },
     GetQuota {},
     UsageStatus {},
+    /// M286/R8: read-only model catalog through the lock-screen-safe local entry.
+    /// The response contains model ids and prices only.
+    ListModels { #[serde(default)] endpoint: Option<String> },
     /// M235: same data and actions as the Settings memory page.
     ListMemories {},
     DeleteMemory { id: String },
@@ -371,6 +374,9 @@ pub fn validate_request(request: &Request) -> Result<(), ErrorBody> {
             if let Some(rule) = rule { rule.validate().map_err(ErrorBody::invalid)?; }
         }
         Request::CleanBuildCache {} | Request::GetQuota {} | Request::UsageStatus {} => {}
+        Request::ListModels { endpoint } => {
+            if let Some(endpoint) = endpoint { require_non_empty("endpoint", endpoint)?; }
+        }
         Request::ListMemories {} | Request::SetMemoryEnabled { .. } => {}
         Request::DeleteMemory { id } => require_non_empty("id", id)?,
         Request::SetQuotaCap { endpoint, five_hour_percent, weekly_percent } => {
@@ -503,7 +509,7 @@ impl AuditEntry {
             Request::SetUsageWindow { endpoint, model, rule } => {
                 entry.message = Some(format!("endpoint={endpoint}; model={}; rule={}", model.as_deref().unwrap_or("<endpoint>"), serde_json::to_string(rule).unwrap_or_default()));
             }
-            Request::GetQuota {} | Request::UsageStatus {} | Request::ListMemories {} => {}
+            Request::GetQuota {} | Request::UsageStatus {} | Request::ListModels { .. } | Request::ListMemories {} => {}
             Request::DeleteMemory { id } => entry.message = Some(format!("id={id}")),
             Request::SetMemoryEnabled { enabled } => entry.message = Some(format!("enabled={enabled}")),
             Request::SetQuotaCap { endpoint, five_hour_percent, weekly_percent } => {
@@ -544,6 +550,7 @@ pub fn operation_of(request: &Request) -> &'static str {
         Request::SetUsageWindow { .. } => "set_usage_window",
         Request::GetQuota {} => "get_quota",
         Request::UsageStatus {} => "usage_status",
+        Request::ListModels { .. } => "list_models",
         Request::ListMemories {} => "list_memories",
         Request::DeleteMemory { .. } => "delete_memory",
         Request::SetMemoryEnabled { .. } => "set_memory_enabled",
@@ -1515,6 +1522,14 @@ mod tests {
             ))
             .is_ok());
         }
+    }
+
+    #[test]
+    fn m286_list_models_dispatch_is_read_only_and_credential_free() {
+        let request = parse_request(r#"{"operation":"list_models","endpoint":"openai"}"#).unwrap();
+        assert_eq!(operation_of(&request), "list_models");
+        let serialized = serde_json::to_string(&AuditEntry::for_request(&request, chrono::Utc::now())).unwrap();
+        assert!(!serialized.contains("api_key"));
     }
 
     #[test]

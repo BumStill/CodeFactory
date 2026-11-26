@@ -1,6 +1,9 @@
 {
   "schema_version": 1,
   "mappings": [
+    { "pattern": "src-tauri/src/unattended_smoke_cli.rs", "scenario_id": "HLT-001" },
+    { "pattern": "src-tauri/src/commands/models.rs", "scenario_id": "HLT-001" },
+    { "pattern": "src-tauri/src/openrouter/client.rs", "scenario_id": "HLT-001" },
     { "pattern": "scripts/delivery-scenario-body.py", "scenario_id": "CXD-002" },
     { "pattern": "src-tauri/src/agent/long_term_memory.rs", "scenario_id": "HLT-001" },
     { "pattern": "src-tauri/src/tools/memory.rs", "scenario_id": "HLT-001" },

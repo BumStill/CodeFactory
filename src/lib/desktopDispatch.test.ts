@@ -6,6 +6,8 @@
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { describe, expect, it, vi } from "vitest";
+import { invoke } from "./tauri";
+vi.mock("./tauri", () => ({ invoke: vi.fn(async () => ({})) }));
 
 import {
   applyDispatchRequest,
@@ -198,6 +200,21 @@ describe("本地派单入口的前端路由", () => {
       (await applyDispatchRequest(request("status", { session_id: "s-1" }), handlers)).ok,
     ).toBe(true);
     expect(handlers.calls[handlers.calls.length - 1]).toBe("status");
+  });
+
+  it("M286 list_models 复用 Tauri 目录命令并默认 openai 端点", async () => {
+    const handlers = stubHandlers();
+    const invokeMock = vi.mocked(invoke);
+    invokeMock.mockResolvedValueOnce([{ id: "gpt-6.1-terra", pricing: { prompt: "0.5", completion: "2" } }]);
+    const outcome = await applyDispatchRequest(request("list_models"), handlers);
+    expect(outcome).toEqual({ ok: true, result: [{ id: "gpt-6.1-terra", pricing: { prompt: "0.5", completion: "2" } }] });
+    expect(invokeMock).toHaveBeenCalledWith("list_models", { endpointName: "openai" });
+    invokeMock.mockResolvedValueOnce([]);
+    const explicit = await applyDispatchRequest(request("list_models", { endpoint: "openai-secondary" }), handlers);
+    expect(explicit.ok).toBe(true);
+    expect(invokeMock).toHaveBeenLastCalledWith("list_models", { endpointName: "openai-secondary" });
+    const bad = await applyDispatchRequest(request("list_models", { endpoint: " " }), handlers);
+    expect(bad.ok).toBe(false);
   });
 
   it("交付授权缺失时请求被拒绝，且不会碰到任何界面动作（M48）", async () => {
