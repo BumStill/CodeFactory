@@ -11,7 +11,7 @@ const WAITING_REASON_LABELS: Record<string, string> = {
   agent_loop_error: "执行过程中断，已停止并把当前结论交还给你",
   context_compaction_exhausted: "对话上下文已压缩到极限，已停止并把当前结论交还给你",
   run_budget_exhausted: "本轮预算已用完，已停止并把当前结论交还给你",
-  authorization_required: "需要你先授权才能继续",
+  authorization_required: "等待你批准",
   needs_business_decision: "需要你先做一个决定才能继续",
   tool_observation_contract_missing: "该操作缺少可验证的观察方式，系统没有执行",
   browser_observation_contract_required: "浏览器操作缺少可验证的观察方式，系统没有执行",

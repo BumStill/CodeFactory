@@ -310,6 +310,12 @@ pub mod sandbox {
     }
 }
 
+fn should_auto_background(command: &str, has_db: bool, has_session: bool) -> bool {
+    has_db
+        && has_session
+        && crate::build_cache::HeavyBuildLimiter::is_heavy_build_command(command)
+}
+
 pub async fn execute(args: Value, ctx: &ExecCtx) -> Result<ToolOutput> {
     execute_inner(args, ctx, None).await
 }
@@ -349,6 +355,23 @@ async fn execute_inner(
         )));
     }
     let risk = policy.risk();
+
+    // M287 R6: safety classification always runs before automatic backgrounding.
+    // The durable task route then owns PID/log/deadline and wakes this session.
+    if timeout_override.is_none()
+        && should_auto_background(&a.command, ctx.db.is_some(), ctx.session_id.is_some())
+    {
+        return super::background_task::execute_start(
+            json!({
+                "command": a.command,
+                "description": a.description,
+                "timeout_sec": a.timeout_sec.unwrap_or(DEFAULT_TIMEOUT_SECS),
+                "source": "agent_decided"
+            }),
+            ctx,
+        )
+        .await;
+    }
 
     // M147b: delivery writes `Release-Urgency:` into the PR body, and the body is
     // rewritable — a single `gh pr edit --body` used to erase it (#818 merged with
@@ -1018,6 +1041,25 @@ fn read_github_quota() -> Option<shell_policy::GithubQuota> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn m287_heavy_builds_auto_background_only_with_durable_session_context() {
+        assert!(super::should_auto_background(
+            "cargo test --workspace",
+            true,
+            true
+        ));
+        assert!(!super::should_auto_background("git status", true, true));
+        assert!(!super::should_auto_background(
+            "cargo test --workspace",
+            false,
+            true
+        ));
+        assert!(!super::should_auto_background(
+            "cargo test --workspace",
+            true,
+            false
+        ));
+    }
     #[cfg(windows)]
     #[tokio::test]
     async fn m143_windows_foreground_outputs_chinese_and_chains() {

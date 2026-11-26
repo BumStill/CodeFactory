@@ -1418,6 +1418,38 @@ pub fn spawn_objective_recovery_supervisor(app: AppHandle, pool: SqlitePool) {
             {
                 tracing::warn!(%error, "objective supervisor poll failed");
             }
+            // M287 R1/R2: the session-level lease is the cross-domain liveness
+            // invariant. Expiry is observed on every 5s supervisor pass, well
+            // inside the 60s maximum. Each violation is persisted before the
+            // related Objective is handed to the existing recovery ladder.
+            let liveness_now = chrono::Utc::now().timestamp_millis();
+            if let Err(error) = crate::commands::liveness_store::project_unfinished_objectives(&pool, liveness_now).await {
+                tracing::warn!(%error, "session liveness projection failed");
+            }
+            match crate::commands::liveness_store::scan_liveness_violations(&pool, liveness_now).await {
+                Ok(objective_ids) => {
+                    for objective_id in objective_ids {
+                        if let Ok(Some(current)) = store.get(&objective_id).await {
+                            if current.status == ObjectiveStatus::Active {
+                                let decision = DecisionRouter::route(
+                                    &current,
+                                    RouteSignal::TechnicalFailure {
+                                        domain: current.domain,
+                                        failure_code: "session_liveness_deadline_exceeded".into(),
+                                        failure_signature: format!("session_liveness_deadline_exceeded:{}", current.id),
+                                        next_observation_at: liveness_now + POLL_INTERVAL.as_millis() as i64,
+                                        resume_cursor: current.resume_cursor.clone().or_else(|| current.root_turn_id.clone()),
+                                    },
+                                );
+                                if let Ok(decision) = decision {
+                                    let _ = store.apply_decision(current.revision, decision.as_convergence()).await;
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(error) => tracing::warn!(%error, "session liveness sweep failed"),
+            }
             // Everything above claims DUE REMEDIATIONS. An Objective that
             // stopped while `active` owns none, so no poll can ever see it —
             // that is precisely how a session becomes invisible rather than

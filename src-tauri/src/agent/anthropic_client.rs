@@ -120,6 +120,9 @@ pub(super) async fn stream_anthropic(
                 cancelled = true;
                 break;
             }
+            StreamPoll::TimedOut => return Err(crate::errors::AppError::Other(
+                "provider_stream_interrupted_no_side_effect: Anthropic SSE idle deadline exceeded; retry the same turn".into(),
+            )),
         };
         let bytes = chunk?;
         byte_buffer.extend_from_slice(&bytes);
