@@ -4397,3 +4397,58 @@ mod m266_tests {
         );
     }
 }
+
+/// M281 R2 (red first): a read-only `for` loop over a bounded list is still
+/// refused with `trusted.shell.unproved`. The structure prover knows how to
+/// unroll literal lists, but a list produced by a substitution (`$(git
+/// ls-files)`, `$(find …)`) or a glob is `ShellValue::Bounded`/`Unknown`, so
+/// the loop body loses its binding and the whole line collapses into "cannot
+/// be decomposed into provable simple commands".
+#[cfg(test)]
+mod m281_readonly_for_loops {
+    use super::sensitive;
+    use super::standalone_shell_policy;
+
+    /// R2 现场形态：只读的 `for` 循环，列表来自 `$()`，循环体只读文件与 Git 状态。
+    const READ_ONLY_LOOPS: [&str; 5] = [
+        "for f in $(git ls-files '*.rs'); do grep -n TODO \"$f\"; done",
+        "for b in $(git branch --format='%(refname:short)'); do echo \"$b\"; done",
+        "for f in $(find . -name '*.md' -not -path './target/*'); do wc -l \"$f\"; done",
+        "for f in src/*.rs; do sed -n 1,5p \"$f\"; done",
+        "for i in 1 2 3; do git status --porcelain; done",
+    ];
+
+    #[test]
+    fn read_only_for_loops_are_proved_local() {
+        let mut failures = Vec::new();
+        for command in READ_ONLY_LOOPS {
+            if sensitive(command) {
+                failures.push(command);
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "M281 R2: these read-only for loops must not require approval: {}",
+            failures.join("\n")
+        );
+    }
+
+    /// Negative control: the same structure carrying a destructive command is
+    /// not silently proved — the shell-safety table still asks.
+    #[test]
+    fn for_loop_with_a_destructive_body_still_asks() {
+        for command in [
+            "for f in a b; do rm -rf \"$f\"; done",
+            "for f in a b; do git reset --hard \"$f\"; done",
+        ] {
+            assert!(
+                !matches!(
+                    standalone_shell_policy::classify_command(command),
+                    standalone_shell_policy::ShellCommandPolicy::Allow { .. }
+                ),
+                "M281 R2 negative control: {command} must not be auto-allowed"
+            );
+        }
+    }
+}
+

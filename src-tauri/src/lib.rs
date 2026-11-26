@@ -12,8 +12,18 @@ pub mod headless_dispatch;
 pub fn run_headless_dispatch_cli() -> bool {
     #[cfg(not(test))]
     if std::env::args().nth(1).as_deref() == Some("--measure-first-request-latency") {
-        let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build().expect("latency runtime");
-        match runtime.block_on(agent::first_request_latency::measure()) {
+        // Windows gives the main thread a 1 MiB stack, which the AgentLoop future
+        // overflows in debug builds. Use the same 8 MiB the other headless entries use.
+        let outcome = std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                let runtime = tokio::runtime::Builder::new_multi_thread().thread_stack_size(8 * 1024 * 1024).enable_all().build().expect("latency runtime");
+                runtime.block_on(agent::first_request_latency::measure())
+            })
+            .expect("latency thread")
+            .join()
+            .expect("latency measurement thread panicked");
+        match outcome {
             Ok(receipt) => println!("{}", serde_json::to_string_pretty(&receipt).expect("latency receipt")),
             Err(error) => { eprintln!("first request measurement failed: {error:#}"); std::process::exit(1); }
         }
@@ -1819,6 +1829,26 @@ pub fn run() {
         .init();
 
     tauri::Builder::default()
+        .plugin(
+            tauri::plugin::Builder::<tauri::Wry, ()>::new("exit-observer")
+                .on_event(|app, event| match event {
+                    tauri::RunEvent::ExitRequested { code, .. } => {
+                        if let Ok(dir) = app.path().app_data_dir() {
+                            startup_recovery::record_exit(
+                                &dir,
+                                &startup_recovery::exit_reason(*code),
+                            );
+                        }
+                    }
+                    tauri::RunEvent::Exit => {
+                        if let Ok(dir) = app.path().app_data_dir() {
+                            startup_recovery::record_exit(&dir, "exit");
+                        }
+                    }
+                    _ => {}
+                })
+                .build(),
+        )
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_updater::Builder::new().build())

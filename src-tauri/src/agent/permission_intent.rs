@@ -332,6 +332,30 @@ impl PermissionIntentStore {
         if let Some(existing) =
             latest_action_in_tx(&mut tx, &request.scope, &action_signature).await?
         {
+            // M281 R1: an unanswered request is not a conflict. An interrupted
+            // attempt (restart, cancelled run, recovery takeover) leaves exactly
+            // this row behind, and the approval the user still sees on screen
+            // belongs to it. Re-issue the SAME intent instead of failing closed,
+            // and move its deadline to the window this attempt just opened —
+            // otherwise a retry turns a live approval into "late or conflicting".
+            if existing.status == PermissionIntentStatus::Pending {
+                sqlx::query(
+                    "UPDATE permission_intents SET expires_at=?, updated_at=?
+                     WHERE intent_id=? AND status='pending'",
+                )
+                .bind(request.expires_at)
+                .bind(now)
+                .bind(&existing.intent_id)
+                .execute(&mut *tx)
+                .await
+                .context("extend the interrupted pending permission intent")?;
+                let refreshed =
+                    latest_action_in_tx(&mut tx, &request.scope, &action_signature)
+                        .await?
+                        .context("the re-issued pending intent disappeared")?;
+                tx.commit().await?;
+                return Ok(refreshed);
+            }
             let reason = match existing.status {
                 PermissionIntentStatus::Pending => "is already waiting for a decision",
                 PermissionIntentStatus::Allowed => "already has an unconsumed allow receipt",
