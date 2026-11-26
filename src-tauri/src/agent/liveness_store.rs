@@ -3,6 +3,8 @@
 use serde::{Deserialize, Serialize};
 use sqlx::{Row, SqlitePool};
 
+use std::sync::{Mutex, OnceLock};
+
 use super::liveness::{
     evaluate_session_liveness, LivenessEvaluation, LivenessOwner, LivenessOwnerKind,
     LivenessViolation, SessionLivenessSnapshot,
@@ -34,6 +36,29 @@ pub struct LivenessMetrics {
     pub total_violations: i64,
     pub longest_idle_ms: i64,
     pub by_kind: Vec<LivenessViolationCount>,
+    pub supervision_consecutive_failures: u64,
+    pub supervision_last_error: Option<String>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct SupervisionHealth {
+    consecutive_failures: u64,
+    last_error: Option<String>,
+}
+
+fn supervision_health() -> &'static Mutex<SupervisionHealth> {
+    static HEALTH: OnceLock<Mutex<SupervisionHealth>> = OnceLock::new();
+    HEALTH.get_or_init(|| Mutex::new(SupervisionHealth::default()))
+}
+
+pub fn record_supervision_success() {
+    *supervision_health().lock().expect("liveness health lock") = SupervisionHealth::default();
+}
+
+pub fn record_supervision_failure(error: &anyhow::Error) {
+    let mut health = supervision_health().lock().expect("liveness health lock");
+    health.consecutive_failures = health.consecutive_failures.saturating_add(1);
+    health.last_error = Some(error.to_string());
 }
 
 pub async fn claim_owner(
@@ -326,6 +351,14 @@ pub async fn supervise_expired_leases(
     Ok(objectives)
 }
 
+pub async fn run_supervision_cycle(
+    pool: &SqlitePool,
+    now_ms: i64,
+) -> anyhow::Result<Vec<String>> {
+    project_unfinished_objectives(pool, now_ms).await?;
+    scan_liveness_violations(pool, now_ms).await
+}
+
 pub async fn metrics(pool: &SqlitePool, hours: i64, now_ms: i64) -> anyhow::Result<LivenessMetrics> {
     let bounded_hours = hours.clamp(1, 24 * 30);
     let since = now_ms.saturating_sub(bounded_hours.saturating_mul(3_600_000));
@@ -354,11 +387,14 @@ pub async fn metrics(pool: &SqlitePool, hours: i64, now_ms: i64) -> anyhow::Resu
     .bind(since)
     .fetch_one(pool)
     .await?;
+    let health = supervision_health().lock().expect("liveness health lock").clone();
     Ok(LivenessMetrics {
         hours: bounded_hours,
         total_violations,
         longest_idle_ms,
         by_kind,
+        supervision_consecutive_failures: health.consecutive_failures,
+        supervision_last_error: health.last_error,
     })
 }
 
@@ -443,6 +479,8 @@ mod tests {
         let metrics = metrics(&pool, 1, 100_000).await.unwrap();
         assert_eq!(metrics.total_violations, 3);
         assert_eq!(metrics.longest_idle_ms, 45_000);
+        assert_eq!(metrics.supervision_consecutive_failures, 0);
+        assert_eq!(metrics.supervision_last_error, None);
         assert_eq!(
             metrics.by_kind,
             vec![
@@ -456,6 +494,26 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn m287b_r2_repeated_supervision_failure_is_visible_and_recovery_clears_it() {
+        record_supervision_success();
+        let error = anyhow::anyhow!("synthetic liveness schema failure");
+        record_supervision_failure(&error);
+        record_supervision_failure(&error);
+        let pool = pool().await;
+        let degraded = metrics(&pool, 24, 100_000).await.unwrap();
+        assert_eq!(degraded.supervision_consecutive_failures, 2);
+        assert_eq!(
+            degraded.supervision_last_error.as_deref(),
+            Some("synthetic liveness schema failure")
+        );
+
+        record_supervision_success();
+        let recovered = metrics(&pool, 24, 100_000).await.unwrap();
+        assert_eq!(recovered.supervision_consecutive_failures, 0);
+        assert_eq!(recovered.supervision_last_error, None);
     }
 
     #[tokio::test]

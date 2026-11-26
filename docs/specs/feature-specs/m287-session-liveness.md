@@ -195,3 +195,30 @@ Snapshot 由 Objective、run control、provider attempt、tool call、background
 - 构建与临时文件仅放 `.codefactory-cache/`。
 - R1–R8 未全部完成前不准备 PR 正文、不调用交付；不完整 PR 保持 draft 且不 armed。
 - 全部完成后 PR 使用 `Release-Urgency: immediate`；真机安装版 24 小时验收由编排方发版后执行。
+
+## 8. M287b：正式程序生产 schema 与监督可观测性修复
+
+# M287b：M287 的活性表在正式程序里从未创建，统一监督在生产中整体失效
+
+## 现场（2026-11-26 22:1x，v1.128.0 真机，只读核实）
+- 生产库 `~/Library/Application Support/com.codefactory.app/codefactory.db` 中不存在 `session_liveness_leases`、`session_liveness_events`（`.tables` 无任何 liveness 表）。
+- `migrations/0027_session_liveness.sql` 只在 `src-tauri/src/agent/liveness_store.rs:371` 的 `#[cfg(test)] mod tests` 里通过 `include_str!` 执行；生产路径没有任何地方执行它（对比 `thin.rs:120` 生产代码会执行 0022）。
+- `objective_supervisor.rs` 约 1425–1430 行每 5 秒调用 `project_unfinished_objectives` / `scan_liveness_violations`，在生产中必然因 no such table 失败，只记 `tracing::warn`，R1/R2/R7/R8 在真实应用里全部未生效；测试全绿是因为测试自建内存库。
+- 合并后审计结论：为何合并前没发现——所有 M287 测试都自建 schema，没有任何测试走「真实应用启动 → 生产 schema 初始化 → 监督周期」路径。
+
+## 规格（追加到 `docs/specs/feature-specs/m287-session-liveness.md` 的 M287b 小节）
+- R1：应用启动时（与其他模块 ensure_schema 同一初始化路径）幂等创建 0027 的全部表与索引；已有库升级与全新库都覆盖。
+- R2：`project_unfinished_objectives` / `scan_liveness_violations` 失败时不得只 warn 后静默：同一错误持续出现时要有可观测信号（结构化事件或健康状态），且不得影响其他监督逻辑。
+- R3：查清 M287 其余新增的生产依赖（命令注册、只读度量查询 `query_session_liveness_metrics`、前端调用）在真实应用里是否都已接线；未接线的一并接上，并列出清单。
+- R4：补一条「真实启动路径」测试：用生产初始化函数打开一个全新文件库（临时目录），断言 liveness 表存在、一次监督周期能写入 lease、制造过期能写入 violation 事件；再用一个旧版本 schema 的库升级同样断言。不得在测试里手动执行 0027 SQL 来凑绿。
+
+## 约束
+改文件只用 edit_file / write_file。不改信任根；场景缺口只追加 `docs/testing/scenario-mappings.json`。不碰凭据、settings.json、其他会话的 PR，不动任何 merge-queue: hold 标签。规格文件在工作区外，用 bash cat 只读查看。
+
+## 交付
+PR 正文 `R | 是否完成 | 证据` 列 R1–R4；`Release-Urgency: immediate`（M287 核心能力在生产中未生效）。全部完成、CI 全绿后正常交付。
+
+## 验收（真机，发版后编排方做）
+安装后生产库出现 liveness 表；运行中的会话在 `session_liveness_leases` 有 owner 行；度量查询返回数据。
+
+Release-Urgency: immediate

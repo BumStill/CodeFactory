@@ -1423,11 +1423,9 @@ pub fn spawn_objective_recovery_supervisor(app: AppHandle, pool: SqlitePool) {
             // inside the 60s maximum. Each violation is persisted before the
             // related Objective is handed to the existing recovery ladder.
             let liveness_now = chrono::Utc::now().timestamp_millis();
-            if let Err(error) = crate::commands::liveness_store::project_unfinished_objectives(&pool, liveness_now).await {
-                tracing::warn!(%error, "session liveness projection failed");
-            }
-            match crate::commands::liveness_store::scan_liveness_violations(&pool, liveness_now).await {
+            match crate::commands::liveness_store::run_supervision_cycle(&pool, liveness_now).await {
                 Ok(objective_ids) => {
+                    crate::commands::liveness_store::record_supervision_success();
                     for objective_id in objective_ids {
                         if let Ok(Some(current)) = store.get(&objective_id).await {
                             if current.status == ObjectiveStatus::Active {
@@ -1448,7 +1446,10 @@ pub fn spawn_objective_recovery_supervisor(app: AppHandle, pool: SqlitePool) {
                         }
                     }
                 }
-                Err(error) => tracing::warn!(%error, "session liveness sweep failed"),
+                Err(error) => {
+                    crate::commands::liveness_store::record_supervision_failure(&error);
+                    tracing::warn!(%error, "session liveness supervision failed; health state records the continuing failure");
+                }
             }
             // Everything above claims DUE REMEDIATIONS. An Objective that
             // stopped while `active` owns none, so no poll can ever see it —

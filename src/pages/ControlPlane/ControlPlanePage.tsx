@@ -117,6 +117,15 @@ interface ObjectiveHealthSnapshot {
   metrics: ObjectiveHealthMetrics | null;
 }
 
+interface SessionLivenessMetrics {
+  hours: number;
+  total_violations: number;
+  longest_idle_ms: number;
+  by_kind: Array<{ violation_kind: string; count: number }>;
+  supervision_consecutive_failures: number;
+  supervision_last_error: string | null;
+}
+
 interface ControlPlanePageProps {
   onBack: () => void;
 }
@@ -176,6 +185,10 @@ async function requestObjectiveHealthSnapshot(): Promise<ObjectiveHealthSnapshot
   } finally {
     if (timeoutId !== undefined) clearTimeout(timeoutId);
   }
+}
+
+async function requestSessionLivenessMetrics(): Promise<SessionLivenessMetrics> {
+  return invoke<SessionLivenessMetrics>("query_session_liveness_metrics", { hours: 24 });
 }
 
 function StatusBadge({ status }: { status: Status }) {
@@ -417,7 +430,7 @@ function ObjectiveHealthMetric({
   risk = false,
   detail,
 }: {
-  testId: string;
+  testId?: string;
   label: string;
   value: number | string;
   risk?: boolean;
@@ -448,6 +461,29 @@ function ObjectiveHealthMetric({
         {value}
       </div>
       {detail && <p className="mt-1 text-caption leading-relaxed text-gray-600">{detail}</p>}
+    </div>
+  );
+}
+
+function SessionLivenessPanel({ metrics }: { metrics: SessionLivenessMetrics | null }) {
+  if (!metrics) return null;
+  const degraded = metrics.supervision_consecutive_failures > 0;
+  return (
+    <div
+      data-testid="session-liveness-health"
+      data-status={degraded ? "degraded" : "healthy"}
+      className={`mt-3 rounded border p-3 ${degraded ? "border-red-500/40 bg-red-500/10" : "border-border bg-surface-1"}`}
+    >
+      <div className="grid grid-cols-1 gap-2 md:grid-cols-3">
+        <ObjectiveHealthMetric label="24h liveness violations" value={metrics.total_violations} risk={metrics.total_violations > 0} />
+        <ObjectiveHealthMetric label="Longest owner idle" value={formatObjectiveLatency(metrics.longest_idle_ms)} />
+        <ObjectiveHealthMetric label="Supervisor failures" value={metrics.supervision_consecutive_failures} risk={degraded} />
+      </div>
+      {degraded && (
+        <p className="mt-2 text-caption text-red-700 dark:text-red-300">
+          Liveness supervision is degraded: {metrics.supervision_last_error ?? "unknown error"}
+        </p>
+      )}
     </div>
   );
 }
@@ -649,6 +685,7 @@ export function ControlPlanePage({ onBack }: ControlPlanePageProps) {
   const cwd = activeSession?.cwd ?? null;
   const [snapshot, setSnapshot] = useState<ControlPlaneSnapshot | null>(null);
   const [objectiveHealth, setObjectiveHealth] = useState<ObjectiveHealthSnapshot | null>(null);
+  const [sessionLiveness, setSessionLiveness] = useState<SessionLivenessMetrics | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const requestSequence = useRef(0);
@@ -667,8 +704,11 @@ export function ControlPlanePage({ onBack }: ControlPlanePageProps) {
       if (requestId !== requestSequence.current) return;
       const nextObjectiveHealth = await requestObjectiveHealthSnapshot();
       if (requestId !== requestSequence.current) return;
+      const nextSessionLiveness = await requestSessionLivenessMetrics();
+      if (requestId !== requestSequence.current) return;
       setSnapshot(next);
       setObjectiveHealth(nextObjectiveHealth);
+      setSessionLiveness(nextSessionLiveness);
     } catch (e) {
       if (requestId !== requestSequence.current) return;
       setError(e instanceof Error ? e.message : String(e));
@@ -750,6 +790,7 @@ export function ControlPlanePage({ onBack }: ControlPlanePageProps) {
 
               <Section title="Objective Continuity">
                 <ObjectiveHealthPanel health={objectiveHealth} />
+                <SessionLivenessPanel metrics={sessionLiveness} />
               </Section>
 
               <Section title="Authority Surfaces">
