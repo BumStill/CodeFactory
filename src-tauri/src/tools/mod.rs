@@ -6,7 +6,12 @@ pub mod browser_session;
 pub mod web_fetch;
 pub mod delegate_tasks;
 pub mod delivery;
+#[path = "delivery_thin_m285.rs"]
 mod delivery_thin;
+mod delivery_m285_policy;
+mod delivery_m285;
+#[cfg(test)]
+mod delivery_m285_tests;
 pub mod docx;
 pub mod edit;
 pub mod file_lock;
