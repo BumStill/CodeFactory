@@ -222,3 +222,31 @@ PR 正文 `R | 是否完成 | 证据` 列 R1–R4；`Release-Urgency: immediate`
 安装后生产库出现 liveness 表；运行中的会话在 `session_liveness_leases` 有 owner 行；度量查询返回数据。
 
 Release-Urgency: immediate
+
+## 9. M287c：活性监督在生产中空转——误判、重复记违例、"recovered" 名不副实
+
+## 现场（v1.129.0 真机，2026-11-27 00:19–00:46，只读核实）
+- `session_liveness_events` 26 分钟写入 1931 行（约每 5 秒 8 行），全部 `violation_kind=deadline_exceeded, action=resume_original_objective, outcome=recovered`，但对应 lease 的 `deadline_at` 不变，下一周期再次判违例 → 无限循环，约 10 万行/天。
+- 被判违例的 8 个会话中：
+  - 5 个是 10–11 月的遗留非终态 objective（0808ca03 active 11-07、48864195/7ac1e453/d91f9d3a waiting_system delivered_awaiting_ci 10-18、af7763ba/afc40ac6 active 11-07/11-11），早已无人推进。
+  - 2 个是正在运行的会话 6e140abf、96c4e911：它们此刻有 `background_tasks.status='running'` 的后台任务，却被投影成 `owner_kind=model`、deadline 已过 → 误判。
+  - `2da3e2a0`、`e2de2968` 为 `waiting_core_input`（等用户），owner=user_input，正常续租。
+- objectives 表在 00:31 后没有任何变化（revision 未增），说明 "resume_original_objective" 实际未生效，但事件仍写 `outcome=recovered`。
+
+## 规格（追加到 `docs/specs/feature-specs/m287-session-liveness.md` 的 M287c 小节）
+- R1：owner 投影必须识别全部合法推进者并取正确截止时间：运行中的后台任务（deadline=任务超时）、待触发唤醒（deadline=next_at+余量）、PR/CI 监视订阅（deadline=订阅约定的复查时间）、待审批、等用户。存在合法推进者时不得投影成过期的 model owner。
+- R2：违例去重：同一 (session, owner, deadline) 只记一次违例；处置后必须续租或改写 lease（新的 owner/deadline）或把 objective 结算到终态，否则下一周期不得重复写同一违例。事件表加保留上限或聚合（写明策略）。
+- R3：`outcome` 必须反映真实结果：apply_decision 成功才记 recovered；revision 冲突、决策被拒、无可恢复路径分别记明确的失败结果与原因，并进入 R8 度量。
+- R4：遗留非终态 objective（超过可配置天数无任何推进，如 >7 天）不纳入每周期恢复：一次性结算为明确终态（或标记 stale 并停止投影），写一条结构化事件；不得把它们重新唤醒去消耗模型额度。
+- R5：用本次现场形状写测试（先红后绿）：运行中后台任务不误判；遗留 objective 不循环；同一违例不重复写；apply 失败不记 recovered；反例：真正过期且无推进者的会话仍被接手一次。
+
+## 约束
+改文件只用 edit_file / write_file。不改信任根；场景缺口只追加 `docs/testing/scenario-mappings.json`。不碰凭据、settings.json、其他会话 PR，不动任何 merge-queue: hold 标签。规格文件在工作区外，用 bash cat 只读查看。
+
+## 交付
+PR 正文 `R | 是否完成 | 证据` 列 R1–R5；`Release-Urgency: immediate`（生产中每天约 10 万行无效事件、真实卡顿无法接手）。
+
+## 验收（真机，发版后）
+安装后 10 分钟内 `session_liveness_events` 新增行数 ≤ 违例会话数；运行后台任务的会话不出现违例；遗留 objective 被一次性结算。
+
+Release-Urgency: immediate
