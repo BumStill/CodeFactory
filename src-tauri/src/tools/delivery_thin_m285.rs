@@ -105,11 +105,29 @@ async fn guarded_args(args: &Value, ctx: &ExecCtx, ceiling: DeliveryCeiling) -> 
         return Err(crate::errors::AppError::ToolArgument(reason));
     }
     if pr["title"].as_str().is_some() || pr["body"].as_str().is_some() {
-        // F6/F7: Reuse existing PR verbatim when present — do NOT override remote title/body
-        // in the invocation args. Downstream legacy thin delivery only updates title/body
-        // when explicitly provided; stripping them here guarantees we never rewrite a
-        // maintainer-edited title/body on PR reuse.
-        if let Some(obj) = guarded.as_object_mut() {
+        // F6/F7: default to preserving remote title/body on PR reuse.
+        let explicit_update = args
+            .get("update_pr_body")
+            .and_then(Value::as_str)
+            .is_some_and(|mode| matches!(mode, "append" | "replace"));
+        if explicit_update {
+            // Allow an explicit evidence update: append or replace the body while keeping the title.
+            if let Some(obj) = guarded.as_object_mut() {
+                if let Some(local) = obj.get("body").and_then(Value::as_str) {
+                    let remote = pr["body"].as_str().unwrap_or("");
+                    let merged = if args["update_pr_body"].as_str() == Some("append") {
+                        if remote.trim().is_empty() { local.to_string() } else { format!("{remote}\n\n{local}") }
+                    } else {
+                        // replace
+                        local.to_string()
+                    };
+                    obj.insert("body".into(), Value::String(merged));
+                }
+                // Never change an existing title here; let legacy path improve only unusable titles.
+                obj.remove("title");
+            }
+        } else if let Some(obj) = guarded.as_object_mut() {
+            // No explicit update requested: strip both fields so the legacy path does not overwrite maintainer edits.
             obj.remove("title");
             obj.remove("body");
         }
