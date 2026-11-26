@@ -104,6 +104,15 @@ describe("M289 whole-window file drop", () => {
     expect(invoke.mock.calls.some(([command]) => command === "save_session_attachment")).toBe(false);
   });
 
+  it("accepts a 20 MiB image attachment and leaves model compression to the send path", async () => {
+    renderInput();
+    const largeImage = new File(["x"], "photo.png", { type: "image/png" });
+    Object.defineProperty(largeImage, "size", { value: 20 * 1024 * 1024 });
+    drop([largeImage]);
+    await waitFor(() => expect(invoke).toHaveBeenCalledWith("save_session_attachment", expect.objectContaining({ filename: "photo.png" })));
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  });
+
   it("accepts exactly 50 MiB and rejects one byte more with the backend-provided limit", async () => {
     renderInput();
     const edge = new File(["x"], "edge.bin");

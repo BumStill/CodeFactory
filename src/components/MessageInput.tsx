@@ -170,13 +170,8 @@ export const MessageInput = forwardRef<MessageInputHandle, Props>(function Messa
 
   const saveAttachmentFile = async (file: File): Promise<void> => {
     const limits = await getAttachmentLimits();
-    const image = isImageAttachment(file.name);
     if (file.size > limits.max_bytes) {
       setAttachError((prev) => [prev, `${file.name} 超过 ${limits.max_mebibytes}MiB 上限，已跳过`].filter(Boolean).join("\n"));
-      return;
-    }
-    if (image && file.size > limits.max_model_image_bytes) {
-      setAttachError((prev) => [prev, `${file.name} 是图片，超过模型可接收的 ${limits.max_model_image_mebibytes}MiB 上限，已跳过；请压缩或缩小图片后重试`].filter(Boolean).join("\n"));
       return;
     }
     const filename = file.name || `粘贴图片-${Date.now()}-${crypto.randomUUID().slice(0, 8)}.${file.type.split("/")[1]?.replace("jpeg", "jpg") || "png"}`;

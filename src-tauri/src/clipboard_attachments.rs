@@ -44,18 +44,7 @@ pub struct PasteResult {
 pub fn check_size(name: &str, size: usize) -> Result<(), String> {
     if size > MAX_ATTACHMENT_BYTES {
         Err(format!("{name} 超过 {MAX_ATTACHMENT_MEBIBYTES}MiB 上限，已跳过"))
-    } else if is_model_image(name) && size > MAX_MODEL_IMAGE_BYTES {
-        Err(format!(
-            "{name} 是图片，超过模型可接收的 {MAX_MODEL_IMAGE_MEBIBYTES}MiB 上限，已跳过；请压缩或缩小图片后重试"
-        ))
     } else { Ok(()) }
-}
-
-fn is_model_image(name: &str) -> bool {
-    Path::new(name)
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .is_some_and(|extension| matches!(extension.to_ascii_lowercase().as_str(), "png" | "jpg" | "jpeg" | "gif" | "webp"))
 }
 
 // All filenames/paths are clipboard data, never interpolated into commands.
@@ -203,7 +192,7 @@ mod tests {
     fn m190_clipboard_limits_and_file_list() {
         assert!(check_size("edge.bin", 50 * 1024 * 1024).is_ok());
         assert!(check_size("large.bin", 50 * 1024 * 1024 + 1).unwrap_err().contains("50MiB"));
-        assert!(check_size("large.png", 8 * 1024 * 1024 + 1).unwrap_err().contains("模型可接收的 8MiB"));
+        assert!(check_size("large.png", 20 * 1024 * 1024).is_ok());
         let limits = attachment_limits();
         assert_eq!(limits.max_bytes, 50 * 1024 * 1024);
         assert_eq!(limits.max_model_image_bytes, 8 * 1024 * 1024);
