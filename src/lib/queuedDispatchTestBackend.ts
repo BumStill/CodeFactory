@@ -12,6 +12,7 @@ export interface QueuedRow {
   id: string;
   sessionId: string;
   content: string;
+  clientMessageId: string;
   rootTurnId: string;
   status: "queued" | "delivering" | "delivered" | "failed";
   attempts: number;
@@ -57,6 +58,7 @@ export function queuedDispatchCommand(
         id: `queued-${sequence}`,
         sessionId: sessionId,
         content: String(args.content ?? "").trim(),
+        clientMessageId: String(args.clientMessageId ?? args.rootTurnId ?? `message-queued-${sequence}`),
         rootTurnId: (args.rootTurnId as string) ?? `root-queued-${sequence}`,
         status: "queued",
         attempts: 0,
@@ -71,6 +73,15 @@ export function queuedDispatchCommand(
     }
     case "list_queued_dispatch_messages":
       return { handled: true, value: pendingOf(sessionId).map(withPosition) };
+    case "list_queued_dispatch_message_history": {
+      const requestedSession = typeof args.sessionId === "string" ? args.sessionId : null;
+      return {
+        handled: true,
+        value: rows
+          .filter((row) => requestedSession == null || row.sessionId === requestedSession)
+          .map(withPosition),
+      };
+    }
     case "claim_next_queued_dispatch_message": {
       const next = pendingOf(sessionId).find((row) => row.status === "queued");
       if (!next) return { handled: true, value: null };
