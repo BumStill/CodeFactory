@@ -39,7 +39,7 @@ fn merge_models(mut custom: Vec<ModelInfo>, remote: Vec<ModelInfo>) -> Vec<Model
     let mut remote: Vec<ModelInfo> = remote
         .into_iter()
         .filter(|model| !custom_ids.contains(&model.id))
-        .map(|model| ModelInfo { is_custom: false, ..model })
+        .map(|mut model| { if model.pricing.is_none() && model.id.starts_with("gpt-") { let rate = crate::agent::openai_api::rate_for_model(&model.id); model.pricing = Some(crate::openrouter::types::ModelPricing { prompt: rate.input_usd_per_mtok.to_string(), completion: rate.output_usd_per_mtok.to_string() }); } ModelInfo { is_custom: false, ..model } })
         .collect();
     remote.sort_by(|left, right| left.id.cmp(&right.id));
     custom.extend(remote);
