@@ -57,14 +57,14 @@ set /p DRAFT=<"!D!"
 if exist "!BASE!.fail_list_once" if "%1 %2"=="pr list" if not exist "!BASE!.failed_once" (type nul>"!BASE!.failed_once" & exit /b 2)
 if "%1 %2"=="pr list" (
   set "LABELS=[]"
-  if "!ARMED!"=="true" set "LABELS=[{{\"name\":\"merge-queue: armed\"}}]"
-  echo [{{\"number\":101,\"url\":\"https://forge.invalid/pr/101\",\"title\":\"fix: remote\",\"body\":\"R table\",\"state\":\"OPEN\",\"headRefOid\":\"unused\",\"isDraft\":!DRAFT!,\"labels\":!LABELS!}}]
+  if "!ARMED!"=="true" set "LABELS=[{""name"":""merge-queue: armed""}]"
+  echo [{"number":101,"url":"https://forge.invalid/pr/101","title":"fix: remote","body":"R table","state":"OPEN","headRefOid":"unused","isDraft":!DRAFT!,"labels":!LABELS!}]
   exit /b 0
 )
 if "%1 %2"=="pr view" (
-  echo %*| findstr /C:"labels" >nul && (set "LABELS=[]" & if "!ARMED!"=="true" set "LABELS=[{{\"name\":\"merge-queue: armed\"}}]" & echo {{\"labels\":!LABELS!}} & exit /b 0)
-  echo %*| findstr /C:"number,url" >nul && (echo {{\"number\":101,\"url\":\"https://forge.invalid/pr/101\"}} & exit /b 0)
-  echo {{\"state\":\"OPEN\",\"statusCheckRollup\":[{{\"status\":\"IN_PROGRESS\"}}]}}
+  echo %*| findstr /C:"labels" >nul && (set "LABELS=[]" & if "!ARMED!"=="true" set "LABELS=[{""name"":""merge-queue: armed""}]" & echo {"labels":!LABELS!} & exit /b 0)
+  echo %*| findstr /C:"number,url" >nul && (echo {"number":101,"url":"https://forge.invalid/pr/101"} & exit /b 0)
+  echo {"state":"OPEN","statusCheckRollup":[{"status":"IN_PROGRESS"}]}
   exit /b 0
 )
 if "%1 %2"=="pr edit" (
