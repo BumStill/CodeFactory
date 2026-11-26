@@ -43,7 +43,7 @@ describe("M289 whole-window file drop", () => {
   });
 
   it("handles Tauri native whole-window drops through the shared backend route", async () => {
-    Object.assign(window, { __TAURI_INTERNALS__: {} });
+    Object.assign(window, { __TAURI_INTERNALS__: { metadata: { currentWindow: { label: "main" } } } });
     invoke.mockImplementation(async (command, args) => {
       if (command === "paste_session_attachments") return args.paths.map((path: string) => ({ path: `/saved/${path.split("/").pop()}`, name: path.split("/").pop(), size_bytes: 5 }));
       if (command === "attachment_metadata") return { max_bytes: 50 * 1024 * 1024, max_mebibytes: 50, max_model_image_bytes: 8 * 1024 * 1024, max_model_image_mebibytes: 8 };

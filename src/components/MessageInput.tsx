@@ -299,7 +299,10 @@ export const MessageInput = forwardRef<MessageInputHandle, Props>(function Messa
     const onWindowBlur = () => resetDrag();
 
     let nativeUnlisten: (() => void) | undefined;
-    if (typeof window !== "undefined" && "__TAURI_INTERNALS__" in window) {
+    const tauriInternals = (window as typeof window & {
+      __TAURI_INTERNALS__?: { metadata?: { currentWindow?: { label?: string } } };
+    }).__TAURI_INTERNALS__;
+    if (tauriInternals?.metadata?.currentWindow?.label) {
       void getCurrentWindow().onDragDropEvent((event: { payload: DragDropEvent }) => {
         if (event.payload.type === "over") {
           setDragFileCount(1);
