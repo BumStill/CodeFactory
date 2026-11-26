@@ -1,11 +1,23 @@
 // SPDX-License-Identifier: Apache-2.0
 
+use tauri::State;
+
+use crate::AppState;
+
 pub(crate) use crate::commands::liveness_store::LivenessMetrics;
 
-/// R8 read-only implementation. The public desktop entry is the existing
-/// `get_objective_health` command, which includes this aggregate without adding
-/// a second command-registration surface.
+/// M287 R8/M287b R3 read-only desktop command. It exposes aggregate events
+/// and the in-process supervisor health signal without session content.
+#[tauri::command]
 pub async fn query_session_liveness_metrics(
+    state: State<'_, AppState>,
+    hours: Option<i64>,
+) -> Result<LivenessMetrics, String> {
+    let pool = state.db.read().await.clone();
+    query_session_liveness_metrics_from_pool(&pool, hours).await
+}
+
+pub async fn query_session_liveness_metrics_from_pool(
     pool: &sqlx::SqlitePool,
     hours: Option<i64>,
 ) -> Result<LivenessMetrics, String> {

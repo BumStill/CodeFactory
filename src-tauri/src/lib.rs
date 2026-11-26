@@ -2312,6 +2312,7 @@ pub fn run() {
             commands::checkpoints::revert_checkpoint,
             commands::control_plane::get_control_plane_snapshot,
             commands::objective_health::get_objective_health,
+            commands::session_liveness::query_session_liveness_metrics,
             commands::session::session_diagnostics,
             commands::session::reset_session_state,
             commands::document::read_document,
