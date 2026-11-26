@@ -365,6 +365,12 @@ async fn ensure_schema(pool: &SqlitePool) -> crate::errors::Result<()> {
 }
 
 async fn ensure_schema_inner(pool: &SqlitePool, startup: bool) -> crate::errors::Result<()> {
+    // M287b R1: migration slots in long-lived user databases are not a
+    // sufficient production guarantee. Keep the canonical 0027 DDL in the
+    // same idempotent startup repair path as every other satellite schema.
+    sqlx::raw_sql(include_str!("../../migrations/0027_session_liveness.sql"))
+        .execute(pool)
+        .await?;
     ensure_column(pool, "sessions", "delivery_mode", "TEXT NOT NULL DEFAULT 'legacy' CHECK (delivery_mode IN ('thin', 'legacy'))").await?;
     sqlx::query("CREATE TABLE IF NOT EXISTS thin_delivery_refs (session_id TEXT PRIMARY KEY, branch TEXT NOT NULL, pr_number INTEGER NOT NULL, ceiling TEXT NOT NULL)")
         .execute(pool).await?;
@@ -2493,6 +2499,96 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(attempts_table, 1);
+    }
+
+    /// M287b R1/R4: this exercises the same production startup initializer as
+    /// the desktop app. It must cover both a fresh file DB and an existing DB
+    /// whose historical migration ledger cannot be trusted to supply 0027.
+    #[tokio::test]
+    async fn m287b_production_startup_creates_and_upgrades_liveness_schema() {
+        async fn assert_startup_path(url: &str) {
+            let pool = connect_startup(url).await.expect("production startup opens database");
+            let objects: Vec<String> = sqlx::query_scalar(
+                "SELECT name FROM sqlite_master
+                 WHERE (type='table' AND name IN ('session_liveness_leases','session_liveness_events'))
+                    OR (type='index' AND name IN ('idx_session_liveness_leases_deadline','idx_session_liveness_events_detected'))
+                 ORDER BY name",
+            )
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+            assert_eq!(
+                objects,
+                vec![
+                    "idx_session_liveness_events_detected",
+                    "idx_session_liveness_leases_deadline",
+                    "session_liveness_events",
+                    "session_liveness_leases",
+                ]
+            );
+
+            sqlx::query(
+                "INSERT INTO sessions(id,title,cwd,model_id,created_at,updated_at)
+                 VALUES ('m287b-session','Synthetic','.','synthetic',0,0)",
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+            crate::agent::objective::ensure_schema(&pool).await.unwrap();
+            let store = crate::agent::objective::ObjectiveStore::new(pool.clone());
+            store
+                .create(crate::agent::objective::CreateObjective {
+                    id: "m287b-objective".into(),
+                    kind: crate::agent::objective::ObjectiveKind::Informational,
+                    session_id: Some("m287b-session".into()),
+                    root_turn_id: Some("m287b-turn".into()),
+                    domain: crate::agent::objective::RecoveryDomain::Provider,
+                    requested_acceptance: "synthetic acceptance".into(),
+                    created_surface: "m287b_startup_test".into(),
+                })
+                .await
+                .unwrap();
+            sqlx::query("UPDATE objectives SET updated_at=1 WHERE id='m287b-objective'")
+                .execute(&pool)
+                .await
+                .unwrap();
+
+            crate::commands::liveness_store::run_supervision_cycle(&pool, 100_000)
+                .await
+                .expect("production supervision cycle");
+            let lease_count: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM session_liveness_leases WHERE session_id='m287b-session'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            let violation_count: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM session_liveness_events
+                 WHERE session_id='m287b-session' AND violation_kind='deadline_exceeded'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!((lease_count, violation_count), (1, 1));
+        }
+
+        let fresh = tempfile::tempdir().unwrap();
+        let fresh_url = format!("sqlite:{}", fresh.path().join("fresh.db").display());
+        assert_startup_path(&fresh_url).await;
+
+        let legacy = tempfile::tempdir().unwrap();
+        let legacy_url = format!("sqlite:{}", legacy.path().join("legacy.db").display());
+        let legacy_pool = connect(&legacy_url).await.unwrap();
+        sqlx::query("DROP TABLE session_liveness_events")
+            .execute(&legacy_pool)
+            .await
+            .unwrap();
+        sqlx::query("DROP TABLE session_liveness_leases")
+            .execute(&legacy_pool)
+            .await
+            .unwrap();
+        legacy_pool.close().await;
+        assert_startup_path(&legacy_url).await;
     }
 
     /// Fresh-install path: ensure_schema must also create the satellite
