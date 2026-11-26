@@ -166,7 +166,11 @@ enum PermissionResponse {
 enum StreamPoll<T> {
     Item(Option<T>),
     Cancelled,
+    TimedOut,
 }
+
+const MODEL_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
+const MODEL_CALL_TOTAL_TIMEOUT: Duration = Duration::from_secs(20 * 60);
 
 async fn wait_for_cancellation(cancel: Option<&Arc<AtomicBool>>) {
     loop {
@@ -184,10 +188,26 @@ async fn next_stream_item<S>(
 where
     S: Stream + Unpin,
 {
+    next_stream_item_with_timeout(stream, cancel, MODEL_STREAM_IDLE_TIMEOUT).await
+}
+
+async fn next_stream_item_with_timeout<S>(
+    stream: &mut S,
+    cancel: Option<&Arc<AtomicBool>>,
+    idle_timeout: Duration,
+) -> StreamPoll<S::Item>
+where
+    S: Stream + Unpin,
+{
     tokio::select! {
         item = stream.next() => StreamPoll::Item(item),
         _ = wait_for_cancellation(cancel), if cancel.is_some() => StreamPoll::Cancelled,
+        _ = tokio::time::sleep(idle_timeout) => StreamPoll::TimedOut,
     }
+}
+
+fn model_http_client_with_timeout(total_timeout: Duration) -> Client {
+    Client::builder().timeout(total_timeout).build().expect("build bounded model HTTP client")
 }
 
 async fn await_permission_response(
@@ -1000,7 +1020,7 @@ impl AgentLoop {
             api_style,
             route_state,
             cwd,
-            http: Client::new(),
+            http: model_http_client_with_timeout(MODEL_CALL_TOTAL_TIMEOUT),
             settings,
             pending_permissions,
             mcp_manager,
@@ -1088,7 +1108,7 @@ impl AgentLoop {
             api_style,
             route_state,
             cwd,
-            http: Client::new(),
+            http: model_http_client_with_timeout(MODEL_CALL_TOTAL_TIMEOUT),
             settings,
             pending_permissions,
             mcp_manager,
@@ -3671,6 +3691,41 @@ mod tests {
             next_stream_item(&mut stream, Some(&cancel)).await,
             StreamPoll::Cancelled
         ));
+    }
+
+    #[tokio::test]
+    async fn m287_pending_stream_hits_the_idle_deadline() {
+        let mut stream = futures_util::stream::pending::<u8>();
+        assert!(matches!(
+            next_stream_item_with_timeout(&mut stream, None, Duration::from_millis(5)).await,
+            StreamPoll::TimedOut
+        ));
+    }
+
+    #[tokio::test]
+    async fn m287_model_http_client_has_a_total_deadline() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind hanging fixture");
+        let url = format!("http://{}", listener.local_addr().expect("fixture addr"));
+        let fixture = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept fixture request");
+            let mut request = [0_u8; 1024];
+            let _ = stream.read(&mut request);
+            std::thread::sleep(Duration::from_millis(100));
+            let _ = stream.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+            );
+        });
+
+        let error = model_http_client_with_timeout(Duration::from_millis(10))
+            .get(url)
+            .send()
+            .await
+            .expect_err("hanging model request must hit the total deadline");
+        assert!(error.is_timeout(), "expected reqwest timeout, got {error:#}");
+        fixture.join().expect("fixture thread");
     }
 
     #[test]
