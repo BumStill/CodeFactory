@@ -145,8 +145,14 @@ fn item_bytes(item: &ClipboardItem) -> Result<Vec<u8>, String> {
 
 /// Public IPC entry also usable by the local dispatch channel without GUI focus.
 #[tauri::command]
-pub async fn paste_session_attachments(app: tauri::AppHandle, cwd: Option<String>, session_id: Option<String>) -> Result<Vec<PasteResult>, String> {
-    let items = tauri::async_runtime::spawn_blocking(read_native).await.map_err(|e| e.to_string())??;
+pub async fn paste_session_attachments(app: tauri::AppHandle, cwd: Option<String>, session_id: Option<String>, paths: Option<Vec<String>>) -> Result<Vec<PasteResult>, String> {
+    let items = match paths {
+        Some(paths) => paths.into_iter().map(|path| {
+            let name = Path::new(&path).file_name().and_then(|value| value.to_str()).unwrap_or("文件").to_string();
+            ClipboardItem { name, path: Some(path), data: None }
+        }).collect(),
+        None => tauri::async_runtime::spawn_blocking(read_native).await.map_err(|e| e.to_string())??,
+    };
     let mut result = Vec::new();
     for item in items {
         let name = item.name.clone();
@@ -164,12 +170,30 @@ pub async fn paste_session_attachments(app: tauri::AppHandle, cwd: Option<String
 }
 
 #[derive(Serialize)]
-pub struct AttachmentMetadata { size_bytes: u64 }
+pub struct AttachmentMetadata {
+    size_bytes: Option<u64>,
+    max_bytes: usize,
+    max_mebibytes: usize,
+    max_model_image_bytes: usize,
+    max_model_image_mebibytes: usize,
+}
 #[tauri::command]
-pub fn attachment_metadata(path: String) -> Result<AttachmentMetadata, String> {
-    let metadata = std::fs::metadata(Path::new(&path)).map_err(|e| format!("文件不存在、已被删除或无法访问：{e}"))?;
-    if !metadata.is_file() { return Err("不是可预览的文件".into()); }
-    Ok(AttachmentMetadata { size_bytes: metadata.len() })
+pub fn attachment_metadata(path: Option<String>) -> Result<AttachmentMetadata, String> {
+    let size_bytes = match path {
+        Some(path) => {
+            let metadata = std::fs::metadata(Path::new(&path)).map_err(|e| format!("文件不存在、已被删除或无法访问：{e}"))?;
+            if !metadata.is_file() { return Err("不是可预览的文件".into()); }
+            Some(metadata.len())
+        }
+        None => None,
+    };
+    Ok(AttachmentMetadata {
+        size_bytes,
+        max_bytes: MAX_ATTACHMENT_BYTES,
+        max_mebibytes: MAX_ATTACHMENT_MEBIBYTES,
+        max_model_image_bytes: MAX_MODEL_IMAGE_BYTES,
+        max_model_image_mebibytes: MAX_MODEL_IMAGE_MEBIBYTES,
+    })
 }
 
 #[cfg(test)]
@@ -183,6 +207,9 @@ mod tests {
         let limits = attachment_limits();
         assert_eq!(limits.max_bytes, 50 * 1024 * 1024);
         assert_eq!(limits.max_model_image_bytes, 8 * 1024 * 1024);
+        let metadata_limits = attachment_metadata(None).unwrap();
+        assert_eq!(metadata_limits.max_bytes, limits.max_bytes);
+        assert_eq!(metadata_limits.max_model_image_bytes, limits.max_model_image_bytes);
         assert!(SCRIPT_TEMPLATE.contains("__MAX_ATTACHMENT_BYTES__"));
         assert!(!SCRIPT_TEMPLATE.contains("26214400"));
         assert!(!SCRIPT_TEMPLATE.contains("25MB"));
@@ -194,7 +221,7 @@ mod tests {
         ])).unwrap();
         assert_eq!(item_bytes(&items[0]).unwrap(), b"clipboard synthetic bytes");
         assert_eq!(item_bytes(&items[1]).unwrap(), b"image");
-        assert_eq!(attachment_metadata(path.to_string_lossy().into()).unwrap().size_bytes, 25);
+        assert_eq!(attachment_metadata(Some(path.to_string_lossy().into())).unwrap().size_bytes, Some(25));
         std::fs::remove_file(path).unwrap();
         assert!(item_bytes(&items[0]).is_err());
     }

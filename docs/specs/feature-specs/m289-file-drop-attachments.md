@@ -29,9 +29,9 @@
 
 ## Implementation Notes
 
-选择方案 (b)：在 `tauri.conf.json` 关闭原生 `dragDropEnabled`，由 WebView 的 HTML5 文件拖放事件统一处理，并把监听范围扩展到 `window`。这是 Windows WebView2 能收到资源管理器文件数据且能复用现有 `File -> save_session_attachment` 路径的最小方案；监听器仅拦截 `DataTransfer.types` 含 `Files` 的事件，因此不接管应用内部文本拖动或其他非文件拖放。
+选择方案 (a)：保留 Tauri 原生拖放接管，在 `MessageInput` 通过 `getCurrentWindow().onDragDropEvent` 监听整窗 hover/drop/cancel；drop 的路径交给既有 `paste_session_attachments` 后端读取并复用 `save_session_attachment` 落盘。浏览器/验收环境仍保留 HTML5 文件事件作为兼容降级。两条监听都只处理文件事件，因此不接管应用内部文本拖动或其他非文件拖放。
 
-附件原始文件统一由 Rust 的 `MAX_ATTACHMENT_BYTES` 限制为 50 MiB，并通过 `attachment_limits` 提供给前端，原生粘贴脚本也由该常量生成数字。模型图片链路仍以 base64 data URL 发送，50 MiB 会膨胀到约 66.7 MiB 且超过现有模型图片保护线，因此图片在统一入口明确限制为 8 MiB并提示压缩；非图片 50 MiB 只落盘并把本地路径交给模型使用工具读取，不整段塞进上下文。保存时前端当前会同时持有 `ArrayBuffer`、二进制字符串和约 1.33 倍的 base64，50 MiB 非图片峰值会显著高于文件本身，但 Tauri IPC 本身没有本项目配置的更低请求体上限，后端再次按解码字节校验后落盘。
+附件原始文件统一由 Rust 的 `MAX_ATTACHMENT_BYTES` 限制为 50 MiB，并通过既有 `attachment_metadata` 命令提供给前端，原生粘贴脚本也由该常量生成数字。模型图片链路仍以 base64 data URL 发送，50 MiB 会膨胀到约 66.7 MiB 且超过现有模型图片保护线，因此图片在统一入口明确限制为 8 MiB并提示压缩；非图片 50 MiB 只落盘并把本地路径交给模型使用工具读取，不整段塞进上下文。保存时前端当前会同时持有 `ArrayBuffer`、二进制字符串和约 1.33 倍的 base64，50 MiB 非图片峰值会显著高于文件本身，但 Tauri IPC 本身没有本项目配置的更低请求体上限，后端再次按解码字节校验后落盘。
 
 ## 约束
 改文件只用 edit_file / write_file。不改信任根；场景缺口只追加 `docs/testing/scenario-mappings.json`。不碰凭据、settings.json、其他会话的 PR。规格文件在工作区外，用 bash cat 只读查看。若改 tauri.conf.json 的窗口配置，在 PR 写明影响面。

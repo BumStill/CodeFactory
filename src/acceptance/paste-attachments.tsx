@@ -10,9 +10,8 @@ const calls: unknown[] = [];
 Object.assign(window, { __m190Calls: calls, __TAURI_INTERNALS__: {
   invoke: async (command: string, args: Record<string, unknown>) => {
     calls.push({ command, args });
-    if (command === "attachment_limits") return { max_bytes: 52428800, max_mebibytes: 50, max_model_image_bytes: 8388608, max_model_image_mebibytes: 8 };
+    if (command === "attachment_metadata") return args.path ? { size_bytes: 2097152, max_bytes: 52428800, max_mebibytes: 50, max_model_image_bytes: 8388608, max_model_image_mebibytes: 8 } : { max_bytes: 52428800, max_mebibytes: 50, max_model_image_bytes: 8388608, max_model_image_mebibytes: 8 };
     if (command === "save_session_attachment") return { path: `/synthetic/attachments/${args.filename}`, name: args.filename, size_bytes: 2097152 };
-    if (command === "attachment_metadata") return { size_bytes: 2097152 };
     if (command === "paste_session_attachments") return [{ path: "/synthetic/attachments/native.pdf", name: "native.pdf", size_bytes: 2048 }];
     if (command === "open_chat_link" && String(args.target).includes("missing")) throw new Error("文件已删除：missing.pdf");
     return null;

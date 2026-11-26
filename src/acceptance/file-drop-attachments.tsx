@@ -10,7 +10,7 @@ Object.assign(window, {
   __TAURI_INTERNALS__: {
     invoke: async (command: string, args: Record<string, unknown>) => {
       calls.push({ command, args });
-      if (command === "attachment_limits") return { max_bytes: 52428800, max_mebibytes: 50, max_model_image_bytes: 8388608, max_model_image_mebibytes: 8 };
+      if (command === "attachment_metadata") return { max_bytes: 52428800, max_mebibytes: 50, max_model_image_bytes: 8388608, max_model_image_mebibytes: 8 };
       if (command === "save_session_attachment") return { path: `/synthetic/attachments/${args.filename}`, name: args.filename, size_bytes: 4 };
       return null;
     },

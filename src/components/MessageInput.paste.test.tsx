@@ -20,7 +20,7 @@ function paste(files: File[], text = "") {
 describe("M190 clipboard attachments R1-R4", () => {
   beforeEach(() => {
     invoke.mockReset().mockImplementation(async (cmd, args) => {
-      if (cmd === "attachment_limits") return { max_bytes: 50 * 1024 * 1024, max_mebibytes: 50, max_model_image_bytes: 8 * 1024 * 1024, max_model_image_mebibytes: 8 };
+      if (cmd === "attachment_metadata") return { max_bytes: 50 * 1024 * 1024, max_mebibytes: 50, max_model_image_bytes: 8 * 1024 * 1024, max_model_image_mebibytes: 8 };
       if (cmd === "save_session_attachment") return { path: `/synthetic/${args.filename}`, name: args.filename, size_bytes: 4 };
       return [];
     });
@@ -56,14 +56,14 @@ describe("M190 clipboard attachments R1-R4", () => {
     invoke.mockResolvedValue([{ path: "/synthetic/fallback.pdf", name: "fallback.pdf", size_bytes: 2048 }]);
     setup(); paste([]);
     await screen.findByText("fallback.pdf");
-    expect(invoke).toHaveBeenCalledWith("paste_session_attachments", { cwd: "/synthetic", sessionId: "m190" });
+    expect(invoke).toHaveBeenCalledWith("paste_session_attachments", { cwd: "/synthetic", sessionId: "m190", paths: null });
   });
   it("R3 ordinary plain text never invokes native clipboard", () => {
     setup(); expect(paste([], "hello")).toBe(true); expect(invoke).not.toHaveBeenCalled();
   });
   it("R4 keeps uploading visible until every concurrent save completes and prevents premature send", async () => {
     const pending: ((value: unknown) => void)[] = [];
-    invoke.mockImplementation((command) => command === "attachment_limits"
+    invoke.mockImplementation((command) => command === "attachment_metadata"
       ? Promise.resolve({ max_bytes: 50 * 1024 * 1024, max_mebibytes: 50, max_model_image_bytes: 8 * 1024 * 1024, max_model_image_mebibytes: 8 })
       : new Promise(resolve => pending.push(resolve)));
     const onSend = setup(); paste([new File(["a"], "one.png", { type: "image/png" }), new File(["b"], "two.png", { type: "image/png" })]);

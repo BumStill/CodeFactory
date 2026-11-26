@@ -3,8 +3,12 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 
 const invoke = vi.hoisted(() => vi.fn());
+const dragDropHandler = vi.hoisted(() => ({ current: undefined as ((event: { payload: unknown }) => void) | undefined }));
 vi.mock("../lib/tauri", () => ({ invoke }));
 vi.mock("@tauri-apps/api/core", () => ({ convertFileSrc: (path: string) => `asset://${path}` }));
+vi.mock("@tauri-apps/api/window", () => ({
+  getCurrentWindow: () => ({ onDragDropEvent: async (handler: (event: { payload: unknown }) => void) => { dragDropHandler.current = handler; return () => {}; } }),
+}));
 
 import { MessageInput } from "./MessageInput";
 
@@ -30,12 +34,30 @@ function drop(files: File[]) {
 describe("M289 whole-window file drop", () => {
   beforeEach(() => {
     invoke.mockReset().mockImplementation(async (command, args) => {
-      if (command === "attachment_limits") return { max_bytes: 50 * 1024 * 1024, max_mebibytes: 50 };
+      if (command === "attachment_metadata") return { max_bytes: 50 * 1024 * 1024, max_mebibytes: 50, max_model_image_bytes: 8 * 1024 * 1024, max_model_image_mebibytes: 8 };
       if (command === "save_session_attachment") {
         return { path: `/synthetic/${args.filename}`, name: args.filename, size_bytes: args.dataBase64.length };
       }
       return [];
     });
+  });
+
+  it("handles Tauri native whole-window drops through the shared backend route", async () => {
+    Object.assign(window, { __TAURI_INTERNALS__: {} });
+    invoke.mockImplementation(async (command, args) => {
+      if (command === "paste_session_attachments") return args.paths.map((path: string) => ({ path: `/saved/${path.split("/").pop()}`, name: path.split("/").pop(), size_bytes: 5 }));
+      if (command === "attachment_metadata") return { max_bytes: 50 * 1024 * 1024, max_mebibytes: 50, max_model_image_bytes: 8 * 1024 * 1024, max_model_image_mebibytes: 8 };
+      return [];
+    });
+    renderInput();
+    await waitFor(() => expect(dragDropHandler.current).toBeTypeOf("function"));
+    dragDropHandler.current?.({ payload: { type: "over", position: { x: 10, y: 10 } } });
+    expect(await screen.findByRole("status")).toHaveTextContent("松开以添加 1 个文件");
+    dragDropHandler.current?.({ payload: { type: "drop", paths: ["C:/synthetic/one.png", "C:/synthetic/two.txt"], position: { x: 10, y: 10 } } });
+    await screen.findByRole("img", { name: "one.png" });
+    await screen.findByText("two.txt");
+    expect(invoke).toHaveBeenCalledWith("paste_session_attachments", expect.objectContaining({ paths: ["C:/synthetic/one.png", "C:/synthetic/two.txt"] }));
+    delete (window as typeof window & { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__;
   });
 
   it("shows a whole-window drop target and saves every dropped file through the shared route", async () => {

@@ -9,6 +9,7 @@ import {
 } from "../stores/slashCommands";
 import { invoke } from "../lib/tauri";
 import { convertFileSrc } from "@tauri-apps/api/core";
+import { getCurrentWindow, type DragDropEvent } from "@tauri-apps/api/window";
 import { ImagePreview } from "./ImagePreview";
 import { ComposerControlBar } from "./ComposerControlBar";
 import { MessageFileArtifactCard } from "./MessageFileArtifactCard";
@@ -162,7 +163,7 @@ export const MessageInput = forwardRef<MessageInputHandle, Props>(function Messa
   // hunting through the textarea content.
   const getAttachmentLimits = async (): Promise<AttachmentLimits> => {
     if (limitsRef.current) return limitsRef.current;
-    const limits = await invoke<AttachmentLimits>("attachment_limits");
+    const limits = await invoke<AttachmentLimits>("attachment_metadata", { path: null });
     limitsRef.current = limits;
     return limits;
   };
@@ -211,7 +212,7 @@ export const MessageInput = forwardRef<MessageInputHandle, Props>(function Messa
     setPendingUploads((n) => n + 1);
     try {
       const saved = await invoke<{ path: string; name: string; size_bytes: number; error?: string }[]>(
-        "paste_session_attachments", { cwd: cwd ?? null, sessionId: sessionId ?? null },
+        "paste_session_attachments", { cwd: cwd ?? null, sessionId: sessionId ?? null, paths: null },
       );
       for (const item of saved ?? []) {
         if (item.error) setAttachError((prev) => [prev, item.error].filter(Boolean).join("\n"));
@@ -226,6 +227,31 @@ export const MessageInput = forwardRef<MessageInputHandle, Props>(function Messa
 
   const enqueueFiles = (files: File[]) => {
     for (const file of files) void saveAttachmentFile(file);
+  };
+
+  const addSavedAttachments = (saved: { path: string; name: string; size_bytes: number; error?: string }[]) => {
+    for (const item of saved ?? []) {
+      if (item.error) setAttachError((prev) => [prev, item.error].filter(Boolean).join("\n"));
+      else setAttachments((prev) => [...prev, { id: crypto.randomUUID(), path: item.path, name: item.name, sizeBytes: item.size_bytes }]);
+    }
+  };
+
+  const enqueueNativePaths = async (paths: string[]) => {
+    if (disabled) {
+      setAttachError("当前输入框不可用，请先打开或新建会话后再添加附件");
+      return;
+    }
+    setPendingUploads((n) => n + 1);
+    try {
+      const saved = await invoke<{ path: string; name: string; size_bytes: number; error?: string }[]>(
+        "paste_session_attachments", { cwd: cwd ?? null, sessionId: sessionId ?? null, paths },
+      );
+      addSavedAttachments(saved);
+    } catch (error) {
+      setAttachError((prev) => [prev, `拖放附件读取失败：${String(error)}`].filter(Boolean).join("\n"));
+    } finally {
+      setPendingUploads((n) => n - 1);
+    }
   };
 
   useEffect(() => {
@@ -272,12 +298,30 @@ export const MessageInput = forwardRef<MessageInputHandle, Props>(function Messa
     };
     const onWindowBlur = () => resetDrag();
 
+    let nativeUnlisten: (() => void) | undefined;
+    if (typeof window !== "undefined" && "__TAURI_INTERNALS__" in window) {
+      void getCurrentWindow().onDragDropEvent((event: { payload: DragDropEvent }) => {
+        if (event.payload.type === "over") {
+          setDragFileCount(1);
+          setDragOver(true);
+        } else if (event.payload.type === "drop") {
+          resetDrag();
+          void enqueueNativePaths(event.payload.paths);
+        } else {
+          resetDrag();
+        }
+      }).then((unlisten) => { nativeUnlisten = unlisten; }).catch((error) => {
+        setAttachError(`文件拖放监听失败：${String(error)}`);
+      });
+    }
+
     window.addEventListener("dragenter", onWindowDragEnter);
     window.addEventListener("dragover", onWindowDragOver);
     window.addEventListener("dragleave", onWindowDragLeave);
     window.addEventListener("drop", onWindowDrop);
     window.addEventListener("blur", onWindowBlur);
     return () => {
+      nativeUnlisten?.();
       window.removeEventListener("dragenter", onWindowDragEnter);
       window.removeEventListener("dragover", onWindowDragOver);
       window.removeEventListener("dragleave", onWindowDragLeave);

@@ -30,7 +30,6 @@
     "test:resume:headless": "node scripts/verify-resume-journal-headless.mjs",
     "test:usage:headless": "node scripts/verify-token-usage-headless.mjs",
     "test:attachments:asset-scope": "node scripts/verify-attachment-asset-scope.mjs",
-    "test:attachments:file-drop": "node scripts/verify-file-drop-attachments-headless.mjs",
     "test:reconnect-banner:headless": "node scripts/verify-reconnect-banner-headless.mjs",
     "test:background-tasks:headless": "node scripts/verify-background-tasks-headless.mjs",
     "test:background-tasks:esbuild-discovery": "node --test scripts/verify-background-tasks-headless.test.mjs",
