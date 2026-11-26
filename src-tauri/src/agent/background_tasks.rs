@@ -2660,6 +2660,7 @@ mod tests {
             &pool,
             "s1",
             "先按我的方案走",
+            "client-user",
             Some("turn-user"),
         )
         .await

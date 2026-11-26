@@ -42,6 +42,8 @@ export type { PendingPermission, ToolCallState, UIMessage };
  *  prevent runaway accidental enqueue. */
 export interface QueuedMessage {
   id: string;
+  /** Stable client identity used for durable enqueue idempotency. */
+  clientMessageId?: string;
   content: string;
   /** Future: attachments. Kept optional so existing call sites need no change. */
   enqueuedAt: number;
@@ -600,6 +602,9 @@ export const useChatStore = create<ChatStore>((set, get) => ({
     // row gets a terminal reason instead of disappearing with the session.
     try {
       await tauriQueuedSendPort.failPending(id, "session was deleted before delivery");
+      if (tauriQueuedSendPort.listHistory) {
+        await tauriQueuedSendPort.listHistory(id);
+      }
     } catch {
       // The session is going away either way; the failure stays in the DB.
     }
@@ -798,6 +803,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
                 queue: [
                   {
                     id: userMsg.id,
+                    clientMessageId: userMsg.id,
                     content,
                     enqueuedAt: userMsg.createdAt,
                     rootTurnId: exactRootTurnId,
@@ -1436,6 +1442,7 @@ function recoverUndeliveredSteers(
             queue: [
               ...rest.map((m) => ({
                 id: crypto.randomUUID(),
+                clientMessageId: m.id,
                 content: m.content,
                 enqueuedAt: m.createdAt,
               })),
@@ -1467,11 +1474,14 @@ async function persistQueuedSend(
 
   // The root turn identity is minted here and persisted with the row, so a
   // restart re-sends the *same* message identity instead of inventing a new one.
+  const clientMessageId = crypto.randomUUID();
+  const rootTurnId = crypto.randomUUID();
   const outcome = await enqueueDurableQueuedSend(
     tauriQueuedSendPort,
     sessionId,
     text,
-    crypto.randomUUID(),
+    rootTurnId,
+    { clientMessageId },
   );
   if (!outcome.ok) return outcome.reason === "full" ? "full" : "unknown";
   // Never report `queued` for a row a restart would forget: the mirror is
@@ -1488,6 +1498,7 @@ async function persistQueuedSend(
             ...prev.queue,
             {
               id: record.id,
+              clientMessageId: record.clientMessageId,
               content: record.content,
               enqueuedAt: record.createdAt,
               rootTurnId: record.rootTurnId,
@@ -1574,6 +1585,7 @@ async function resumeQueuedDelivery(sessionId: string): Promise<number> {
       .filter((row) => !known.has(row.id))
       .map((row) => ({
         id: row.id,
+        clientMessageId: row.clientMessageId,
         content: row.content,
         enqueuedAt: row.createdAt,
         rootTurnId: row.rootTurnId,
@@ -1593,26 +1605,33 @@ async function resumeQueuedDelivery(sessionId: string): Promise<number> {
   return rows.length;
 }
 
+export async function superviseQueuedDeliveryCycle(): Promise<void> {
+  const sessionIds = await sessionsOwingDelivery(tauriQueuedSendPort);
+  if (!Array.isArray(sessionIds)) return;
+  for (const sessionId of sessionIds) {
+    const session = findSession(useChatStore.getState(), sessionId);
+    if (!session) {
+      await tauriQueuedSendPort.failPending(
+        sessionId,
+        "session is unavailable; queued message was not delivered",
+      );
+      continue;
+    }
+    await resumeQueuedDelivery(sessionId);
+    const runtime = useChatStore.getState().runtime[sessionId];
+    if (!turnInFlight(session, runtime)) {
+      await drainNextQueuedMessage(sessionId);
+    }
+  }
+}
+
 /// Startup recovery (T3): sessions that still owe a delivery resume instead of
 /// forgetting, so a restart mid-queue loses nothing.
 export async function resumePendingQueuedDelivery(): Promise<void> {
-  let sessionIds: string[] = [];
   try {
-    sessionIds = await sessionsOwingDelivery(tauriQueuedSendPort);
-  } catch {
-    return;
-  }
-  if (!Array.isArray(sessionIds) || sessionIds.length === 0) return;
-  for (const sessionId of sessionIds) {
-    if (!findSession(useChatStore.getState(), sessionId)) continue;
-    // One session that cannot restore must not stop the others from resuming.
-    try {
-      await resumeQueuedDelivery(sessionId);
-    } catch (error) {
-      reportQueuedRecoveryFailure(sessionId, error);
-      continue;
-    }
-    await drainNextQueuedMessage(sessionId);
+    await superviseQueuedDeliveryCycle();
+  } catch (error) {
+    reportQueuedRecoveryFailure("startup", error);
   }
 }
 
