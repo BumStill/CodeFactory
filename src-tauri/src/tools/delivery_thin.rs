@@ -26,7 +26,7 @@ struct Local<'a>(&'a Path);
 impl Commands for Local<'_> {
     fn git(&mut self, args: &[&str]) -> Result<String, String> { delivery::git(self.0, args) }
     fn gh(&mut self, args: &[&str]) -> Result<String, String> {
-        delivery::bounded_delivery_output(delivery::dev_command("gh").current_dir(self.0).args(args))
+        delivery::bounded_delivery_output(delivery::dev_command_in("gh", self.0).current_dir(self.0).args(args))
     }
     fn stage(&mut self, excludes: &[String]) -> Result<Vec<String>, String> { delivery::stage_scoped(self.0, excludes) }
     fn precheck_governance(&mut self) -> Result<(Vec<String>, u64), String> {

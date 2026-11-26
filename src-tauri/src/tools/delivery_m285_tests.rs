@@ -31,7 +31,7 @@ set -eu
 BASE="{s}"; A="$BASE.armed"; D="$BASE.draft"; L="$BASE.log"
 [ -f "$A" ] || echo false > "$A"; [ -f "$D" ] || echo false > "$D"
 ARMED=$(cat "$A"); DRAFT=$(cat "$D")
-if [ "${{CF_TEST_GH_LIST_FAIL:-0}}" = 1 ] && [ "$1 $2" = "pr list" ] && [ ! -f "$BASE.failed_once" ]; then touch "$BASE.failed_once"; exit 2; fi
+if [ -f "$BASE.fail_list_once" ] && [ "$1 $2" = "pr list" ] && [ ! -f "$BASE.failed_once" ]; then touch "$BASE.failed_once"; exit 2; fi
 case "$1 $2" in
  "pr list") [ "$ARMED" = true ] && LABELS='[{{"name":"merge-queue: armed"}}]' || LABELS='[]'; echo "[{{\"number\":101,\"url\":\"https://forge.invalid/pr/101\",\"title\":\"fix: remote\",\"body\":\"R | 是否完成 | 证据\",\"state\":\"OPEN\",\"headRefOid\":\"unused\",\"isDraft\":$DRAFT,\"labels\":$LABELS}}]";;
  "pr view") if echo "$@" | grep -q labels; then [ "$ARMED" = true ] && LABELS='[{{"name":"merge-queue: armed"}}]' || LABELS='[]'; echo "{{\"labels\":$LABELS}}"; elif echo "$@" | grep -q number,url; then echo '{{"number":101,"url":"https://forge.invalid/pr/101"}}'; else echo '{{"state":"OPEN","statusCheckRollup":[{{"status":"IN_PROGRESS"}}]}}'; fi;;
@@ -43,13 +43,13 @@ esac
 "#, s=state.display()) }
 
     async fn setup() -> (tempfile::TempDir, tempfile::TempDir, sqlx::SqlitePool, std::path::PathBuf) {
-        use std::process::Command;
         let dir=tempfile::tempdir().unwrap(); let bare=tempfile::tempdir().unwrap();
-        for a in [vec!["init"],vec!["config","user.name","Synthetic"],vec!["config","user.email","synthetic@example.invalid"]] { assert!(Command::new("git").current_dir(dir.path()).args(a).status().unwrap().success()); }
-        fs::write(dir.path().join("README.md"),"x").unwrap(); for a in [vec!["add","."],vec!["commit","-m","init"]] { assert!(Command::new("git").current_dir(dir.path()).args(a).status().unwrap().success()); }
-        assert!(Command::new("git").current_dir(bare.path()).args(["init","--bare"]).status().unwrap().success()); assert!(Command::new("git").current_dir(dir.path()).args(["remote","add","origin",bare.path().to_str().unwrap()]).status().unwrap().success());
-        let head=String::from_utf8(Command::new("git").current_dir(dir.path()).args(["rev-parse","HEAD"]).output().unwrap().stdout).unwrap(); assert!(Command::new("git").current_dir(dir.path()).args(["update-ref","refs/remotes/origin/main",head.trim()]).status().unwrap().success()); assert!(Command::new("git").current_dir(dir.path()).args(["checkout","-b","feature"]).status().unwrap().success()); fs::write(dir.path().join("file.txt"),"changed").unwrap();
-        let state=dir.path().join("gh-state"); let gh=dir.path().join("gh"); fs::write(&gh,fake_gh(&state)).unwrap(); #[cfg(unix)] { let mut p=fs::metadata(&gh).unwrap().permissions(); p.set_mode(0o755); fs::set_permissions(&gh,p).unwrap(); } std::env::set_var("CODEFACTORY_TEST_GH_BIN",gh);
+        let git = |cwd: &std::path::Path, args: &[&str]| crate::agent::delivery::git(cwd,args).unwrap();
+        for a in [vec!["init"],vec!["config","user.name","Synthetic"],vec!["config","user.email","synthetic@example.invalid"]] { git(dir.path(), &a); }
+        fs::write(dir.path().join("README.md"),"x").unwrap(); for a in [vec!["add","."],vec!["commit","-m","init"]] { git(dir.path(), &a); }
+        git(bare.path(), &["init","--bare"]); git(dir.path(), &["remote","add","origin",bare.path().to_str().unwrap()]);
+        let head=git(dir.path(), &["rev-parse","HEAD"]); git(dir.path(), &["update-ref","refs/remotes/origin/main",head.trim()]); git(dir.path(), &["checkout","-b","feature"]); fs::write(dir.path().join("file.txt"),"changed").unwrap();
+        let state=dir.path().join("gh-state"); let gh=dir.path().join("gh"); fs::write(&gh,fake_gh(&state)).unwrap(); #[cfg(unix)] { let mut p=fs::metadata(&gh).unwrap().permissions(); p.set_mode(0o755); fs::set_permissions(&gh,p).unwrap(); } crate::agent::delivery::register_test_gh(dir.path(), gh);
         let db=sqlx::sqlite::SqlitePoolOptions::new().max_connections(1).connect("sqlite::memory:").await.unwrap();
         sqlx::query("CREATE TABLE sessions(id TEXT PRIMARY KEY,delivery_authorized INTEGER NOT NULL,release_urgency TEXT NOT NULL,delivery_mode TEXT NOT NULL)").execute(&db).await.unwrap(); sqlx::query("INSERT INTO sessions VALUES('s',1,'default','thin')").execute(&db).await.unwrap();
         sqlx::query("CREATE TABLE thin_delivery_refs(session_id TEXT PRIMARY KEY,branch TEXT,pr_number INTEGER,ceiling TEXT)").execute(&db).await.unwrap();
@@ -59,7 +59,7 @@ esac
     fn context(dir:&std::path::Path,db:sqlx::SqlitePool)->crate::tools::ExecCtx { let mut c=crate::tools::ExecCtx::new(dir.to_path_buf(),Some(db)); c.session_id=Some("s".into()); c.task_id=Some("task".into()); let mut s=crate::config::settings::Settings::default(); s.delivery_ceiling=DeliveryCeiling::ThroughMerge; c.settings=Some(s); c }
 
     #[tokio::test]
-    async fn query_failure_downgrades_to_pr_only_and_never_arms(){let(d,_b,db,state)=setup().await;std::env::set_var("CF_TEST_GH_LIST_FAIL","1");let o=crate::tools::dispatch("deliver_changes",json!({"title":"fix: t","body":"b","ceiling":"through_merge"}),&context(d.path(),db)).await.unwrap();std::env::remove_var("CF_TEST_GH_LIST_FAIL");assert_eq!(o.status,crate::tools::ToolExecutionStatus::Waiting,"{}",o.content);let v:serde_json::Value=serde_json::from_str(&o.content).unwrap();assert_eq!(v["effective_ceiling"],"pr_only");assert!(!fs::read_to_string(state.with_extension("log")).unwrap_or_default().contains("--add-label"));}
+    async fn query_failure_downgrades_to_pr_only_and_never_arms(){let(d,_b,db,state)=setup().await;fs::write(state.with_extension("fail_list_once"),"1").unwrap();let o=crate::tools::dispatch("deliver_changes",json!({"title":"fix: t","body":"b","ceiling":"through_merge"}),&context(d.path(),db)).await.unwrap();assert_eq!(o.status,crate::tools::ToolExecutionStatus::Waiting,"{}",o.content);let v:serde_json::Value=serde_json::from_str(&o.content).unwrap();assert_eq!(v["effective_ceiling"],"pr_only");assert!(!fs::read_to_string(state.with_extension("log")).unwrap_or_default().contains("--add-label"));}
     #[tokio::test]
     async fn draft_revocation_persists_across_restart_until_new_authorization(){let(d,_b,db,state)=setup().await;fs::write(state.with_extension("draft"),"true").unwrap();sqlx::query("INSERT INTO thin_delivery_refs VALUES('s','feature',101,'ThroughMerge')").execute(&db).await.unwrap();let a=crate::tools::dispatch("deliver_changes",json!({"title":"fix: t","body":"b","ceiling":"through_merge"}),&context(d.path(),db.clone())).await.unwrap();assert!(a.is_error&&a.content.contains("草稿"),"{}",a.content);let b=crate::tools::dispatch("deliver_changes",json!({"title":"fix: t","body":"b","ceiling":"through_merge"}),&context(d.path(),db.clone())).await.unwrap();assert!(b.is_error&&b.content.contains("撤回"),"{}",b.content);assert_eq!(sqlx::query_scalar::<_,i64>("SELECT delivery_authorized FROM sessions WHERE id='s'").fetch_one(&db).await.unwrap(),0);}
     #[tokio::test]

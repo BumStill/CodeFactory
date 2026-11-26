@@ -25,7 +25,7 @@ async fn guarded_args(args: &Value, ctx: &ExecCtx, ceiling: DeliveryCeiling) -> 
         _ => return Ok((guarded, false)),
     };
     let raw = match crate::agent::delivery::bounded_delivery_output(
-        crate::agent::delivery::dev_command("gh").current_dir(&ctx.cwd).args([
+        crate::agent::delivery::dev_command_in("gh", &ctx.cwd).current_dir(&ctx.cwd).args([
             "pr", "list", "--head", &branch, "--state", "open", "--json",
             "number,title,body,isDraft,labels",
         ]),

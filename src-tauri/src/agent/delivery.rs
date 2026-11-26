@@ -1791,21 +1791,32 @@ pub trait DeliveryRemote {
 /// blocked" even though the CLI works from a terminal. EVERY production spawn of
 /// gh/git in this module MUST go through here (pinned by a source-text test).
 pub(crate) fn dev_command(program: &str) -> Command {
-    // Test-only override: allow integration tests to point gh to a fake binary.
-    // No effect in production when the variable is unset.
-    if program == "gh" {
-        if let Ok(override_bin) = std::env::var("CODEFACTORY_TEST_GH_BIN") {
-            if !override_bin.is_empty() {
-                // Test override: absolute path provided by tests; still apply developer PATH for child lookups.
-                let mut command = Command::new(override_bin).no_window();
-                command_env::apply_developer_path_std(&mut command);
-                return command;
-            }
-        }
-    }
     let mut command = Command::new(command_env::resolve_developer_command(program)).no_window();
     command_env::apply_developer_path_std(&mut command);
     command
+}
+
+#[cfg(test)]
+fn test_gh_commands() -> &'static std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, std::path::PathBuf>> {
+    static COMMANDS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, std::path::PathBuf>>> = std::sync::OnceLock::new();
+    COMMANDS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+#[cfg(test)]
+pub(crate) fn register_test_gh(cwd: &Path, binary: std::path::PathBuf) {
+    test_gh_commands().lock().unwrap().insert(cwd.to_path_buf(), binary);
+}
+
+pub(crate) fn dev_command_in(program: &str, cwd: &Path) -> Command {
+    #[cfg(test)]
+    if program == "gh" {
+        if let Some(binary) = test_gh_commands().lock().unwrap().get(cwd).cloned() {
+            let mut command = Command::new(binary).no_window();
+            command_env::apply_developer_path_std(&mut command);
+            return command;
+        }
+    }
+    dev_command(program)
 }
 
 fn retry_delivery_network<T>(step: &str, mut operation: impl FnMut() -> Result<T, String>, mut sleep: impl FnMut(u64)) -> Result<T, String> {

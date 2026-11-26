@@ -11,5 +11,6 @@ fn m285_delivery_entry_is_wired_to_ceiling_and_draft_guards() {
     assert!(wrapper.contains("effective_delivery_ceiling(authorized_ceiling, requested)"));
     assert!(wrapper.contains("existing_pr_merge_refusal("));
     assert!(wrapper.contains("number,title,body,isDraft,labels"));
-    assert!(wrapper.contains("preserve_existing_pr_content(title, body)"));
+    assert!(wrapper.contains("obj.remove(\"title\")"));
+    assert!(wrapper.contains("obj.remove(\"body\")"));
 }
