@@ -10,6 +10,7 @@ import { createRoot } from "react-dom/client";
 import "../styles/globals.css";
 import { MessageList } from "../components/MessageList";
 import { statusBannerView } from "../lib/statusBanner";
+import type { UIMessage } from "../stores/chatEvents";
 
 type Activity = NonNullable<UIMessage["turnActivity"]>;
 
