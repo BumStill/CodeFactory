@@ -2885,6 +2885,57 @@ mod tests {
         );
     }
 
+    /// M288 R3: edit_file is sent without strict mode and with only `path`
+    /// required. OpenAI, DeepSeek, and OpenRouter all use the same
+    /// OpenAI-compatible payload; ChatGPT Responses flattens the function but
+    /// preserves the exact parameters schema.
+    #[test]
+    fn m288_edit_file_optional_mode_fields_reach_every_provider_shape() {
+        let defs = vec![crate::tools::edit::definition()];
+        let responses_tools: Vec<serde_json::Value> = defs
+            .iter()
+            .map(|tool| {
+                serde_json::json!({
+                    "type": "function",
+                    "name": tool.function.name,
+                    "description": tool.function.description,
+                    "parameters": tool.function.parameters,
+                })
+            })
+            .collect();
+        let chatgpt = build_chatgpt_responses_body(
+            "gpt-5",
+            "instructions".into(),
+            Vec::new(),
+            responses_tools,
+            false,
+            "low",
+            None,
+        );
+        let openai_compatible = serde_json::to_value(&defs).expect("serialize tools");
+
+        let schemas = [
+            chatgpt["tools"][0]["parameters"].clone(),
+            openai_compatible[0]["function"]["parameters"].clone(),
+        ];
+        for schema in schemas {
+            assert_eq!(schema["required"], json!(["path"]), "{schema}");
+            assert!(schema.get("oneOf").is_none(), "{schema}");
+            for optional in ["edits", "old_string", "new_string", "replace_all"] {
+                assert!(
+                    !schema["required"]
+                        .as_array()
+                        .expect("required array")
+                        .iter()
+                        .any(|field| field == optional),
+                    "{optional} must be optional: {schema}"
+                );
+            }
+        }
+        assert!(chatgpt["tools"][0].get("strict").is_none());
+        assert!(openai_compatible[0]["function"].get("strict").is_none());
+    }
+
     fn call(id: &str, name: &str, args: &str) -> ToolCall {
         ToolCall {
             id: id.into(),
