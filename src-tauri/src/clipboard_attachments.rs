@@ -4,7 +4,28 @@ use base64::{engine::general_purpose::STANDARD, Engine};
 use serde::{Deserialize, Serialize};
 use std::{io::Read, path::Path};
 
-pub const MAX_ATTACHMENT_BYTES: usize = 25 * 1024 * 1024;
+pub const MAX_ATTACHMENT_BYTES: usize = 50 * 1024 * 1024;
+pub const MAX_MODEL_IMAGE_BYTES: usize = 8 * 1024 * 1024;
+pub const MAX_ATTACHMENT_MEBIBYTES: usize = MAX_ATTACHMENT_BYTES / 1024 / 1024;
+pub const MAX_MODEL_IMAGE_MEBIBYTES: usize = MAX_MODEL_IMAGE_BYTES / 1024 / 1024;
+
+#[derive(Serialize)]
+pub struct AttachmentLimits {
+    max_bytes: usize,
+    max_mebibytes: usize,
+    max_model_image_bytes: usize,
+    max_model_image_mebibytes: usize,
+}
+
+#[tauri::command]
+pub fn attachment_limits() -> AttachmentLimits {
+    AttachmentLimits {
+        max_bytes: MAX_ATTACHMENT_BYTES,
+        max_mebibytes: MAX_ATTACHMENT_MEBIBYTES,
+        max_model_image_bytes: MAX_MODEL_IMAGE_BYTES,
+        max_model_image_mebibytes: MAX_MODEL_IMAGE_MEBIBYTES,
+    }
+}
 
 #[derive(Deserialize)]
 struct ClipboardItem {
@@ -22,13 +43,24 @@ pub struct PasteResult {
 
 pub fn check_size(name: &str, size: usize) -> Result<(), String> {
     if size > MAX_ATTACHMENT_BYTES {
-        Err(format!("{name} 超过 25MB 上限，已跳过"))
+        Err(format!("{name} 超过 {MAX_ATTACHMENT_MEBIBYTES}MiB 上限，已跳过"))
+    } else if is_model_image(name) && size > MAX_MODEL_IMAGE_BYTES {
+        Err(format!(
+            "{name} 是图片，超过模型可接收的 {MAX_MODEL_IMAGE_MEBIBYTES}MiB 上限，已跳过；请压缩或缩小图片后重试"
+        ))
     } else { Ok(()) }
+}
+
+fn is_model_image(name: &str) -> bool {
+    Path::new(name)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| matches!(extension.to_ascii_lowercase().as_str(), "png" | "jpg" | "jpeg" | "gif" | "webp"))
 }
 
 // All filenames/paths are clipboard data, never interpolated into commands.
 #[cfg(target_os = "macos")]
-const SCRIPT: &str = r#"
+const SCRIPT_TEMPLATE: &str = r#"
 ObjC.import('AppKit');
 ObjC.import('Foundation');
 function run() {
@@ -47,7 +79,7 @@ function run() {
         if (image && !image.isNil()) {
             const bitmap = $.NSBitmapImageRep.alloc.initWithData(image.TIFFRepresentation);
             const png = bitmap.representationUsingTypeProperties($.NSPNGFileType, $({}));
-            if (png.length > 26214400) throw new Error('粘贴图片 超过 25MB 上限，已跳过');
+            if (png.length > __MAX_ATTACHMENT_BYTES__) throw new Error('粘贴图片超过附件上限，已跳过');
             result.push({name: '粘贴图片-' + Date.now() + '.png', data: ObjC.unwrap(png.base64EncodedStringWithOptions(0))});
         }
     }
@@ -55,7 +87,7 @@ function run() {
 }
 "#;
 #[cfg(target_os = "windows")]
-const SCRIPT: &str = r#"
+const SCRIPT_TEMPLATE: &str = r#"
 $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)
 Add-Type -AssemblyName System.Windows.Forms
@@ -70,7 +102,7 @@ if ([System.Windows.Forms.Clipboard]::ContainsFileDropList()) {
   $stream = New-Object IO.MemoryStream
   try {
     $image.Save($stream, [System.Drawing.Imaging.ImageFormat]::Png)
-    if ($stream.Length -gt 26214400) { throw '粘贴图片 超过 25MB 上限，已跳过' }
+    if ($stream.Length -gt __MAX_ATTACHMENT_BYTES__) { throw '粘贴图片超过附件上限，已跳过' }
     $result += @{ name = ('粘贴图片-' + [DateTimeOffset]::Now.ToUnixTimeMilliseconds() + '.png'); data = [Convert]::ToBase64String($stream.ToArray()) }
   } finally { $stream.Dispose(); $image.Dispose() }
 }
@@ -79,10 +111,11 @@ ConvertTo-Json -InputObject @($result) -Compress
 
 fn read_native() -> Result<Vec<ClipboardItem>, String> {
     use crate::util::no_window::NoWindow;
+    let script = SCRIPT_TEMPLATE.replace("__MAX_ATTACHMENT_BYTES__", &MAX_ATTACHMENT_BYTES.to_string());
     #[cfg(target_os = "macos")]
-    let command = { let mut c = std::process::Command::new("/usr/bin/osascript"); c.args(["-l", "JavaScript", "-e", SCRIPT]); c };
+    let command = { let mut c = std::process::Command::new("/usr/bin/osascript"); c.args(["-l", "JavaScript", "-e", &script]); c };
     #[cfg(target_os = "windows")]
-    let mut command = { let mut c = std::process::Command::new("powershell.exe"); c.args(["-NoProfile", "-NonInteractive", "-STA", "-Command", SCRIPT]); c };
+    let mut command = { let mut c = std::process::Command::new("powershell.exe"); c.args(["-NoProfile", "-NonInteractive", "-STA", "-Command", &script]); c };
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     return Err("当前平台不支持原生剪贴板附件，请使用拖放或选择文件".into());
     #[cfg(any(target_os = "macos", target_os = "windows"))]
@@ -103,7 +136,7 @@ fn item_bytes(item: &ClipboardItem) -> Result<Vec<u8>, String> {
         Ok(bytes)
     } else {
         let data = item.data.as_deref().ok_or("剪贴板图片数据为空")?;
-        if data.len() > (MAX_ATTACHMENT_BYTES + 2) / 3 * 4 { return Err(format!("{} 超过 25MB 上限，已跳过", item.name)); }
+        if data.len() > (MAX_ATTACHMENT_BYTES + 2) / 3 * 4 { return Err(format!("{} 超过 {}MiB 上限，已跳过", item.name, MAX_ATTACHMENT_MEBIBYTES)); }
         let bytes = STANDARD.decode(data).map_err(|e| e.to_string())?;
         check_size(&item.name, bytes.len())?;
         Ok(bytes)
@@ -144,8 +177,15 @@ mod tests {
     use super::*;
     #[test]
     fn m190_clipboard_limits_and_file_list() {
-        assert!(check_size("edge.png", MAX_ATTACHMENT_BYTES).is_ok());
-        assert!(check_size("large.png", MAX_ATTACHMENT_BYTES + 1).unwrap_err().contains("25MB"));
+        assert!(check_size("edge.bin", 50 * 1024 * 1024).is_ok());
+        assert!(check_size("large.bin", 50 * 1024 * 1024 + 1).unwrap_err().contains("50MiB"));
+        assert!(check_size("large.png", 8 * 1024 * 1024 + 1).unwrap_err().contains("模型可接收的 8MiB"));
+        let limits = attachment_limits();
+        assert_eq!(limits.max_bytes, 50 * 1024 * 1024);
+        assert_eq!(limits.max_model_image_bytes, 8 * 1024 * 1024);
+        assert!(SCRIPT_TEMPLATE.contains("__MAX_ATTACHMENT_BYTES__"));
+        assert!(!SCRIPT_TEMPLATE.contains("26214400"));
+        assert!(!SCRIPT_TEMPLATE.contains("25MB"));
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("synthetic.txt");
         std::fs::write(&path, b"clipboard synthetic bytes").unwrap();

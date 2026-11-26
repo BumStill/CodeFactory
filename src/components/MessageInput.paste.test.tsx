@@ -19,7 +19,11 @@ function paste(files: File[], text = "") {
 }
 describe("M190 clipboard attachments R1-R4", () => {
   beforeEach(() => {
-    invoke.mockReset().mockImplementation(async (cmd, args) => cmd === "save_session_attachment" ? { path: `/synthetic/${args.filename}`, name: args.filename, size_bytes: 4 } : []);
+    invoke.mockReset().mockImplementation(async (cmd, args) => {
+      if (cmd === "attachment_limits") return { max_bytes: 50 * 1024 * 1024, max_mebibytes: 50, max_model_image_bytes: 8 * 1024 * 1024, max_model_image_mebibytes: 8 };
+      if (cmd === "save_session_attachment") return { path: `/synthetic/${args.filename}`, name: args.filename, size_bytes: 4 };
+      return [];
+    });
   });
   it("R1 handles all pasted images and documents, preserving mixed text default", async () => {
     setup();
@@ -36,12 +40,12 @@ describe("M190 clipboard attachments R1-R4", () => {
   it("R2 rejects oversize pasted files through the same size guard and error can be dismissed", async () => {
     setup();
     const huge = new File(["a"], "huge.png", { type: "image/png" });
-    Object.defineProperty(huge, "size", { value: 25 * 1024 * 1024 + 1 });
+    Object.defineProperty(huge, "size", { value: 50 * 1024 * 1024 + 1 });
     paste([huge]);
-    await screen.findByText(/huge.png 超过 25MB/);
-    expect(invoke).not.toHaveBeenCalled();
+    await screen.findByText(/huge.png 超过 50MiB/);
+    expect(invoke.mock.calls.some(([cmd]) => cmd === "save_session_attachment")).toBe(false);
     fireEvent.click(screen.getByRole("button", { name: "移除附件错误" }));
-    expect(screen.queryByText(/超过 25MB/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/超过 50MiB/)).not.toBeInTheDocument();
   });
   it("R2 assigns a unique timestamp name to nameless clipboard images", async () => {
     setup();
@@ -59,7 +63,9 @@ describe("M190 clipboard attachments R1-R4", () => {
   });
   it("R4 keeps uploading visible until every concurrent save completes and prevents premature send", async () => {
     const pending: ((value: unknown) => void)[] = [];
-    invoke.mockImplementation(() => new Promise(resolve => pending.push(resolve)));
+    invoke.mockImplementation((command) => command === "attachment_limits"
+      ? Promise.resolve({ max_bytes: 50 * 1024 * 1024, max_mebibytes: 50, max_model_image_bytes: 8 * 1024 * 1024, max_model_image_mebibytes: 8 })
+      : new Promise(resolve => pending.push(resolve)));
     const onSend = setup(); paste([new File(["a"], "one.png", { type: "image/png" }), new File(["b"], "two.png", { type: "image/png" })]);
     await waitFor(() => expect(pending).toHaveLength(2));
     pending[0]({ path: "/synthetic/one.png", name: "one.png", size_bytes: 1 });

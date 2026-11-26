@@ -15,6 +15,7 @@
         "title": "CodeFactory",
         "width": 1200,
         "height": 800,
+        "dragDropEnabled": false,
         "minWidth": 800,
         "minHeight": 600,
         "resizable": true,

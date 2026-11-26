@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-import { forwardRef, useRef, useState, useEffect, useImperativeHandle, ChangeEvent, KeyboardEvent, ClipboardEvent, DragEvent, type ReactNode } from "react";
+import { forwardRef, useRef, useState, useEffect, useImperativeHandle, ChangeEvent, KeyboardEvent, ClipboardEvent, type ReactNode } from "react";
 import { recallHistory, pushHistory } from "./messageHistory";
 import { Send, Square, Paperclip, X, Loader2, Check } from "lucide-react";
 import {
@@ -31,9 +31,15 @@ interface AttachmentChip {
   sizeBytes: number;
 }
 
+interface AttachmentLimits {
+  max_bytes: number;
+  max_mebibytes: number;
+  max_model_image_bytes: number;
+  max_model_image_mebibytes: number;
+}
+
 const IMAGE_EXTS = ["png", "jpg", "jpeg", "gif", "webp"];
 const ACCEPT_ATTR = "*/*";
-const MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024;
 
 function extOf(name: string): string {
   const i = name.lastIndexOf(".");
@@ -124,6 +130,9 @@ export const MessageInput = forwardRef<MessageInputHandle, Props>(function Messa
   const [pendingUploads, setPendingUploads] = useState(0);
   const uploading = pendingUploads > 0;
   const [dragOver, setDragOver] = useState(false);
+  const [dragFileCount, setDragFileCount] = useState(0);
+  const dragDepthRef = useRef(0);
+  const limitsRef = useRef<AttachmentLimits | null>(null);
   const [attachError, setAttachError] = useState<string | null>(null);
   const [guidanceState, setGuidanceState] = useState<
     { kind: "idle" } | { kind: "pending" } | { kind: "success"; message: string } | { kind: "error"; message: string }
@@ -151,9 +160,22 @@ export const MessageInput = forwardRef<MessageInputHandle, Props>(function Messa
   // get back the on-disk path → add a chip. The actual markdown link
   // is appended at SEND time, not now, so chips can be removed without
   // hunting through the textarea content.
+  const getAttachmentLimits = async (): Promise<AttachmentLimits> => {
+    if (limitsRef.current) return limitsRef.current;
+    const limits = await invoke<AttachmentLimits>("attachment_limits");
+    limitsRef.current = limits;
+    return limits;
+  };
+
   const saveAttachmentFile = async (file: File): Promise<void> => {
-    if (file.size > MAX_ATTACHMENT_BYTES) {
-      setAttachError((prev) => [prev, `${file.name} 超过 25MB 上限，已跳过`].filter(Boolean).join("\n"));
+    const limits = await getAttachmentLimits();
+    const image = isImageAttachment(file.name);
+    if (file.size > limits.max_bytes) {
+      setAttachError((prev) => [prev, `${file.name} 超过 ${limits.max_mebibytes}MiB 上限，已跳过`].filter(Boolean).join("\n"));
+      return;
+    }
+    if (image && file.size > limits.max_model_image_bytes) {
+      setAttachError((prev) => [prev, `${file.name} 是图片，超过模型可接收的 ${limits.max_model_image_mebibytes}MiB 上限，已跳过；请压缩或缩小图片后重试`].filter(Boolean).join("\n"));
       return;
     }
     const filename = file.name || `粘贴图片-${Date.now()}-${crypto.randomUUID().slice(0, 8)}.${file.type.split("/")[1]?.replace("jpeg", "jpg") || "png"}`;
@@ -206,6 +228,64 @@ export const MessageInput = forwardRef<MessageInputHandle, Props>(function Messa
     for (const file of files) void saveAttachmentFile(file);
   };
 
+  useEffect(() => {
+    const hasFiles = (event: globalThis.DragEvent) => Array.from(event.dataTransfer?.types ?? []).includes("Files");
+    const resetDrag = () => {
+      dragDepthRef.current = 0;
+      setDragOver(false);
+      setDragFileCount(0);
+    };
+    const onWindowDragEnter = (event: globalThis.DragEvent) => {
+      if (!hasFiles(event)) return;
+      event.preventDefault();
+      dragDepthRef.current += 1;
+      setDragFileCount(event.dataTransfer?.files?.length || event.dataTransfer?.items?.length || 1);
+      setDragOver(true);
+    };
+    const onWindowDragOver = (event: globalThis.DragEvent) => {
+      if (!hasFiles(event)) return;
+      event.preventDefault();
+      if (event.dataTransfer) event.dataTransfer.dropEffect = "copy";
+    };
+    const onWindowDragLeave = (event: globalThis.DragEvent) => {
+      if (!hasFiles(event)) return;
+      dragDepthRef.current = Math.max(0, dragDepthRef.current - 1);
+      if (dragDepthRef.current === 0) resetDrag();
+    };
+    const onWindowDrop = (event: globalThis.DragEvent) => {
+      if (!hasFiles(event)) return;
+      event.preventDefault();
+      const directoryNames = Array.from(event.dataTransfer?.items ?? [])
+        .filter((item) => item.kind === "file" && item.webkitGetAsEntry?.()?.isDirectory)
+        .map((item) => item.getAsFile()?.name || "文件夹");
+      const files = Array.from(event.dataTransfer?.files ?? []);
+      resetDrag();
+      if (disabled) {
+        setAttachError("当前输入框不可用，请先打开或新建会话后再添加附件");
+        return;
+      }
+      if (directoryNames.length > 0) {
+        setAttachError((prev) => [prev, ...directoryNames.map((name) => `${name} 是文件夹，暂不支持添加`)].filter(Boolean).join("\n"));
+      }
+      const directorySet = new Set(directoryNames);
+      enqueueFiles(files.filter((file) => !directorySet.has(file.name)));
+    };
+    const onWindowBlur = () => resetDrag();
+
+    window.addEventListener("dragenter", onWindowDragEnter);
+    window.addEventListener("dragover", onWindowDragOver);
+    window.addEventListener("dragleave", onWindowDragLeave);
+    window.addEventListener("drop", onWindowDrop);
+    window.addEventListener("blur", onWindowBlur);
+    return () => {
+      window.removeEventListener("dragenter", onWindowDragEnter);
+      window.removeEventListener("dragover", onWindowDragOver);
+      window.removeEventListener("dragleave", onWindowDragLeave);
+      window.removeEventListener("drop", onWindowDrop);
+      window.removeEventListener("blur", onWindowBlur);
+    };
+  }, [disabled, cwd, sessionId]);
+
   const onPaste = (e: ClipboardEvent<HTMLTextAreaElement>) => {
     const data = e.clipboardData;
     if (!data) return;
@@ -226,23 +306,11 @@ export const MessageInput = forwardRef<MessageInputHandle, Props>(function Messa
     }
   };
 
-  const onDrop = (e: DragEvent<HTMLDivElement>) => {
-    e.preventDefault();
-    setDragOver(false);
-    enqueueFiles(Array.from(e.dataTransfer?.files ?? []));
-  };
-
   const onPickFiles = (e: ChangeEvent<HTMLInputElement>) => {
     enqueueFiles(Array.from(e.target.files ?? []));
     // Reset so picking the same file again still fires onChange.
     e.target.value = "";
   };
-
-  const onDragOver = (e: DragEvent<HTMLDivElement>) => {
-    e.preventDefault();
-    if (!dragOver) setDragOver(true);
-  };
-  const onDragLeave = () => setDragOver(false);
 
   const removeAttachment = (id: string) => {
     setAttachments((prev) => prev.filter((a) => a.id !== id));
@@ -439,14 +507,18 @@ export const MessageInput = forwardRef<MessageInputHandle, Props>(function Messa
     : hasContent && (!disabled || Boolean(commandCandidate));
 
   return (
-    <div
-      className={`transition-colors ${
-        dragOver ? "rounded-xl bg-status-progress-soft" : ""
-      }`}
-      onDragOver={onDragOver}
-      onDragLeave={onDragLeave}
-      onDrop={onDrop}
-    >
+    <div className="relative">
+      {dragOver && (
+        <div
+          role="status"
+          aria-live="polite"
+          className="fixed inset-3 z-[100] flex items-center justify-center rounded-2xl border-2 border-dashed border-accent bg-surface-0/90 text-center shadow-2xl backdrop-blur-sm pointer-events-none"
+        >
+          <div className="rounded-xl bg-surface-2 px-6 py-4 text-reading font-medium text-accent">
+            松开以添加 {dragFileCount} 个文件
+          </div>
+        </div>
+      )}
       {suggestions.length > 0 && !streaming && (
         <div className="mb-2 max-h-48 overflow-auto rounded-lg border border-border bg-surface-2 shadow-xl">
           {suggestions.map((command) => (
