@@ -174,6 +174,32 @@ mod m286_tests {
 
 
     #[test]
+    fn m286_stale_catalog_is_available_only_for_failed_refresh() {
+        let endpoint = "m286-stale-catalog";
+        MODELS_CACHE.lock().unwrap().insert(
+            endpoint.into(),
+            (
+                now_ms() - MODEL_CATALOG_TTL_MS - 1,
+                vec![model("gpt-6.1-terra", false)],
+            ),
+        );
+        assert!(cached_models(endpoint, false).is_none());
+        assert_eq!(cached_models(endpoint, true).unwrap()[0].id, "gpt-6.1-terra");
+    }
+
+    #[test]
+    fn m286_missing_catalog_keeps_refresh_failure_visible() {
+        let endpoint = "m286-no-catalog";
+        MODELS_CACHE.lock().unwrap().remove(endpoint);
+        assert!(cached_models(endpoint, true).is_none());
+        let message = format!(
+            "MODEL_CATALOG_UNAVAILABLE: endpoint '{endpoint}' model catalog refresh failed and no cached list is available"
+        );
+        assert!(message.contains("MODEL_CATALOG_UNAVAILABLE"));
+        assert!(message.contains(endpoint));
+    }
+
+    #[test]
     fn m286_balanced_prefers_latest_terra_and_falls_back_explicitly() {
         let catalog = vec![model("gpt-6.0-terra", false), model("gpt-6.1-terra", false), model("gpt-6.2-sol", false)];
         assert_eq!(preferred_openai_model(&catalog, "terra"), Some(("gpt-6.1-terra".into(), false)));
