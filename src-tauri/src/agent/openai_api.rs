@@ -14,7 +14,7 @@
 //!   estimate marker and the rate-card date.
 //!
 //! Rate card values are USD per million tokens and are recorded with their
-//! source date so the UI can say "as of 2025-09".
+//! source date so the UI can say "as of 2026-11-25".
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -26,7 +26,7 @@ pub const CURRENCY: &str = "USD";
 /// R3: a spent-per-day ceiling that is visible but not punishing.
 pub const DEFAULT_DAILY_CAP_USD: f64 = 3.0;
 /// R5: the UI shows which price list the number came from.
-pub const RATE_CARD_DATE: &str = "2025-09";
+pub const RATE_CARD_DATE: &str = "2026-11-25";
 pub const RATE_CARD_SOURCE: &str = "OpenAI API pricing (USD / 1M tokens)";
 
 /// Per-million-token USD prices for one model.
@@ -54,6 +54,26 @@ impl ModelRate {
 
 /// Longest-prefix-wins table, ordered most specific first.
 const RATE_TABLE: &[(&str, ModelRate)] = &[
+    ("gpt-6.2-sol", ModelRate { input_usd_per_mtok: 4.0, cached_input_usd_per_mtok: 0.40, output_usd_per_mtok: 20.0 }),
+    ("gpt-6.1-terra", ModelRate { input_usd_per_mtok: 0.50, cached_input_usd_per_mtok: 0.05, output_usd_per_mtok: 2.0 }),
+    ("gpt-6.1-sol", ModelRate { input_usd_per_mtok: 2.0, cached_input_usd_per_mtok: 0.20, output_usd_per_mtok: 10.0 }),
+    ("gpt-6", ModelRate { input_usd_per_mtok: 1.0, cached_input_usd_per_mtok: 0.10, output_usd_per_mtok: 5.0 }),
+    ("gpt-5.6-sol", ModelRate { input_usd_per_mtok: 4.0, cached_input_usd_per_mtok: 0.40, output_usd_per_mtok: 20.0 }),
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
     (
         "gpt-5-mini",
         ModelRate { input_usd_per_mtok: 0.25, cached_input_usd_per_mtok: 0.025, output_usd_per_mtok: 2.0 },
@@ -109,7 +129,8 @@ pub fn rate_for_model(model: &str) -> ModelRate {
     // Longest prefix wins; the table is ordered that way, but do not rely on it.
     let mut best: Option<(&str, ModelRate)> = None;
     for (prefix, rate) in RATE_TABLE {
-        if lower.starts_with(prefix) && best.map(|(b, _)| prefix.len() > b.len()).unwrap_or(true) {
+        let boundary = lower == *prefix || lower.strip_prefix(prefix).is_some_and(|suffix| suffix.starts_with('-') || suffix.starts_with(':'));
+        if boundary && best.map(|(b, _)| prefix.len() > b.len()).unwrap_or(true) {
             best = Some((prefix, *rate));
         }
     }
@@ -458,6 +479,22 @@ mod tests {
         assert_eq!(rate_for_model("GPT-4o-mini-2024-07-18").output_usd_per_mtok, 0.6);
         // Longer prefix wins over a shorter one that also matches.
         assert_eq!(rate_for_model("gpt-5-mini-2025-08-07").output_usd_per_mtok, 2.0);
+    }
+
+    #[test]
+    fn m286_current_rates_cover_family_boundaries_and_cached_token_shape() {
+        let sol56 = rate_for_model("gpt-5.6-sol");
+        assert_eq!(sol56.input_usd_per_mtok, 4.0);
+        assert_eq!(sol56.cached_input_usd_per_mtok, 0.40);
+        assert_eq!(sol56.output_usd_per_mtok, 20.0);
+        assert_ne!(sol56, rate_for_model("gpt-5"));
+        assert_eq!(rate_for_model("gpt-6.1-terra").cached_input_usd_per_mtok, 0.05);
+        assert_eq!(rate_for_model("gpt-6.2-sol").output_usd_per_mtok, 20.0);
+
+        let actual = estimate_cost_usd("gpt-5.6-sol", 133_000, 129_000, 771);
+        let expected = (4_000.0 * 4.0 + 129_000.0 * 0.40 + 771.0 * 20.0) / 1_000_000.0;
+        assert!((actual - expected).abs() < 1e-12, "got {actual}, expected {expected}");
+        assert_eq!(RATE_CARD_DATE, "2026-11-25");
     }
 
     /// R3 / R4: crossing the cap blocks the next request and resets at local
