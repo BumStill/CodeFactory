@@ -18,6 +18,25 @@ pub(crate) fn m232_deliver_fixture(cwd: &std::path::Path) -> Value {
     legacy::m232_deliver_fixture(cwd)
 }
 
+fn blocked_marker_head(pr: &Value) -> Option<&str> {
+    pr.get("comments")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|comment| comment.get("body").and_then(Value::as_str))
+        .find_map(|body| {
+            let marker = body.split("<!-- merge-queue:blocked head=").nth(1)?;
+            marker.split_whitespace().next()
+        })
+}
+
+fn blocked_head_is_stale(pr: &Value, local_head: &str, has_local_changes: bool) -> bool {
+    let remote_head = pr.get("headRefOid").and_then(Value::as_str).unwrap_or_default();
+    blocked_marker_head(pr).is_some_and(|blocked| {
+        blocked != remote_head || has_local_changes || local_head != remote_head
+    })
+}
+
 async fn guarded_args(args: &Value, ctx: &ExecCtx, ceiling: DeliveryCeiling) -> crate::errors::Result<(Value, bool)> {
     let mut guarded = args.clone();
     let branch = match crate::agent::delivery::git(&ctx.cwd, &["branch", "--show-current"]) {
@@ -27,7 +46,7 @@ async fn guarded_args(args: &Value, ctx: &ExecCtx, ceiling: DeliveryCeiling) -> 
     let raw = match crate::agent::delivery::bounded_delivery_output(
         crate::agent::delivery::dev_command_in("gh", &ctx.cwd).current_dir(&ctx.cwd).args([
             "pr", "list", "--head", &branch, "--state", "open", "--json",
-            "number,title,body,isDraft,labels",
+            "number,title,body,isDraft,labels,headRefOid,comments",
         ]),
     ) {
         Ok(raw) => raw,
@@ -39,17 +58,32 @@ async fn guarded_args(args: &Value, ctx: &ExecCtx, ceiling: DeliveryCeiling) -> 
     let is_armed = pr["labels"].as_array().is_some_and(|labels| {
         labels.iter().any(|label| label["name"] == "merge-queue: armed")
     });
-    let has_merge_block = pr["labels"].as_array().is_some_and(|labels| {
+    let has_hold = pr["labels"].as_array().is_some_and(|labels| {
+        labels.iter().any(|label| label["name"] == "merge-queue: hold")
+    });
+    if has_hold {
+        return Err(crate::errors::AppError::ToolArgument(
+            "PR 带有 merge-queue: hold；未转 ready、未打 armed、未改写标题或正文。人工合并阻断由人工/编排方解除。".into(),
+        ));
+    }
+    let has_blocked = pr["labels"].as_array().is_some_and(|labels| {
         labels.iter().any(|label| {
-            label["name"].as_str().is_some_and(|name| {
-                name == "merge-queue: hold" || name.starts_with("merge-queue: blocked")
-            })
+            label["name"].as_str().is_some_and(|name| name.starts_with("merge-queue: blocked"))
         })
     });
-    if has_merge_block {
-        return Err(crate::errors::AppError::ToolArgument(
-            "PR 带有 merge-queue: hold / merge-queue: blocked*；未转 ready、未打 armed、未改写标题或正文。合并阻断由人工/编排方解除。".into(),
-        ));
+    if has_blocked {
+        let local_head = crate::agent::delivery::git(&ctx.cwd, &["rev-parse", "HEAD"])
+            .unwrap_or_default();
+        let has_local_changes = crate::agent::delivery::git(&ctx.cwd, &["status", "--porcelain"])
+            .is_ok_and(|status| !status.trim().is_empty());
+        if !blocked_head_is_stale(pr, local_head.trim(), has_local_changes) {
+            return Err(crate::errors::AppError::ToolArgument(
+                "merge-queue: blocked 对应当前 head；未打 armed、未移除标签，等待队列重新判定。系统自动重试/自愈：修复失败检查并产生新 head 后继续交付。".into(),
+            ));
+        }
+        if let Some(obj) = guarded.as_object_mut() {
+            obj.insert("clear_stale_blocked".into(), Value::Bool(true));
+        }
     }
     let (prior_ceiling, newly_authorized) = if let (Some(db), Some(session)) = (&ctx.db, &ctx.session_id) {
         let prior = sqlx::query_scalar::<_, String>("SELECT ceiling FROM thin_delivery_refs WHERE session_id=?")
@@ -166,6 +200,22 @@ pub(super) async fn execute(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stale_blocked_marker_requires_a_new_or_changed_head() {
+        let pr = serde_json::json!({
+            "headRefOid": "head-a",
+            "comments": [{"body": "<!-- merge-queue:blocked head=head-a at=2026-11-27T00:00:00Z -->"}]
+        });
+        assert!(!blocked_head_is_stale(&pr, "head-a", false));
+        assert!(blocked_head_is_stale(&pr, "head-b", false));
+        assert!(blocked_head_is_stale(&pr, "head-a", true));
+        let old = serde_json::json!({
+            "headRefOid": "head-b",
+            "comments": [{"body": "<!-- merge-queue:blocked head=head-a at=2026-11-27T00:00:00Z -->"}]
+        });
+        assert!(blocked_head_is_stale(&old, "head-b", false));
+    }
 
     #[test]
     fn persisted_merge_ceiling_marks_prior_authorization() {

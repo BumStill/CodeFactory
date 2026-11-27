@@ -346,6 +346,11 @@ fn run(commands: &mut impl Commands, args: &Value, ceiling: DeliveryCeiling, exc
     let number = pr["number"].as_u64().ok_or("PR number missing")?;
     log.pr_number = Some(number);
     let number_arg = number.to_string();
+    let clear_stale_blocked = args.get("clear_stale_blocked").and_then(Value::as_bool) == Some(true);
+    if clear_stale_blocked {
+        log.gh(commands, &["pr", "edit", &number_arg, "--remove-label", "merge-queue: blocked"])?;
+        log.step("queue", "stale blocked cleared");
+    }
     if ceiling.rank() >= DeliveryCeiling::ThroughMerge.rank() {
         let raw = log.gh(commands, &["pr", "view", &number_arg, "--json", "labels"])?;
         let labels: Value = serde_json::from_str(&raw).map_err(|e| e.to_string())?;

@@ -52,14 +52,14 @@ mod integration {
         format!(
             r#"#!/bin/sh
 set -eu
-BASE="{s}"; A="$BASE.armed"; D="$BASE.draft"; H="$BASE.hold"; L="$BASE.log"
-[ -f "$A" ] || echo false > "$A"; [ -f "$D" ] || echo false > "$D"; [ -f "$H" ] || echo false > "$H"
-ARMED=$(cat "$A"); DRAFT=$(cat "$D"); HOLD=$(cat "$H")
+BASE="{s}"; A="$BASE.armed"; D="$BASE.draft"; H="$BASE.hold"; B="$BASE.blocked"; BH="$BASE.blocked-head"; L="$BASE.log"
+[ -f "$A" ] || echo false > "$A"; [ -f "$D" ] || echo false > "$D"; [ -f "$H" ] || echo false > "$H"; [ -f "$B" ] || echo false > "$B"; [ -f "$BH" ] || echo none > "$BH"
+ARMED=$(cat "$A"); DRAFT=$(cat "$D"); HOLD=$(cat "$H"); BLOCKED=$(cat "$B"); BLOCKED_HEAD=$(cat "$BH")
 if [ -f "$BASE.fail_list_once" ] && [ "$1 $2" = "pr list" ] && [ ! -f "$BASE.failed_once" ]; then touch "$BASE.failed_once"; exit 2; fi
 case "$1 $2" in
- "pr list") echo "$@" >> "$L"; LABELS='[]'; [ "$ARMED" = true ] && LABELS='[{{"name":"merge-queue: armed"}}]'; [ "$HOLD" = true ] && LABELS='[{{"name":"merge-queue: hold"}}]'; echo "[{{\"number\":101,\"url\":\"https://forge.invalid/pr/101\",\"title\":\"fix: remote\",\"body\":\"R | 是否完成 | 证据\",\"state\":\"OPEN\",\"headRefOid\":\"unused\",\"isDraft\":$DRAFT,\"labels\":$LABELS}}]";;
+ "pr list") echo "$@" >> "$L"; LABELS='[]'; [ "$ARMED" = true ] && LABELS='[{{"name":"merge-queue: armed"}}]'; [ "$BLOCKED" = true ] && LABELS='[{{"name":"merge-queue: blocked"}}]'; [ "$HOLD" = true ] && LABELS='[{{"name":"merge-queue: hold"}}]'; COMMENTS='[]'; [ "$BLOCKED_HEAD" != none ] && COMMENTS='[{{"body":"<!-- merge-queue:blocked head='"$BLOCKED_HEAD"' at=2026-11-27T00:00:00Z -->"}}]'; echo "[{{\"number\":101,\"url\":\"https://forge.invalid/pr/101\",\"title\":\"fix: remote\",\"body\":\"R | 是否完成 | 证据\",\"state\":\"OPEN\",\"headRefOid\":\"$BLOCKED_HEAD\",\"isDraft\":$DRAFT,\"labels\":$LABELS,\"comments\":$COMMENTS}}]";;
  "pr view") echo "$@" >> "$L"; if echo "$@" | grep -q labels; then [ "$ARMED" = true ] && LABELS='[{{"name":"merge-queue: armed"}}]' || LABELS='[]'; echo "{{\"labels\":$LABELS}}"; elif echo "$@" | grep -q number,url; then echo '{{"number":101,"url":"https://forge.invalid/pr/101"}}'; else echo '{{"state":"OPEN","statusCheckRollup":[{{"status":"IN_PROGRESS"}}]}}'; fi;;
- "pr edit") echo "$@" >> "$L"; echo "$@" | grep -q -- --add-label && echo true > "$A" || :;;
+ "pr edit") echo "$@" >> "$L"; echo "$@" | grep -q -- --add-label && echo true > "$A" || :; echo "$@" | grep -q -- --remove-label && echo false > "$B" || :;;
  "pr ready") echo "$@" >> "$L";;
  "pr create") echo "$@" >> "$L";;
  "workflow run") echo "$@" >> "$L";;
@@ -151,6 +151,7 @@ exit /b 3
             &["update-ref", "refs/remotes/origin/main", head.trim()],
         );
         git(dir.path(), &["checkout", "-b", "feature"]);
+        fs::write(dir.path().join(".git/info/exclude"), "gh\ngh.cmd\ngh-state*\n").unwrap();
         fs::write(dir.path().join("file.txt"), "changed").unwrap();
         let state = dir.path().join("gh-state");
         let gh = if cfg!(windows) {
@@ -300,6 +301,50 @@ exit /b 3
         assert!(!log.lines().any(|line| line.starts_with("pr ready")), "hold must block ready: {log}");
         assert!(!log.contains("--add-label"), "hold must block armed: {log}");
         assert!(!log.contains("--title") && !log.contains("--body"), "hold must preserve title/body: {log}");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn stale_blocked_head_pushes_clears_then_rearms() {
+        let (d, _b, db, state) = setup().await;
+        fs::write(state.with_extension("blocked"), "true").unwrap();
+        fs::write(state.with_extension("blocked-head"), "old-head").unwrap();
+        let output = crate::tools::dispatch(
+            "deliver_changes",
+            json!({"title":"fix: stale blocked","body":"R | 是否完成 | 证据","ceiling":"through_merge"}),
+            &context(d.path(), db),
+        )
+        .await
+        .unwrap();
+        assert!(!output.is_error, "{}", output.content);
+        let log = fs::read_to_string(state.with_extension("log")).unwrap_or_default();
+        let clear = log.find("--remove-label merge-queue: blocked").expect("stale blocked label must clear");
+        let arm = log.find("--add-label merge-queue: armed").expect("new head must re-arm");
+        assert!(clear < arm, "stale blocked must clear before re-arm: {log}");
+        assert_eq!(fs::read_to_string(state.with_extension("blocked")).unwrap().trim(), "false");
+        let remote = crate::agent::delivery::git(d.path(), &["ls-remote", "--heads", "origin", "refs/heads/feature"]).unwrap();
+        assert!(!remote.trim().is_empty(), "fixed head must be pushed");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn current_blocked_head_stays_queue_owned() {
+        let (d, _b, db, state) = setup().await;
+        let head = crate::agent::delivery::git(d.path(), &["rev-parse", "HEAD"]).unwrap();
+        fs::write(state.with_extension("blocked"), "true").unwrap();
+        fs::write(state.with_extension("blocked-head"), head.trim()).unwrap();
+        fs::remove_file(d.path().join("file.txt")).unwrap();
+        let output = crate::tools::dispatch(
+            "deliver_changes",
+            json!({"title":"fix: current blocked","body":"R | 是否完成 | 证据","ceiling":"through_merge"}),
+            &context(d.path(), db),
+        )
+        .await
+        .unwrap();
+        assert!(output.is_error, "current blocked head must not be made mergeable: {}", output.content);
+        let log = fs::read_to_string(state.with_extension("log")).unwrap_or_default();
+        assert!(!log.contains("--remove-label merge-queue: blocked"), "{log}");
+        assert!(!log.contains("--add-label merge-queue: armed"), "{log}");
     }
 
     #[tokio::test]
