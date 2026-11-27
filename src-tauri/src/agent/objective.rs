@@ -276,13 +276,10 @@ const DEAD_ENDPOINT_RETRY_MS: i64 = 10_000;
 /// policy: wait it out, then say so honestly.
 pub const PROVIDER_TRANSPORT_UNREACHABLE: &str = "provider_transport_unreachable";
 
-/// How long one transport outage may last before the objective stops waiting
-/// and settles. Fifteen minutes is deliberately far past the events that
-/// motivate this: the 2026-10-08 DeepSeek outage recovered on its own after
-/// ~3 minutes, a Wi‑Fi switch or VPN reconnect is seconds, and a proxy restart
-/// is under a minute — while still being short enough that nobody is left
-/// watching "等待中" for an afternoon.
-const TRANSPORT_OUTAGE_WINDOW_MS: i64 = 15 * 60 * 1_000;
+/// A transport outage remains system-owned through ordinary transient failures.
+/// After a full day with no usable endpoint, the system must stop waiting and
+/// write an explicit, readable terminal explanation instead of hanging forever.
+const TRANSPORT_OUTAGE_WINDOW_MS: i64 = 24 * 60 * 60 * 1_000;
 
 /// How often the cheap reachability probe is repeated while the path is down.
 /// The probe is what keeps an outage from spending the recovery budget: a
@@ -490,8 +487,7 @@ pub(crate) fn parked_incident_message(failure_code: Option<&str>) -> &'static st
 进度和上下文都已保留：可以在输入框旁换成另一个可用模型继续同一目标，不必重述需求。";
     }
     if failure_code == Some(PROVIDER_TRANSPORT_UNREACHABLE) {
-        return "网络或模型服务连不上了，本回合已停在安全边界。进度和上下文都已保留：\
-网络或服务恢复后直接回一句「继续」，就会在原来的进度上接着做。";
+        return "网络或模型服务暂时不可用，系统会在恢复后自动继续当前任务，无需手动重试。";
     }
     "本回合的自动恢复已达到安全上限，已登记为系统故障。你不需要补充输入；CodeFactory 会在恢复策略或能力更新后续接同一目标。"
 }
@@ -5373,9 +5369,6 @@ impl ObjectiveStore {
                     &text,
                 )
                 .await;
-                // U3's failed terminal, reached honestly: the objective stays
-                // `failed` with a code that explains itself. No new intermediate
-                // state is invented for the user to decode.
                 decision.decision_type = DecisionType::FailedInternal;
                 decision.status = ObjectiveStatus::Failed;
                 decision.failure_code = Some(PROVIDER_TRANSPORT_UNREACHABLE.into());
@@ -5385,6 +5378,7 @@ impl ObjectiveStore {
                 decision.next_action_authorized = false;
                 decision.requires_user_action = false;
                 decision.recovery_owner = Some(OBJECTIVE_INCIDENT_CONTROLLER.into());
+                decision.transport_probe_wait = false;
                 Ok(decision)
             }
         }
@@ -5461,7 +5455,34 @@ impl ObjectiveStore {
                 .execute(&self.pool)
                 .await?
                 .rows_affected(),
-                TransportOutageAction::Retry | TransportOutageAction::GiveUp { .. } => {
+                TransportOutageAction::GiveUp {
+                    unreachable_ms,
+                    attempts,
+                } => {
+                    let text = transport_outage_terminal_message(unreachable_ms, attempts);
+                    self.record_transport_outage_terminal(
+                        &objective_id,
+                        unreachable_ms,
+                        attempts,
+                        &text,
+                    )
+                    .await;
+                    sqlx::query(
+                        "UPDATE objectives SET status='failed', decision_type='failed_internal',
+                                failure_code=?, recovery_owner=?, remediation_id=NULL,
+                                next_observation_at=NULL, requires_user_action=0, updated_at=?
+                         WHERE id=? AND remediation_id=? AND status='waiting_system'",
+                    )
+                    .bind(PROVIDER_TRANSPORT_UNREACHABLE)
+                    .bind(OBJECTIVE_INCIDENT_CONTROLLER)
+                    .bind(now)
+                    .bind(&objective_id)
+                    .bind(&remediation_id)
+                    .execute(&self.pool)
+                    .await?
+                    .rows_affected()
+                }
+                TransportOutageAction::Retry => {
                     sqlx::query(
                         "INSERT INTO objective_remediations
                          (id, objective_id, binding_id, domain, status, failure_code,
@@ -14992,6 +15013,21 @@ CREATE TABLE objectives (
         .unwrap()
     }
 
+    #[test]
+    fn m298_transport_outage_has_transient_wait_and_long_terminal_boundaries() {
+        let now = 1_700_000_000_000_i64;
+        assert!(matches!(
+            transport_outage_action(now, now - 16 * 60_000, 3, false),
+            TransportOutageAction::Wait { .. }
+        ));
+        assert!(matches!(
+            transport_outage_action(now, now - TRANSPORT_OUTAGE_WINDOW_MS - 1_000, 3, false),
+            TransportOutageAction::GiveUp { .. }
+        ));
+        assert_eq!(parked_incident_message(Some(PROVIDER_TRANSPORT_UNREACHABLE)),
+            "网络或模型服务暂时不可用，系统会在恢复后自动继续当前任务，无需手动重试。");
+    }
+
     /// U25 policy table: wait inside the window, retry the moment the path
     /// answers, give up only once the window is over.
     #[test]
@@ -15257,11 +15293,10 @@ CREATE TABLE objectives (
         );
     }
 
-    /// U25 requirement 4: an outage that outlasts the window settles honestly,
-    /// saying how long it was unreachable and how many times it was tried, and
-    /// using no internal vocabulary.
+    /// M298: an ordinary 16-minute outage is still transient and remains a
+    /// system-owned wait. The explicit terminal boundary is one full day.
     #[tokio::test]
-    async fn an_outage_past_the_window_settles_with_long_and_honest_wording() {
+    async fn an_outage_inside_the_long_window_remains_system_owned() {
         let pool = pool().await;
         let store = ObjectiveStore::new(pool.clone());
         let current = recovery_ceiling_objective(&pool, "objective-transport-window").await;
@@ -15273,13 +15308,34 @@ CREATE TABLE objectives (
 
         let after = route_transport_failure(&store, &current).await;
 
-        assert_eq!(after.status, ObjectiveStatus::Failed);
-        assert_eq!(
-            after.failure_code.as_deref(),
-            Some(PROVIDER_TRANSPORT_UNREACHABLE),
-            "the settled reason must explain itself"
-        );
+        assert_eq!(after.status, ObjectiveStatus::WaitingSystem);
+        assert_eq!(after.failure_code.as_deref(), Some(PROVIDER_TRANSPORT_UNREACHABLE));
         assert!(!after.requires_user_action);
+        assert!(after.next_observation_at.is_some());
+        assert!(after.remediation_id.is_some());
+    }
+
+    /// M298 hard boundary: after 24 hours with no usable endpoint, waiting must
+    /// terminate with readable duration/attempt evidence and no intermediate
+    /// remediation left behind.
+    #[tokio::test]
+    async fn an_outage_past_the_long_window_settles_with_honest_wording() {
+        let pool = pool().await;
+        let store = ObjectiveStore::new(pool.clone());
+        let current = recovery_ceiling_objective(&pool, "objective-transport-long-window").await;
+        let url = unreachable_local_route();
+        let now = Utc::now().timestamp_millis();
+        for offset in [25 * 60 * 60_000_i64, 12 * 60 * 60_000, 60 * 60_000, 30_000] {
+            seed_transport_failure(&pool, &current.id, &url, now - offset).await;
+        }
+
+        let after = route_transport_failure(&store, &current).await;
+
+        assert_eq!(after.status, ObjectiveStatus::Failed);
+        assert_eq!(after.failure_code.as_deref(), Some(PROVIDER_TRANSPORT_UNREACHABLE));
+        assert!(!after.requires_user_action);
+        assert!(after.remediation_id.is_none(), "terminal state keeps no intermediate remediation");
+        assert!(after.next_observation_at.is_none(), "terminal state keeps no wake");
 
         let detail: String = sqlx::query_scalar(
             "SELECT detail_json FROM objective_events
@@ -15292,7 +15348,7 @@ CREATE TABLE objectives (
         .unwrap();
         let value: serde_json::Value = serde_json::from_str(&detail).unwrap();
         let message = value["message"].as_str().unwrap();
-        assert!(message.contains("16 分钟"), "how long: {message}");
+        assert!(message.contains("1500 分钟"), "how long: {message}");
         assert!(message.contains("4 次"), "how many times: {message}");
         assert!(message.contains("保留"), "progress is kept: {message}");
         assert!(message.contains("继续"), "how to go on: {message}");
