@@ -321,10 +321,12 @@ mod tests {
             assert!(!SCRIPT_TEMPLATE.contains("25MB"));
         }
         #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-        {
-            let err = super::read_native().unwrap_err();
-            assert!(err.contains("拖放"));
-            assert!(err.contains("选择文件"));
+        match super::read_native() {
+            Err(err) => {
+                assert!(err.contains("拖放"));
+                assert!(err.contains("选择文件"));
+            }
+            Ok(_) => panic!("linux native clipboard should stay unsupported"),
         }
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("synthetic.txt");
