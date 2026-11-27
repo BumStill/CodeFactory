@@ -50,6 +50,12 @@ struct ReadArgs {
     /// warnings. Use before/after format_pptx to catch text that won't fit.
     #[serde(default)]
     check_overflow: bool,
+    /// First slide to read (1-based). Defaults to 1.
+    #[serde(default)]
+    start_slide: Option<usize>,
+    /// Maximum slides returned per call. Defaults to 50, capped at 100.
+    #[serde(default)]
+    slide_limit: Option<usize>,
 }
 
 pub fn read_definition() -> ToolDefinition {
@@ -68,7 +74,9 @@ uploaded a deck and wants an enriched new version of it."
                 "properties": {
                     "path": { "type": "string", "description": "Workspace-relative or absolute path to an existing .pptx." },
                     "with_format": { "type": "boolean", "description": "Also report each paragraph's current font/size/color/bold/alignment — use before format_pptx to spot inconsistencies." },
-                    "check_overflow": { "type": "boolean", "description": "Also estimate whether any text box overflows its frame (font too big / too much text) and warn. Approximate — there's no render engine." }
+                    "check_overflow": { "type": "boolean", "description": "Also estimate whether any text box overflows its frame (font too big / too much text) and warn. Approximate — there's no render engine." },
+                    "start_slide": { "type": "integer", "minimum": 1, "description": "First slide to read (1-based; default 1)." },
+                    "slide_limit": { "type": "integer", "minimum": 1, "maximum": 100, "description": "Maximum slides to return (default 50)." }
                 },
                 "required": ["path"]
             }),
@@ -103,14 +111,19 @@ pub async fn execute_read(args: Value, ctx: &ExecCtx) -> Result<ToolOutput> {
         return Ok(ToolOutput::err("No slides found in deck (ppt/slides/slideN.xml missing)"));
     }
 
+    let total_slides = slide_nos.len();
+    let start_slide = a.start_slide.unwrap_or(1).max(1);
+    let slide_limit = a.slide_limit.unwrap_or(50).clamp(1, 100);
+    let selected: Vec<usize> = slide_nos.into_iter().filter(|n| *n >= start_slide).take(slide_limit).collect();
+
     let mut out = String::new();
     out.push_str(&format!(
         "Deck: {} ({} slides)\nLocator legend: sN.F.P = slide N, text-frame F, paragraph P (use these as edit_pptx slide/frame/para).\n",
         rel_for_display(&path, ctx),
-        slide_nos.len()
+        total_slides
     ));
     let mut overflow_hits = 0usize;
-    for n in slide_nos {
+    for n in selected.iter().copied() {
         let name = format!("ppt/slides/slide{n}.xml");
         let mut xml = String::new();
         if archive
@@ -126,6 +139,12 @@ pub async fn execute_read(args: Value, ctx: &ExecCtx) -> Result<ToolOutput> {
             let reports = slide_overflow_reports(&xml, &geom);
             overflow_hits += reports.len();
             out.push_str(&render_overflow(n, &reports));
+        }
+    }
+    if let Some(last) = selected.last() {
+        let remaining = total_slides.saturating_sub(*last);
+        if remaining > 0 {
+            out.push_str(&format!("\n还有 {remaining} 张幻灯片，可用 start_slide={} 继续读。\n", last + 1));
         }
     }
     if a.check_overflow && overflow_hits == 0 {

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-import { forwardRef, useRef, useState, useEffect, useImperativeHandle, ChangeEvent, KeyboardEvent, ClipboardEvent, type ReactNode } from "react";
+import { forwardRef, useRef, useState, useEffect, useImperativeHandle, KeyboardEvent, ClipboardEvent, type ReactNode } from "react";
 import { recallHistory, pushHistory } from "./messageHistory";
 import { Send, Square, Paperclip, X, Loader2, Check } from "lucide-react";
 import {
@@ -8,7 +8,8 @@ import {
   type ParsedSlashCommand,
 } from "../stores/slashCommands";
 import { invoke } from "../lib/tauri";
-import { convertFileSrc } from "@tauri-apps/api/core";
+import { convertFileSrc, Channel } from "@tauri-apps/api/core";
+import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { getCurrentWindow, type DragDropEvent } from "@tauri-apps/api/window";
 import { ImagePreview } from "./ImagePreview";
 import { ComposerControlBar } from "./ComposerControlBar";
@@ -35,12 +36,13 @@ interface AttachmentChip {
 interface AttachmentLimits {
   max_bytes: number;
   max_mebibytes: number;
+  max_clipboard_bytes: number;
+  max_clipboard_mebibytes: number;
   max_model_image_bytes: number;
   max_model_image_mebibytes: number;
 }
 
 const IMAGE_EXTS = ["png", "jpg", "jpeg", "gif", "webp"];
-const ACCEPT_ATTR = "*/*";
 
 function extOf(name: string): string {
   const i = name.lastIndexOf(".");
@@ -129,6 +131,8 @@ export const MessageInput = forwardRef<MessageInputHandle, Props>(function Messa
   const ref = useRef<HTMLTextAreaElement>(null);
   const [attachments, setAttachments] = useState<AttachmentChip[]>([]);
   const [pendingUploads, setPendingUploads] = useState(0);
+  const [copyProgress, setCopyProgress] = useState<{ copyId: string; name: string; bytesCopied: number; totalBytes: number } | null>(null);
+  const activeCopyIdRef = useRef<string | null>(null);
   const uploading = pendingUploads > 0;
   const [dragOver, setDragOver] = useState(false);
   const [dragFileCount, setDragFileCount] = useState(0);
@@ -138,7 +142,6 @@ export const MessageInput = forwardRef<MessageInputHandle, Props>(function Messa
   const [guidanceState, setGuidanceState] = useState<
     { kind: "idle" } | { kind: "pending" } | { kind: "success"; message: string } | { kind: "error"; message: string }
   >({ kind: "idle" });
-  const fileInputRef = useRef<HTMLInputElement>(null);
   // Shell-style input history: sent messages this session + where we are in it.
   // Seeded from the session's prior user messages (the component is keyed by
   // session, so this re-seeds on switch).
@@ -156,11 +159,9 @@ export const MessageInput = forwardRef<MessageInputHandle, Props>(function Messa
 
   // ── Attachment plumbing ──────────────────────────────────────────────
   //
-  // Both paste and drag-drop funnel through saveAttachmentFile: turn a
-  // File into base64 → invoke the Tauri save_session_attachment command →
-  // get back the on-disk path → add a chip. The actual markdown link
-  // is appended at SEND time, not now, so chips can be removed without
-  // hunting through the textarea content.
+  // Native picker/drop paths are copied by Rust with a bounded buffer. Only
+  // clipboard File objects (which have no trustworthy filesystem path) use
+  // the byte/base64 fallback and its independent 20 MiB ceiling.
   const getAttachmentLimits = async (): Promise<AttachmentLimits> => {
     if (limitsRef.current) return limitsRef.current;
     const limits = await invoke<AttachmentLimits>("attachment_metadata", { path: null });
@@ -170,8 +171,10 @@ export const MessageInput = forwardRef<MessageInputHandle, Props>(function Messa
 
   const saveAttachmentFile = async (file: File): Promise<void> => {
     const limits = await getAttachmentLimits();
-    if (file.size > limits.max_bytes) {
-      setAttachError((prev) => [prev, `${file.name} 超过 ${limits.max_mebibytes}MiB 上限，已跳过`].filter(Boolean).join("\n"));
+    const clipboardMaxBytes = limits.max_clipboard_bytes ?? limits.max_bytes;
+    const clipboardMaxMebibytes = limits.max_clipboard_mebibytes ?? limits.max_mebibytes;
+    if (file.size > clipboardMaxBytes) {
+      setAttachError((prev) => [prev, `${file.name} 超过 ${clipboardMaxMebibytes}MiB 剪贴板上限，请用添加附件或拖入`].filter(Boolean).join("\n"));
       return;
     }
     const filename = file.name || `粘贴图片-${Date.now()}-${crypto.randomUUID().slice(0, 8)}.${file.type.split("/")[1]?.replace("jpeg", "jpg") || "png"}`;
@@ -231,20 +234,28 @@ export const MessageInput = forwardRef<MessageInputHandle, Props>(function Messa
     }
   };
 
-  const enqueueNativePaths = async (paths: string[]) => {
+  const enqueueNativePaths = async (paths: string[], source: "选择" | "拖放" = "拖放") => {
     if (disabled) {
       setAttachError("当前输入框不可用，请先打开或新建会话后再添加附件");
       return;
     }
+    const copyId = crypto.randomUUID();
+    activeCopyIdRef.current = copyId;
+    const progress = new Channel<{ copy_id: string; name: string; bytes_copied: number; total_bytes: number }>();
+    progress.onmessage = (event) => {
+      setCopyProgress({ copyId: event.copy_id, name: event.name, bytesCopied: event.bytes_copied, totalBytes: event.total_bytes });
+    };
     setPendingUploads((n) => n + 1);
     try {
       const saved = await invoke<{ path: string; name: string; size_bytes: number; error?: string }[]>(
-        "paste_session_attachments", { cwd: cwd ?? null, sessionId: sessionId ?? null, paths },
+        "copy_session_attachments", { cwd: cwd ?? null, sessionId: sessionId ?? null, paths, copyId, progress },
       );
       addSavedAttachments(saved);
     } catch (error) {
-      setAttachError((prev) => [prev, `拖放附件读取失败：${String(error)}`].filter(Boolean).join("\n"));
+      setAttachError((prev) => [prev, `${source}附件读取失败：${String(error)}`].filter(Boolean).join("\n"));
     } finally {
+      activeCopyIdRef.current = null;
+      setCopyProgress(null);
       setPendingUploads((n) => n - 1);
     }
   };
@@ -348,10 +359,19 @@ export const MessageInput = forwardRef<MessageInputHandle, Props>(function Messa
     }
   };
 
-  const onPickFiles = (e: ChangeEvent<HTMLInputElement>) => {
-    enqueueFiles(Array.from(e.target.files ?? []));
-    // Reset so picking the same file again still fires onChange.
-    e.target.value = "";
+  const onPickFiles = async () => {
+    try {
+      const selected = await openDialog({ multiple: true, directory: false });
+      const paths = typeof selected === "string" ? [selected] : selected ?? [];
+      if (paths.length > 0) await enqueueNativePaths(paths, "选择");
+    } catch (error) {
+      setAttachError(`打开文件选择器失败：${String(error)}`);
+    }
+  };
+
+  const cancelCopy = () => {
+    const copyId = activeCopyIdRef.current;
+    if (copyId) void invoke("cancel_attachment_copy", { copyId });
   };
 
   const removeAttachment = (id: string) => {
@@ -629,8 +649,11 @@ export const MessageInput = forwardRef<MessageInputHandle, Props>(function Messa
             )
           ))}
           {uploading && (
-            <span className="inline-flex items-center gap-1 text-note text-gray-500">
-              <Loader2 size={14} className="animate-spin motion-reduce:animate-none" /> 保存中…
+            <span role="status" aria-live="polite" className="inline-flex min-w-52 items-center gap-2 text-note text-gray-500">
+              <Loader2 size={14} className="animate-spin motion-reduce:animate-none" />
+              <span>{copyProgress ? `${copyProgress.name} ${Math.min(100, Math.round(copyProgress.bytesCopied / Math.max(1, copyProgress.totalBytes) * 100))}%` : "保存中…"}</span>
+              {copyProgress && <progress aria-label="附件复制进度" value={copyProgress.bytesCopied} max={copyProgress.totalBytes} className="w-24" />}
+              {activeCopyIdRef.current && <button type="button" onClick={cancelCopy} className="rounded px-2 py-1 text-status-danger hover:bg-status-danger-soft">取消</button>}
             </span>
           )}
           {attachError && (
@@ -646,17 +669,9 @@ export const MessageInput = forwardRef<MessageInputHandle, Props>(function Messa
         className="group rounded-2xl border border-border/40 bg-surface-2 shadow-sm transition-shadow focus-within:shadow-md"
       >
         <div className="flex items-end gap-2 px-3 py-2.5">
-        <input
-          ref={fileInputRef}
-          type="file"
-          multiple
-          accept={ACCEPT_ATTR}
-          className="hidden"
-          onChange={onPickFiles}
-        />
         <button
           type="button"
-          onClick={() => fileInputRef.current?.click()}
+          onClick={() => void onPickFiles()}
           disabled={uploading}
           aria-label="附加文件"
           className="flex h-[44px] w-[44px] shrink-0 items-center justify-center rounded-lg text-gray-500 transition-colors enabled:hover:bg-surface-4 focus:outline-none focus-visible:ring-2 focus-visible:ring-accent disabled:opacity-30 lg:h-[36px] lg:w-[36px]"

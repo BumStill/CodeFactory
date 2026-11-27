@@ -171,6 +171,23 @@ describe("ContextUsageBar compact ring", () => {
     }
   });
 
+  it("focuses the fixed detail without scrolling its composer ancestor", async () => {
+    const user = userEvent.setup();
+    const focusSpy = vi.spyOn(HTMLElement.prototype, "focus");
+
+    try {
+      render(<ContextUsageBar sessionId="s1" />);
+      await waitForUsageRefresh("s1");
+      await user.click(screen.getByRole("button", { name: /上下文.*详情/ }));
+      const detail = screen.getByRole("dialog", { name: /上下文.*用量详情/ });
+
+      expect(focusSpy).toHaveBeenCalledWith({ preventScroll: true });
+      expect(detail).toHaveFocus();
+    } finally {
+      focusSpy.mockRestore();
+    }
+  });
+
   it("ignores a previous session response that arrives after a fast session switch", async () => {
     const user = userEvent.setup();
     let resolveFirstSession!: (value: ReturnType<typeof summary>) => void;

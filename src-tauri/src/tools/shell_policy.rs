@@ -324,7 +324,7 @@ fn normalize(command: &str) -> String {
 }
 
 const MERGE_BLOCK_DENIAL: &str =
-    "禁止移除 merge-queue: hold / merge-queue: blocked*；合并阻断由人工/编排方解除。";
+    "禁止移除 merge-queue: hold；人工合并阻断由人工/编排方解除。";
 
 fn merge_block_removal_denial(command: &str) -> Option<&'static str> {
     let expanded = expand_common_shell_variables(command);
@@ -334,8 +334,7 @@ fn merge_block_removal_denial(command: &str) -> Option<&'static str> {
         .replace("\\\"", "\"")
         .replace("\\'", "'");
     let semantic = decoded.replace(['\"', '\''], "");
-    let protected =
-        semantic.contains("merge-queue: hold") || semantic.contains("merge-queue: blocked");
+    let protected = semantic.contains("merge-queue: hold");
     if !protected {
         return None;
     }
@@ -602,14 +601,13 @@ mod tests {
     }
 
     #[test]
-    fn m290_merge_block_removal_is_denied_semantically() {
+    fn m290_hold_removal_is_denied_semantically_while_blocked_is_not_a_human_hold() {
         let denied = [
             r#"gh issue edit 1084 --remove-label \"merge-queue: hold\""#,
             "gh api -X DELETE repos/BumStill/CodeFactory/issues/1090/labels/merge-queue%3A%20hold",
-            "gh api --method DELETE repos/BumStill/CodeFactory/issues/1090/labels/merge-queue%3A%20blocked%3A%20ci",
             r#"LABEL='merge-queue: hold'; gh pr edit 1090 --remove-label \"$LABEL\""#,
             r#"METHOD=DELETE; LABEL='merge-queue%3A%20hold'; gh api -X \"$METHOD\" repos/BumStill/CodeFactory/issues/1090/labels/\"$LABEL\""#,
-            r#"gh api graphql -f query='mutation { removeLabelsFromLabelable(input:{labelableId:\"PR\",labelIds:[\"merge-queue: blocked\"]}) { clientMutationId } }'"#,
+            r#"gh api graphql -f query='mutation { removeLabelsFromLabelable(input:{labelableId:\"PR\",labelIds:[\"merge-queue: hold\"]}) { clientMutationId } }'"#,
         ];
         for command in denied {
             let ShellCommandPolicy::Deny { reason } = classify_command(command) else {
@@ -617,6 +615,14 @@ mod tests {
             };
             assert!(reason.contains("合并阻断由人工/编排方解除"), "{reason}");
         }
+        assert!(!matches!(
+            classify_command("gh pr edit 1090 --remove-label 'merge-queue: blocked'"),
+            ShellCommandPolicy::Deny { .. }
+        ));
+        assert!(matches!(
+            classify_command("gh api --method DELETE repos/BumStill/CodeFactory/issues/1090/labels/merge-queue%3A%20blocked"),
+            ShellCommandPolicy::Ask { .. }
+        ));
     }
 
     #[test]

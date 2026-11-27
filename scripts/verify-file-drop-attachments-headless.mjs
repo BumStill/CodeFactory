@@ -8,6 +8,11 @@ import { gotoScenario } from "./headless-acceptance-support.mjs";
 
 const dir = path.resolve(".codefactory-cache/m289-headless");
 await mkdir(dir, { recursive: true });
+// Keep Chrome profile/crash state inside the task cache. The trusted-command
+// sandbox permits the workspace but intentionally blocks the user's real
+// ~/Library/Application Support tree.
+process.env.HOME = dir;
+process.env.TMPDIR = dir;
 const server = spawn(process.execPath, ["node_modules/vite/bin/vite.js", "--host", "127.0.0.1", "--port", "1492", "--strictPort"], { stdio: ["ignore", "pipe", "pipe"] });
 let log = "";
 server.stdout.on("data", (value) => { log += value; });
@@ -23,15 +28,21 @@ try {
     await new Promise((resolve) => setTimeout(resolve, 250));
   }
   assert(ready);
+  const bundledShell = path.join(path.resolve(".codefactory-cache/ms-playwright"), "chromium_headless_shell-1228", "chrome-headless-shell-mac-arm64", "chrome-headless-shell");
   const candidates = process.platform === "darwin"
-    ? ["/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"]
+    ? [bundledShell, "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"]
     : process.platform === "win32"
       ? [path.join(process.env.PROGRAMFILES ?? "C:\\Program Files", "Google/Chrome/Application/chrome.exe"), path.join(process.env["PROGRAMFILES(X86)"] ?? "C:\\Program Files (x86)", "Microsoft/Edge/Application/msedge.exe")]
       : ["/usr/bin/chromium", "/usr/bin/google-chrome"];
   let executablePath;
   for (const candidate of candidates) { try { await access(candidate); executablePath = candidate; break; } catch {} }
   assert(executablePath);
-  browser = await chromium.launch({ executablePath, headless: true });
+  browser = await chromium.launch({
+    executablePath,
+    headless: true,
+    args: ["--disable-crashpad", "--disable-crash-reporter"],
+    env: { ...process.env, HOME: dir, TMPDIR: dir },
+  });
   for (const theme of ["light", "dark"]) for (const width of [1366, 480]) {
     const page = await browser.newPage({ viewport: { width, height: 768 } });
     await gotoScenario(page, url, { landmark: page.getByRole("main", { name: "M289 file drop" }), label: "M289" });

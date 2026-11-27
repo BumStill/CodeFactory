@@ -1,6 +1,6 @@
 {
   "name": "codefactory",
-  "version": "1.131.0",
+  "version": "1.133.1",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -29,6 +29,7 @@
     "test:repository-intent:headless": "node scripts/verify-repository-intent-headless.mjs",
     "test:resume:headless": "node scripts/verify-resume-journal-headless.mjs",
     "test:usage:headless": "node scripts/verify-token-usage-headless.mjs",
+    "test:context-usage-ring:headless": "node scripts/verify-context-usage-ring-headless.mjs",
     "test:attachments:asset-scope": "node scripts/verify-attachment-asset-scope.mjs",
     "test:reconnect-banner:headless": "node scripts/verify-reconnect-banner-headless.mjs",
     "test:background-tasks:headless": "node scripts/verify-background-tasks-headless.mjs",
