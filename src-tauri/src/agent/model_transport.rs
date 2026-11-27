@@ -2293,7 +2293,11 @@ impl ModelTransport for RoutedDesktopModelTransport {
                     continue;
                 }
             };
-            match transport.complete(messages, tools, opts).await {
+            // M298/M286 Windows: keep the provider round future off the
+            // phase-one worker's 1 MiB main stack. The retry state machine adds
+            // branches around this future; boxing here prevents those states
+            // from being embedded recursively in the outer routed future.
+            match Box::pin(transport.complete(messages, tools, opts)).await {
                 Ok(mut response) => {
                     self.turn_uncommitted_output.store(false, Ordering::SeqCst);
                     self.turn_uncommitted_side_effect.store(false, Ordering::SeqCst);
