@@ -319,33 +319,83 @@ fn build_chatgpt_responses_body(
     }
     body
 }
-fn parse_openai_responses_sse(payload: &str) -> Result<(String, Vec<ToolCall>, Option<Usage>, Option<String>)> {
+fn parse_openai_responses_sse(
+    payload: &str,
+) -> Result<(String, Vec<ToolCall>, Option<Usage>, Option<String>)> {
     let mut text = String::new();
     let mut reasoning = String::new();
     let mut calls = Vec::new();
-    let mut usage = None;
     for line in payload.lines() {
-        let Some(data) = line.strip_prefix("data: ") else { continue };
-        if data == "[DONE]" { break; }
-        let Ok(event) = serde_json::from_str::<serde_json::Value>(data) else { continue };
+        let Some(data) = line.strip_prefix("data:") else {
+            continue;
+        };
+        let data = data.trim_start();
+        if data == "[DONE]" {
+            break;
+        }
+        let Ok(event) = serde_json::from_str::<serde_json::Value>(data) else {
+            continue;
+        };
         match event.get("type").and_then(|v| v.as_str()).unwrap_or("") {
-            "response.output_text.delta" => if let Some(delta) = event.get("delta").and_then(|v| v.as_str()) { text.push_str(delta); },
-            "response.reasoning_summary_text.delta" | "response.reasoning_text.delta" => if let Some(delta) = event.get("delta").and_then(|v| v.as_str()) { reasoning.push_str(delta); },
-            "response.output_item.done" => if let Some(item) = event.get("item") {
-                if item.get("type").and_then(|v| v.as_str()) == Some("function_call") {
-                    calls.push(ToolCall { id:item.get("call_id").and_then(|v|v.as_str()).unwrap_or("").into(), r#type:"function".into(), function:FunctionCall { name:item.get("name").and_then(|v|v.as_str()).unwrap_or("").into(), arguments:item.get("arguments").and_then(|v|v.as_str()).unwrap_or("{}").into() } });
+            "response.output_text.delta" => {
+                if let Some(delta) = event.get("delta").and_then(|v| v.as_str()) {
+                    text.push_str(delta);
                 }
-            },
-            "response.completed" => if let Some(u) = event.pointer("/response/usage") {
-                let input = u.get("input_tokens").and_then(|v|v.as_u64()).unwrap_or(0) as u32;
-                let output = u.get("output_tokens").and_then(|v|v.as_u64()).unwrap_or(0) as u32;
-                usage = Some(Usage { prompt_tokens:input, completion_tokens:output, total_tokens:input+output, cost:u.get("cost").and_then(|v|v.as_f64()), prompt_tokens_details:Some(crate::openrouter::types::PromptTokenDetails { cached_tokens:u.pointer("/input_tokens_details/cached_tokens").and_then(|v|v.as_u64()).unwrap_or(0) as u32 }), completion_tokens_details:Some(crate::openrouter::types::CompletionTokenDetails { reasoning_tokens:u.pointer("/output_tokens_details/reasoning_tokens").and_then(|v|v.as_u64()).unwrap_or(0) as u32 }) });
-            },
-            "response.failed" => return Err(crate::errors::AppError::Other(event.pointer("/response/error/message").and_then(|v|v.as_str()).unwrap_or("OpenAI Responses failed").into())),
+            }
+            "response.reasoning_summary_text.delta" | "response.reasoning_text.delta" => {
+                if let Some(delta) = event.get("delta").and_then(|v| v.as_str()) {
+                    reasoning.push_str(delta);
+                }
+            }
+            "response.output_item.done" => {
+                if let Some(item) = event.get("item").filter(|item| {
+                    item.get("type").and_then(|v| v.as_str()) == Some("function_call")
+                }) {
+                    calls.push(ToolCall {
+                        id: item.get("call_id").and_then(|v| v.as_str()).unwrap_or("").into(),
+                        r#type: "function".into(),
+                        function: FunctionCall {
+                            name: item.get("name").and_then(|v| v.as_str()).unwrap_or("").into(),
+                            arguments: item.get("arguments").and_then(|v| v.as_str()).unwrap_or("{}").into(),
+                        },
+                    });
+                }
+            }
+            "response.completed" => {
+                validate_responses_completed(&event)?;
+                let usage = event.pointer("/response/usage").map(|u| {
+                    let input = u.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                    let output = u.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                    Usage {
+                        prompt_tokens: input,
+                        completion_tokens: output,
+                        total_tokens: input.saturating_add(output),
+                        cost: u.get("cost").and_then(|v| v.as_f64()),
+                        prompt_tokens_details: Some(crate::openrouter::types::PromptTokenDetails {
+                            cached_tokens: u.pointer("/input_tokens_details/cached_tokens")
+                                .and_then(|v| v.as_u64()).unwrap_or(0) as u32,
+                        }),
+                        completion_tokens_details: Some(crate::openrouter::types::CompletionTokenDetails {
+                            reasoning_tokens: u.pointer("/output_tokens_details/reasoning_tokens")
+                                .and_then(|v| v.as_u64()).unwrap_or(0) as u32,
+                        }),
+                    }
+                });
+                return Ok((text, calls, usage, (!reasoning.is_empty()).then_some(reasoning)));
+            }
+            "response.incomplete" => return Err(responses_event_incomplete(&event)),
+            "response.failed" => {
+                let message = event.pointer("/response/error/message").and_then(|v| v.as_str())
+                    .unwrap_or("OpenAI Responses failed");
+                return Err(crate::errors::AppError::Other(message.into()));
+            }
             _ => {}
         }
     }
-    Ok((text, calls, usage, (!reasoning.is_empty()).then_some(reasoning)))
+    // Neither a generic sentinel nor EOF can commit accumulated text or tools.
+    Err(crate::errors::AppError::Other(
+        "MODEL_OUTPUT_INCOMPLETE: OpenAI Responses stream ended before response.completed".into(),
+    ))
 }
 
 
@@ -1312,6 +1362,14 @@ impl DesktopModelTransport {
             crate::agent::quota_cap::shared_quota_ledger().record_server_usage(&self.base_url, quota);
         }
 
+        self.parse_chatgpt_response(response, finalization_response).await
+    }
+
+    // Shared by the authenticated request and local protocol acceptance. Auth
+    // and quota admission remain above; the parser never invents credentials.
+    async fn parse_chatgpt_response(
+        &self, response: reqwest::Response, finalization_response: bool,
+    ) -> Result<(String, Vec<ToolCall>, Option<Usage>, Option<String>)> {
         // ── Parse the Responses SSE stream ──
         let mut byte_stream = response.bytes_stream();
         let mut text_buf = String::new();
@@ -1399,7 +1457,9 @@ impl DesktopModelTransport {
                             }
                         }
                     }
+                    "response.incomplete" => return Err(responses_event_incomplete(&ev)),
                     "response.completed" => {
+                        validate_responses_completed(&ev)?;
                         saw_terminal_marker = true;
                         if let Some(u) = ev.get("response").and_then(|r| r.get("usage")) {
                             let inp =
@@ -1461,6 +1521,9 @@ impl DesktopModelTransport {
         )
         .map_err(crate::errors::AppError::Other)?;
 
+        if text_buf.trim().is_empty() && tool_calls.is_empty() && reasoning_buf.trim().is_empty() {
+            return Err(crate::errors::AppError::Other("MODEL_OUTPUT_EMPTY: 模型没有返回可用内容或工具调用".into()));
+        }
         if finalization_response {
             if self.max_output_tokens.is_none() {
                 text_buf = sanitize_completion_summary(&text_buf);
@@ -1723,7 +1786,9 @@ impl DesktopModelTransport {
                     usage = Some(u);
                 }
                 for choice in sc.choices {
-                    if choice.finish_reason.is_some() {
+                    if let Some(reason) = choice.finish_reason.as_deref() {
+                        validate_model_finish_reason(reason, &["stop", "tool_calls", "function_call"])
+                            .map_err(crate::errors::AppError::Other)?;
                         saw_terminal_marker = true;
                     }
                     let delta = choice.delta;
@@ -1796,6 +1861,9 @@ impl DesktopModelTransport {
             .collect();
         tool_calls.sort_by_key(|tc| tc.id.clone());
 
+        if text_buf.trim().is_empty() && tool_calls.is_empty() && reasoning_buf.trim().is_empty() {
+            return Err(crate::errors::AppError::Other("MODEL_OUTPUT_EMPTY: 模型没有返回可用内容或工具调用".into()));
+        }
         if finalization_response {
             if self.max_output_tokens.is_none() {
                 text_buf = sanitize_completion_summary(&text_buf);
@@ -1816,6 +1884,36 @@ impl DesktopModelTransport {
         };
         Ok((text_buf, tool_calls, usage, reasoning))
     }
+}
+
+fn validate_responses_completed(event: &serde_json::Value) -> Result<()> {
+    match event.pointer("/response/status").and_then(|value| value.as_str()) {
+        Some("incomplete") => Err(responses_event_incomplete(event)),
+        // Some compatible endpoints omit status on the completed event.
+        None | Some("completed") => Ok(()),
+        Some(status) => validate_model_finish_reason(status, &["completed"])
+            .map_err(crate::errors::AppError::Other),
+    }
+}
+
+fn responses_event_incomplete(event: &serde_json::Value) -> crate::errors::AppError {
+    let reason = event.pointer("/response/incomplete_details/reason")
+        .and_then(|value| value.as_str()).unwrap_or("unknown");
+    crate::errors::AppError::Other(responses_incomplete_error(reason))
+}
+
+fn responses_incomplete_error(reason: &str) -> String {
+    let marker = if reason == "max_output_tokens" { "MODEL_OUTPUT_TRUNCATED" } else { "MODEL_OUTPUT_INCOMPLETE" };
+    format!("{marker}: 模型响应未完成（{reason}），部分内容未作为完整结果接受")
+}
+
+/// Incomplete responses cannot authorize tools or populate complete-answer caches.
+pub(super) fn validate_model_finish_reason(reason: &str, accepted: &[&str]) -> std::result::Result<(), String> {
+    if accepted.contains(&reason) { return Ok(()); }
+    let code = if matches!(reason, "length" | "max_tokens" | "incomplete") {
+        "MODEL_OUTPUT_TRUNCATED"
+    } else { "MODEL_OUTPUT_INCOMPLETE" };
+    Err(format!("{code}: 模型输出未完整结束（{reason}），部分内容未作为完整结果接受"))
 }
 
 fn normalize_chatgpt_reasoning_effort(value: &str) -> &str {
@@ -2110,6 +2208,9 @@ impl ModelTransport for DesktopModelTransport {
                     .call_anthropic_model(messages, tools, opts.require_tool)
                     .await
                     .map_err(|e| classify_transport_error(e.to_string()))?;
+                if !resp.cancelled && resp.text.trim().is_empty() && resp.tool_calls.is_empty() {
+                    return Err(TransportError::Fatal("MODEL_OUTPUT_EMPTY: 模型没有返回可用内容或工具调用".into()));
+                }
                 Ok(anthropic_response_to_model_response(resp))
             }
             _ => {
@@ -2127,6 +2228,15 @@ impl ModelTransport for DesktopModelTransport {
                 )
                 .await
                 .map_err(|e| classify_transport_error(e.to_string()))?;
+                if !self.is_cancelled()
+                    && text.trim().is_empty()
+                    && tool_calls.is_empty()
+                    && reasoning.as_deref().is_none_or(|r| r.trim().is_empty())
+                {
+                    return Err(TransportError::Fatal(
+                        "MODEL_OUTPUT_EMPTY: 模型没有返回可用内容或工具调用".into(),
+                    ));
+                }
                 Ok(ModelResponse {
                     text,
                     tool_calls,
@@ -3356,6 +3466,158 @@ mod tests {
             }
         });
         (base_url, hits)
+    }
+
+    #[tokio::test]
+    async fn ppt_output_responses_incomplete_and_completed_use_real_sse_parser() {
+        for (event, expected) in [
+            (r#"{"type":"response.incomplete","response":{"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"}}}"#, Some("MODEL_OUTPUT_TRUNCATED")),
+            (r#"{"type":"response.completed","response":{"status":"incomplete"}}"#, Some("MODEL_OUTPUT_INCOMPLETE")),
+            (r#"{"type":"response.incomplete","response":{"status":"incomplete","incomplete_details":{"reason":"content_filter"}}}"#, Some("MODEL_OUTPUT_INCOMPLETE")),
+            (r#"{"type":"response.completed","response":{"status":"completed"}}"#, None),
+        ] {
+            let body = format!("data: {{\"type\":\"response.output_text.delta\",\"delta\":\"description\"}}\n\ndata: {event}\n\n");
+            let (url, _) = serve_responses(vec![("200 OK", "text/event-stream", Box::leak(body.into_boxed_str()))]);
+            let t = transport();
+            let response = t.http.post(url).body("").send().await.unwrap();
+            let result = t.parse_chatgpt_response(response, true).await;
+            if let Some(marker) = expected { assert!(result.unwrap_err().to_string().contains(marker)); }
+            else { assert_eq!(result.unwrap().0, "description"); }
+        }
+    }
+
+    async fn direct_gpt6_fixture(
+        terminal: &str,
+    ) -> std::result::Result<ModelResponse, TransportError> {
+        let body = format!(
+            "event: response.output_text.delta\ndata: {{\"type\":\"response.output_text.delta\",\"delta\":\"dense slide tail\"}}\n\n\
+             event: response.output_item.done\ndata: {{\"type\":\"response.output_item.done\",\"output_index\":1,\"item\":{{\"type\":\"function_call\",\"call_id\":\"call_ppt\",\"name\":\"read_pptx\",\"arguments\":\"{{}}\"}}}}\n\n{terminal}"
+        );
+        let (base_url, hits, requests) = serve_captured_responses(vec![(
+            "200 OK", "text/event-stream", Box::leak(body.into_boxed_str()),
+        )]);
+        let mut transport = transport();
+        transport.base_url = format!("{base_url}/v1");
+        transport.model_id = "gpt-6-fixture".into();
+        let result = transport
+            .complete(
+                &[cm("user", "Read the dense synthetic slide")],
+                &[crate::tools::pptx_edit::read_definition()],
+                &RoundOptions::default(),
+            )
+            .await;
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        assert!(requests.lock().unwrap()[0].starts_with("POST /v1/responses "));
+        result
+    }
+
+    #[tokio::test]
+    async fn ppt_output_direct_gpt6_rejects_incomplete_text_and_tool_calls() {
+        let cases = [
+            (
+                "response.incomplete",
+                r#"{"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"}}"#,
+                "MODEL_OUTPUT_TRUNCATED",
+            ),
+            (
+                "response.completed",
+                r#"{"status":"incomplete","incomplete_details":{"reason":"content_filter"}}"#,
+                "MODEL_OUTPUT_INCOMPLETE",
+            ),
+            (
+                "response.incomplete",
+                r#"{"status":"incomplete","incomplete_details":{"reason":"content_filter"}}"#,
+                "MODEL_OUTPUT_INCOMPLETE",
+            ),
+        ];
+        for (kind, response, expected) in cases {
+            let terminal = format!(
+                "event: {kind}\ndata: {{\"type\":\"{kind}\",\"response\":{response}}}\n\n"
+            );
+            let error = direct_gpt6_fixture(&terminal)
+                .await
+                .expect_err("partial response must not return text or executable tools");
+            assert!(matches!(error, TransportError::Fatal(_)), "{error}");
+            assert!(error.to_string().contains(expected), "{error}");
+        }
+        for terminal in ["", "data: [DONE]\n\n"] {
+            let error = direct_gpt6_fixture(terminal)
+                .await
+                .expect_err("partial response needs a completion event");
+            assert!(error.to_string().contains("MODEL_OUTPUT_INCOMPLETE"), "{error}");
+        }
+    }
+
+    #[tokio::test]
+    async fn ppt_output_direct_gpt6_completed_preserves_text_tools_and_usage() {
+        let result = direct_gpt6_fixture(concat!(
+            "event: response.completed\n",
+            "data: ",
+            r#"{"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":321,"output_tokens":1800,"total_tokens":2121}}}"#,
+            "\n\n",
+        ))
+        .await
+        .expect("complete direct response");
+        assert_eq!(result.text, "dense slide tail");
+        assert_eq!(result.tool_calls.len(), 1);
+        assert_eq!(result.tool_calls[0].id, "call_ppt");
+        assert_eq!(result.tool_calls[0].function.name, "read_pptx");
+        let usage = result.usage.unwrap();
+        assert_eq!((usage.prompt_tokens, usage.completion_tokens), (321, 1800));
+    }
+
+    #[tokio::test]
+    async fn ppt_output_openai_partial_and_empty_are_not_success() {
+        for (body, marker) in [
+            ("data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"partial\"},\"finish_reason\":\"length\"}]}\n\ndata: [DONE]\n\n", "MODEL_OUTPUT_TRUNCATED"),
+            ("data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n", "MODEL_OUTPUT_EMPTY"),
+        ] {
+            let (url, hits) = serve_responses(vec![("200 OK", "text/event-stream", body)]);
+            let mut t = transport(); t.base_url = url;
+            let err = t.complete(&[cm("user", "describe synthetic slide")], &[], &RoundOptions::default()).await.expect_err("must reject incomplete output");
+            assert!(err.to_string().contains(marker), "{err}");
+            assert_eq!(hits.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn ppt_output_anthropic_partial_is_not_success() {
+        let body = "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"partial\"}}\n\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"max_tokens\"}}\n\ndata: {\"type\":\"message_stop\"}\n\n";
+        let (url, hits) = serve_responses(vec![("200 OK", "text/event-stream", body)]);
+        let mut t = transport(); t.base_url = url; t.api_style = ApiStyle::Anthropic;
+        let err = t.complete(&[cm("user", "describe synthetic slide")], &[], &RoundOptions::default()).await.expect_err("must reject incomplete output");
+        assert!(err.to_string().contains("MODEL_OUTPUT_TRUNCATED"), "{err}");
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn ppt_output_eof_timeout_and_cancel_keep_distinct_outcomes() {
+        let body = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"partial\"},\"finish_reason\":null}]}\n\n";
+        let (url, _) = serve_responses(vec![("200 OK", "text/event-stream", body)]);
+        let mut t = transport(); t.base_url = url;
+        let error = t.complete(&[cm("user", "inspect")], &[], &RoundOptions::default()).await.expect_err("EOF is not successful completion");
+        assert!(error.to_string().contains("stream ended"), "{error}");
+        for cancelled in [false, true] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let server = std::thread::spawn(move || {
+                let (mut socket, _) = listener.accept().unwrap();
+                let mut request = [0; 8192]; let _ = socket.read(&mut request);
+                socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n").unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(300));
+            });
+            let mut t = transport(); t.base_url = url;
+            t.http = Client::builder().no_proxy().timeout(std::time::Duration::from_millis(150)).build().unwrap();
+            let flag = Arc::new(AtomicBool::new(false));
+            if cancelled {
+                t.cancel = Some(flag.clone());
+                std::thread::spawn(move || { std::thread::sleep(std::time::Duration::from_millis(40)); flag.store(true, Ordering::SeqCst); });
+            }
+            let result = t.complete(&[cm("user", "inspect")], &[], &RoundOptions::default()).await;
+            if cancelled { assert!(result.is_ok(), "cooperative cancellation remains distinct: {result:?}"); }
+            else { assert!(result.is_err(), "timeout cannot become empty success"); }
+            server.join().unwrap();
+        }
     }
 
     fn openai_candidate(name: &str, model: &str, base_url: String) -> RouteCandidate {

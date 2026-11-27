@@ -247,6 +247,10 @@ pub(super) async fn stream_anthropic(
                     }
                 }
                 "message_delta" => {
+                    if let Some(reason) = event.pointer("/delta/stop_reason").and_then(|v| v.as_str()) {
+                        super::model_transport::validate_model_finish_reason(reason, &["end_turn", "tool_use", "stop_sequence"])
+                            .map_err(crate::errors::AppError::Other)?;
+                    }
                     // {"type":"message_delta","usage":{"output_tokens":N}}
                     if let Some(u) = event
                         .pointer("/usage/output_tokens")
@@ -283,6 +287,9 @@ pub(super) async fn stream_anthropic(
         })
         .collect();
     tool_calls.sort_by_key(|tc| tc.id.clone());
+    if !cancelled && text_buf.trim().is_empty() && tool_calls.is_empty() {
+        return Err(crate::errors::AppError::Other("MODEL_OUTPUT_EMPTY: 模型没有返回可用内容或工具调用".into()));
+    }
     if finalization_response {
         if sanitize_finalization {
             text_buf = sanitize_completion_summary(&text_buf);

@@ -83,6 +83,11 @@
     { "pattern": "src-tauri/src/agent/anthropic_client.rs", "scenario_id": "HLT-001" },
     { "pattern": "src/lib/waitingReason.ts", "scenario_id": "UI-008" },
     { "pattern": "src/pages/ControlPlane/ControlPlanePage.tsx", "scenario_id": "HLT-001" },
-    { "pattern": "src-tauri/src/agent/attachments.rs", "scenario_id": "UI-007" }
+    { "pattern": "src-tauri/src/agent/attachments.rs", "scenario_id": "UI-007" },
+    { "pattern": "src-tauri/src/agent/anthropic_client.rs", "scenario_id": "VIS-001" },
+    { "pattern": "src-tauri/src/tools/pptx_edit.rs", "scenario_id": "HLT-001" },
+    { "pattern": "src-tauri/src/tools/pptx_edit.rs", "scenario_id": "VIS-001" },
+    { "pattern": ".github/workflows/ppt-dense-acceptance.yml", "scenario_id": "VIS-001" },
+    { "pattern": "src-tauri/tests/fixtures/dense-single-slide-201.pptx", "scenario_id": "VIS-001" }
   ]
 }

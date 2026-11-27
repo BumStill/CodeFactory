@@ -73,6 +73,16 @@ fn mime_for_extension(extension: &str) -> &'static str {
 }
 
 pub async fn execute(args: Value, ctx: &ExecCtx) -> ToolOutput {
+    let routes = ctx
+        .settings
+        .as_ref()
+        .map(vision::vision_routes)
+        .unwrap_or_default();
+    execute_with_routes(args, ctx, routes).await
+}
+
+// Private handler: production routes always come from host settings above.
+async fn execute_with_routes(args: Value, ctx: &ExecCtx, routes: Vec<crate::agent::failover::RouteCandidate>) -> ToolOutput {
     let Some(raw_path) = arg_str(&args, "path") else {
         return ToolOutput::err("view_image 需要一个非空的 `path`");
     };
@@ -150,11 +160,6 @@ pub async fn execute(args: Value, ctx: &ExecCtx) -> ToolOutput {
     let image = ImageInput::new(bytes, mime, label);
     let session_id = ctx.session_id.clone().unwrap_or_else(|| "no-session".to_string());
     let db = ctx.db.as_ref();
-    let routes = ctx
-        .settings
-        .as_ref()
-        .map(vision::vision_routes)
-        .unwrap_or_default();
 
     let mut attempts: Vec<String> = Vec::new();
 
@@ -333,4 +338,9 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
+}
+
+#[cfg(test)]
+pub(crate) async fn execute_with_test_routes(args: Value, ctx: &ExecCtx, routes: Vec<crate::agent::failover::RouteCandidate>) -> ToolOutput {
+    execute_with_routes(args, ctx, routes).await
 }
