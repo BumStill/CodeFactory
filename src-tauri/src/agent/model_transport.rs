@@ -286,6 +286,47 @@ fn chatgpt_wire_output_ceiling(_local_ceiling: Option<u32>) -> Option<u32> {
     None
 }
 
+fn build_openai_responses_input(messages: &[ChatMessage]) -> (String, Vec<serde_json::Value>) {
+    let mut instructions = String::new();
+    let mut input = Vec::new();
+    for message in messages {
+        match message.role.as_str() {
+            "system" => instructions = super::AgentLoop::content_to_text(&message.content),
+            "tool" => input.push(serde_json::json!({
+                "type": "function_call_output",
+                "call_id": message.tool_call_id.clone().unwrap_or_default(),
+                "output": super::AgentLoop::content_to_text(&message.content),
+            })),
+            "assistant" => {
+                let text = super::AgentLoop::content_to_text(&message.content);
+                if !text.is_empty() {
+                    input.push(serde_json::json!({
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": text}],
+                    }));
+                }
+                if let Some(tool_calls) = &message.tool_calls {
+                    for call in tool_calls {
+                        input.push(serde_json::json!({
+                            "type": "function_call",
+                            "call_id": call.id,
+                            "name": call.function.name,
+                            "arguments": call.function.arguments,
+                        }));
+                    }
+                }
+            }
+            _ => input.push(serde_json::json!({
+                "type": "message",
+                "role": "user",
+                "content": super::AgentLoop::content_to_chatgpt_user_parts(&message.content),
+            })),
+        }
+    }
+    (instructions, input)
+}
+
 fn build_chatgpt_responses_body(
     model_id: &str,
     instructions: String,
@@ -353,6 +394,24 @@ fn should_use_openai_responses(base_url: &str, model_id: &str) -> bool {
     let base = base_url.to_ascii_lowercase();
     let model = model_id.to_ascii_lowercase();
     model.starts_with("gpt-6") && !base.contains("openrouter")
+}
+
+const STREAM_INTERRUPTION_RETRY_LIMIT: u32 = 2;
+const STREAM_INTERRUPTION_RETRY_BASE_MS: u64 = 250;
+
+fn is_replay_safe_stream_interruption(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("provider_stream_interrupted_no_side_effect")
+        || lower.contains("error decoding response body")
+        || lower.contains("connection closed before message completed")
+        || lower.contains("unexpected eof")
+}
+
+fn stream_interruption_retry_delay(attempt: usize) -> std::time::Duration {
+    let exponent = attempt.saturating_sub(1).min(4) as u32;
+    std::time::Duration::from_millis(
+        STREAM_INTERRUPTION_RETRY_BASE_MS.saturating_mul(2_u64.saturating_pow(exponent)),
+    )
 }
 
 fn classify_transport_error(message: String) -> TransportError {
@@ -504,8 +563,9 @@ impl ProviderAttemptRuntime {
         // `invalid_request_error` 400s). Classified as replayed=no below, which
         // the durable receipt records as a non-replayable failure.
         let deterministic = is_deterministic_request_rejection(text);
-        let replayable =
-            (!self.post_admitted.load(Ordering::SeqCst) || explicit_response) && !deterministic;
+        let stream_interruption = is_replay_safe_stream_interruption(text);
+        let replayable = stream_interruption
+            || ((!self.post_admitted.load(Ordering::SeqCst) || explicit_response) && !deterministic);
         let (failure_class, failure_code) = if is_quota_exhausted(text) {
             // U33 / M51: the endpoint answered, and the answer was "your quota
             // is used up". Checked before the overload arm, because
@@ -1166,44 +1226,7 @@ impl DesktopModelTransport {
         // than the endpoint's base_url so the request always lands correctly.
         let url = format!("{}/responses", crate::codex_auth::CHATGPT_BASE_URL);
 
-        // ── ChatMessage history → Responses instructions + input items ──
-        let mut instructions = String::new();
-        let mut input: Vec<serde_json::Value> = Vec::new();
-        for m in messages {
-            match m.role.as_str() {
-                "system" => instructions = super::AgentLoop::content_to_text(&m.content),
-                "tool" => input.push(serde_json::json!({
-                    "type": "function_call_output",
-                    "call_id": m.tool_call_id.clone().unwrap_or_default(),
-                    "output": super::AgentLoop::content_to_text(&m.content),
-                })),
-                "assistant" => {
-                    let text = super::AgentLoop::content_to_text(&m.content);
-                    if !text.is_empty() {
-                        input.push(serde_json::json!({
-                            "type": "message",
-                            "role": "assistant",
-                            "content": [{"type": "output_text", "text": text}],
-                        }));
-                    }
-                    if let Some(tcs) = &m.tool_calls {
-                        for tc in tcs {
-                            input.push(serde_json::json!({
-                                "type": "function_call",
-                                "call_id": tc.id,
-                                "name": tc.function.name,
-                                "arguments": tc.function.arguments,
-                            }));
-                        }
-                    }
-                }
-                _ => input.push(serde_json::json!({
-                    "type": "message",
-                    "role": "user",
-                    "content": super::AgentLoop::content_to_chatgpt_user_parts(&m.content),
-                })),
-            }
-        }
+        let (instructions, input) = build_openai_responses_input(messages);
 
         // Tools → Responses shape (function fields flattened, no "function" nest).
         let tools: Vec<serde_json::Value> = tool_defs
@@ -1488,12 +1511,7 @@ impl DesktopModelTransport {
         reasoning_effort: &str,
     ) -> Result<(String, Vec<ToolCall>, Option<Usage>, Option<String>)> {
         let url = format!("{}/responses", self.base_url.trim_end_matches('/'));
-        let mut instructions = String::new();
-        let mut input = Vec::new();
-        for message in messages {
-            let text = super::AgentLoop::content_to_text(&message.content);
-            if message.role == "system" { instructions = text; } else { input.push(serde_json::json!({"type":"message","role":message.role,"content":[{"type":"input_text","text":text}]})); }
-        }
+        let (instructions, input) = build_openai_responses_input(messages);
         let tools = tool_defs.iter().map(|tool| serde_json::json!({"type":"function","name":tool.function.name,"description":tool.function.description,"parameters":tool.function.parameters})).collect::<Vec<_>>();
         let body = build_chatgpt_responses_body(&self.model_id, instructions, input, tools, require_tool, reasoning_effort, self.max_output_tokens);
         let _billing_hold = self.billing.as_ref().map(|admission| BillingHold::reserve(admission, &body, self.max_output_tokens)).transpose()?;
@@ -2179,6 +2197,7 @@ impl ModelTransport for RoutedDesktopModelTransport {
         // without it is a different request, so it runs on a fresh attempt
         // opened by the next turn of this loop.
         let mut downgraded_options: Option<RoundOptions> = None;
+        let mut stream_interruption_retries = 0_usize;
         loop {
             let opts = downgraded_options.as_ref().unwrap_or(opts);
             let admission = if super::thin::is_thin(&self.db, &self.session_id).await {
@@ -2276,11 +2295,6 @@ impl ModelTransport for RoutedDesktopModelTransport {
             };
             match transport.complete(messages, tools, opts).await {
                 Ok(mut response) => {
-                    // This round's output is now part of the conversation the
-                    // next round is built from, so it is no longer "uncommitted".
-                    // Keeping these latched for the whole turn is what stripped a
-                    // multi-round agent turn of its configured fallbacks after
-                    // round one, even for a later round that emitted nothing.
                     self.turn_uncommitted_output.store(false, Ordering::SeqCst);
                     self.turn_uncommitted_side_effect.store(false, Ordering::SeqCst);
                     if let Some(attempt) = provider_attempt.as_ref() {
@@ -2290,21 +2304,14 @@ impl ModelTransport for RoutedDesktopModelTransport {
                     if let Err(error) = super::usage_windows::model_wait::clear(&self.db, &self.session_id).await {
                         tracing::warn!("model availability wait reset failed: {error}");
                     }
-                    // CF-QUOTA-R1 (estimate path): charge this round's real
-                    // tokens to the subscription endpoint's local estimate, the
-                    // one used whenever the service gave us no usage reading.
-                    // Pay-per-token endpoints are never metered.
                     if route.api_style == ApiStyle::Chatgpt {
                         if let Some(usage) = response.usage.as_ref() {
                             crate::agent::quota_cap::shared_quota_ledger().record_local_usage(
                                 &route.base_url,
                                 crate::agent::quota_cap::TokenUsage {
                                     input_tokens: usage.prompt_tokens as u64,
-                                    cached_input_tokens: usage
-                                        .prompt_tokens_details
-                                        .as_ref()
-                                        .map(|details| details.cached_tokens as u64)
-                                        .unwrap_or(0),
+                                    cached_input_tokens: usage.prompt_tokens_details.as_ref()
+                                        .map(|details| details.cached_tokens as u64).unwrap_or(0),
                                     output_tokens: usage.completion_tokens as u64,
                                 },
                                 chrono::Utc::now().timestamp_millis(),
@@ -2313,11 +2320,8 @@ impl ModelTransport for RoutedDesktopModelTransport {
                     }
                     response.effective_route = Some(effective_route(&route));
                     if let Some(first) = transitions.first() {
-                        let reason = transitions
-                            .iter()
-                            .map(|change| change.reason.as_str())
-                            .collect::<Vec<_>>()
-                            .join("；");
+                        let reason = transitions.iter().map(|change| change.reason.as_str())
+                            .collect::<Vec<_>>().join("；");
                         let combined = super::failover::RouteChange {
                             from_endpoint: first.from_endpoint.clone(),
                             from_model: first.from_model.clone(),
@@ -2344,12 +2348,6 @@ impl ModelTransport for RoutedDesktopModelTransport {
                     if error.to_string().contains(REQUIRED_TOOL_CHOICE_NEEDS_NEW_ATTEMPT)
                         && downgraded_options.is_none()
                     {
-                        // The refused attempt is settled just above; the next
-                        // turn of the loop opens a fresh one and re-sends
-                        // without `tool_choice: required`. Once per call, so a
-                        // provider that keeps refusing still terminates. The
-                        // route is untouched: the endpoint answered correctly,
-                        // it simply does not accept that option.
                         downgraded_options = Some(RoundOptions {
                             require_tool: false,
                             ..opts.clone()
@@ -2360,6 +2358,34 @@ impl ModelTransport for RoutedDesktopModelTransport {
                     return Err(self.failure_with_chain(error));
                 }
                 Err(TransportError::Retryable(reason)) => {
+                    if is_replay_safe_stream_interruption(&reason)
+                        && !round_side_effect_started.load(Ordering::SeqCst)
+                        && !side_effect_before_round
+                        && stream_interruption_retries < STREAM_INTERRUPTION_RETRY_LIMIT as usize
+                    {
+                        if let Some(attempt) = provider_attempt.as_ref() {
+                            let _ = attempt
+                                .settle_failure_with_failover(
+                                    &TransportError::Retryable(reason.clone()),
+                                    false,
+                                )
+                                .await?;
+                        }
+                        stream_interruption_retries += 1;
+                        let delay = stream_interruption_retry_delay(stream_interruption_retries);
+                        self.events.emit(StreamEvent::TransportRetry {
+                            label: "流式连接中断".into(),
+                            attempt: stream_interruption_retries as u32,
+                            max_attempts: STREAM_INTERRUPTION_RETRY_LIMIT,
+                            delay_ms: delay.as_millis() as u64,
+                            reason: format!(
+                                "模型连接中断，系统自动重试/自愈（第 {} 次）",
+                                stream_interruption_retries
+                            ),
+                        });
+                        tokio::time::sleep(delay).await;
+                        continue;
+                    }
                     let action = match provider_attempt.as_ref() {
                         Some(attempt) => {
                             attempt
@@ -2707,6 +2733,47 @@ mod tests {
             &mut req.messages,
         );
         serde_json::to_value(&req).expect("wire body serializes")
+    }
+
+    #[test]
+    fn m298_stream_interruptions_are_bounded_replay_safe_retries() {
+        for message in [
+            "provider_stream_interrupted_no_side_effect: stream ended",
+            "error decoding response body",
+            "connection closed before message completed",
+            "unexpected EOF",
+        ] {
+            assert!(is_replay_safe_stream_interruption(message), "{message}");
+        }
+        assert!(!is_replay_safe_stream_interruption("HTTP 400 Bad Request: invalid input_text"));
+        assert_eq!(STREAM_INTERRUPTION_RETRY_LIMIT, 2);
+        assert_eq!(stream_interruption_retry_delay(1), std::time::Duration::from_millis(250));
+        assert_eq!(stream_interruption_retry_delay(2), std::time::Duration::from_millis(500));
+    }
+
+    #[test]
+    fn m298_openai_responses_serializes_multiround_history_with_role_specific_items() {
+        let mut assistant = cm("assistant", "我先读取文件。");
+        assistant.tool_calls = Some(vec![call("call-m298", "read_file", "{\"path\":\"src/lib.rs\"}")]);
+        let history = vec![
+            cm("user", "修复问题"),
+            assistant,
+            tool_cm("call-m298", "文件内容"),
+            cm("assistant", "已分析。"),
+            cm("user", "继续"),
+        ];
+        let (_, input) = build_openai_responses_input(&history);
+        assert_eq!(input[0]["content"][0]["type"], "input_text");
+        assert_eq!(input[1]["content"][0]["type"], "output_text");
+        assert_eq!(input[2]["type"], "function_call");
+        assert_eq!(input[2]["call_id"], "call-m298");
+        assert_eq!(input[3]["type"], "function_call_output");
+        assert_eq!(input[3]["call_id"], "call-m298");
+        assert_eq!(input[4]["content"][0]["type"], "output_text");
+        assert_eq!(input[5]["content"][0]["type"], "input_text");
+        assert!(input.iter().filter(|item| item["role"] == "assistant").all(|item| {
+            item["content"].as_array().is_some_and(|parts| parts.iter().all(|part| part["type"] == "output_text"))
+        }));
     }
 
     #[test]

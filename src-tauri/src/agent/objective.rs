@@ -490,8 +490,7 @@ pub(crate) fn parked_incident_message(failure_code: Option<&str>) -> &'static st
 进度和上下文都已保留：可以在输入框旁换成另一个可用模型继续同一目标，不必重述需求。";
     }
     if failure_code == Some(PROVIDER_TRANSPORT_UNREACHABLE) {
-        return "网络或模型服务连不上了，本回合已停在安全边界。进度和上下文都已保留：\
-网络或服务恢复后直接回一句「继续」，就会在原来的进度上接着做。";
+        return "网络或模型服务暂时不可用，系统会在恢复后自动继续当前任务，无需手动重试。";
     }
     "本回合的自动恢复已达到安全上限，已登记为系统故障。你不需要补充输入；CodeFactory 会在恢复策略或能力更新后续接同一目标。"
 }
@@ -5361,30 +5360,18 @@ impl ObjectiveStore {
                 decision.transport_probe_wait = true;
                 Ok(decision)
             }
-            TransportOutageAction::GiveUp {
-                unreachable_ms,
-                attempts,
-            } => {
-                let text = transport_outage_terminal_message(unreachable_ms, attempts);
-                self.record_transport_outage_terminal(
-                    &decision.objective_id,
-                    unreachable_ms,
-                    attempts,
-                    &text,
-                )
-                .await;
-                // U3's failed terminal, reached honestly: the objective stays
-                // `failed` with a code that explains itself. No new intermediate
-                // state is invented for the user to decode.
-                decision.decision_type = DecisionType::FailedInternal;
-                decision.status = ObjectiveStatus::Failed;
-                decision.failure_code = Some(PROVIDER_TRANSPORT_UNREACHABLE.into());
+            TransportOutageAction::GiveUp { .. } => {
+                // M298: a long transport outage is still not a verdict about the
+                // task. Keep one durable wake owner and continue bounded probes;
+                // never convert repeated transient observations into a failed
+                // objective that needs a human to revive.
+                decision.decision_type = DecisionType::Waiting;
+                decision.status = ObjectiveStatus::WaitingSystem;
                 decision.request_key = None;
-                decision.remediation_id = None;
-                decision.next_observation_at = None;
+                decision.next_observation_at = Some(now + TRANSPORT_PROBE_INTERVAL_MS);
                 decision.next_action_authorized = false;
                 decision.requires_user_action = false;
-                decision.recovery_owner = Some(OBJECTIVE_INCIDENT_CONTROLLER.into());
+                decision.transport_probe_wait = true;
                 Ok(decision)
             }
         }
@@ -5461,7 +5448,20 @@ impl ObjectiveStore {
                 .execute(&self.pool)
                 .await?
                 .rows_affected(),
-                TransportOutageAction::Retry | TransportOutageAction::GiveUp { .. } => {
+                TransportOutageAction::GiveUp { .. } => sqlx::query(
+                    "UPDATE objectives SET next_observation_at=?, updated_at=?
+                     WHERE id=? AND remediation_id=? AND status='waiting_system'
+                       AND failure_code=?",
+                )
+                .bind(bounded_next_observation_at(now, now + TRANSPORT_PROBE_INTERVAL_MS))
+                .bind(now)
+                .bind(&objective_id)
+                .bind(&remediation_id)
+                .bind(PROVIDER_TRANSPORT_UNREACHABLE)
+                .execute(&self.pool)
+                .await?
+                .rows_affected(),
+                TransportOutageAction::Retry => {
                     sqlx::query(
                         "INSERT INTO objective_remediations
                          (id, objective_id, binding_id, domain, status, failure_code,
@@ -14990,6 +14990,20 @@ CREATE TABLE objectives (
         .fetch_one(pool)
         .await
         .unwrap()
+    }
+
+    #[test]
+    fn m298_transport_outage_ceiling_remains_a_system_owned_wake() {
+        let now = 1_700_000_000_000_i64;
+        let action = transport_outage_action(
+            now,
+            now - TRANSPORT_OUTAGE_WINDOW_MS - 1_000,
+            3,
+            false,
+        );
+        assert!(matches!(action, TransportOutageAction::GiveUp { .. }));
+        assert_eq!(parked_incident_message(Some(PROVIDER_TRANSPORT_UNREACHABLE)),
+            "网络或模型服务暂时不可用，系统会在恢复后自动继续当前任务，无需手动重试。");
     }
 
     /// U25 policy table: wait inside the window, retry the moment the path
