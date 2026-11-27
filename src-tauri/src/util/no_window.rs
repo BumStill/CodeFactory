@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Hide the console window of child processes on Windows.
 //!
-//! Without this, every `Command::new("powershell")` / `Command::new("git")`
+//! Without this, every `Command::new("powershell")` or git child process
 //! / etc. flashes a black console window before the bound stdio takes
 //! over — the user sees a brief popup on every AI tool call and every
 //! auto-checkpoint write. The flag we need is `CREATE_NO_WINDOW`

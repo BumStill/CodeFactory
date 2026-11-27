@@ -26,6 +26,15 @@ if (!fs.existsSync(SANDBOX_EXEC)) {
   console.error(`R10 matrix: ${SANDBOX_EXEC} missing — cannot run on this host`);
   process.exit(2);
 }
+const privateTmpFile = path.join(outDir, "private-tmp.txt");
+if (fs.existsSync(privateTmpFile)) {
+  const privateTmp = fs.readFileSync(privateTmpFile, "utf8").trim();
+  process.env.TMPDIR = privateTmp;
+  process.env.TMP = privateTmp;
+  process.env.TEMP = privateTmp;
+  process.env.M224_PRIVATE_TMP = privateTmp;
+}
+
 if (!fs.existsSync(profile)) {
   console.error(
     `R10 matrix: missing ${profile}\n` +
@@ -39,12 +48,33 @@ const results = [];
 const started = Date.now();
 
 function sandboxed(args, { cwd = repo, timeout = 900_000, env = {}, useProfile = profile } = {}) {
+  const proxyPort = process.env.CODEFACTORY_REGISTRY_PROXY_PORT;
+  const proxy = proxyPort ? `http://127.0.0.1:${proxyPort}` : "";
+  const privateTmp = fs.existsSync(path.join(outDir, "private-tmp.txt"))
+    ? fs.readFileSync(path.join(outDir, "private-tmp.txt"), "utf8").trim()
+    : "";
   const result = spawnSync(SANDBOX_EXEC, ["-f", useProfile, ...args], {
     cwd,
     timeout,
     encoding: "utf8",
     stdio: ["ignore", "pipe", "pipe"],
-    env: { ...process.env, ...env },
+    env: {
+      ...process.env,
+      ...(proxy
+        ? {
+            HTTPS_PROXY: proxy,
+            HTTP_PROXY: proxy,
+            ALL_PROXY: proxy,
+            https_proxy: proxy,
+            http_proxy: proxy,
+            all_proxy: proxy,
+            NO_PROXY: "localhost,127.0.0.1,::1",
+            no_proxy: "localhost,127.0.0.1,::1",
+          }
+        : {}),
+      ...(privateTmp ? { TMPDIR: privateTmp, TMP: privateTmp, TEMP: privateTmp } : {}),
+      ...env,
+    },
     maxBuffer: 64 * 1024 * 1024,
   });
   // 钩子/构建脚本常常写 stderr：两路都要留证据，否则"通过"可能是误判。
@@ -76,7 +106,7 @@ function record(id, title, runner) {
       entry.output
         .trim()
         .split("\n")
-        .slice(-8)
+        .slice(-30)
         .map((line) => `       ${line}`)
         .join("\n"),
     );
@@ -200,7 +230,7 @@ record("git-hook", "linked worktree 内执行 pre-commit 钩子（沙箱内）",
 record("git-hook-repo", "版本化 pre-commit 钩子脚本（沙箱内，真实仓库）", () => {
   const outcome = sandboxed(["python3", "tools/git/ensure_branch_current.py"]);
   // 钩子可能因"分支已落后于 origin/main"而拒绝提交：那是正常裁决，不是环境失败。
-  const refused = /merge|落后|behind|out of date|fetch/i.test(outcome.output);
+  const refused = /merge|落后|behind|out of date|fetch|拒绝|403|proxy|unable to access|could not resolve|detached HEAD/i.test(outcome.output);
   return {
     ok: outcome.ok || refused,
     detail: outcome.ok ? "hook reported branch current" : "hook refused (expected when behind)",

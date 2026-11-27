@@ -87,7 +87,7 @@ jobs:
     needs: release-token-preflight
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ needs.release-token-preflight.outputs.authorized_head_sha }}
           fetch-depth: 0
@@ -344,7 +344,7 @@ jobs:
 
       - name: Setup Node.js
         if: steps.reconcile.outputs.recovered != 'true' && steps.slot.outputs.skip != 'true'
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: '20'
 
@@ -472,7 +472,7 @@ jobs:
           # workflow so the release gate and the repo ruleset can be compared by
           # reading (tests/test_github_main_gate.py), and passed to the
           # classifier so judgement lives in tested code rather than in shell.
-          REQUIRED_CHECKS="governance-baseline agent-bridge-linux check-frontend check-rust remote-real-app-gui scenario-gate-pr"
+          REQUIRED_CHECKS="governance-baseline agent-bridge-linux check-frontend check-rust check-rust-macos-security check-rust-unix docker-sandbox remote-real-app-gui scenario-gate-pr"
           MAX_INFRA_RETRIES=3
           RETRY_COUNTS='{}'
           INFRA_RETRIES=0
@@ -680,7 +680,7 @@ jobs:
                 ;;
             esac
 
-            if [ "$SUCCESSES" -eq 6 ] && [ "$DECISION" = "merge" ]; then
+            if [ "$SUCCESSES" -eq 9 ] && [ "$DECISION" = "merge" ]; then
               if gh pr merge "$PR" --repo "$GITHUB_REPOSITORY" --squash \
                    --auto --match-head-commit "$EXPECTED_HEAD"; then
                 echo "All required checks passed; submitted guarded merge for version PR #$PR"
@@ -690,7 +690,7 @@ jobs:
               sleep 5
               continue
             fi
-            echo "Version PR #$PR waiting ($attempt/360, state=$MERGE_STATE, required=$SUCCESSES/6, infra-retries=$INFRA_RETRIES): $REASON"
+            echo "Version PR #$PR waiting ($attempt/360, state=$MERGE_STATE, required=$SUCCESSES/9, infra-retries=$INFRA_RETRIES): $REASON"
             sleep 20
           done
           echo "::error::Version PR #$PR did not merge within 60 minutes (infrastructure observations or required checks did not converge)"

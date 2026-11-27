@@ -57,6 +57,18 @@
               "integration_id": 15368
             },
             {
+              "context": "check-rust-macos-security",
+              "integration_id": 15368
+            },
+            {
+              "context": "check-rust-unix",
+              "integration_id": 15368
+            },
+            {
+              "context": "docker-sandbox",
+              "integration_id": 15368
+            },
+            {
               "context": "governance-baseline",
               "integration_id": 15368
             },

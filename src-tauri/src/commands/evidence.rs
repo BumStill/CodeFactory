@@ -299,7 +299,7 @@ pub async fn collect_evidence_pack(
     let mut files_changed_out: Vec<serde_json::Value> = Vec::new();
     for file_path in &changed_paths {
         // Try to get git diff for this file
-        let diff = Command::new("git").no_window()
+        let diff = crate::util::host_git::command().no_window()
             .current_dir(cwd)
             .args(["diff", "HEAD~1", "--", file_path])
             .output()
@@ -367,7 +367,7 @@ pub async fn collect_evidence_pack(
             .unwrap_or_default();
 
         if !dt.is_empty() {
-            let git_log_out = Command::new("git").no_window()
+            let git_log_out = crate::util::host_git::command().no_window()
                 .current_dir(cwd)
                 .args([
                     "log",

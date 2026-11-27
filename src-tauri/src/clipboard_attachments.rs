@@ -119,16 +119,18 @@ ConvertTo-Json -InputObject @($result) -Compress
 "#;
 
 fn read_native() -> Result<Vec<ClipboardItem>, String> {
-    use crate::util::no_window::NoWindow;
-    let script = SCRIPT_TEMPLATE.replace("__MAX_CLIPBOARD_BYTES__", &MAX_CLIPBOARD_BYTES.to_string());
-    #[cfg(target_os = "macos")]
-    let command = { let mut c = std::process::Command::new("/usr/bin/osascript"); c.args(["-l", "JavaScript", "-e", &script]); c };
-    #[cfg(target_os = "windows")]
-    let mut command = { let mut c = std::process::Command::new("powershell.exe"); c.args(["-NoProfile", "-NonInteractive", "-STA", "-Command", &script]); c };
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-    return Err("当前平台不支持原生剪贴板附件，请使用拖放或选择文件".into());
+    {
+        return Err("当前平台不支持原生剪贴板附件，请使用拖放或选择文件".into());
+    }
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     {
+        use crate::util::no_window::NoWindow;
+        let script = SCRIPT_TEMPLATE.replace("__MAX_CLIPBOARD_BYTES__", &MAX_CLIPBOARD_BYTES.to_string());
+        #[cfg(target_os = "macos")]
+        let command = { let mut c = std::process::Command::new("/usr/bin/osascript"); c.args(["-l", "JavaScript", "-e", &script]); c };
+        #[cfg(target_os = "windows")]
+        let mut command = { let mut c = std::process::Command::new("powershell.exe"); c.args(["-NoProfile", "-NonInteractive", "-STA", "-Command", &script]); c };
         let output = command.no_window().output().map_err(|e| e.to_string())?;
         if !output.status.success() { return Err(String::from_utf8_lossy(&output.stderr).to_string()); }
         serde_json::from_slice(&output.stdout).map_err(|e| format!("剪贴板数据无法读取：{e}"))
@@ -312,9 +314,20 @@ mod tests {
         let metadata_limits = attachment_metadata(None).unwrap();
         assert_eq!(metadata_limits.max_bytes, limits.max_bytes);
         assert_eq!(metadata_limits.max_model_image_bytes, limits.max_model_image_bytes);
-        assert!(SCRIPT_TEMPLATE.contains("__MAX_CLIPBOARD_BYTES__"));
-        assert!(!SCRIPT_TEMPLATE.contains("26214400"));
-        assert!(!SCRIPT_TEMPLATE.contains("25MB"));
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        {
+            assert!(SCRIPT_TEMPLATE.contains("__MAX_CLIPBOARD_BYTES__"));
+            assert!(!SCRIPT_TEMPLATE.contains("26214400"));
+            assert!(!SCRIPT_TEMPLATE.contains("25MB"));
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        match super::read_native() {
+            Err(err) => {
+                assert!(err.contains("拖放"));
+                assert!(err.contains("选择文件"));
+            }
+            Ok(_) => panic!("linux native clipboard should stay unsupported"),
+        }
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("synthetic.txt");
         std::fs::write(&path, b"clipboard synthetic bytes").unwrap();

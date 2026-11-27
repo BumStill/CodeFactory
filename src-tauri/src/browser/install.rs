@@ -126,8 +126,11 @@ fn install_root_candidates_from(
 
     #[cfg(target_os = "windows")]
     let ordered = [local, home, temp];
+    // macOS / Linux 不把临时目录根当作浏览器安装位置。Windows 仍保留它作为最后的可写兜底。
     #[cfg(not(target_os = "windows"))]
-    let ordered = [home, local, temp];
+    let ordered = [home, local];
+    #[cfg(not(target_os = "windows"))]
+    let _ = temp;
 
     let mut roots: Vec<PathBuf> = Vec::new();
     for candidate in ordered.into_iter().flatten() {
@@ -533,11 +536,19 @@ mod tests {
         assert!(first.contains("AppData"), "{first}");
         #[cfg(not(target_os = "windows"))]
         assert!(first.contains(".codefactory"), "{first}");
+        #[cfg(target_os = "windows")]
         assert!(
             candidates
                 .iter()
                 .any(|root| root.to_string_lossy().contains("Temp")),
-            "the temp tree must be a candidate: {candidates:?}"
+            "Windows keeps the temp tree as a last-resort candidate: {candidates:?}"
+        );
+        #[cfg(not(target_os = "windows"))]
+        assert!(
+            candidates
+                .iter()
+                .all(|root| !root.to_string_lossy().contains("Temp")),
+            "macOS and Linux must not install the managed browser under the temp root: {candidates:?}"
         );
     }
 

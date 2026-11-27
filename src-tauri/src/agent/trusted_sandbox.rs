@@ -11,7 +11,8 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::command_sandbox::{CommandSandbox, CommandLaunch, NetworkPolicy, WritablePath};
+use crate::command_sandbox::{CommandLaunch, CommandSandbox, NetworkPolicy, SandboxConstraints, WritablePath};
+#[cfg_attr(not(target_os = "macos"), allow(unused_imports))]
 use crate::util::no_window::NoWindow;
 use crate::config::settings::Settings;
 
@@ -93,8 +94,19 @@ pub fn blocked_paths(workspace: &Path) -> Vec<WritablePath> {
 
 /// 一次算清允许与拒绝两套路径，避免 `resolve` 里重复读 git 元数据。
 pub fn sandbox_paths(workspace: &Path) -> (Vec<WritablePath>, Vec<WritablePath>) {
+    let private = private_tmpdir(None).ok();
+    sandbox_paths_for(workspace, private.as_deref())
+}
+
+pub fn sandbox_paths_for(
+    workspace: &Path,
+    private_tmpdir: Option<&Path>,
+) -> (Vec<WritablePath>, Vec<WritablePath>) {
     let mut paths: Vec<WritablePath> = vec![WritablePath::tree(workspace)];
-    let mut extras: Vec<WritablePath> = vec![WritablePath::tree(std::env::temp_dir())];
+    let mut extras: Vec<WritablePath> = Vec::new();
+    if let Some(dir) = private_tmpdir {
+        extras.push(WritablePath::tree(dir));
+    }
 
     // 收窄 ~/.cargo：只放行 cargo 真正要写的 `registry` 与 `git` 两个子树，外加包缓存
     // 锁文件。`~/.cargo/bin` 与 `~/.cargo/config.toml` 一旦可写，沙箱内进程就能植入
@@ -112,9 +124,6 @@ pub fn sandbox_paths(workspace: &Path) -> (Vec<WritablePath>, Vec<WritablePath>)
         for relative in [".npm", ".cache", "Library/Caches"] {
             extras.push(WritablePath::tree(home.join(relative)));
         }
-    }
-    if let Some(tmpdir) = env_path("TMPDIR") {
-        extras.push(WritablePath::tree(tmpdir));
     }
     // 编译缓存：任务专属缓存目录与 .codefactory-cache 容器（沙箱化构建必须能写，
     // 否则 R10 矩阵里的 cargo/pnpm 会因缓存只读而失败）。
@@ -210,31 +219,203 @@ fn git_paths(workspace: &Path) -> (Vec<WritablePath>, Vec<WritablePath>) {
 
 /// `git rev-parse --git-dir --git-common-dir`，一次性拿到本工作区与公共仓库目录。
 fn git_dirs(workspace: &Path) -> Option<(PathBuf, PathBuf)> {
-    let output = std::process::Command::new("git")
-        .no_window()
-        .arg("-C")
-        .arg(workspace)
-        .args([
-            "rev-parse",
-            "--path-format=absolute",
-            "--git-dir",
-            "--git-common-dir",
-        ])
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
+    crate::util::host_git::git_dirs(workspace)
+}
+
+/// `$TMPDIR/codefactory-sbx/<session>/`，0700。失败时调用方必须退回审批，不能改用全局临时目录。
+pub fn private_tmpdir(session_id: Option<&str>) -> Result<PathBuf, String> {
+    // R10 矩阵先生成仓库 profile，再生成 worktree profile。两次如果各自再套一层
+    // `codefactory-sbx/<pid>`，worktree 会写到第一份目录，而第二份策略只放行自己的
+    // 子目录。显式钉住同一目录时，profile 与子进程 TMPDIR 才是同一条写白名单。
+    if let Some(pinned) = std::env::var_os("M224_PRIVATE_TMP") {
+        let dir = PathBuf::from(pinned);
+        if dir.is_absolute() {
+            return prepare_private_dir(&dir);
+        }
     }
-    let text = String::from_utf8(output.stdout).ok()?;
-    let mut lines = text.lines().map(str::trim).filter(|line| !line.is_empty());
-    let git_dir = PathBuf::from(lines.next()?);
-    let common = PathBuf::from(lines.next()?);
-    Some((git_dir, common))
+    let base = std::env::var_os("TMPDIR")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .unwrap_or_else(std::env::temp_dir);
+    let leaf = match session_id {
+        Some(session) => session
+            .chars()
+            .map(|ch| {
+                if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                    ch
+                } else {
+                    '-'
+                }
+            })
+            .collect::<String>(),
+        None => format!("process-{}", std::process::id()),
+    };
+    if leaf.is_empty() {
+        return Err("会话标识为空，无法建立私有临时目录".into());
+    }
+    let dir = base.join("codefactory-sbx").join(leaf);
+    prepare_private_dir(&dir)
+}
+
+fn prepare_private_dir(dir: &Path) -> Result<PathBuf, String> {
+    std::fs::create_dir_all(dir).map_err(|error| format!("私有临时目录不可用：{error}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+            .map_err(|error| format!("私有临时目录权限不可设置：{error}"))?;
+    }
+    Ok(dir.to_path_buf())
+}
+
+pub fn cleanup_private_tmpdir(session_id: &str) {
+    if let Ok(dir) = private_tmpdir(Some(session_id)) {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+static HOST_PORTS: std::sync::Mutex<Vec<u16>> = std::sync::Mutex::new(Vec::new());
+static FULL_NETWORK: std::sync::Mutex<Vec<(String, String)>> = std::sync::Mutex::new(Vec::new());
+
+/// 用户刚刚批准的 bash 命令可以走完整网络。自动放行的命令不会记到这里。
+pub fn note_full_network(session_id: &str, command: &str) {
+    FULL_NETWORK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .push((session_id.to_string(), command.to_string()));
+}
+
+pub fn take_full_network(session_id: &str, command: &str) -> bool {
+    let mut grants = FULL_NETWORK.lock().unwrap_or_else(|error| error.into_inner());
+    if let Some(index) = grants.iter().position(|(session, granted)| session == session_id && granted == command) {
+        grants.remove(index);
+        true
+    } else {
+        false
+    }
+}
+
+/// 浏览器桥等宿主持有的回环端口。生成策略时显式拒绝，避免沙箱连上宿主端点。
+pub fn remember_host_port(port: u16) {
+    let mut ports = HOST_PORTS.lock().unwrap_or_else(|error| error.into_inner());
+    if !ports.contains(&port) {
+        ports.push(port);
+    }
+}
+
+fn denied_host_ports() -> Vec<u16> {
+    HOST_PORTS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .clone()
+}
+
+pub fn seatbelt_constraints() -> Result<SandboxConstraints, String> {
+    let home = env_path("HOME").ok_or_else(|| {
+        "无法定位 HOME，凭据读拒绝清单不完整，已拒绝生成沙箱策略".to_string()
+    })?;
+    let mut read_deny = Vec::new();
+    for relative in [
+        "Library/Application Support/CodeFactory",
+        "Library/Application Support/CodeFactoryDev",
+        "Library/Application Support/com.codefactory.app",
+        "Library/Keychains",
+        ".ssh",
+        ".aws",
+        ".config/gh",
+        ".git-credentials",
+        ".netrc",
+        ".codex",
+        ".npmrc",
+        ".pypirc",
+        ".cargo/credentials",
+        ".cargo/credentials.toml",
+        ".docker/config.json",
+        ".kube",
+        ".config/gcloud",
+        ".azure",
+        ".config/CodeFactory",
+        ".config/CodeFactoryDev",
+        ".config/com.codefactory.app",
+    ] {
+        read_deny.push(home.join(relative));
+    }
+    let mut dispatch_dirs = Vec::new();
+    let mut socket_paths = Vec::new();
+    if let Ok(override_dir) = std::env::var("CODEFACTORY_DISPATCH_DIR") {
+        let path = PathBuf::from(override_dir);
+        if !path.is_absolute() {
+            return Err("CODEFACTORY_DISPATCH_DIR 不是绝对路径，已拒绝生成沙箱策略".into());
+        }
+        socket_paths.push(path.join("dispatch.sock"));
+        dispatch_dirs.push(path);
+    } else {
+        for relative in [
+            "Library/Application Support/com.codefactory.app",
+            "Library/Application Support/CodeFactoryDev",
+            ".config/com.codefactory.app",
+        ] {
+            let dir = home.join(relative);
+            socket_paths.push(dir.join("dispatch.sock"));
+            dispatch_dirs.push(dir);
+        }
+    }
+    Ok(SandboxConstraints {
+        read_deny,
+        dispatch_dirs,
+        require_dispatch_deny: true,
+        socket_paths,
+        denied_loopback_ports: denied_host_ports(),
+    })
+}
+
+/// 路径是否落在与 profile 同源的写白名单里，且没有被后置拒绝盖住。
+/// 判断不了时按可写处理，宿主因此拒绝执行。
+pub fn is_sandbox_writable(path: &Path, workspace: &Path) -> bool {
+    if crate::runtime_manifest::is_runtime_path(path) {
+        return false;
+    }
+    let (allow, block) = sandbox_paths(workspace);
+    if path_covered(path, &block) {
+        return false;
+    }
+    path_covered(path, &allow)
+}
+
+fn path_covered(path: &Path, entries: &[WritablePath]) -> bool {
+    let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    entries.iter().any(|entry| {
+        let entry_path = entry.path();
+        let entry_canonical = entry_path.canonicalize().unwrap_or_else(|_| entry_path.to_path_buf());
+        if entry.is_recursive() {
+            canonical.starts_with(&entry_canonical) || path.starts_with(entry_path)
+        } else {
+            canonical == entry_canonical || path == entry_path
+        }
+    })
+}
+
+pub fn assert_host_may_execute(path: &Path, workspace: &Path) -> Result<(), String> {
+    if is_sandbox_writable(path, workspace) {
+        return Err(format!(
+            "拒绝执行 {}：该路径对沙箱可写，宿主不会运行这里的程序。",
+            path.display()
+        ));
+    }
+    Ok(())
 }
 
 /// 解析沙箱。失败一律是 `FallbackApproval`，调用方据此退回审批。
 pub fn resolve(workspace: &Path, settings: Option<&Settings>) -> SandboxGate {
+    resolve_with(workspace, settings, None, false)
+}
+
+pub fn resolve_with(
+    workspace: &Path,
+    settings: Option<&Settings>,
+    session_id: Option<&str>,
+    full_network: bool,
+) -> SandboxGate {
     if !enabled(settings) {
         return SandboxGate::FallbackApproval(
             "M224：信任模式沙箱已被设置关闭（trusted_command_sandbox=false），命令按原审批路径执行。"
@@ -258,8 +439,24 @@ pub fn resolve(workspace: &Path, settings: Option<&Settings>) -> SandboxGate {
                 .to_string(),
         );
     }
-    let (writable, blocked) = sandbox_paths(&absolute);
-    match CommandSandbox::new(&absolute, writable, blocked, NetworkPolicy::Enabled) {
+    let private = match private_tmpdir(session_id) {
+        Ok(dir) => dir,
+        Err(reason) => return SandboxGate::FallbackApproval(reason),
+    };
+    let (writable, blocked) = sandbox_paths_for(&absolute, Some(&private));
+    let constraints = match seatbelt_constraints() {
+        Ok(constraints) => constraints,
+        Err(reason) => return SandboxGate::FallbackApproval(reason),
+    };
+    let network = if full_network {
+        NetworkPolicy::Full
+    } else {
+        match crate::registry_proxy::ensure_started() {
+            Ok(port) => NetworkPolicy::RegistryProxy { port },
+            Err(reason) => return SandboxGate::FallbackApproval(reason),
+        }
+    };
+    match CommandSandbox::new(&absolute, writable, blocked, network, constraints) {
         Ok(sandbox) => SandboxGate::Enforced(sandbox),
         Err(reason) => SandboxGate::FallbackApproval(reason),
     }
@@ -321,7 +518,18 @@ pub fn wrap_command(
     program: &str,
     args: &[String],
 ) -> (String, Vec<String>, Option<CommandSandbox>) {
-    match resolve(workspace, settings) {
+    wrap_command_with(workspace, settings, program, args, None, false)
+}
+
+pub fn wrap_command_with(
+    workspace: &Path,
+    settings: Option<&Settings>,
+    program: &str,
+    args: &[String],
+    session_id: Option<&str>,
+    full_network: bool,
+) -> (String, Vec<String>, Option<CommandSandbox>) {
+    match resolve_with(workspace, settings, session_id, full_network) {
         SandboxGate::Enforced(sandbox) => {
             let CommandLaunch {
                 program: wrapped_program,
@@ -378,8 +586,14 @@ mod tests {
 
     fn sandbox(workspace: &Path) -> CommandSandbox {
         let (writable, blocked) = sandbox_paths(workspace);
-        CommandSandbox::new(workspace, writable, blocked, NetworkPolicy::Enabled)
-            .expect("sandbox builds on macOS")
+        CommandSandbox::new(
+            workspace,
+            writable,
+            blocked,
+            NetworkPolicy::Full,
+            SandboxConstraints::default(),
+        )
+        .expect("sandbox builds on macOS")
     }
 
     /// 生成的 profile 必须真的表达三条边界：写白名单、工作区写入、网络出站。
@@ -396,6 +610,9 @@ mod tests {
         assert!(profile.contains("(deny file-write*)"), "{profile}");
         assert!(profile.contains("(deny default)"), "{profile}");
         assert!(profile.contains("(allow network*)"), "{profile}");
+        assert!(profile.contains("com.apple.trustd"), "{profile}");
+        assert!(!profile.contains("com.apple.SecurityServer"), "{profile}");
+        assert!(profile.contains("(deny process-exec (literal \"/usr/bin/open\"))"), "{profile}");
         assert!(profile.contains("allow file-write*"), "{profile}");
         // 路径里的空格与引号必须被转义，否则 profile 会解析失败或越界。
         assert!(profile.contains("\\\""), "{profile}");
@@ -595,11 +812,19 @@ mod tests {
             .parent()
             .expect("repo root")
             .to_path_buf();
-        let sandbox = sandbox(&repo);
+        let sandbox = match resolve(&repo, None) {
+            SandboxGate::Enforced(sandbox) => sandbox,
+            SandboxGate::Inherited(reason) | SandboxGate::FallbackApproval(reason) => {
+                panic!("product sandbox did not build for the R10 profile: {reason}")
+            }
+        };
         let dir = repo.join("target").join("m224");
         std::fs::create_dir_all(&dir).expect("target/m224");
         let path = dir.join("repo.sb");
         std::fs::write(&path, sandbox.profile()).expect("write repo profile");
+        if let Ok(private) = private_tmpdir(None) {
+            std::fs::write(dir.join("private-tmp.txt"), private.display().to_string()).ok();
+        }
         let written = std::fs::read_to_string(&path).expect("read back");
         assert!(written.contains("(deny file-write*)"), "{written}");
         assert!(
@@ -887,7 +1112,13 @@ mod tests {
             return;
         };
         let out = std::env::var("M224_PROFILE_OUT").expect("M224_PROFILE_OUT");
-        let sandbox = sandbox(&PathBuf::from(workspace));
+        let workspace = PathBuf::from(workspace);
+        let sandbox = match resolve(&workspace, None) {
+            SandboxGate::Enforced(sandbox) => sandbox,
+            SandboxGate::Inherited(reason) | SandboxGate::FallbackApproval(reason) => {
+                panic!("product sandbox did not build for the R10 worktree profile: {reason}")
+            }
+        };
         std::fs::write(&out, sandbox.profile()).expect("write profile");
     }
 

@@ -686,6 +686,12 @@ export interface Settings {
   /** Shell isolation for the bash tool: docker wraps every command in a disposable container mounting only the project dir. */
   sandbox_mode?: 'off' | 'docker';
   sandbox_image?: string;
+  sandbox_network?: 'none' | 'bridge';
+  sandbox_registry_hosts?: string[];
+  /** 允许本地任务入口批准请求、切换到信任模式、授予交付权限。默认关闭。 */
+  dispatch_privileged_ops?: boolean;
+  /** 在本机保存一份未加密的密钥副本。默认关闭。 */
+  macos_plaintext_key_fallback?: boolean;
   /**
    * 内部回退开关：macOS/Linux 可信模式下把命令包进系统沙箱，默认开。
    * 不是产品选项，设置页不提供开关；仅供内部回退与排障使用。

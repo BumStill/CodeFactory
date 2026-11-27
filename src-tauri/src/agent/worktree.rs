@@ -75,7 +75,7 @@ pub enum MergeOutcome {
 }
 
 fn git(dir: &Path, args: &[&str]) -> Result<String, String> {
-    let out = Command::new("git")
+    let out = crate::util::host_git::command()
         .no_window()
         .arg("-C")
         .arg(dir)
@@ -230,7 +230,7 @@ pub fn merge_back(wt: &TaskWorktree) -> Result<MergeOutcome, String> {
     .map_err(|e| format!("git add in worktree failed: {e}"))?;
 
     // Anything staged? `diff --cached --quiet` exits 1 when there are changes.
-    let staged = Command::new("git")
+    let staged = crate::util::host_git::command()
         .no_window()
         .arg("-C")
         .arg(&wt.worktree_root)
@@ -260,7 +260,7 @@ pub fn merge_back(wt: &TaskWorktree) -> Result<MergeOutcome, String> {
 
     // Full binary diff base..task-branch, written to a file for both apply
     // and (on conflict) manual recovery.
-    let patch_out = Command::new("git")
+    let patch_out = crate::util::host_git::command()
         .no_window()
         .arg("-C")
         .arg(&wt.worktree_root)

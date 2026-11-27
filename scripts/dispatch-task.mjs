@@ -12,6 +12,7 @@
 //   * 请求体必须正好是协议认识的那些字段；
 //   * 只连本机 Unix domain socket，不用任何网络地址。
 
+import { readFileSync } from "node:fs";
 import { connect } from "node:net";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -103,13 +104,27 @@ function validate(request) {
   return request;
 }
 
-function socketPath() {
-  const base =
+export function dispatchDir() {
+  return (
     process.env.CODEFACTORY_DISPATCH_DIR ??
     (process.platform === "darwin"
       ? join(homedir(), "Library/Application Support/com.codefactory.app")
-      : join(homedir(), ".config/com.codefactory.app"));
-  return join(base, "dispatch.sock");
+      : join(homedir(), ".config/com.codefactory.app"))
+  );
+}
+
+function socketPath() {
+  return join(dispatchDir(), "dispatch.sock");
+}
+
+function readToken() {
+  try {
+    const token = readFileSync(join(dispatchDir(), "dispatch.token"), "utf8").trim();
+    if (!token) fail("unauthenticated", "应用未运行或版本过旧");
+    return token;
+  } catch {
+    fail("unauthenticated", "应用未运行或版本过旧");
+  }
 }
 
 async function readStdin() {
@@ -131,12 +146,14 @@ async function main() {
     fail("invalid_request", `request is not valid JSON: ${error.message}`);
   }
   const request = validate(parsed);
+  const token = readToken();
+  const envelope = { auth: token, request };
   const path = socketPath();
 
   const response = await new Promise((resolve) => {
     const socket = connect(path);
     let buffer = "";
-    socket.on("connect", () => socket.write(`${JSON.stringify(request)}\n`));
+    socket.on("connect", () => socket.write(`${JSON.stringify(envelope)}\n`));
     socket.on("data", (chunk) => {
       buffer += chunk.toString("utf8");
       if (buffer.includes("\n")) {

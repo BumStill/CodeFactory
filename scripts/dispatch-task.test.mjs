@@ -9,7 +9,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { chmodSync, mkdtempSync, rmSync } from "node:fs";
+import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -40,13 +40,14 @@ function startStubServer(reply) {
       buffer += chunk;
       const newline = buffer.indexOf("\n");
       if (newline < 0) return;
-      const request = JSON.parse(buffer.slice(0, newline));
-      connection.end(`${JSON.stringify(reply(request))}\n`);
+      const envelope = JSON.parse(buffer.slice(0, newline));
+      connection.end(`${JSON.stringify(reply(envelope.request ?? envelope))}\n`);
     });
   });
   return new Promise((resolve) => {
     server.listen(socketPath, () => {
       chmodSync(socketPath, 0o600);
+      writeFileSync(join(dir, "dispatch.token"), "synthetic-dispatch-token\n", { mode: 0o600 });
       resolve({
         dir,
         close: () =>
@@ -113,10 +114,31 @@ test("失败应答不会被包装成成功", async () => {
   }
 });
 
-test("应用不在时给出明确错误，而不是谎报成功", async () => {
-  const result = await runExample('{"operation":"stop"}', {
-    CODEFACTORY_DISPATCH_DIR: join(tmpdir(), "cf-dispatch-absent"),
-  });
-  assert.equal(result.code, 2);
-  assert.match(result.stderr, /not accepting local tasks/);
+test("令牌文件缺失时提示应用未运行或版本过旧", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "cf-dispatch-notoken-"));
+  try {
+    const result = await runExample('{"operation":"stop"}', {
+      CODEFACTORY_DISPATCH_DIR: dir,
+    });
+    assert.equal(result.code, 1);
+    assert.match(result.stderr, /应用未运行或版本过旧/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("CODEFACTORY_DISPATCH_DIR 决定令牌与套接字目录", async () => {
+  const server = await startStubServer((request) => ({
+    ok: true,
+    result: { echo: request.operation },
+  }));
+  try {
+    const result = await runExample('{"operation":"list_approvals"}', {
+      CODEFACTORY_DISPATCH_DIR: server.dir,
+    });
+    assert.equal(result.code, 0);
+    assert.equal(JSON.parse(result.stdout).result.echo, "list_approvals");
+  } finally {
+    await server.close();
+  }
 });

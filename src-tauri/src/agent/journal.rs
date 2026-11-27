@@ -173,7 +173,7 @@ async fn journal_list_session(pool: &SqlitePool, session_id: &str) -> Result<Vec
 // ── Local git helper (presence gate / merging finalize) ─────────────────────
 
 fn git(dir: &str, args: &[&str]) -> std::result::Result<String, String> {
-    let out = Command::new("git")
+    let out = crate::util::host_git::command()
         .no_window()
         .arg("-C")
         .arg(dir)

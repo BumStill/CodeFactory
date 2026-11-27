@@ -54,7 +54,8 @@ fn m224_real_seatbelt_default_deny_and_children() {
         &ws,
         vec![WritablePath::tree(ws.clone())],
         vec![],
-        NetworkPolicy::Enabled,
+        NetworkPolicy::Full,
+        command_sandbox::SandboxConstraints::default(),
     )
     .unwrap();
     let execute = |command: &str| {
@@ -113,7 +114,8 @@ fn m224_invalid_roots_and_unavailable_runtime_fail_closed() {
             &PathBuf::from("relative"),
             vec![],
             vec![],
-            NetworkPolicy::Enabled
+            NetworkPolicy::Full,
+            command_sandbox::SandboxConstraints::default(),
         )
         .is_err()
     );
@@ -136,6 +138,7 @@ fn m224_policy_variants_and_accessors_are_observable() {
         vec![WritablePath::literal(other.clone())],
         vec![],
         NetworkPolicy::Disabled,
+        command_sandbox::SandboxConstraints::default(),
     )
     .unwrap();
 

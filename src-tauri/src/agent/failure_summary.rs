@@ -962,7 +962,7 @@ mod tests {
 
     fn m46_git(dir: &std::path::Path, args: &[&str]) -> String {
         use crate::util::no_window::NoWindow;
-        let output = std::process::Command::new("git")
+        let output = crate::util::host_git::command()
             .no_window()
             .arg("-C")
             .arg(dir)

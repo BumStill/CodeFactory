@@ -9,7 +9,16 @@
 //! although every segment stays inside the session workspace.
 #[path = "../src/util/no_window.rs"]
 pub mod no_window;
-mod util { pub use crate::no_window; }
+mod util {
+    pub use crate::no_window;
+    pub mod host_git {
+        use crate::no_window::NoWindow;
+        pub fn command() -> std::process::Command {
+            std::process::Command::new("git").no_window()
+        }
+        pub fn command_with_host_credentials() -> std::process::Command { command() }
+    }
+}
 #[path = "../src/agent/trusted_git.rs"]
 mod trusted_git;
 use std::{path::Path, path::PathBuf, process::Command};

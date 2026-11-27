@@ -24,6 +24,9 @@ ALL_REQUIRED = (
     "agent-bridge-linux",
     "check-frontend",
     "check-rust",
+    "check-rust-macos-security",
+    "check-rust-unix",
+    "docker-sandbox",
     "remote-real-app-gui",
     "scenario-gate-pr",
 )

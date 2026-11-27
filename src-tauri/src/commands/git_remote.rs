@@ -338,7 +338,7 @@ fn compare_proves_release_contains_merge(status: &str) -> bool {
 }
 
 fn default_git_remote_name(cwd: &Path) -> String {
-    let output = Command::new("git")
+    let output = crate::util::host_git::command()
         .no_window()
         .arg("-C")
         .arg(cwd)
@@ -361,7 +361,7 @@ fn default_git_remote_name(cwd: &Path) -> String {
 
 fn workspace_remote_url(cwd: &Path) -> Result<String, String> {
     let remote = default_git_remote_name(cwd);
-    let output = Command::new("git")
+    let output = crate::util::host_git::command()
         .no_window()
         .arg("-C")
         .arg(cwd)

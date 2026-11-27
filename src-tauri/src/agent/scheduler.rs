@@ -1829,7 +1829,7 @@ mod tests {
     }
 
     fn test_git(cwd: &std::path::Path, args: &[&str]) {
-        let output = std::process::Command::new("git")
+        let output = crate::util::host_git::command()
             .no_window()
             .arg("-C")
             .arg(cwd)

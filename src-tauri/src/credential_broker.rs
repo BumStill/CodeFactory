@@ -163,6 +163,25 @@ impl CredentialBroker {
     pub async fn invalidate(&self, key_ref: &str) {
         self.slots.lock().await.remove(key_ref);
     }
+
+    /// 启动后把已配置账户读入内存。之后钥匙串暂时不可用时，模型调用仍使用这份缓存。
+    pub async fn prewarm(&self, accounts: &[String]) {
+        for account in accounts {
+            if account.trim().is_empty() {
+                continue;
+            }
+            let _ = self.get(account).await;
+        }
+    }
+
+    pub async fn clear(&self) {
+        let mut slots = self.slots.lock().await;
+        for (_, slot) in slots.drain() {
+            if let CredentialSlot::Ready(Ok(Some(mut value))) = slot {
+                value.clear();
+            }
+        }
+    }
 }
 
 #[cfg(test)]
