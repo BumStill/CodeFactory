@@ -202,7 +202,7 @@ export function ContextUsageBar({ sessionId, onOpenUsage }: Props) {
 
   useEffect(() => {
     if (!detailOpen) return;
-    detailRef.current?.focus();
+    detailRef.current?.focus({ preventScroll: true });
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key !== "Escape") return;
       event.preventDefault();
