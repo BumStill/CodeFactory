@@ -1,0 +1,157 @@
+# Supplemental native acceptance only. This is not a canonical scenario receipt.
+# Synthetic localhost providers need no account, API key, or production data.
+name: Dense PPT supplemental acceptance
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened]
+    paths:
+      - 'src-tauri/src/tools/pptx*.rs'
+      - 'src-tauri/src/tools/view_image.rs'
+      - 'src-tauri/src/vision/**'
+      - 'src-tauri/src/agent/model_transport.rs'
+      - 'src-tauri/src/agent/internal_text.rs'
+      - 'src-tauri/src/agent/anthropic_client.rs'
+      - 'src-tauri/crates/agent-loop/**'
+      - 'src-tauri/Cargo.toml'
+      - 'src-tauri/Cargo.lock'
+      - 'src-tauri/tests/fixtures/dense-single-slide-201.pptx'
+      - '.github/workflows/ppt-dense-acceptance.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  native-acceptance:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-15]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    env:
+      EXPECTED_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+      EVIDENCE_DIR: ${{ runner.temp }}/ppt-dense-evidence
+      CARGO_INCREMENTAL: '0'
+      CARGO_TERM_COLOR: never
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+      - name: Verify exact revision and immutable synthetic fixture
+        shell: python
+        run: |
+          import hashlib, json, os, pathlib, re, subprocess, zipfile
+          import xml.etree.ElementTree as ET
+          out = pathlib.Path(os.environ['EVIDENCE_DIR']); out.mkdir(parents=True, exist_ok=True)
+          head = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
+          assert re.fullmatch('[0-9a-f]{40}', os.environ['EXPECTED_HEAD'])
+          assert head == os.environ['EXPECTED_HEAD'], 'checkout must match requested revision'
+          fixture = pathlib.Path('src-tauri/tests/fixtures/dense-single-slide-201.pptx').resolve()
+          digest = hashlib.sha256(fixture.read_bytes()).hexdigest()
+          assert digest == '2576a6cb2d044e65791360ea4e73152ddfb328b7d83ff7371189385fd197fbf6'
+          with zipfile.ZipFile(fixture) as z:
+              assert [n for n in z.namelist() if re.fullmatch(r'ppt/slides/slide\d+\.xml', n)] == ['ppt/slides/slide1.xml']
+              ns = {'p': 'http://schemas.openxmlformats.org/presentationml/2006/main'}
+              slide = ET.fromstring(z.read('ppt/slides/slide1.xml'))
+              assert len(slide.findall('.//p:sp', ns)) == 162
+              assert len(slide.findall('.//p:cxnSp', ns)) == 39
+              for name in z.namelist():
+                  if name.endswith('.rels'):
+                      assert all(r.get('TargetMode') != 'External' for r in ET.fromstring(z.read(name)))
+          (out / 'identity.json').write_text(json.dumps({'head_sha': head, 'fixture_sha256': digest, 'native_elements': 201, 'synthetic_provider': True, 'canonical_scenario_receipt': False}, indent=2))
+          with open(os.environ['GITHUB_ENV'], 'a') as f:
+              f.write('CODEFACTORY_PPT_FIXTURE_PATH=' + str(fixture) + '\n')
+      - name: Install Windows rendering dependencies
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          choco install libreoffice-fresh poppler --yes --no-progress
+          if ($LASTEXITCODE -ne 0) { throw 'Rendering dependency installation failed (infrastructure)' }
+          'C:\Program Files\LibreOffice\program' | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          # Poppler package layouts differ by version; locate its actual executable.
+          $pdf = Get-ChildItem 'C:\ProgramData\chocolatey\lib\poppler' -Filter pdftoppm.exe -Recurse | Select-Object -First 1
+          if (-not $pdf) { throw 'pdftoppm was not installed (infrastructure)' }
+          $pdf.DirectoryName | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+      - name: Install macOS rendering dependencies
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          brew install --cask libreoffice
+          brew install poppler
+          echo '/Applications/LibreOffice.app/Contents/MacOS' >> "$GITHUB_PATH"
+      - name: Record and require actual rendering runtime
+        shell: python
+        run: |
+          import json, os, pathlib, shutil, subprocess
+          out = pathlib.Path(os.environ['EVIDENCE_DIR'])
+          results = {}
+          for command in [['soffice', '--version'], ['pdftoppm', '-v'], ['rustc', '--version'], ['cargo', '--version']]:
+              executable = shutil.which(command[0])
+              assert executable, 'infrastructure: missing ' + command[0]
+              p = subprocess.run([executable, *command[1:]], text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=60)
+              results[command[0]] = {'version': p.stdout, 'exit_code': p.returncode}
+              assert p.returncode == 0, 'infrastructure: runtime probe failed: ' + command[0]
+          (out / 'runtime.json').write_text(json.dumps(results, indent=2))
+      - name: Run five exact acceptance tests and retain all results
+        shell: python
+        run: |
+          import hashlib, json, os, pathlib, re, subprocess
+          out = pathlib.Path(os.environ['EVIDENCE_DIR'])
+          tests = [
+              ('tools::pptx_edit::tests::dense_pptx_real_render_truncation_then_structure_reread', True),
+              ('tools::pptx_edit::tests::dense_pptx_real_render_complete_description_then_structure_reread', True),
+              ('tools::pptx_edit::tests::dense_pptx_real_render_empty_final_round_surfaces_error', True),
+              ('agent::model_transport::tests::ppt_output_direct_gpt6_rejects_incomplete_text_and_tool_calls', False),
+              ('agent::model_transport::tests::ppt_output_direct_gpt6_completed_preserves_text_tools_and_usage', False),
+          ]
+          records = []
+          for index, (name, ignored) in enumerate(tests):
+              command = ['cargo', 'test', '--locked', '--manifest-path', 'src-tauri/Cargo.toml', '--lib', name, '--', '--exact', '--nocapture', '--test-threads=1']
+              if ignored: command.append('--ignored')
+              log = out / (str(index + 1) + '-' + name.split('::')[-1] + '.log')
+              test_env = os.environ.copy()
+              if ignored:
+                  test_env['CODEFACTORY_PPT_ACCEPTANCE_DIR'] = str(out / ('native-' + str(index + 1)))
+              with log.open('wb') as stream:
+                  try:
+                      result = subprocess.run(command, env=test_env, stdout=stream, stderr=subprocess.STDOUT, timeout=2400)
+                      code = result.returncode
+                  except subprocess.TimeoutExpired:
+                      code = None
+              text = log.read_text(errors='replace')
+              named_start = bool(re.search(r'(?m)^test ' + re.escape(name) + r' \.\.\. ', text))
+              native_receipt = None
+              if ignored:
+                  lines = re.findall(r'(?m)^ppt-native-acceptance: (.+)$', text)
+                  if len(lines) == 1:
+                      native_receipt = dict(part.split('=', 1) for part in lines[0].split() if '=' in part)
+              native_ok = not ignored or (native_receipt is not None and all(native_receipt.get(k) == v for k, v in {'slides': '1', 'native_elements': '201', 'cached_partial': '0', 'source_unchanged': 'true', 'structure_reread': 'true', 'synthetic_provider': 'true', 'real_gui': 'false'}.items()) and native_receipt.get('renderer') in {'libreoffice', 'powerpoint-com', 'quicklook'} and int(native_receipt.get('png_bytes', '0')) > 5000)
+              summary = bool(re.search(r'test result: ok\. 1 passed; 0 failed; 0 ignored;', text))
+              passed = code == 0 and named_start and summary and native_ok
+              runtime_failure = any(marker in text for marker in ['NO_RENDERER:', 'official rendering runtime required', 'native renderer must be bounded', 'PDFTOPPM_SPAWN:', 'SOFFICE_SPAWN:'])
+              failure = None if passed else ('rendering_runtime_failure' if runtime_failure else 'infrastructure_timeout' if code is None else 'test_assertion_failure' if re.search(r'test result: FAILED\.', text) else 'build_runtime_or_missing_test_failure')
+              records.append({'test': name, 'command': command, 'exit_code': code, 'passed': passed, 'failure_category': failure, 'native_receipt': native_receipt, 'log': log.name, 'log_sha256': hashlib.sha256(log.read_bytes()).hexdigest()})
+              print(json.dumps(records[-1]), flush=True)
+          receipt = json.loads((out / 'identity.json').read_text())
+          receipt.update({'runner_os': os.environ['RUNNER_OS'], 'runner_arch': os.environ['RUNNER_ARCH'], 'run_id': os.environ['GITHUB_RUN_ID'], 'run_attempt': os.environ['GITHUB_RUN_ATTEMPT'], 'tests': records, 'passed': all(r['passed'] for r in records), 'real_provider': False, 'real_powerpoint_gui': False})
+          (out / 'supplemental-receipt.json').write_text(json.dumps(receipt, indent=2))
+          raise SystemExit(0 if receipt['passed'] else 1)
+      - name: Upload supplemental evidence (also on failure)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppt-dense-${{ matrix.os }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/ppt-dense-evidence
+          if-no-files-found: warn
