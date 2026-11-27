@@ -446,6 +446,18 @@ async fn publish_turn_activity(
     Ok(())
 }
 
+async fn settle_model_output_failure(
+    persistence: &dyn Persistence, events: &dyn EventSink, root_turn_id: Option<&str>,
+    gate: &codefactory_agent_core::CompletionGate, tokens: (u64, u64), final_text: &str,
+) -> Result<RunOutcome, LoopError> {
+    let notice = "模型没有返回完整的后续答复；已完成的工具结果和当前进度已保留，本次未重放工具操作。";
+    persistence.persist_gate_message(notice, "turn_notice").await?;
+    publish_turn_activity(persistence, events, root_turn_id, "finalizing", "failed_internal",
+        "model_output_incomplete", "模型答复未完成", None, Some("model_output_incomplete")).await?;
+    events.emit(crate::types::StreamEvent::Error { message: notice.into() });
+    Ok(run_outcome_for_terminal(gate, StopReason::FailedInternal, tokens, final_text))
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn settle_context_recovery(
     persistence: &dyn Persistence,
@@ -1417,6 +1429,11 @@ pub async fn run_agent_loop(
                     ))
                     .into());
                 }
+                Err(e) if e.message().contains("MODEL_OUTPUT_") => {
+                    return settle_model_output_failure(persistence.as_ref(), events.as_ref(),
+                        root_turn_id.as_deref(), &completion_gate,
+                        (total_input_tokens, total_output_tokens), &last_final_text).await;
+                }
                 Err(e) => return Err(e.into()),
             };
             output_started_in_run |= !text.is_empty();
@@ -1454,6 +1471,12 @@ pub async fn run_agent_loop(
                 });
                 emitted_terminal = true;
                 break;
+            }
+
+            if text.trim().is_empty() && tool_calls.is_empty() {
+                return settle_model_output_failure(persistence.as_ref(), events.as_ref(),
+                    root_turn_id.as_deref(), &completion_gate,
+                    (total_input_tokens, total_output_tokens), &last_final_text).await;
             }
 
             // Emit real (provider-reported) context-usage right after each
@@ -7154,6 +7177,27 @@ mod tests {
             .events()
             .iter()
             .any(|event| matches!(event, StreamEvent::Done { .. })));
+    }
+
+    #[tokio::test]
+    async fn ppt_output_failure_after_tool_is_visible_and_does_not_replay() {
+        for failure in [None, Some("MODEL_OUTPUT_TRUNCATED: provider output limit"), Some("MODEL_OUTPUT_EMPTY: no usable output")] {
+            let second = failure.map(|m| Err(TransportError::Fatal(m.into())))
+                .unwrap_or_else(|| Ok(response("", vec![], 1)));
+            let transport = Arc::new(ScriptedTransport::from_results(vec![
+                Ok(response("读取结构", vec![call("ppt-read", "read_file", serde_json::json!({"path":"fixture.pptx"}))], 0)),
+                second,
+            ]));
+            let persistence = Arc::new(RecordingPersistence::default());
+            let events = Arc::new(CollectingEventSink::new());
+            let outcome = run_agent_loop(inputs(), config(), services(transport.clone(), persistence.clone(), events.clone()))
+                .await.expect("incomplete output must become an explicit terminal");
+            assert_eq!(outcome.stop_reason, StopReason::FailedInternal);
+            assert_eq!(transport.requests().len(), 2, "must not rerun completed tools or loop forever");
+            assert!(persistence.notices.lock().unwrap().iter().any(|(kind, body)| kind == "turn_notice" && body.contains("模型")));
+            assert!(events.events().iter().any(|e| matches!(e, StreamEvent::Error { message } if message.contains("模型"))));
+            assert!(!events.events().iter().any(|e| matches!(e, StreamEvent::Done { .. })));
+        }
     }
 
     #[test]

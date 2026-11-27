@@ -2446,4 +2446,412 @@ mod tests {
 
         std::fs::remove_dir_all(&cwd).ok();
     }
+
+    async fn dense_synthetic_deck(ctx: &ExecCtx) -> Vec<u8> {
+        let written = super::super::pptx::execute(json!({
+            "path":"dense.pptx", "slides":[{"title":"Synthetic dense single-slide planning board","bullets":[]}],
+        }), ctx).await.unwrap();
+        assert!(!written.is_error, "{}", written.content);
+        let original = std::fs::read(ctx.cwd.join("dense.pptx")).unwrap();
+        let mut archive = ZipArchive::new(Cursor::new(original)).unwrap();
+        let mut output = ZipWriter::new(Cursor::new(Vec::new()));
+        let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+        for index in 0..archive.len() {
+            let mut entry = archive.by_index(index).unwrap();
+            let name = entry.name().to_string();
+            let mut bytes = Vec::new(); entry.read_to_end(&mut bytes).unwrap();
+            if name == "ppt/slides/slide1.xml" {
+                let mut shapes = String::new();
+                // 120 individually editable text-bearing rectangles, 40 editable
+                // ellipse graphics and 39 native connectors: one page, not a bitmap.
+                for n in 0..160 {
+                    let id = n + 100;
+                    let x = 300_000 + (n % 12) * 950_000;
+                    let y = 1_000_000 + (n / 12) * 350_000;
+                    let preset = if n < 120 { "rect" } else { "ellipse" };
+                    let text = if n < 120 { format!("CELL-{n:03} owner / milestone / evidence") } else { format!("GRAPH-{n:03}") };
+                    shapes.push_str(&format!(r#"<p:sp><p:nvSpPr><p:cNvPr id="{id}" name="Dense-{n:03}"/><p:cNvSpPr/><p:nvPr/></p:nvSpPr><p:spPr><a:xfrm><a:off x="{x}" y="{y}"/><a:ext cx="900000" cy="300000"/></a:xfrm><a:prstGeom prst="{preset}"><a:avLst/></a:prstGeom><a:solidFill><a:srgbClr val="E6F0FA"/></a:solidFill><a:ln w="6350"><a:solidFill><a:srgbClr val="224466"/></a:solidFill></a:ln></p:spPr><p:txBody><a:bodyPr wrap="square"/><a:lstStyle/><a:p><a:r><a:rPr lang="en-US" sz="650"/><a:t>{text}</a:t></a:r></a:p></p:txBody></p:sp>"#));
+                }
+                for n in 0..39 {
+                    let id = 300+n; let x=300_000+(n%12)*950_000; let y=1_300_000+(n/12)*350_000;
+                    shapes.push_str(&format!(r#"<p:cxnSp><p:nvCxnSpPr><p:cNvPr id="{id}" name="Connector-{n}"/><p:cNvCxnSpPr/><p:nvPr/></p:nvCxnSpPr><p:spPr><a:xfrm><a:off x="{x}" y="{y}"/><a:ext cx="950000" cy="350000"/></a:xfrm><a:prstGeom prst="line"><a:avLst/></a:prstGeom><a:ln w="6350"><a:solidFill><a:srgbClr val="335577"/></a:solidFill><a:tailEnd type="triangle"/></a:ln></p:spPr></p:cxnSp>"#));
+                }
+                let xml = String::from_utf8(bytes).unwrap();
+                assert!(xml.contains("</p:spTree>"));
+                bytes = xml.replace("</p:spTree>", &(shapes+"</p:spTree>")).into_bytes();
+            }
+            output.start_file::<_, ()>(name, options).unwrap(); output.write_all(&bytes).unwrap();
+        }
+        let source = output.finish().unwrap().into_inner();
+        std::fs::write(ctx.cwd.join("dense.pptx"), &source).unwrap();
+        let mut archive = ZipArchive::new(Cursor::new(&source)).unwrap();
+        assert_eq!(archive.file_names().filter(|n| slide_no_from_name(n).is_some()).count(),1);
+        let mut xml=String::new();archive.by_name("ppt/slides/slide1.xml").unwrap().read_to_string(&mut xml).unwrap();
+        assert_eq!(xml.matches("<p:cxnSp>").count(),39);
+        assert_eq!(xml.matches("name=\"Dense-").count(),160);
+        assert!(xml.contains("x=\"300000\" y=\"1000000\""));
+        source
+    }
+
+    #[tokio::test]
+    async fn dense_pptx_structure_reread_and_copy_edit_preserve_source() {
+        let temp = tempfile::tempdir().unwrap();
+        let ctx = ExecCtx::new(temp.path().to_path_buf(), None);
+        let source = dense_synthetic_deck(&ctx).await;
+        let args = json!({"path":"dense.pptx", "with_format":true});
+        let first = execute_read(args.clone(), &ctx).await.unwrap();
+        assert!(!first.is_error, "{}", first.content);
+        assert!(first.content.contains("(1 slides)"));
+        for n in 0..120 { assert!(first.content.contains(&format!("CELL-{n:03}"))); }
+        for n in 120..160 { assert!(first.content.contains(&format!("GRAPH-{n:03}"))); }
+        let second = execute_read(args, &ctx).await.unwrap();
+        assert_eq!(first.content, second.content, "a second structure read must be complete and stable");
+        let edit = execute_edit(json!({
+            "path":"dense.pptx", "out_path":"dense-reviewed.pptx",
+            "edits":[{"op":"replace", "slide":1,"frame":0,"para":0,"text":"Synthetic reviewed title"}]
+        }), &ctx).await.unwrap();
+        assert!(!edit.is_error, "{}", edit.content);
+        let edited = execute_read(json!({"path":"dense-reviewed.pptx"}), &ctx).await.unwrap();
+        assert!(edited.content.contains("Synthetic reviewed title"));
+        assert!(edited.content.contains("CELL-119"));
+        assert_eq!(std::fs::read(ctx.cwd.join("dense.pptx")).unwrap(), source);
+    }
+
+    // Supplemental native acceptance: real OOXML -> production renderer ->
+    // exact rendered PNG over production provider transport -> SQLite cache ->
+    // real structure reread. The provider is deliberately synthetic localhost;
+    // this is not evidence of authentication, model quality, or desktop UI.
+    #[tokio::test]
+    #[ignore = "requires official LibreOffice and poppler runtime; run explicitly for PPT acceptance"]
+    async fn dense_pptx_real_render_truncation_then_structure_reread() {
+        dense_native_render_and_tool_loop(false, false).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires official LibreOffice and poppler runtime; run explicitly for PPT acceptance"]
+    async fn dense_pptx_real_render_complete_description_then_structure_reread() {
+        dense_native_render_and_tool_loop(true, false).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires official LibreOffice and poppler runtime; run explicitly for PPT acceptance"]
+    async fn dense_pptx_real_render_empty_final_round_surfaces_error() {
+        dense_native_render_and_tool_loop(false, true).await;
+    }
+
+    async fn dense_native_render_and_tool_loop(complete: bool, empty_final_round: bool) {
+        use std::sync::{Arc, Mutex};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use crate::vision::{self, ImageInput};
+        let temp = tempfile::tempdir().unwrap();
+        let pool = sqlx::sqlite::SqlitePoolOptions::new().max_connections(1)
+            .connect("sqlite::memory:").await.unwrap();
+        let ctx = ExecCtx::new(temp.path().to_path_buf(), Some(pool.clone()));
+        let original_fixture = std::env::var_os("CODEFACTORY_PPT_FIXTURE_PATH")
+            .map(std::path::PathBuf::from);
+        let source = if let Some(path) = original_fixture.as_ref() {
+            let bytes = std::fs::read(path).expect("saved dense fixture must be readable");
+            std::fs::write(ctx.cwd.join("dense.pptx"), &bytes).unwrap();
+            bytes
+        } else {
+            dense_synthetic_deck(&ctx).await
+        };
+        // Reused fixtures must still be the one-page native 201-element deck.
+        // These are structural facts, not an assessment of model understanding.
+        let mut archive = ZipArchive::new(Cursor::new(&source)).unwrap();
+        assert_eq!(archive.file_names().filter(|n| slide_no_from_name(n).is_some()).count(), 1);
+        let mut xml = String::new();
+        archive.by_name("ppt/slides/slide1.xml").unwrap().read_to_string(&mut xml).unwrap();
+        assert_eq!(xml.matches("<p:cxnSp>").count(), 39);
+        assert_eq!(xml.matches("name=\"Dense-").count(), 160);
+        assert_eq!(xml.matches("<p:sp>").count() + xml.matches("<p:cxnSp>").count(), 201);
+        let args = json!({"path":"dense.pptx","with_format":true});
+        let first = execute_read(args.clone(), &ctx).await.unwrap();
+        assert!(!first.is_error);
+        for index in 0..120 {
+            let label = format!("CELL-{index:03} owner / milestone / evidence");
+            assert!(first.content.contains(&label), "missing structure label {label}");
+        }
+        for index in 120..160 {
+            let label = format!("GRAPH-{index:03}");
+            assert!(first.content.contains(&label), "missing structure label {label}");
+        }
+        let rendered = tokio::time::timeout(std::time::Duration::from_secs(90),
+            vision::render::render_page(&ctx.cwd.join("dense.pptx"), 1, &ctx.cwd.join("rendered")))
+            .await.expect("native renderer must be bounded").expect("official rendering runtime required");
+        let png = std::fs::read(&rendered.png_path).unwrap();
+        assert!(png.starts_with(b"\x89PNG\r\n\x1a\n"));
+        assert!(png.len() > 5_000, "dense document must render actual content");
+        let image = ImageInput::new(png, "image/png", "dense.pptx page 1 synthetic acceptance");
+        let expected_image = image.data_url();
+        const COMPLETE_END: &str = "DENSE_COMPLETE_END_201_NATIVE_ELEMENTS";
+        // Deliberately supplied oracle text, not a real provider's semantics.
+        let complete_description = complete.then(|| {
+            let mut text = String::from("Synthetic complete single-slide description.\n");
+            for n in 0..160 {
+                let label = if n < 120 { format!("CELL-{n:03}") } else { format!("GRAPH-{n:03}") };
+                text.push_str(&format!("{label} x={} y={} editable.\n",
+                    300_000 + (n % 12) * 950_000, 1_000_000 + (n / 12) * 350_000));
+            }
+            text.push_str("39 native connectors; original title and body remain native objects.\n");
+            text.push_str(COMPLETE_END);
+            assert!(text.chars().count() > 5_000, "exercise a long description including its tail");
+            text
+        });
+        let response_text = complete_description.clone()
+            .unwrap_or_else(|| "Partial synthetic description that must never be cached".into());
+        let finish_reason = if complete { "stop" } else { "length" };
+        let requests = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let sink = requests.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            for (text, reason) in [(response_text, finish_reason)] {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut bytes = Vec::new();
+                let body_offset;
+                loop {
+                    let mut chunk = [0u8; 16384];
+                    let size = socket.read(&mut chunk).await.unwrap();
+                    assert!(size > 0, "request ended before body");
+                    bytes.extend_from_slice(&chunk[..size]);
+                    assert!(bytes.len() < 12 * 1024 * 1024, "bounded test request");
+                    if let Some(offset) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
+                        let headers = std::str::from_utf8(&bytes[..offset]).unwrap();
+                        let len = headers.lines().find_map(|line| {
+                            let (key, value) = line.split_once(':')?;
+                            key.eq_ignore_ascii_case("content-length").then(||value.trim().parse::<usize>().unwrap())
+                        }).unwrap();
+                        if bytes.len() >= offset + 4 + len { body_offset = offset + 4; break; }
+                    }
+                }
+                sink.lock().unwrap().push(serde_json::from_slice(&bytes[body_offset..]).unwrap());
+                let frame = json!({"choices":[{"index":0,"delta":{"content":text},"finish_reason":reason}],
+                    "usage":{"prompt_tokens":321,"completion_tokens":1800,"total_tokens":2121}}).to_string();
+                let body = format!("data: {frame}\n\ndata: [DONE]\n\n");
+                let response = format!("HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len());
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        let route = crate::agent::failover::RouteCandidate {
+            endpoint_name:"synthetic-ppt-acceptance".into(),model_id:"synthetic-vision".into(),
+            base_url:format!("http://{address}/v1"),credential_ref:None,
+            legacy_inline_api_key:Some("synthetic-no-real-credential".into()),supports_vision:true,
+            api_style:crate::config::settings::ApiStyle::Openai,
+        };
+        dense_tool_loop(&ctx, route.clone(), complete_description.as_deref(), empty_final_round)
+            .await;
+        tokio::time::timeout(std::time::Duration::from_secs(5), server).await.unwrap().unwrap();
+        let wire = requests.lock().unwrap();
+        assert_eq!(wire.len(), 1, "truncation must not issue an unaccounted second request");
+        assert!(wire[0].to_string().contains(&expected_image), "provider receives actual rendered slide bytes");
+        drop(wire);
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM vision_descriptions")
+            .fetch_one(&pool).await.unwrap();
+        if let Some(expected) = complete_description.as_ref() {
+            assert_eq!(rows, 1, "a complete stop response must enter SQLite exactly once");
+            let (cached_text, backend, endpoint, model): (String, String, Option<String>, Option<String>) =
+                sqlx::query_as("SELECT text,backend,endpoint,model FROM vision_descriptions")
+                    .fetch_one(&pool).await.unwrap();
+            assert_eq!(&cached_text, expected, "cache must retain the entire response, not a prefix");
+            assert!(cached_text.ends_with(COMPLETE_END));
+            assert_eq!(backend, "vision_model");
+            assert_eq!(endpoint.as_deref(), Some("synthetic-ppt-acceptance"));
+            assert_eq!(model.as_deref(), Some("synthetic-vision"));
+            // The localhost listener is gone: this must reuse the full cache,
+            // with no provider call and therefore no new usage tokens.
+            let cached = super::super::view_image::execute_with_test_routes(
+                json!({"path":"dense.pptx","page":1,"question":"Summarize this dense slide"}),
+                &ctx, vec![route]).await;
+            assert!(!cached.is_error);
+            assert!(cached.content.contains(expected.as_str()));
+            assert!(cached.content.contains(COMPLETE_END));
+            let metadata = cached.metadata.as_ref().unwrap();
+            assert_eq!(metadata["cache_hit"], true);
+            assert_eq!(metadata["backend"], "vision_model");
+            assert_eq!(metadata["input_tokens"], 0);
+            assert_eq!(metadata["output_tokens"], 0);
+            assert_eq!(requests.lock().unwrap().len(), 1);
+        } else {
+            assert_eq!(rows, 0, "partial answer must not enter SQLite");
+        }
+        // This acceptance uses NullPersistence and a cache-only SQLite pool.
+        // Wire usage and tool metadata above are NOT durable billing evidence.
+        let usage_tables: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='model_usage_events'")
+            .fetch_one(&pool).await.unwrap();
+        assert_eq!(usage_tables, 0, "this harness must not claim a persistent usage ledger");
+        let second = execute_read(args, &ctx).await.unwrap();
+        assert!(!second.is_error);
+        assert_eq!(first.content, second.content);
+        assert_eq!(std::fs::read(ctx.cwd.join("dense.pptx")).unwrap(), source);
+        if let Some(path) = original_fixture.as_ref() {
+            assert_eq!(std::fs::read(path).unwrap(), source, "saved source fixture must remain unchanged");
+        }
+        if let Ok(destination) = std::env::var("CODEFACTORY_PPT_ACCEPTANCE_DIR") {
+            let destination = std::path::PathBuf::from(destination);
+            std::fs::create_dir_all(&destination).unwrap();
+            let deck_output = destination.join("dense-single-slide.pptx");
+            let would_overwrite_fixture = original_fixture.as_ref().is_some_and(|original| {
+                original.canonicalize().ok().zip(deck_output.canonicalize().ok())
+                    .is_some_and(|(original, output)| original == output)
+            });
+            if !would_overwrite_fixture { std::fs::write(deck_output, &source).unwrap(); }
+            std::fs::write(destination.join("dense-single-slide.png"), &image.bytes).unwrap();
+            std::fs::write(destination.join("structure.txt"), &first.content).unwrap();
+        }
+        println!("ppt-native-acceptance: slides=1 native_elements=201 text_shapes=120 graphics=40 connectors=39 renderer={} png_bytes={} image_sha={} requests=1 complete_description={} cached_partial=0 production_view_image_fallback={} source_unchanged=true structure_reread=true synthetic_wire_input_tokens=321 synthetic_wire_output_tokens=1800 durable_usage_verified=false synthetic_provider=true real_gui=false",
+            rendered.renderer, image.bytes.len(), image.sha256(), complete, !complete);
+    }
+
+    // Actual handlers and shared loop, but a scripted model (no account/provider quality claim).
+    async fn dense_tool_loop(
+        ctx: &ExecCtx,
+        route: crate::agent::failover::RouteCandidate,
+        complete_description: Option<&str>,
+        empty_final_round: bool,
+    ) {
+        use codefactory_agent_loop::{events::{CollectingEventSink,EventSink}, journal::{NullBudget,NullPersistence}, run::*, services::*, tool::*, transport::*, types::*};
+        use std::sync::{Arc,Mutex};
+        struct Backend { cwd: std::path::PathBuf, pool: sqlx::SqlitePool, route: crate::agent::failover::RouteCandidate, calls: Mutex<Vec<String>>, complete_description: Option<String> }
+        #[async_trait::async_trait]
+        impl ToolBackend for Backend {
+            async fn thin_mode(&self, _: &str) -> bool { true }
+            async fn list_schemas(&self)->Vec<ToolDefinition> { vec![read_definition(),super::super::view_image::definition()] }
+            async fn execute(&self, call:&ToolCall,args:&Value,_:&ToolCtx)->std::result::Result<ToolInvocationResult,ToolError> {
+                self.calls.lock().unwrap().push(call.function.name.clone());
+                let ctx=ExecCtx::new(self.cwd.clone(),Some(self.pool.clone()));
+                let out=match call.function.name.as_str() {
+                    "read_pptx" => execute_read(args.clone(),&ctx).await.unwrap(),
+                    "view_image" => super::super::view_image::execute_with_test_routes(args.clone(),&ctx,vec![self.route.clone()]).await,
+                    other=>panic!("unexpected tool {other}"),
+                };
+                assert!(!out.is_error);
+                if call.function.name=="read_pptx" { assert!(out.content.contains("CELL-119")); }
+                else {
+                    let metadata = out.metadata.as_ref().expect("view_image usage metadata");
+                    if let Some(expected) = self.complete_description.as_ref() {
+                        assert!(out.content.contains(expected.as_str()), "complete description tail must reach the tool result");
+                        assert!(!out.content.contains("VISION_OUTPUT_TRUNCATED"));
+                        assert_eq!(metadata["backend"], "vision_model");
+                        assert_eq!(metadata["cache_hit"], false);
+                        assert_eq!(metadata["input_tokens"], 321, "synthetic wire usage survives the successful transport");
+                        assert_eq!(metadata["output_tokens"], 1800);
+                    } else {
+                        assert!(out.content.contains("VISION_OUTPUT_TRUNCATED"),"must expose fallback reason: {}",out.content);
+                        // The synthetic truncated wire response carried usage,
+                        // but fallback metadata does not preserve that usage.
+                        // This is an explicit remaining accounting boundary.
+                        assert_eq!(metadata["input_tokens"], 0);
+                        assert_eq!(metadata["output_tokens"], 0);
+                    }
+                }
+                Ok(ToolInvocationResult { content:out.content,is_error:false,status:ToolExecutionStatus::Done,command:String::new(),kind:codefactory_agent_core::ToolKind::ReadOnly,return_code:Some(0),stdout:String::new(),stderr:String::new(),error:None,metadata:None,next_working_directory:None,duration_ms:0 })
+            }
+        }
+        struct Model {
+            round: Mutex<usize>,
+            events: Arc<CollectingEventSink>,
+            complete_description: Option<String>,
+            empty_final_round: bool,
+        }
+        #[async_trait::async_trait]
+        impl ModelTransport for Model {
+            async fn complete(&self,messages:&[ChatMessage],_:&[ToolDefinition],_:&RoundOptions)->std::result::Result<ModelResponse,TransportError> {
+                let mut round=self.round.lock().unwrap(); let n=*round; *round+=1;
+                assert!(n<4,"must not replay tools after final answer");
+                if n==2 {
+                    let history = serde_json::to_string(messages).unwrap();
+                    if let Some(expected) = self.complete_description.as_ref() {
+                        assert!(history.contains("DENSE_COMPLETE_END_201_NATIVE_ELEMENTS"));
+                        assert!(history.contains("CELL-119"));
+                        assert!(messages.iter().any(|message| serde_json::to_value(message).unwrap().to_string().contains(expected.lines().last().unwrap())));
+                    } else { assert!(history.contains("VISION_OUTPUT_TRUNCATED")); }
+                }
+                if n==3 {
+                    assert!(serde_json::to_string(messages).unwrap().contains("CELL-119"));
+                    if self.empty_final_round {
+                        return Ok(ModelResponse::default());
+                    }
+                    let text = if self.complete_description.is_some() {
+                        "完整视觉描述与结构复读已收到：CELL-119；DENSE_COMPLETE_END_201_NATIVE_ELEMENTS；原文件未修改。".to_string()
+                    } else {
+                        "视觉输出被截断，已重新读取结构：单页含 CELL-119；原文件未修改。".to_string()
+                    };
+                    self.events.emit(StreamEvent::TextDelta{content:text.clone()});
+                    return Ok(ModelResponse{text,..Default::default()});
+                }
+                let name=if n==1 {"view_image"} else {"read_pptx"};
+                let args=if n==1 {json!({"path":"dense.pptx","page":1,"question":"Summarize this dense slide"})} else {json!({"path":"dense.pptx","with_format":true})};
+                Ok(ModelResponse{tool_calls:vec![ToolCall{id:format!("ppt-{n}"),r#type:"function".into(),function:FunctionCall{name:name.into(),arguments:args.to_string()}}],..Default::default()})
+            }
+        }
+        struct Context;
+        #[async_trait::async_trait]
+        impl ContextPolicy for Context {
+            async fn context_window(&self,_:u32)->(u32,u32) {(200_000,200_000)}
+            async fn supports_vision(&self)->bool {true}
+            async fn round_reasoning_effort(&self)->String {String::new()}
+        }
+        let events=Arc::new(CollectingEventSink::new());
+        let model = Arc::new(Model {
+            round: Mutex::new(0),
+            events: events.clone(),
+            complete_description: complete_description.map(str::to_owned),
+            empty_final_round,
+        });
+        let backend=Arc::new(Backend{cwd:ctx.cwd.clone(),pool:ctx.db.clone().unwrap(),route,calls:Mutex::new(vec![]),complete_description:complete_description.map(str::to_owned)});
+        let input=LoopInputs{messages:vec![ChatMessage{role:"user".into(),content:MessageContent::Text("读取这张密集 PPT 并给出结果".into()),tool_calls:None,tool_call_id:None,name:None,reasoning_content:None}],system_prompt:"synthetic acceptance".into(),tool_defs:backend.list_schemas().await,completion_instruction:"读取这张密集 PPT 并给出结果".into(),fact_check_instruction:String::new(),audit_session_id:"synthetic-ppt".into(),root_turn_id:Some("synthetic-root".into()),mutation_permit:None,knowledge_library_ids:None,cancel:None};
+        let services=LoopServices{transport:model.clone(),tools:backend.clone(),persistence:Arc::new(NullPersistence),events:events.clone(),budget:Arc::new(NullBudget),compactor:Arc::new(DefaultCompressor),context_compaction_gate:Arc::new(AllowAllContextCompaction),permission:Arc::new(AllowAllPermissions),hooks:Arc::new(NoOpHooks),context_policy:Arc::new(Context),fact_checker:Arc::new(NoOpFactChecker),steer:Arc::new(NoSteering)};
+        let config = RunConfig {
+            finalization: FinalizationPolicy::ReleaseWithWarning,
+            turn_capability: TurnCapability::Implement,
+            gate_benchmark: false,
+            progress_window: 8,
+            recovery_limit: 0,
+            max_iterations: 6,
+            wall_budget_applies: false,
+            context_compression: true,
+            overload_backoff: false,
+            overload_retry_delays: [
+                std::time::Duration::from_secs(20),
+                std::time::Duration::from_secs(40),
+            ],
+            inspection_budget: false,
+            replay_rejected_draft: false,
+            tool_heartbeat_interval: None,
+            long_tool_wait_threshold: std::time::Duration::from_secs(60),
+            tool_amplification_threshold: None,
+            session_id: "session".into(),
+            endpoint_name: "test".into(),
+            model_id: "model".into(),
+            base_url: "http://example.invalid".into(),
+            usage_run_id: "run".into(),
+            surface: "interactive".into(),
+            task_id: None,
+            anonymous: false,
+            is_chatgpt: false,
+            cwd: ctx.cwd.clone(),
+        };
+        let outcome=run_agent_loop(input,config,services).await.unwrap();
+        assert_eq!(*backend.calls.lock().unwrap(),vec!["read_pptx","view_image","read_pptx"]);
+        assert_eq!(*model.round.lock().unwrap(),4);
+        if empty_final_round {
+            assert_eq!(outcome.stop_reason, StopReason::FailedInternal);
+            let changes = events.events();
+            assert!(changes.iter().any(|event| matches!(event,
+                StreamEvent::Error { message } if message.contains("工具结果") && message.contains("未重放"))));
+            assert!(!changes.iter().any(|event| matches!(event, StreamEvent::Done { .. })));
+            println!("ppt-loop-acceptance: actual_handlers=read_pptx,view_image,read_pptx rounds=4 empty_final_round=true visible_error=true tool_replayed=false synthetic_model=true");
+            return;
+        }
+        assert_eq!(outcome.stop_reason,StopReason::Finished);
+        assert!(events.events().iter().any(|e|matches!(e,StreamEvent::TextDelta{content} if content.contains("CELL-119"))));
+        assert!(events.events().iter().any(|e|matches!(e,StreamEvent::Done{..})));
+        if complete_description.is_some() {
+            assert!(events.events().iter().any(|e|matches!(e,StreamEvent::TextDelta{content} if content.contains("DENSE_COMPLETE_END_201_NATIVE_ELEMENTS"))));
+        }
+        println!("ppt-loop-acceptance: actual_handlers=read_pptx,view_image,read_pptx rounds=4 visible_followup=true complete_description={} synthetic_model=true durable_usage_verified=false", complete_description.is_some());
+    }
+
 }

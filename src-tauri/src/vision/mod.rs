@@ -261,14 +261,18 @@ pub async fn ask_vision_route(
         reasoning_content: None,
     };
 
+    // Auxiliary calls do not yet carry durable per-attempt billing receipts.
+    // Never automatically issue a second billable request after a partial result.
+    // The caller can continue with structure/OCR and receives a visible reason.
     let out = crate::agent::internal_text::generate_bounded_text(
-        route.clone(),
-        session_id,
-        vec![message],
-        1200,
-        MODEL_DEADLINE,
-    )
-    .await?;
+        route.clone(), session_id, vec![message], 2400, MODEL_DEADLINE,
+    ).await.map_err(|error| {
+        if error.contains("MODEL_OUTPUT_TRUNCATED") {
+            "VISION_OUTPUT_TRUNCATED: 视觉描述达到输出上限，未缓存部分结果，也未自动重试；可读结构或缩小问题范围".to_string()
+        } else if error.contains("SESSION_TITLE_TIMEOUT") {
+            "VISION_TIMEOUT: 视觉描述超时，未缓存部分结果，也未自动重试".to_string()
+        } else { error }
+    })?;
 
     // thinking 路由可能把答案整段放进 reasoning。
     let text = if out.text.trim().is_empty() {
@@ -311,6 +315,8 @@ async fn ensure_cache_table(pool: &SqlitePool) -> Result<(), String> {
 
 fn question_sha(question: &str) -> String {
     let mut hasher = Sha256::new();
+    // Old entries have no provider-completion proof and must never be reused.
+    hasher.update(b"vision-complete-v3:single-attempt:2400:");
     hasher.update(question.trim().to_lowercase().as_bytes());
     format!("{:x}", hasher.finalize())
 }
@@ -711,6 +717,101 @@ mod wire_tests {
             request.contains("stub-vl"),
             "the chosen model was not requested: {request}"
         );
+    }
+
+    // Real localhost SSE and SQLite, never a provider or user document.
+    async fn sequence_server(
+        replies: Vec<(&'static str, &'static str)>,
+        requests: Arc<Mutex<Vec<serde_json::Value>>>,
+    ) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            for (text, reason) in replies {
+                let Ok(Ok((mut socket, _))) = tokio::time::timeout(
+                    Duration::from_secs(5), listener.accept()).await else { break; };
+                let mut bytes = Vec::new();
+                loop {
+                    let mut chunk = [0; 8192];
+                    let n = tokio::io::AsyncReadExt::read(&mut socket, &mut chunk).await.unwrap();
+                    if n == 0 { break; }
+                    bytes.extend_from_slice(&chunk[..n]);
+                    let Some(split) = bytes.windows(4).position(|s| s == b"\r\n\r\n") else { continue; };
+                    let length = String::from_utf8_lossy(&bytes[..split]).lines().find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length").then(|| value.trim().parse::<usize>().ok()).flatten()
+                    }).unwrap_or(0);
+                    if bytes.len() >= split + 4 + length {
+                        requests.lock().unwrap().push(serde_json::from_slice(&bytes[split+4..split+4+length]).unwrap());
+                        break;
+                    }
+                }
+                let event = serde_json::json!({"choices":[{"index":0,"delta":{"content":text},"finish_reason":reason}],
+                    "usage":{"prompt_tokens":11,"completion_tokens":7,"total_tokens":18}});
+                let body = format!("data: {event}\n\ndata: [DONE]\n\n");
+                let response = format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body);
+                let _ = tokio::io::AsyncWriteExt::write_all(&mut socket, response.as_bytes()).await;
+            }
+        });
+        format!("http://{address}/v1")
+    }
+
+    fn sequence_route(base_url: String) -> RouteCandidate {
+        RouteCandidate { endpoint_name: "fixture-vision".into(), model_id: "fixture-vl".into(), base_url,
+            credential_ref: None, legacy_inline_api_key: Some("fixture-key".into()),
+            supports_vision: true, api_style: ApiStyle::Openai }
+    }
+
+    #[tokio::test]
+    async fn nonempty_truncated_vision_is_bounded_and_never_cached() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let route = sequence_route(sequence_server(vec![("partial one", "length")], requests.clone()).await);
+        let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
+        let image = ImageInput::new(b"fixture".to_vec(), "image/png", "dense-slide");
+        let result = describe_cached(Some(&pool), "s", &image, "q", || ask_vision_route(route, "s", &image, "q")).await;
+        assert!(result.is_err(), "nonempty partial output must not become a complete cached description");
+        let error = result.unwrap_err();
+        assert!(error.contains("VISION_OUTPUT_TRUNCATED"), "{error}");
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 1, "no unaccounted automatic recovery request");
+        assert_eq!(requests[0]["max_tokens"], 2400);
+        drop(requests);
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM vision_descriptions").fetch_one(&pool).await.unwrap();
+        assert_eq!(rows, 0);
+    }
+
+    #[tokio::test]
+    async fn explicit_new_call_after_truncation_caches_only_complete_description() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let route = sequence_route(sequence_server(vec![("partial", "length"), ("complete layout", "stop")], requests.clone()).await);
+        let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
+        let image = ImageInput::new(b"fixture".to_vec(), "image/png", "dense-slide");
+        let first = describe_cached(Some(&pool), "s", &image, "q", || ask_vision_route(route.clone(), "s", &image, "q")).await;
+        assert!(first.unwrap_err().contains("VISION_OUTPUT_TRUNCATED"));
+        assert_eq!(requests.lock().unwrap().len(), 1);
+        // A separate caller invocation is new work, not an invisible retry.
+        let (answer, hit) = describe_cached(Some(&pool), "s", &image, "q", || ask_vision_route(route, "s", &image, "q")).await.unwrap();
+        assert!(!hit);
+        assert_eq!(answer.text, "complete layout");
+        assert_eq!(requests.lock().unwrap().len(), 2);
+        let (cached, hit) = describe_cached(Some(&pool), "s", &image, "q", || async { panic!("must use complete cache") }).await.unwrap();
+        assert!(hit);
+        assert_eq!(cached.text, "complete layout");
+    }
+
+    #[tokio::test]
+    async fn old_unversioned_description_is_not_reused() {
+        let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
+        ensure_cache_table(&pool).await.unwrap();
+        let image = ImageInput::new(b"fixture".to_vec(), "image/png", "dense-slide");
+        let mut hash = Sha256::new(); hash.update(b"q"); let old_question_sha = format!("{:x}", hash.finalize());
+        sqlx::query("INSERT INTO vision_descriptions(session_id,image_sha,question_sha,backend,text) VALUES ('s',?,?,'vision_model','legacy partial')")
+            .bind(image.sha256()).bind(old_question_sha).execute(&pool).await.unwrap();
+        let (answer, hit) = describe_cached(Some(&pool), "s", &image, "q", || async {
+            Ok(VisionAnswer::model_answer("new complete".into(), &sequence_route("http://unused.invalid".into()), 1, 1))
+        }).await.unwrap();
+        assert!(!hit, "old cache has no completion proof");
+        assert_eq!(answer.text, "new complete");
     }
 
     #[tokio::test]

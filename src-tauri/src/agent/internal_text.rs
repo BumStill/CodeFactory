@@ -263,7 +263,7 @@ mod tests {
             .unwrap();
         });
 
-        let output = generate_bounded_text(
+        let error = generate_bounded_text(
             route(base_url),
             "empty-title-test",
             vec![message("user", "总结")],
@@ -271,9 +271,9 @@ mod tests {
             Duration::from_secs(2),
         )
         .await
-        .unwrap();
+        .err().expect("empty metadata must not become a successful invented summary");
 
-        assert!(output.text.is_empty(), "unexpected text: {}", output.text);
+        assert!(error.contains("MODEL_OUTPUT_EMPTY"), "{error}");
     }
 
     #[tokio::test]

@@ -1312,6 +1312,14 @@ impl DesktopModelTransport {
             crate::agent::quota_cap::shared_quota_ledger().record_server_usage(&self.base_url, quota);
         }
 
+        self.parse_chatgpt_response(response, finalization_response).await
+    }
+
+    // Shared by the authenticated request and local protocol acceptance. Auth
+    // and quota admission remain above; the parser never invents credentials.
+    async fn parse_chatgpt_response(
+        &self, response: reqwest::Response, finalization_response: bool,
+    ) -> Result<(String, Vec<ToolCall>, Option<Usage>, Option<String>)> {
         // ── Parse the Responses SSE stream ──
         let mut byte_stream = response.bytes_stream();
         let mut text_buf = String::new();
@@ -1399,7 +1407,21 @@ impl DesktopModelTransport {
                             }
                         }
                     }
+                    "response.incomplete" => {
+                        let reason = ev.pointer("/response/incomplete_details/reason")
+                            .and_then(|v| v.as_str()).unwrap_or("unknown");
+                        return Err(crate::errors::AppError::Other(responses_incomplete_error(reason)));
+                    }
                     "response.completed" => {
+                        if let Some(status) = ev.pointer("/response/status").and_then(|v| v.as_str()) {
+                            if status == "incomplete" {
+                                let reason = ev.pointer("/response/incomplete_details/reason")
+                                    .and_then(|v| v.as_str()).unwrap_or("unknown");
+                                return Err(crate::errors::AppError::Other(responses_incomplete_error(reason)));
+                            }
+                            validate_model_finish_reason(status, &["completed"])
+                                .map_err(crate::errors::AppError::Other)?;
+                        }
                         saw_terminal_marker = true;
                         if let Some(u) = ev.get("response").and_then(|r| r.get("usage")) {
                             let inp =
@@ -1461,6 +1483,9 @@ impl DesktopModelTransport {
         )
         .map_err(crate::errors::AppError::Other)?;
 
+        if text_buf.trim().is_empty() && tool_calls.is_empty() && reasoning_buf.trim().is_empty() {
+            return Err(crate::errors::AppError::Other("MODEL_OUTPUT_EMPTY: 模型没有返回可用内容或工具调用".into()));
+        }
         if finalization_response {
             if self.max_output_tokens.is_none() {
                 text_buf = sanitize_completion_summary(&text_buf);
@@ -1723,7 +1748,9 @@ impl DesktopModelTransport {
                     usage = Some(u);
                 }
                 for choice in sc.choices {
-                    if choice.finish_reason.is_some() {
+                    if let Some(reason) = choice.finish_reason.as_deref() {
+                        validate_model_finish_reason(reason, &["stop", "tool_calls", "function_call"])
+                            .map_err(crate::errors::AppError::Other)?;
                         saw_terminal_marker = true;
                     }
                     let delta = choice.delta;
@@ -1796,6 +1823,9 @@ impl DesktopModelTransport {
             .collect();
         tool_calls.sort_by_key(|tc| tc.id.clone());
 
+        if text_buf.trim().is_empty() && tool_calls.is_empty() && reasoning_buf.trim().is_empty() {
+            return Err(crate::errors::AppError::Other("MODEL_OUTPUT_EMPTY: 模型没有返回可用内容或工具调用".into()));
+        }
         if finalization_response {
             if self.max_output_tokens.is_none() {
                 text_buf = sanitize_completion_summary(&text_buf);
@@ -1816,6 +1846,20 @@ impl DesktopModelTransport {
         };
         Ok((text_buf, tool_calls, usage, reasoning))
     }
+}
+
+fn responses_incomplete_error(reason: &str) -> String {
+    let marker = if reason == "max_output_tokens" { "MODEL_OUTPUT_TRUNCATED" } else { "MODEL_OUTPUT_INCOMPLETE" };
+    format!("{marker}: 模型响应未完成（{reason}），部分内容未作为完整结果接受")
+}
+
+/// Incomplete responses cannot authorize tools or populate complete-answer caches.
+pub(super) fn validate_model_finish_reason(reason: &str, accepted: &[&str]) -> std::result::Result<(), String> {
+    if accepted.contains(&reason) { return Ok(()); }
+    let code = if matches!(reason, "length" | "max_tokens" | "incomplete") {
+        "MODEL_OUTPUT_TRUNCATED"
+    } else { "MODEL_OUTPUT_INCOMPLETE" };
+    Err(format!("{code}: 模型输出未完整结束（{reason}），部分内容未作为完整结果接受"))
 }
 
 fn normalize_chatgpt_reasoning_effort(value: &str) -> &str {
@@ -2110,6 +2154,9 @@ impl ModelTransport for DesktopModelTransport {
                     .call_anthropic_model(messages, tools, opts.require_tool)
                     .await
                     .map_err(|e| classify_transport_error(e.to_string()))?;
+                if !resp.cancelled && resp.text.trim().is_empty() && resp.tool_calls.is_empty() {
+                    return Err(TransportError::Fatal("MODEL_OUTPUT_EMPTY: 模型没有返回可用内容或工具调用".into()));
+                }
                 Ok(anthropic_response_to_model_response(resp))
             }
             _ => {
@@ -2127,6 +2174,15 @@ impl ModelTransport for DesktopModelTransport {
                 )
                 .await
                 .map_err(|e| classify_transport_error(e.to_string()))?;
+                if !self.is_cancelled()
+                    && text.trim().is_empty()
+                    && tool_calls.is_empty()
+                    && reasoning.as_deref().is_none_or(|r| r.trim().is_empty())
+                {
+                    return Err(TransportError::Fatal(
+                        "MODEL_OUTPUT_EMPTY: 模型没有返回可用内容或工具调用".into(),
+                    ));
+                }
                 Ok(ModelResponse {
                     text,
                     tool_calls,
@@ -3356,6 +3412,78 @@ mod tests {
             }
         });
         (base_url, hits)
+    }
+
+    #[tokio::test]
+    async fn ppt_output_responses_incomplete_and_completed_use_real_sse_parser() {
+        for (event, expected) in [
+            (r#"{"type":"response.incomplete","response":{"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"}}}"#, Some("MODEL_OUTPUT_TRUNCATED")),
+            (r#"{"type":"response.completed","response":{"status":"incomplete"}}"#, Some("MODEL_OUTPUT_INCOMPLETE")),
+            (r#"{"type":"response.incomplete","response":{"status":"incomplete","incomplete_details":{"reason":"content_filter"}}}"#, Some("MODEL_OUTPUT_INCOMPLETE")),
+            (r#"{"type":"response.completed","response":{"status":"completed"}}"#, None),
+        ] {
+            let body = format!("data: {{\"type\":\"response.output_text.delta\",\"delta\":\"description\"}}\n\ndata: {event}\n\n");
+            let (url, _) = serve_responses(vec![("200 OK", "text/event-stream", Box::leak(body.into_boxed_str()))]);
+            let t = transport();
+            let response = t.http.post(url).body("").send().await.unwrap();
+            let result = t.parse_chatgpt_response(response, true).await;
+            if let Some(marker) = expected { assert!(result.unwrap_err().to_string().contains(marker)); }
+            else { assert_eq!(result.unwrap().0, "description"); }
+        }
+    }
+
+    #[tokio::test]
+    async fn ppt_output_openai_partial_and_empty_are_not_success() {
+        for (body, marker) in [
+            ("data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"partial\"},\"finish_reason\":\"length\"}]}\n\ndata: [DONE]\n\n", "MODEL_OUTPUT_TRUNCATED"),
+            ("data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n", "MODEL_OUTPUT_EMPTY"),
+        ] {
+            let (url, hits) = serve_responses(vec![("200 OK", "text/event-stream", body)]);
+            let mut t = transport(); t.base_url = url;
+            let err = t.complete(&[cm("user", "describe synthetic slide")], &[], &RoundOptions::default()).await.expect_err("must reject incomplete output");
+            assert!(err.to_string().contains(marker), "{err}");
+            assert_eq!(hits.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn ppt_output_anthropic_partial_is_not_success() {
+        let body = "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"partial\"}}\n\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"max_tokens\"}}\n\ndata: {\"type\":\"message_stop\"}\n\n";
+        let (url, hits) = serve_responses(vec![("200 OK", "text/event-stream", body)]);
+        let mut t = transport(); t.base_url = url; t.api_style = ApiStyle::Anthropic;
+        let err = t.complete(&[cm("user", "describe synthetic slide")], &[], &RoundOptions::default()).await.expect_err("must reject incomplete output");
+        assert!(err.to_string().contains("MODEL_OUTPUT_TRUNCATED"), "{err}");
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn ppt_output_eof_timeout_and_cancel_keep_distinct_outcomes() {
+        let body = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"partial\"},\"finish_reason\":null}]}\n\n";
+        let (url, _) = serve_responses(vec![("200 OK", "text/event-stream", body)]);
+        let mut t = transport(); t.base_url = url;
+        let error = t.complete(&[cm("user", "inspect")], &[], &RoundOptions::default()).await.expect_err("EOF is not successful completion");
+        assert!(error.to_string().contains("stream ended"), "{error}");
+        for cancelled in [false, true] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let server = std::thread::spawn(move || {
+                let (mut socket, _) = listener.accept().unwrap();
+                let mut request = [0; 8192]; let _ = socket.read(&mut request);
+                socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n").unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(300));
+            });
+            let mut t = transport(); t.base_url = url;
+            t.http = Client::builder().no_proxy().timeout(std::time::Duration::from_millis(150)).build().unwrap();
+            let flag = Arc::new(AtomicBool::new(false));
+            if cancelled {
+                t.cancel = Some(flag.clone());
+                std::thread::spawn(move || { std::thread::sleep(std::time::Duration::from_millis(40)); flag.store(true, Ordering::SeqCst); });
+            }
+            let result = t.complete(&[cm("user", "inspect")], &[], &RoundOptions::default()).await;
+            if cancelled { assert!(result.is_ok(), "cooperative cancellation remains distinct: {result:?}"); }
+            else { assert!(result.is_err(), "timeout cannot become empty success"); }
+            server.join().unwrap();
+        }
     }
 
     fn openai_candidate(name: &str, model: &str, base_url: String) -> RouteCandidate {
