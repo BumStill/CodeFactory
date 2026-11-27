@@ -33,7 +33,6 @@ jobs:
     timeout-minutes: 90
     env:
       EXPECTED_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
-      EVIDENCE_DIR: ${{ runner.temp }}/ppt-dense-evidence
       CARGO_INCREMENTAL: '0'
       CARGO_TERM_COLOR: never
     steps:
@@ -53,7 +52,7 @@ jobs:
         run: |
           import hashlib, json, os, pathlib, re, subprocess, zipfile
           import xml.etree.ElementTree as ET
-          out = pathlib.Path(os.environ['EVIDENCE_DIR']); out.mkdir(parents=True, exist_ok=True)
+          out = pathlib.Path(os.environ['RUNNER_TEMP']) / 'ppt-dense-evidence'; out.mkdir(parents=True, exist_ok=True)
           head = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
           assert re.fullmatch('[0-9a-f]{40}', os.environ['EXPECTED_HEAD'])
           assert head == os.environ['EXPECTED_HEAD'], 'checkout must match requested revision'
@@ -95,7 +94,7 @@ jobs:
         shell: python
         run: |
           import json, os, pathlib, shutil, subprocess
-          out = pathlib.Path(os.environ['EVIDENCE_DIR'])
+          out = pathlib.Path(os.environ['RUNNER_TEMP']) / 'ppt-dense-evidence'
           results = {}
           for command in [['soffice', '--version'], ['pdftoppm', '-v'], ['rustc', '--version'], ['cargo', '--version']]:
               executable = shutil.which(command[0])
@@ -108,7 +107,7 @@ jobs:
         shell: python
         run: |
           import hashlib, json, os, pathlib, re, subprocess
-          out = pathlib.Path(os.environ['EVIDENCE_DIR'])
+          out = pathlib.Path(os.environ['RUNNER_TEMP']) / 'ppt-dense-evidence'
           tests = [
               ('tools::pptx_edit::tests::dense_pptx_real_render_truncation_then_structure_reread', True),
               ('tools::pptx_edit::tests::dense_pptx_real_render_complete_description_then_structure_reread', True),
