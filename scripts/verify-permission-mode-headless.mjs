@@ -22,6 +22,8 @@ function assert(condition, message) {
 }
 
 async function firstBrowser() {
+  const configured = process.env.CODEFACTORY_HEADLESS_BROWSER;
+  if (configured) { await access(configured); return configured; }
   const candidates = process.platform === "darwin"
     ? [
         "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",

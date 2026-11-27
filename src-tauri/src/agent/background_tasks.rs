@@ -1290,6 +1290,14 @@ pub(crate) async fn settle_objectiveless_wake(pool: &SqlitePool, session: &str, 
     }
     // M251：升级重启会退休 objective，它不代表任务做完；PR 还开着就不能结束会话。
     if super::thin_derive::unfinished_delivery(pool, session).await?.is_some() { return Ok(false); }
+    // M283/R3: a pending permission-identity reconciliation owns this session.
+    // Retiring the Objective does not cancel the owner; settling here cancelled
+    // `permission-reconcile-…` seconds after it was armed and left the turn in
+    // `waiting` with nobody to resume it (session 78d0fe52, 45 minutes).
+    let reconcile_pending: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM wakeup_schedules WHERE session_id=? AND status='pending' AND id LIKE 'permission-reconcile-%'")
+        .bind(session).fetch_one(pool).await?;
+    if reconcile_pending > 0 { return Ok(false); }
     let mut tx = crate::storage::db::begin_write(pool).await?;
     let has_objectives: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='objectives'").fetch_one(&mut *tx).await?;
     if has_objectives == 0 { return Ok(false); }
