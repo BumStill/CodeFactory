@@ -14,6 +14,11 @@
 - R3：测试（先红后绿）：headless 真浏览器验收页模拟 Windows 条件——强制占位滚动条（如 `::-webkit-scrollbar { width: 17px }` 并让容器可滚动）、设备缩放 1.25/1.5、窄窗口；断言点击前后圈的 boundingClientRect 不变、详情框可见且在视口内。不得只用 jsdom。
 - R4：PR 写明「Windows 真机需用户回填」的具体场景：100%/125%/150% 缩放下点圈，圈不动、框弹出。
 
+## 根因与实现说明
+- 根因：`src/components/ContextUsageBar.tsx` 中详情 portal 打开后的 focus effect（当前约 202–205 行）调用无参数 `HTMLElement.focus()`。在 Windows WebView2 的经典占位滚动条、窄窗口与 125%/150% 缩放组合下，新挂载且首帧仍位于初始 fixed 坐标的 portal 会触发浏览器 scroll-into-view；滚动祖先随之移动 composer，表现为右下角用量圈瞬移，且详情框未稳定停在圈附近。macOS overlay scrollbar 不占布局宽度，通常不触发该路径。
+- 修复：focus 详情框时传入标准 `preventScroll: true`，保留键盘焦点与 Escape/关闭行为，同时阻止 WebView2 为 fixed portal 改变滚动位置；不使用平台判断或硬编码坐标偏移。
+- 复现与验证：`src/acceptance/contextUsageRing.tsx` 在真实浏览器验收页强制 17px 占位滚动条，并模拟 WebView2 对未声明 `preventScroll` 的 portal focus 滚动；`scripts/verify-context-usage-ring-headless.mjs` 在 1.25/1.5 device scale 与窄视口下比较点击前后 ring rect，检查 portal 视口边界、锚定、滚动/缩放跟随及两种关闭方式。
+
 ## 约束
 改文件只用 edit_file / write_file。不改信任根；场景缺口只追加 `docs/testing/scenario-mappings.json`。不碰凭据、settings.json、其他会话 PR，不动任何 merge-queue: hold 标签。规格文件在工作区外，用 bash cat 只读查看。
 
