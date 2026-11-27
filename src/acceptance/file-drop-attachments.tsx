@@ -10,8 +10,14 @@ Object.assign(window, {
   __TAURI_INTERNALS__: {
     invoke: async (command: string, args: Record<string, unknown>) => {
       calls.push({ command, args });
-      if (command === "attachment_metadata") return { max_bytes: 52428800, max_mebibytes: 50, max_model_image_bytes: 8388608, max_model_image_mebibytes: 8 };
+      if (command === "attachment_metadata") return { max_bytes: 209715200, max_mebibytes: 200, max_clipboard_bytes: 20971520, max_clipboard_mebibytes: 20, max_model_image_bytes: 8388608, max_model_image_mebibytes: 8 };
       if (command === "save_session_attachment") return { path: `/synthetic/attachments/${args.filename}`, name: args.filename, size_bytes: 4 };
+      if (command === "copy_session_attachments") {
+        const progress = args.progress as { onmessage?: (event: unknown) => void };
+        progress.onmessage?.({ copy_id: args.copyId, name: "80MB 演示.pptx", bytes_copied: 40 * 1024 * 1024, total_bytes: 80 * 1024 * 1024 });
+        return new Promise((resolve) => setTimeout(() => resolve([{ path: "/synthetic/attachments/80MB-demo.pptx", name: "80MB 演示.pptx", size_bytes: 80 * 1024 * 1024 }]), 250));
+      }
+      if (command === "cancel_attachment_copy") return null;
       return null;
     },
     convertFileSrc: () => png,

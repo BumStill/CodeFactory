@@ -70,7 +70,9 @@ pub fn read_definition() -> ToolDefinition {
                 "type": "object",
                 "properties": {
                     "path": { "type": "string", "description": "Path to the .xlsx file" },
-                    "sheet": { "type": "string", "description": "Sheet name (optional; default = first sheet)" }
+                    "sheet": { "type": "string", "description": "Sheet name (optional; default = first sheet)" },
+                    "start_row": { "type": "integer", "minimum": 1, "description": "First row to return (1-based; default 1)" },
+                    "row_limit": { "type": "integer", "minimum": 1, "maximum": 400, "description": "Maximum rows to return (default 200)" }
                 },
                 "required": ["path"]
             }),
@@ -83,6 +85,8 @@ pub async fn execute_read(args: Value, ctx: &ExecCtx) -> Result<ToolOutput> {
     struct A {
         path: String,
         sheet: Option<String>,
+        start_row: Option<usize>,
+        row_limit: Option<usize>,
     }
     let a: A = match serde_json::from_value(args) {
         Ok(v) => v,
@@ -139,12 +143,16 @@ pub async fn execute_read(args: Value, ctx: &ExecCtx) -> Result<ToolOutput> {
 
     // Soft cap so a huge sheet doesn't blow the context; note any truncation.
     const MAX_ROWS: usize = 400;
+    let requested_start = a.start_row.unwrap_or(start_row as usize + 1).max(start_row as usize + 1);
+    let row_limit = a.row_limit.unwrap_or(200).clamp(1, MAX_ROWS);
+    let skip_rows = requested_start.saturating_sub(start_row as usize + 1);
     let mut shown = 0usize;
-    for (ri, row) in range.rows().enumerate() {
-        if shown >= MAX_ROWS {
+    for (ri, row) in range.rows().enumerate().skip(skip_rows) {
+        if shown >= row_limit {
+            let remaining = height.saturating_sub(skip_rows + shown);
             out.push_str(&format!(
-                "\n…(已省略剩余 {} 行;如需可分批用 sheet/范围继续)\n",
-                height - shown
+                "\n…(还有 {remaining} 行，可用 start_row={} 继续读)\n",
+                requested_start + shown
             ));
             break;
         }

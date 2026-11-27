@@ -2393,6 +2393,8 @@ pub fn run() {
             commands::files::list_dir,
             commands::chat::chat_links::open_chat_link,
             commands::chat::chat_links::save_session_attachment,
+            clipboard_attachments::copy_session_attachments,
+            clipboard_attachments::cancel_attachment_copy,
             clipboard_attachments::paste_session_attachments,
             clipboard_attachments::attachment_metadata,
             commands::files::save_chat_attachment,
