@@ -2,6 +2,10 @@
 # Synthetic localhost providers need no account, API key, or production data.
 name: Dense PPT supplemental acceptance
 
+env:
+  PYTHONUTF8: "1"
+  PYTHONIOENCODING: utf-8
+
 on:
   pull_request:
     branches: [main]
